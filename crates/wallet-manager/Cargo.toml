@@ -1,0 +1,54 @@
+[package]
+name = "wallet-manager"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# EVM signing — use k256 directly to avoid alloy's Rust 1.88 transitive deps
+k256 = { version = "0.13", features = ["ecdsa"] }
+
+# Keccak256 for Ethereum address derivation
+tiny-keccak = { version = "2.0", features = ["keccak"] }
+
+# Mnemonic generation (BIP39)
+bip39 = "2"
+
+# BIP32 HD key derivation
+coins-bip32 = "0.13"
+
+# AES-256-GCM encryption
+aes-gcm = "0.10"
+
+# Argon2id key derivation
+argon2 = "0.5"
+
+# SQLite storage
+rusqlite = { version = "0.37", features = ["bundled"] }
+
+# Error handling
+anyhow = "1.0"
+thiserror = "2.0"
+
+# CSPRNG
+rand = "0.8"
+
+# Hex encoding
+hex = "0.4"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Time
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+# ED25519 for Solana and TON
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+
+# Base58 encoding for Solana addresses
+bs58 = "0.5"
+
+# PBKDF2 for TON key derivation; hmac + sha2 also used for Solana SLIP-0010 derivation
+pbkdf2 = "0.12"
+hmac = "0.12"
+sha2 = "0.10"

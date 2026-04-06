@@ -1,0 +1,107 @@
+import { Component, useState, useEffect } from 'react'
+import type { ReactNode } from 'react'
+import { Routes, Route } from 'react-router-dom'
+import Sidebar from './components/Sidebar'
+import PairingModal from './components/PairingModal'
+import Dashboard from './pages/Dashboard'
+import Wallets from './pages/Wallets'
+import Polymarket from './pages/Polymarket'
+import Telegram from './pages/Telegram'
+import Skills from './pages/Skills'
+import Chat from './pages/Chat'
+import LLMSettings from './pages/LLMSettings'
+import Config from './pages/Config'
+import TradingViewPage from './pages/TradingView'
+import Backtesting from './pages/Backtesting'
+import { getAuthToken } from './hooks/useApi'
+
+// ── Error boundary ────────────────────────────────────────────────
+class ErrorBoundary extends Component<
+  { children: ReactNode },
+  { error: Error | null }
+> {
+  state = { error: null }
+
+  static getDerivedStateFromError(error: Error) {
+    return { error }
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <div
+          className="flex h-screen items-center justify-center p-8"
+          style={{ backgroundColor: 'var(--color-base)' }}
+        >
+          <div
+            className="max-w-lg w-full rounded-xl border p-6 text-sm font-mono"
+            style={{
+              backgroundColor: 'var(--color-surface)',
+              borderColor: 'var(--color-danger)',
+              color: 'var(--color-danger)',
+            }}
+          >
+            <p className="font-bold mb-2">Runtime error</p>
+            <p style={{ color: 'var(--color-text-muted)' }}>
+              {(this.state.error as Error).message}
+            </p>
+            <button
+              className="mt-4 px-4 py-2 rounded text-xs font-semibold"
+              style={{ backgroundColor: 'var(--color-accent)', color: '#000' }}
+              onClick={() => window.location.reload()}
+            >
+              Reload
+            </button>
+          </div>
+        </div>
+      )
+    }
+    return this.props.children
+  }
+}
+
+// ── App ───────────────────────────────────────────────────────────
+export default function App() {
+  const [showPairing, setShowPairing] = useState(false)
+
+  useEffect(() => {
+    fetch('/health')
+      .then((r) => r.json())
+      .then((data: { require_pairing?: boolean }) => {
+        if (data.require_pairing && !getAuthToken()) {
+          setShowPairing(true)
+        }
+      })
+      .catch(() => {
+        if (!getAuthToken()) setShowPairing(true)
+      })
+  }, [])
+
+  function handlePaired() {
+    // Token is now in localStorage — reload so all queries start fresh with auth
+    window.location.reload()
+  }
+
+  return (
+    <ErrorBoundary>
+      <div className="flex h-screen overflow-hidden" style={{ backgroundColor: 'var(--color-base)' }}>
+        <Sidebar />
+        <main className="flex-1 overflow-auto">
+          <Routes>
+            <Route path="/" element={<Dashboard />} />
+            <Route path="/wallets" element={<Wallets />} />
+            <Route path="/polymarket" element={<Polymarket />} />
+            <Route path="/telegram" element={<Telegram />} />
+            <Route path="/skills" element={<Skills />} />
+            <Route path="/chat" element={<Chat />} />
+            <Route path="/tradingview" element={<TradingViewPage />} />
+            <Route path="/backtesting" element={<Backtesting />} />
+            <Route path="/settings/llm" element={<LLMSettings />} />
+            <Route path="/settings/config" element={<Config />} />
+          </Routes>
+        </main>
+        {showPairing && <PairingModal onPaired={handlePaired} />}
+      </div>
+    </ErrorBoundary>
+  )
+}
