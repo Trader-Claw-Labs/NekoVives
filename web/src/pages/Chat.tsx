@@ -1,9 +1,9 @@
-import { useState, useRef, useEffect, useCallback } from 'react'
+import { useState, useRef, useEffect, useCallback, forwardRef, useImperativeHandle } from 'react'
 import {
   Plus, X, Wifi, WifiOff, Pencil, Terminal, Cpu,
   Zap, BarChart2, Search, Wallet, BookOpen, Settings2, ChevronRight,
 } from 'lucide-react'
-import { useWebSocket } from '../hooks/useWebSocket'
+import { useWebSocket, WsMessage } from '../hooks/useWebSocket'
 import { apiPost } from '../hooks/useApi'
 import clsx from 'clsx'
 
@@ -121,9 +121,10 @@ const QUICK_PROMPTS = [
 ]
 
 interface ToolEvent {
-  type: 'tool_call' | 'tool_result'
+  type: 'tool_call' | 'tool_result' | 'thinking'
   name: string
   summary?: string
+  iteration?: number
 }
 
 interface Message {
@@ -132,6 +133,7 @@ interface Message {
   timestamp: number
   streaming?: boolean
   toolEvents?: ToolEvent[]
+  agentStartedAt?: number
 }
 
 interface Session {
@@ -144,36 +146,164 @@ function generateId(): string {
   return Math.random().toString(36).slice(2, 10)
 }
 
-// ── Tool events log shown while agent is thinking ──────────────────
+// ── Tool-to-label + icon map ────────────────────────────────────────
 
-function AgentThinking({ toolEvents }: { toolEvents: ToolEvent[] }) {
-  const latest = toolEvents.filter((e) => e.type === 'tool_call').slice(-1)[0]
+const TOOL_META: Record<string, { label: string; icon: string }> = {
+  shell:              { label: 'Running shell command',       icon: '$' },
+  bash:               { label: 'Running bash',                icon: '$' },
+  read_file:          { label: 'Reading file',                icon: '📄' },
+  write_file:         { label: 'Writing file',                icon: '✏️' },
+  list_directory:     { label: 'Listing directory',           icon: '📁' },
+  search:             { label: 'Searching codebase',          icon: '🔍' },
+  grep:               { label: 'Searching files',             icon: '🔍' },
+  web_fetch:          { label: 'Fetching URL',                icon: '🌐' },
+  web_search:         { label: 'Searching the web',           icon: '🌐' },
+  wallet_balance:     { label: 'Checking wallet balances',    icon: '💰' },
+  polymarket_markets: { label: 'Fetching Polymarket markets', icon: '📊' },
+  polymarket_buy:     { label: 'Placing buy order',           icon: '🟢' },
+  polymarket_sell:    { label: 'Placing sell order',          icon: '🔴' },
+  evm_balance:        { label: 'Checking EVM balance',        icon: '⛓️' },
+  solana_balance:     { label: 'Checking Solana balance',     icon: '◎' },
+  tradingview_scan:   { label: 'Scanning TradingView',        icon: '📈' },
+  backtest_run:       { label: 'Running backtest',            icon: '🧪' },
+  memory_store:       { label: 'Saving to memory',            icon: '🧠' },
+  memory_search:      { label: 'Searching memory',            icon: '🧠' },
+  cron_add:           { label: 'Scheduling strategy',         icon: '⏱️' },
+  cron_list:          { label: 'Listing strategies',          icon: '⏱️' },
+}
+
+function toolLabel(name: string): string {
+  const key = name.toLowerCase().replace(/[^a-z_]/g, '_')
+  for (const [k, v] of Object.entries(TOOL_META)) {
+    if (key.includes(k)) return v.label
+  }
+  return `Using ${name}`
+}
+
+function toolIcon(name: string): string {
+  const key = name.toLowerCase().replace(/[^a-z_]/g, '_')
+  for (const [k, v] of Object.entries(TOOL_META)) {
+    if (key.includes(k)) return v.icon
+  }
+  return '⚙️'
+}
+
+// ── Rotating idle messages ───────────────────────────────────────────
+
+const IDLE_MESSAGES = [
+  'Analyzing your request…',
+  'Consulting the oracle…',
+  'Scanning the markets…',
+  'Checking on-chain data…',
+  'Running the numbers…',
+  'Crunching alpha…',
+  'Evaluating signals…',
+  'Reading the charts…',
+  'Asking the LLM gods…',
+  'Plotting the strategy…',
+  'Connecting the dots…',
+  'Decoding the matrix…',
+]
+
+// ── Agent thinking component ─────────────────────────────────────────
+
+function AgentThinking({ toolEvents, startedAt }: { toolEvents: ToolEvent[]; startedAt: number }) {
+  const [idleIdx, setIdleIdx] = useState(0)
+  const [elapsed, setElapsed] = useState(0)
+
+  // Rotate idle message every 2.5s
+  useEffect(() => {
+    const t = setInterval(() => setIdleIdx((i) => (i + 1) % IDLE_MESSAGES.length), 2500)
+    return () => clearInterval(t)
+  }, [])
+
+  // Tick elapsed timer every second
+  useEffect(() => {
+    const t = setInterval(() => setElapsed(Math.floor((Date.now() - startedAt) / 1000)), 1000)
+    return () => clearInterval(t)
+  }, [startedAt])
+
+  const thinkingRounds = toolEvents.filter((e) => e.type === 'thinking').length
+  const calls = toolEvents.filter((e) => e.type === 'tool_call')
+  const latestCall = calls[calls.length - 1]
+
+  // Pair tool_calls with their results
+  const pairs: { call: ToolEvent; result?: ToolEvent; done: boolean }[] = []
+  let ri = 0
+  const results = toolEvents.filter((e) => e.type === 'tool_result')
+  for (const call of calls) {
+    const result = results[ri]
+    if (result) { ri++; pairs.push({ call, result, done: true }) }
+    else pairs.push({ call, result: undefined, done: false })
+  }
+
+  const elapsedStr = elapsed >= 60
+    ? `${Math.floor(elapsed / 60)}m ${elapsed % 60}s`
+    : `${elapsed}s`
+
+  const warning = elapsed >= 120
+    ? { msg: 'This is taking unusually long — the model may be stalled. You can close and retry.', color: 'var(--color-danger)' }
+    : elapsed >= 60
+    ? { msg: 'Still working… complex tasks can take a minute.', color: 'var(--color-warning)' }
+    : elapsed >= 30
+    ? { msg: 'Taking a bit longer than usual…', color: 'var(--color-warning)' }
+    : null
+
   return (
-    <div className="flex flex-col gap-0.5">
-      {toolEvents.map((ev, i) => (
-        <div key={i} className="tool-call-badge flex items-center gap-2 text-xs font-mono">
-          {ev.type === 'tool_call' ? (
-            <>
-              <Terminal size={10} style={{ color: 'var(--color-accent)', flexShrink: 0 }} />
-              <span style={{ color: 'var(--color-accent)' }}>→ {ev.name}</span>
-            </>
-          ) : (
-            <>
-              <Cpu size={10} style={{ color: 'var(--color-text-muted)', flexShrink: 0 }} />
-              <span style={{ color: 'var(--color-text-muted)' }}>← {ev.name}</span>
-            </>
-          )}
-          {ev.summary && (
-            <span className="truncate max-w-xs" style={{ color: 'var(--color-text-muted)', opacity: 0.7 }}>
-              {ev.summary}
+    <div className="flex flex-col gap-1 py-0.5">
+      {/* LLM thinking rounds */}
+      {thinkingRounds > 0 && (
+        <div className="flex items-center gap-2 text-xs font-mono opacity-60">
+          <span className="w-4 text-center flex-shrink-0">🧠</span>
+          <span style={{ color: 'var(--color-text-muted)' }}>
+            {thinkingRounds === 1 ? 'LLM reasoning…' : `LLM reasoning — ${thinkingRounds} rounds`}
+          </span>
+        </div>
+      )}
+
+      {/* Completed steps */}
+      {pairs.filter((p) => p.done).map((p, i) => (
+        <div key={i} className="flex items-center gap-2 text-xs font-mono opacity-60">
+          <span className="w-4 text-center flex-shrink-0">{toolIcon(p.call.name)}</span>
+          <span style={{ color: 'var(--color-text-muted)' }}>{toolLabel(p.call.name)}</span>
+          {p.call.summary && (
+            <span className="truncate max-w-[240px]" style={{ color: 'var(--color-text-muted)', opacity: 0.6 }}>
+              — {p.call.summary}
             </span>
           )}
+          <span className="ml-auto flex-shrink-0" style={{ color: 'var(--color-accent)', opacity: 0.5 }}>✓</span>
         </div>
       ))}
+
+      {/* Currently active step */}
+      {latestCall && !pairs[pairs.length - 1]?.done && (
+        <div className="flex items-center gap-2 text-xs font-mono">
+          <span className="w-4 text-center flex-shrink-0">{toolIcon(latestCall.name)}</span>
+          <span style={{ color: 'var(--color-accent)' }}>{toolLabel(latestCall.name)}</span>
+          {latestCall.summary && (
+            <span className="truncate max-w-[240px]" style={{ color: 'var(--color-text-muted)' }}>
+              — {latestCall.summary}
+            </span>
+          )}
+          <span className="agent-spinner ml-1 flex-shrink-0" />
+        </div>
+      )}
+
+      {/* Status bar */}
       <div className="flex items-center gap-2 text-xs font-mono mt-0.5">
-        <span className="agent-spinner" />
-        <span style={{ color: 'var(--color-text-muted)' }}>
-          {latest ? `running ${latest.name}…` : 'thinking…'}
+        {!latestCall && <span className="agent-spinner flex-shrink-0" />}
+        <span style={{ color: warning ? warning.color : 'var(--color-text-muted)' }}>
+          {warning
+            ? warning.msg
+            : latestCall && pairs[pairs.length - 1]?.done
+            ? IDLE_MESSAGES[idleIdx]
+            : latestCall
+            ? `${toolLabel(latestCall.name)}…`
+            : IDLE_MESSAGES[idleIdx]}
+        </span>
+        <span className="ml-auto flex-shrink-0 font-mono" style={{ color: warning ? warning.color : 'var(--color-text-muted)', opacity: warning ? 0.9 : 0.5 }}>
+          {elapsed > 0 ? elapsedStr : ''}
+          {calls.length > 0 ? `  ${calls.length} step${calls.length !== 1 ? 's' : ''}` : ''}
         </span>
       </div>
     </div>
@@ -214,7 +344,7 @@ function TerminalLine({ msg }: { msg: Message }) {
   return (
     <div className="pl-6 py-1 group">
       {isEmpty ? (
-        <AgentThinking toolEvents={msg.toolEvents ?? []} />
+        <AgentThinking toolEvents={msg.toolEvents ?? []} startedAt={msg.agentStartedAt ?? msg.timestamp} />
       ) : (
         <>
           {/* Completed tool events */}
@@ -259,10 +389,15 @@ function TerminalLine({ msg }: { msg: Message }) {
 interface ChatWindowProps {
   session: Session
   onUpdate: (session: Session) => void
-  visible: boolean
+  connected: boolean
+  send: (msg: WsMessage) => void
 }
 
-function ChatWindow({ session, onUpdate, visible }: ChatWindowProps) {
+export interface ChatWindowHandle {
+  deliver: (msg: WsMessage) => void
+}
+
+const ChatWindow = forwardRef<ChatWindowHandle, ChatWindowProps>(function ChatWindow({ session, onUpdate, connected, send }, ref) {
   const [input, setInput] = useState('')
   const [sending, setSending] = useState(false)
   const [cmdIndex, setCmdIndex] = useState(0)
@@ -283,78 +418,71 @@ function ChatWindow({ session, onUpdate, visible }: ChatWindowProps) {
 
   useEffect(() => { setCmdIndex(0) }, [slashQuery])
 
-  const { connected, send } = useWebSocket('/ws/chat', {
-    onMessage: (msg) => {
-      if (msg.session_id !== sessionRef.current.id) return
-      const cur = sessionRef.current
+  // Called by parent Chat to deliver WS messages for this session
+  const onWsMessage = useCallback((msg: WsMessage) => {
+    const cur = sessionRef.current
+    if (msg.type === 'thinking') {
+      onUpdate({
+        ...cur,
+        messages: cur.messages.map((m, i) =>
+          i === cur.messages.length - 1 && m.role === 'assistant' && m.streaming
+            ? { ...m, toolEvents: [...(m.toolEvents ?? []), { type: 'thinking', name: 'thinking', iteration: Number(msg.iteration ?? 1) }] }
+            : m
+        ),
+      })
+    } else if (msg.type === 'chunk' && typeof msg.content === 'string') {
+      onUpdate({
+        ...cur,
+        messages: cur.messages.map((m, i) =>
+          i === cur.messages.length - 1 && m.role === 'assistant' && m.streaming
+            ? { ...m, content: m.content + msg.content }
+            : m
+        ),
+      })
+    } else if (msg.type === 'tool_call') {
+      onUpdate({
+        ...cur,
+        messages: cur.messages.map((m, i) =>
+          i === cur.messages.length - 1 && m.role === 'assistant' && m.streaming
+            ? { ...m, toolEvents: [...(m.toolEvents ?? []), { type: 'tool_call', name: String(msg.name ?? ''), summary: summariseArgs(msg.args) }] }
+            : m
+        ),
+      })
+    } else if (msg.type === 'tool_result') {
+      onUpdate({
+        ...cur,
+        messages: cur.messages.map((m, i) =>
+          i === cur.messages.length - 1 && m.role === 'assistant' && m.streaming
+            ? { ...m, toolEvents: [...(m.toolEvents ?? []), { type: 'tool_result', name: String(msg.name ?? ''), summary: truncate(String(msg.output ?? ''), 60) }] }
+            : m
+        ),
+      })
+    } else if (msg.type === 'done') {
+      const fullResponse = typeof msg.full_response === 'string' ? msg.full_response : undefined
+      onUpdate({
+        ...cur,
+        messages: cur.messages.map((m) =>
+          m.streaming ? { ...m, content: fullResponse ?? m.content, streaming: false } : m
+        ),
+      })
+      setSending(false)
+    } else if (msg.type === 'error') {
+      onUpdate({
+        ...cur,
+        messages: cur.messages.map((m) =>
+          m.streaming ? { ...m, content: `error: ${msg.message ?? 'unknown error'}`, streaming: false } : m
+        ),
+      })
+      setSending(false)
+    }
+  }, [onUpdate])
 
-      if (msg.type === 'chunk' && typeof msg.content === 'string') {
-        onUpdate({
-          ...cur,
-          messages: cur.messages.map((m, i) =>
-            i === cur.messages.length - 1 && m.role === 'assistant' && m.streaming
-              ? { ...m, content: m.content + msg.content }
-              : m
-          ),
-        })
-      } else if (msg.type === 'tool_call') {
-        onUpdate({
-          ...cur,
-          messages: cur.messages.map((m, i) =>
-            i === cur.messages.length - 1 && m.role === 'assistant' && m.streaming
-              ? {
-                  ...m,
-                  toolEvents: [
-                    ...(m.toolEvents ?? []),
-                    { type: 'tool_call', name: String(msg.name ?? ''), summary: summariseArgs(msg.args) },
-                  ],
-                }
-              : m
-          ),
-        })
-      } else if (msg.type === 'tool_result') {
-        onUpdate({
-          ...cur,
-          messages: cur.messages.map((m, i) =>
-            i === cur.messages.length - 1 && m.role === 'assistant' && m.streaming
-              ? {
-                  ...m,
-                  toolEvents: [
-                    ...(m.toolEvents ?? []),
-                    { type: 'tool_result', name: String(msg.name ?? ''), summary: truncate(String(msg.output ?? ''), 60) },
-                  ],
-                }
-              : m
-          ),
-        })
-      } else if (msg.type === 'done') {
-        const fullResponse = typeof msg.full_response === 'string' ? msg.full_response : undefined
-        onUpdate({
-          ...cur,
-          messages: cur.messages.map((m) =>
-            m.streaming
-              ? { ...m, content: fullResponse ?? m.content, streaming: false }
-              : m
-          ),
-        })
-        setSending(false)
-      } else if (msg.type === 'error') {
-        onUpdate({
-          ...cur,
-          messages: cur.messages.map((m) =>
-            m.streaming
-              ? { ...m, content: `error: ${msg.message ?? 'unknown error'}`, streaming: false }
-              : m
-          ),
-        })
-        setSending(false)
-      }
-    },
-  })
+  // Expose message delivery to parent
+  useImperativeHandle(ref, () => ({ deliver: onWsMessage }), [onWsMessage])
 
   useEffect(() => {
-    if (visible) bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [session.messages, visible])
+    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [session.messages])
 
   // Auto-resize textarea
   useEffect(() => {
@@ -374,6 +502,7 @@ function ChatWindow({ session, onUpdate, visible }: ChatWindowProps) {
       timestamp: Date.now(),
       streaming: true,
       toolEvents: [],
+      agentStartedAt: Date.now(),
     }
 
     const updated: Session = {
@@ -453,7 +582,7 @@ function ChatWindow({ session, onUpdate, visible }: ChatWindowProps) {
   }
 
   return (
-    <div className="flex flex-col h-full font-mono" style={{ display: visible ? 'flex' : 'none' }}>
+    <div className="flex flex-col h-full font-mono">
       {/* Messages */}
       <div className="flex-1 overflow-y-auto px-4 py-3">
         {session.messages.length === 0 ? (
@@ -562,7 +691,7 @@ function ChatWindow({ session, onUpdate, visible }: ChatWindowProps) {
       </div>
     </div>
   )
-}
+})
 
 // ── Session tab ─────────────────────────────────────────────────────
 
@@ -711,7 +840,15 @@ export default function Chat() {
   const [sessions, setSessions] = useState<Session[]>(initialSessions)
   const [activeId, setActiveId] = useState<string>(() => loadActiveId(initialSessions))
 
-  const { connected } = useWebSocket('/ws/chat', { autoReconnect: true })
+  // Single shared WebSocket — one connection regardless of how many sessions exist
+  const activeWindowRef = useRef<ChatWindowHandle>(null)
+  const { connected, send } = useWebSocket('/ws/chat', {
+    autoReconnect: true,
+    onMessage: (msg) => {
+      // Deliver to the currently active session window
+      activeWindowRef.current?.deliver(msg)
+    },
+  })
 
   useEffect(() => {
     try { localStorage.setItem(STORAGE_KEY, JSON.stringify(sessions)) } catch { /* quota */ }
@@ -742,6 +879,8 @@ export default function Chat() {
   function renameSession(id: string, label: string) {
     setSessions((s) => s.map((session) => session.id === id ? { ...session, label } : session))
   }
+
+  const activeSession = sessions.find((s) => s.id === activeId) ?? sessions[0]
 
   return (
     <div className="flex flex-col h-full font-mono">
@@ -787,17 +926,16 @@ export default function Chat() {
         </div>
       </div>
 
-      {/* All chat windows — ALL mounted so WebSocket stays alive */}
-      <div className="flex-1 overflow-hidden relative">
-        {sessions.map((session) => (
-          <div key={session.id} className="absolute inset-0">
-            <ChatWindow
-              session={session}
-              onUpdate={updateSession}
-              visible={session.id === activeId}
-            />
-          </div>
-        ))}
+      {/* Only the active session is mounted — one WS connection, no parallel requests */}
+      <div className="flex-1 overflow-hidden">
+        <ChatWindow
+          key={activeSession.id}
+          ref={activeWindowRef}
+          session={activeSession}
+          onUpdate={updateSession}
+          connected={connected}
+          send={send}
+        />
       </div>
     </div>
   )

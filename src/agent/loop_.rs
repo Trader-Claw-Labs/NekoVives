@@ -3213,7 +3213,7 @@ pub async fn run(
 /// Process a single message through the full agent (with tools, peripherals, memory).
 /// Used by channels (Telegram, Discord, etc.) to enable hardware and tool use.
 pub async fn process_message(config: Config, message: &str) -> Result<String> {
-    let observer: Arc<dyn Observer> =
+    let _observer: Arc<dyn Observer> =
         Arc::from(observability::create_observer(&config.observability));
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
         Arc::from(runtime::create_runtime(&config.runtime)?);
@@ -3260,22 +3260,9 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         .default_model
         .clone()
         .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into());
-    let provider_runtime_options = providers::ProviderRuntimeOptions {
-        auth_profile_override: None,
-        provider_api_url: config.api_url.clone(),
-        traderclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
-        secrets_encrypt: config.secrets.encrypt,
-        reasoning_enabled: config.runtime.reasoning_enabled,
-    };
-    let provider: Box<dyn Provider> = providers::create_routed_provider_with_options(
-        provider_name,
-        config.api_key.as_deref(),
-        config.api_url.as_deref(),
-        &config.reliability,
-        &config.model_routes,
-        &model_name,
-        &provider_runtime_options,
-    )?;
+
+    let claw_client = make_claw_provider_client(&config)?;
+    let claw_model = resolve_model_for_claw(provider_name, &model_name);
 
     let hardware_rag: Option<crate::rag::HardwareRag> = config
         .peripherals
@@ -3345,7 +3332,6 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     } else {
         None
     };
-    let native_tools = provider.supports_native_tools();
     let mut system_prompt = crate::channels::build_system_prompt_with_mode(
         &config.workspace_dir,
         &model_name,
@@ -3353,12 +3339,9 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         &skills,
         Some(&config.identity),
         bootstrap_max_chars,
-        native_tools,
+        true, // claw-api always uses native tool calling
         config.skills.prompt_injection_mode,
     );
-    if !native_tools {
-        system_prompt.push_str(&build_tool_instructions(&tools_registry));
-    }
 
     // Ensure the scripts directory exists so the agent can write strategies there
     let scripts_path = config.workspace_dir.join("scripts");
@@ -3433,24 +3416,19 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         format!("{context}[{now}] {message}")
     };
 
-    let mut history = vec![
-        ChatMessage::system(&system_prompt),
-        ChatMessage::user(&enriched),
-    ];
-
-    let response = agent_turn(
-        provider.as_ref(),
-        &mut history,
-        &tools_registry,
-        observer.as_ref(),
-        provider_name,
-        &model_name,
-        config.default_temperature,
-        true,
-        &config.multimodal,
-        config.agent.max_tool_iterations,
-    )
-    .await?;
+    let tool_defs = tools_to_claw_definitions(&tools_registry);
+    let executor = TraderToolExecutor { tools: tools_registry };
+    let claw_runtime = crate::agent::runtime::ConversationRuntime::new(
+        claw_client,
+        claw_model,
+        8192u32,
+        Some(config.default_temperature),
+        system_prompt,
+    );
+    let mut session = crate::agent::runtime::Session::new();
+    let response = claw_runtime
+        .run_turn(&enriched, &tool_defs, &executor, &mut session, None)
+        .await?;
 
     // Persist the conversation turn to memory so the agent recalls it in future sessions
     let ts = chrono::Utc::now().timestamp();
@@ -3472,6 +3450,199 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         .await;
 
     Ok(response)
+}
+
+/// Like `process_message` but streams structured JSON events to `ws_tx` while the agent works.
+///
+/// Events emitted:
+/// - `{"type":"thinking","iteration":N}`         — LLM is processing (round N)
+/// - `{"type":"tool_call","name":"...","args":"..."}` — tool about to run
+/// - `{"type":"tool_result","name":"...","success":bool}` — tool finished
+/// - `{"type":"chunk","content":"..."}` — final answer fragment
+pub async fn process_message_with_events(
+    config: Config,
+    message: &str,
+    ws_tx: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
+    session: &mut crate::agent::runtime::Session,
+) -> Result<String> {
+    let _observer: Arc<dyn Observer> =
+        Arc::from(observability::create_observer(&config.observability));
+    let runtime: Arc<dyn runtime::RuntimeAdapter> =
+        Arc::from(runtime::create_runtime(&config.runtime)?);
+    let security = Arc::new(SecurityPolicy::from_config(
+        &config.autonomy,
+        &config.workspace_dir,
+    ));
+    let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
+        &config.memory,
+        Some(&config.storage.provider.config),
+        &config.workspace_dir,
+        config.api_key.as_deref(),
+    )?);
+
+    let (composio_key, composio_entity_id) = if config.composio.enabled {
+        (
+            config.composio.api_key.as_deref(),
+            Some(config.composio.entity_id.as_str()),
+        )
+    } else {
+        (None, None)
+    };
+    let mut tools_registry = tools::all_tools_with_runtime(
+        Arc::new(config.clone()),
+        &security,
+        runtime,
+        mem.clone(),
+        composio_key,
+        composio_entity_id,
+        &config.browser,
+        &config.http_request,
+        &config.web_fetch,
+        &config.workspace_dir,
+        &config.agents,
+        config.api_key.as_deref(),
+        &config,
+    );
+    let peripheral_tools: Vec<Box<dyn Tool>> =
+        crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
+    tools_registry.extend(peripheral_tools);
+
+    let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
+    let model_name = config
+        .default_model
+        .clone()
+        .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into());
+
+    let claw_client = make_claw_provider_client(&config)?;
+    let claw_model = resolve_model_for_claw(provider_name, &model_name);
+
+    let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
+    let system_prompt = crate::channels::build_system_prompt(
+        &config.workspace_dir,
+        &model_name,
+        &[],
+        &skills,
+        Some(&config.identity),
+        None,
+    );
+
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
+    let enriched = format!("[{now}] {message}");
+
+    let tool_defs = tools_to_claw_definitions(&tools_registry);
+    let executor = TraderToolExecutor { tools: tools_registry };
+    let claw_runtime = crate::agent::runtime::ConversationRuntime::new(
+        claw_client,
+        claw_model,
+        8192u32,
+        Some(config.default_temperature),
+        system_prompt,
+    );
+    let response = claw_runtime
+        .run_turn(&enriched, &tool_defs, &executor, session, Some(&ws_tx))
+        .await?;
+
+    // Persist conversation turn
+    let ts = chrono::Utc::now().timestamp();
+    let _ = mem.store(&format!("chat_user_{ts}"), &format!("User: {message}"), MemoryCategory::Conversation, None).await;
+    let _ = mem.store(&format!("chat_agent_{ts}"), &format!("Agent: {response}"), MemoryCategory::Conversation, None).await;
+
+    Ok(response)
+}
+
+// ── claw-api bridge helpers ───────────────────────────────────────────────────
+
+/// Build a `claw_api::ProviderClient` from the active Trader-Claw config.
+fn make_claw_provider_client(config: &Config) -> anyhow::Result<claw_api::ProviderClient> {
+    use claw_api::{ProviderConfig, ProviderKind};
+    let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
+    let api_key = config.api_key.clone().unwrap_or_default();
+    let (kind, base_url) = match provider_name {
+        "anthropic" => (
+            ProviderKind::Anthropic,
+            config
+                .api_url
+                .clone()
+                .unwrap_or_else(|| "https://api.anthropic.com".into()),
+        ),
+        "openai" => (
+            ProviderKind::OpenAiCompat,
+            config
+                .api_url
+                .clone()
+                .unwrap_or_else(|| "https://api.openai.com/v1".into()),
+        ),
+        "ollama" => (
+            ProviderKind::OpenAiCompat,
+            config
+                .api_url
+                .clone()
+                .unwrap_or_else(|| "http://localhost:11434/v1".into()),
+        ),
+        _ => (
+            ProviderKind::OpenAiCompat,
+            config
+                .api_url
+                .clone()
+                .unwrap_or_else(|| "https://openrouter.ai/api/v1".into()),
+        ),
+    };
+    Ok(claw_api::ProviderClient::from_config(ProviderConfig {
+        api_key,
+        base_url,
+        provider_kind: kind,
+        provider_name: provider_name.to_string(),
+    }))
+}
+
+/// Resolve model name: strip "anthropic/" prefix for Anthropic native, expand aliases.
+fn resolve_model_for_claw(provider_name: &str, model: &str) -> String {
+    let model = if provider_name == "anthropic" {
+        model.trim_start_matches("anthropic/")
+    } else {
+        model
+    };
+    claw_api::resolve_model_alias(model)
+}
+
+/// Bridges Trader-Claw's `Tool` trait to claw-api's `ToolExecutor` trait.
+struct TraderToolExecutor {
+    tools: Vec<Box<dyn Tool>>,
+}
+
+#[async_trait::async_trait]
+impl crate::agent::runtime::ToolExecutor for TraderToolExecutor {
+    async fn execute(
+        &self,
+        name: &str,
+        input: serde_json::Value,
+    ) -> Result<String, String> {
+        let tool = self
+            .tools
+            .iter()
+            .find(|t| t.name() == name)
+            .ok_or_else(|| format!("Tool not found: {name}"))?;
+        match tool.execute(input).await {
+            Ok(result) => Ok(if result.success {
+                result.output
+            } else {
+                result.error.unwrap_or(result.output)
+            }),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+}
+
+/// Convert Trader-Claw tools into `claw_api::ToolDefinition` list.
+fn tools_to_claw_definitions(tools: &[Box<dyn Tool>]) -> Vec<claw_api::ToolDefinition> {
+    tools
+        .iter()
+        .map(|t| claw_api::ToolDefinition {
+            name: t.name().to_string(),
+            description: Some(t.description().to_string()),
+            input_schema: t.parameters_schema(),
+        })
+        .collect()
 }
 
 #[cfg(test)]

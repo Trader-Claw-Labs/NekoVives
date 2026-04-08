@@ -7,6 +7,7 @@ members = [
     "crates/ton-trader",
     "crates/polymarket-trader",
     "crates/market-analyzer",
+    "crates/claw-api",
 ]
 resolver = "2"
 
@@ -100,6 +101,7 @@ ring = "0.17"
 rhai = { version = "1", features = ["sync"] }
 
 # Degen Agent workspace crates
+claw-api = { path = "crates/claw-api" }
 market-analyzer = { path = "crates/market-analyzer" }
 polymarket-trader = { path = "crates/polymarket-trader" }
 wallet-manager = { path = "crates/wallet-manager" }

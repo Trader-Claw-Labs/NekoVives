@@ -127,6 +127,13 @@ fn is_non_retryable_rate_limit(err: &anyhow::Error) -> bool {
         "package not active",
         "purchase package",
         "model not available for your plan",
+        // Upstream provider throttle — the retry window (seconds) won't help
+        "temporarily rate-limited upstream",
+        "rate-limited upstream",
+        "rate limited upstream",
+        "upstream rate limit",
+        "upstream provider",
+        "provider returned error",
     ];
 
     if business_hints.iter().any(|hint| lower.contains(hint)) {

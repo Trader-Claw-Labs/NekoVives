@@ -18,3 +18,7 @@ target/
 
 **/*.log
 
+.DS_Store
+.claude/settings.local.json
+/.claude
+.remember/tmp/save-session.pid

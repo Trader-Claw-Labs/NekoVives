@@ -662,16 +662,14 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             get(api::handle_api_telegram_messages),
         )
         .route("/api/chat", post(api::handle_api_chat))
-        // ── SSE event stream ──
+        // ── SSE event stream (no timeout — long-lived) ──
         .route("/api/events", get(sse::handle_sse_events))
-        // ── WebSocket agent chat ──
-        .route("/ws/chat", get(ws::handle_ws_chat))
         // ── Static assets (web dashboard) ──
         .route("/_app/{*path}", get(static_files::handle_static))
         .route("/assets/{*path}", get(static_files::handle_assets))
         // ── Config PUT with larger body limit ──
         .merge(config_put_router)
-        .with_state(state)
+        .with_state(state.clone())
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
@@ -679,6 +677,14 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         ))
         // ── SPA fallback: non-API GET requests serve index.html ──
         .fallback(get(static_files::handle_spa_fallback));
+
+    // WebSocket and SSE routes must NOT have a timeout layer — they are long-lived connections.
+    // The agent itself enforces a 5-minute hard timeout internally.
+    let ws_router = axum::Router::new()
+        .route("/ws/chat", get(ws::handle_ws_chat))
+        .with_state(state);
+
+    let app = ws_router.merge(app);
 
     // Spawn Telegram (and any other configured channels) alongside the HTTP server.
     // start_channels() runs the long-poll loop; if no channels are configured it exits

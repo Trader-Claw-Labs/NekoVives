@@ -49,6 +49,8 @@ pub async fn handle_ws_chat(
 
 async fn handle_socket(socket: WebSocket, state: AppState) {
     let (mut sender, mut receiver) = socket.split();
+    // Per-connection conversation history — persists across multiple user messages.
+    let mut session = crate::agent::Session::new();
 
     while let Some(msg) = receiver.next().await {
         let msg = match msg {
@@ -92,8 +94,30 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             "model": model_snap,
         }));
 
-        match crate::agent::process_message(config, &content).await {
-            Ok(response) => {
+        // Create an unbounded channel for streaming agent events to this WS client.
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+
+        // Spawn a forwarder: reads structured events and sends them as WS text frames.
+        let mut sender_clone = sender;
+        let forward_handle = tokio::spawn(async move {
+            while let Some(event) = event_rx.recv().await {
+                let _ = sender_clone.send(Message::Text(event.to_string().into())).await;
+            }
+            sender_clone
+        });
+
+        // Hard timeout: 5 minutes max per agent turn
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(300),
+            crate::agent::process_message_with_events(config, &content, event_tx, &mut session),
+        ).await;
+
+        // Recover the sender from the forwarder task (task cannot panic — safe to unwrap).
+        let Ok(recovered) = forward_handle.await else { break };
+        sender = recovered;
+
+        match result {
+            Ok(Ok(response)) => {
                 let done = serde_json::json!({
                     "type": "done",
                     "full_response": response,
@@ -106,7 +130,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     "model": model_snap,
                 }));
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 let sanitized = crate::providers::sanitize_api_error(&e.to_string());
                 let err = serde_json::json!({
                     "type": "error",
@@ -119,6 +143,19 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     "component": "ws_chat",
                     "message": sanitized,
                 }));
+            }
+            Err(_elapsed) => {
+                let err = serde_json::json!({
+                    "type": "error",
+                    "message": "Agent timed out after 5 minutes. The request may have stalled — please try again.",
+                    "timeout": true,
+                });
+                let _ = sender.send(Message::Text(err.to_string().into())).await;
+                tracing::warn!(
+                    provider = provider_label,
+                    model = model_snap,
+                    "Agent turn timed out after 5 minutes"
+                );
             }
         }
     }
