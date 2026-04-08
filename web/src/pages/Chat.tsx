@@ -121,10 +121,19 @@ const QUICK_PROMPTS = [
 ]
 
 interface ToolEvent {
-  type: 'tool_call' | 'tool_result' | 'thinking'
+  type: 'tool_call' | 'tool_result' | 'thinking' | 'executing'
   name: string
-  summary?: string
+  summary?: string       // args summary for tool_call
+  outputSnippet?: string // result preview for tool_result
+  success?: boolean
   iteration?: number
+  step?: number
+  totalSteps?: number
+  toolCount?: number
+  tools?: string[]
+  elapsedMs?: number
+  replanning?: boolean
+  toolsDone?: number
 }
 
 interface Message {
@@ -210,39 +219,53 @@ const IDLE_MESSAGES = [
 function AgentThinking({ toolEvents, startedAt }: { toolEvents: ToolEvent[]; startedAt: number }) {
   const [idleIdx, setIdleIdx] = useState(0)
   const [elapsed, setElapsed] = useState(0)
+  const [expandedSnippets, setExpandedSnippets] = useState<Set<number>>(new Set())
 
-  // Rotate idle message every 2.5s
   useEffect(() => {
     const t = setInterval(() => setIdleIdx((i) => (i + 1) % IDLE_MESSAGES.length), 2500)
     return () => clearInterval(t)
   }, [])
 
-  // Tick elapsed timer every second
   useEffect(() => {
     const t = setInterval(() => setElapsed(Math.floor((Date.now() - startedAt) / 1000)), 1000)
     return () => clearInterval(t)
   }, [startedAt])
 
-  const thinkingRounds = toolEvents.filter((e) => e.type === 'thinking').length
-  const calls = toolEvents.filter((e) => e.type === 'tool_call')
-  const latestCall = calls[calls.length - 1]
+  function toggleSnippet(i: number) {
+    setExpandedSnippets((prev) => {
+      const next = new Set(prev)
+      next.has(i) ? next.delete(i) : next.add(i)
+      return next
+    })
+  }
 
-  // Pair tool_calls with their results
+  // Build a timeline of phases (thinking → executing → tools → thinking again…)
+  // Group events into "rounds" by iteration number
+  const calls = toolEvents.filter((e) => e.type === 'tool_call')
+  const results = toolEvents.filter((e) => e.type === 'tool_result')
+  const thinkingEvents = toolEvents.filter((e) => e.type === 'thinking')
+  const latestThinking = thinkingEvents[thinkingEvents.length - 1]
+  const currentRound = latestThinking?.iteration ?? 1
+  const isReplanning = Boolean(latestThinking?.replanning)
+
+  // Pair calls with results
   const pairs: { call: ToolEvent; result?: ToolEvent; done: boolean }[] = []
   let ri = 0
-  const results = toolEvents.filter((e) => e.type === 'tool_result')
   for (const call of calls) {
     const result = results[ri]
     if (result) { ri++; pairs.push({ call, result, done: true }) }
     else pairs.push({ call, result: undefined, done: false })
   }
 
+  const activePair = pairs.length > 0 && !pairs[pairs.length - 1].done ? pairs[pairs.length - 1] : null
+  const donePairs = pairs.filter((p) => p.done)
+
   const elapsedStr = elapsed >= 60
     ? `${Math.floor(elapsed / 60)}m ${elapsed % 60}s`
-    : `${elapsed}s`
+    : elapsed > 0 ? `${elapsed}s` : ''
 
   const warning = elapsed >= 120
-    ? { msg: 'This is taking unusually long — the model may be stalled. You can close and retry.', color: 'var(--color-danger)' }
+    ? { msg: 'Taking unusually long — model may be stalled. Try again.', color: 'var(--color-danger)' }
     : elapsed >= 60
     ? { msg: 'Still working… complex tasks can take a minute.', color: 'var(--color-warning)' }
     : elapsed >= 30
@@ -250,62 +273,187 @@ function AgentThinking({ toolEvents, startedAt }: { toolEvents: ToolEvent[]; sta
     : null
 
   return (
-    <div className="flex flex-col gap-1 py-0.5">
-      {/* LLM thinking rounds */}
-      {thinkingRounds > 0 && (
-        <div className="flex items-center gap-2 text-xs font-mono opacity-60">
-          <span className="w-4 text-center flex-shrink-0">🧠</span>
-          <span style={{ color: 'var(--color-text-muted)' }}>
-            {thinkingRounds === 1 ? 'LLM reasoning…' : `LLM reasoning — ${thinkingRounds} rounds`}
-          </span>
-        </div>
-      )}
+    <div className="flex flex-col gap-0.5 py-0.5" style={{ fontFamily: 'var(--font-mono, monospace)' }}>
 
-      {/* Completed steps */}
-      {pairs.filter((p) => p.done).map((p, i) => (
-        <div key={i} className="flex items-center gap-2 text-xs font-mono opacity-60">
-          <span className="w-4 text-center flex-shrink-0">{toolIcon(p.call.name)}</span>
-          <span style={{ color: 'var(--color-text-muted)' }}>{toolLabel(p.call.name)}</span>
-          {p.call.summary && (
-            <span className="truncate max-w-[240px]" style={{ color: 'var(--color-text-muted)', opacity: 0.6 }}>
-              — {p.call.summary}
+      {/* ── Phase header ── */}
+      <div className="flex items-center gap-2 text-xs mb-0.5">
+        <span className="agent-spinner flex-shrink-0" style={{ opacity: 0.8 }} />
+        {isReplanning ? (
+          <span style={{ color: 'var(--color-accent)' }}>
+            re-evaluating{donePairs.length > 0 ? ` after ${donePairs.length} step${donePairs.length !== 1 ? 's' : ''}` : ''}
+            <span className="ml-2 opacity-50" style={{ color: 'var(--color-text-muted)' }}>round {currentRound}</span>
+          </span>
+        ) : calls.length === 0 ? (
+          <span style={{ color: 'var(--color-text-muted)' }}>{IDLE_MESSAGES[idleIdx]}</span>
+        ) : (
+          <span style={{ color: 'var(--color-text-muted)' }}>{IDLE_MESSAGES[idleIdx]}</span>
+        )}
+        <span className="ml-auto flex-shrink-0 text-xs opacity-40" style={{ color: warning?.color ?? 'var(--color-text-muted)' }}>
+          {warning ? warning.msg : elapsedStr}
+        </span>
+      </div>
+
+      {/* ── Completed tool steps ── */}
+      {donePairs.map((p, i) => (
+        <div key={i} className="flex flex-col gap-0 pl-1">
+          {/* Tool call row */}
+          <div className="flex items-center gap-2 text-xs opacity-55">
+            <span className="w-3 text-center flex-shrink-0" style={{ color: 'var(--color-accent)', opacity: 0.6 }}>↳</span>
+            <span style={{ color: 'var(--color-text-muted)' }}>{toolLabel(p.call.name)}</span>
+            {p.call.summary && (
+              <span className="truncate max-w-[180px] opacity-60" style={{ color: 'var(--color-text-muted)' }}>
+                {p.call.summary}
+              </span>
+            )}
+            <span className="ml-auto flex-shrink-0 flex items-center gap-1.5">
+              {p.result?.elapsedMs ? (
+                <span className="opacity-40" style={{ color: 'var(--color-text-muted)', fontSize: '0.65rem' }}>
+                  {p.result.elapsedMs < 1000 ? `${p.result.elapsedMs}ms` : `${(p.result.elapsedMs / 1000).toFixed(1)}s`}
+                </span>
+              ) : null}
+              <span style={{ color: p.result?.success === false ? 'var(--color-danger)' : 'var(--color-accent)', opacity: 0.7, fontSize: '0.65rem' }}>
+                {p.result?.success === false ? '✗' : '✓'}
+              </span>
             </span>
+          </div>
+          {/* Output snippet row */}
+          {p.result?.outputSnippet && (
+            <div className="pl-5 mt-0.5">
+              <button
+                onClick={() => toggleSnippet(i)}
+                className="text-left w-full"
+                style={{ background: 'none', border: 'none', padding: 0, cursor: 'pointer' }}
+              >
+                <span
+                  className={clsx('text-xs block', expandedSnippets.has(i) ? 'whitespace-pre-wrap' : 'truncate')}
+                  style={{
+                    color: 'var(--color-text-muted)',
+                    opacity: 0.45,
+                    maxWidth: expandedSnippets.has(i) ? '100%' : '360px',
+                    fontSize: '0.68rem',
+                  }}
+                >
+                  {p.result.outputSnippet}
+                </span>
+              </button>
+            </div>
           )}
-          <span className="ml-auto flex-shrink-0" style={{ color: 'var(--color-accent)', opacity: 0.5 }}>✓</span>
         </div>
       ))}
 
-      {/* Currently active step */}
-      {latestCall && !pairs[pairs.length - 1]?.done && (
-        <div className="flex items-center gap-2 text-xs font-mono">
-          <span className="w-4 text-center flex-shrink-0">{toolIcon(latestCall.name)}</span>
-          <span style={{ color: 'var(--color-accent)' }}>{toolLabel(latestCall.name)}</span>
-          {latestCall.summary && (
-            <span className="truncate max-w-[240px]" style={{ color: 'var(--color-text-muted)' }}>
-              — {latestCall.summary}
+      {/* ── Active tool (in progress) ── */}
+      {activePair && (
+        <div className="flex items-center gap-2 text-xs pl-1">
+          <span className="agent-spinner flex-shrink-0" style={{ width: 8, height: 8 }} />
+          <span style={{ color: 'var(--color-accent)' }}>{toolLabel(activePair.call.name)}</span>
+          {activePair.call.summary && (
+            <span className="truncate max-w-[200px]" style={{ color: 'var(--color-text-muted)', opacity: 0.7 }}>
+              {activePair.call.summary}
             </span>
           )}
-          <span className="agent-spinner ml-1 flex-shrink-0" />
+          {activePair.call.totalSteps && activePair.call.totalSteps > 1 && (
+            <span className="ml-auto flex-shrink-0 opacity-40 text-xs" style={{ color: 'var(--color-text-muted)' }}>
+              {activePair.call.step}/{activePair.call.totalSteps}
+            </span>
+          )}
         </div>
       )}
 
-      {/* Status bar */}
-      <div className="flex items-center gap-2 text-xs font-mono mt-0.5">
-        {!latestCall && <span className="agent-spinner flex-shrink-0" />}
-        <span style={{ color: warning ? warning.color : 'var(--color-text-muted)' }}>
-          {warning
-            ? warning.msg
-            : latestCall && pairs[pairs.length - 1]?.done
-            ? IDLE_MESSAGES[idleIdx]
-            : latestCall
-            ? `${toolLabel(latestCall.name)}…`
-            : IDLE_MESSAGES[idleIdx]}
+      {/* ── Progress bar when multiple tools in one round ── */}
+      {pairs.length > 1 && (
+        <div className="pl-1 mt-1" style={{ maxWidth: 200 }}>
+          <div style={{ height: 2, background: 'rgba(255,255,255,0.08)', borderRadius: 1, overflow: 'hidden' }}>
+            <div
+              style={{
+                height: '100%',
+                width: `${(donePairs.length / pairs.length) * 100}%`,
+                background: 'var(--color-accent)',
+                borderRadius: 1,
+                transition: 'width 0.3s ease',
+                opacity: 0.6,
+              }}
+            />
+          </div>
+          <div className="flex justify-between text-xs mt-0.5 opacity-30" style={{ color: 'var(--color-text-muted)', fontSize: '0.6rem' }}>
+            <span>{donePairs.length} done</span>
+            <span>{pairs.length} total</span>
+          </div>
+        </div>
+      )}
+
+    </div>
+  )
+}
+
+// ── Completed tool summary (shown after agent responds) ─────────────
+
+function CompletedToolSummary({ toolEvents }: { toolEvents: ToolEvent[] }) {
+  const [expanded, setExpanded] = useState(false)
+
+  const calls = toolEvents.filter((e) => e.type === 'tool_call')
+  const results = toolEvents.filter((e) => e.type === 'tool_result')
+
+  // Pair calls with results
+  const pairs: { call: ToolEvent; result?: ToolEvent }[] = []
+  let ri = 0
+  for (const call of calls) {
+    const result = results[ri]
+    if (result) { ri++; pairs.push({ call, result }) }
+    else pairs.push({ call })
+  }
+
+  if (pairs.length === 0) return null
+
+  const totalRounds = Math.max(...toolEvents.filter(e => e.type === 'thinking').map(e => e.iteration ?? 1), 1)
+  const failures = pairs.filter((p) => p.result?.success === false).length
+
+  return (
+    <div className="mb-2">
+      {/* Collapsed summary pill */}
+      <button
+        onClick={() => setExpanded((v) => !v)}
+        className="flex items-center gap-1.5 text-xs font-mono opacity-50 hover:opacity-80 transition-opacity mb-1"
+        style={{ background: 'none', border: 'none', padding: 0, cursor: 'pointer', color: 'var(--color-text-muted)' }}
+      >
+        <Terminal size={9} />
+        <span>
+          {pairs.length} step{pairs.length !== 1 ? 's' : ''}
+          {totalRounds > 1 ? `, ${totalRounds} rounds` : ''}
+          {failures > 0 ? `, ${failures} failed` : ''}
         </span>
-        <span className="ml-auto flex-shrink-0 font-mono" style={{ color: warning ? warning.color : 'var(--color-text-muted)', opacity: warning ? 0.9 : 0.5 }}>
-          {elapsed > 0 ? elapsedStr : ''}
-          {calls.length > 0 ? `  ${calls.length} step${calls.length !== 1 ? 's' : ''}` : ''}
-        </span>
-      </div>
+        <ChevronRight size={9} style={{ transform: expanded ? 'rotate(90deg)' : 'none', transition: 'transform 0.15s' }} />
+      </button>
+
+      {/* Expanded detail */}
+      {expanded && (
+        <div className="flex flex-col gap-0.5 pl-3 border-l" style={{ borderColor: 'rgba(255,255,255,0.06)' }}>
+          {pairs.map((p, i) => (
+            <div key={i} className="flex flex-col gap-0">
+              <div className="flex items-center gap-2 text-xs font-mono opacity-60">
+                <span className="flex-shrink-0" style={{ color: p.result?.success === false ? 'var(--color-danger)' : 'var(--color-accent)', opacity: 0.8, fontSize: '0.6rem' }}>
+                  {p.result?.success === false ? '✗' : '✓'}
+                </span>
+                <span style={{ color: 'var(--color-text-muted)' }}>{toolLabel(p.call.name)}</span>
+                {p.call.summary && (
+                  <span className="truncate max-w-[160px] opacity-60" style={{ color: 'var(--color-text-muted)', fontSize: '0.68rem' }}>
+                    {p.call.summary}
+                  </span>
+                )}
+                {p.result?.elapsedMs ? (
+                  <span className="ml-auto flex-shrink-0 opacity-35" style={{ color: 'var(--color-text-muted)', fontSize: '0.6rem' }}>
+                    {p.result.elapsedMs < 1000 ? `${p.result.elapsedMs}ms` : `${(p.result.elapsedMs / 1000).toFixed(1)}s`}
+                  </span>
+                ) : null}
+              </div>
+              {p.result?.outputSnippet && (
+                <div className="pl-4 text-xs opacity-35 truncate" style={{ color: 'var(--color-text-muted)', fontSize: '0.65rem', maxWidth: '400px' }}>
+                  {p.result.outputSnippet}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   )
 }
@@ -347,30 +495,9 @@ function TerminalLine({ msg }: { msg: Message }) {
         <AgentThinking toolEvents={msg.toolEvents ?? []} startedAt={msg.agentStartedAt ?? msg.timestamp} />
       ) : (
         <>
-          {/* Completed tool events */}
-          {msg.toolEvents && msg.toolEvents.length > 0 && (
-            <div className="flex flex-col gap-0.5 mb-1.5">
-              {msg.toolEvents.map((ev, i) => (
-                <div key={i} className="flex items-center gap-2 text-xs font-mono">
-                  {ev.type === 'tool_call' ? (
-                    <>
-                      <Terminal size={10} style={{ color: 'var(--color-accent)', flexShrink: 0 }} />
-                      <span style={{ color: 'var(--color-accent)' }}>→ {ev.name}</span>
-                    </>
-                  ) : (
-                    <>
-                      <Cpu size={10} style={{ color: 'var(--color-text-muted)', flexShrink: 0 }} />
-                      <span style={{ color: 'var(--color-text-muted)' }}>← {ev.name}</span>
-                    </>
-                  )}
-                  {ev.summary && (
-                    <span className="truncate max-w-xs" style={{ color: 'var(--color-text-muted)', opacity: 0.6 }}>
-                      {ev.summary}
-                    </span>
-                  )}
-                </div>
-              ))}
-            </div>
+          {/* Completed tool events — shown collapsed after response arrives */}
+          {msg.toolEvents && msg.toolEvents.filter(e => e.type === 'tool_call').length > 0 && (
+            <CompletedToolSummary toolEvents={msg.toolEvents} />
           )}
           <span
             className={clsx('text-sm whitespace-pre-wrap leading-relaxed', msg.streaming && 'typewriter-cursor')}
@@ -426,7 +553,28 @@ const ChatWindow = forwardRef<ChatWindowHandle, ChatWindowProps>(function ChatWi
         ...cur,
         messages: cur.messages.map((m, i) =>
           i === cur.messages.length - 1 && m.role === 'assistant' && m.streaming
-            ? { ...m, toolEvents: [...(m.toolEvents ?? []), { type: 'thinking', name: 'thinking', iteration: Number(msg.iteration ?? 1) }] }
+            ? { ...m, toolEvents: [...(m.toolEvents ?? []), {
+                type: 'thinking' as const,
+                name: 'thinking',
+                iteration: Number(msg.iteration ?? 1),
+                replanning: Boolean(msg.replanning),
+                toolsDone: Number(msg.tools_done ?? 0),
+              }] }
+            : m
+        ),
+      })
+    } else if (msg.type === 'executing') {
+      onUpdate({
+        ...cur,
+        messages: cur.messages.map((m, i) =>
+          i === cur.messages.length - 1 && m.role === 'assistant' && m.streaming
+            ? { ...m, toolEvents: [...(m.toolEvents ?? []), {
+                type: 'executing' as const,
+                name: 'executing',
+                iteration: Number(msg.iteration ?? 1),
+                toolCount: Number(msg.tool_count ?? 0),
+                tools: Array.isArray(msg.tools) ? (msg.tools as string[]) : [],
+              }] }
             : m
         ),
       })
@@ -444,7 +592,14 @@ const ChatWindow = forwardRef<ChatWindowHandle, ChatWindowProps>(function ChatWi
         ...cur,
         messages: cur.messages.map((m, i) =>
           i === cur.messages.length - 1 && m.role === 'assistant' && m.streaming
-            ? { ...m, toolEvents: [...(m.toolEvents ?? []), { type: 'tool_call', name: String(msg.name ?? ''), summary: summariseArgs(msg.args) }] }
+            ? { ...m, toolEvents: [...(m.toolEvents ?? []), {
+                type: 'tool_call' as const,
+                name: String(msg.name ?? ''),
+                summary: summariseArgs(msg.args),
+                iteration: Number(msg.iteration ?? 1),
+                step: Number(msg.step ?? 1),
+                totalSteps: Number(msg.total_steps ?? 1),
+              }] }
             : m
         ),
       })
@@ -453,7 +608,14 @@ const ChatWindow = forwardRef<ChatWindowHandle, ChatWindowProps>(function ChatWi
         ...cur,
         messages: cur.messages.map((m, i) =>
           i === cur.messages.length - 1 && m.role === 'assistant' && m.streaming
-            ? { ...m, toolEvents: [...(m.toolEvents ?? []), { type: 'tool_result', name: String(msg.name ?? ''), summary: truncate(String(msg.output ?? ''), 60) }] }
+            ? { ...m, toolEvents: [...(m.toolEvents ?? []), {
+                type: 'tool_result' as const,
+                name: String(msg.name ?? ''),
+                outputSnippet: String(msg.output_snippet ?? ''),
+                success: Boolean(msg.success ?? true),
+                elapsedMs: Number(msg.elapsed_ms ?? 0),
+                iteration: Number(msg.iteration ?? 1),
+              }] }
             : m
         ),
       })

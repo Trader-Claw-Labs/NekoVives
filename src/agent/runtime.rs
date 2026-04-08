@@ -94,15 +94,19 @@ impl ConversationRuntime {
 
         let mut final_text = String::new();
         let mut thinking_rounds = 0u32;
+        let mut total_tools_done = 0u32;
 
         for iteration in 0..MAX_TOOL_ITERATIONS {
-            // Notify UI: new LLM round starting
+            // Notify UI: LLM round starting (round 2+ means the agent is re-evaluating after tools)
             thinking_rounds += 1;
             if let Some(tx) = ws_tx {
                 let _ = tx.send(serde_json::json!({
                     "type": "thinking",
                     "iteration": thinking_rounds,
                     "rounds": thinking_rounds,
+                    "tools_done": total_tools_done,
+                    // "replanning" is true on round 2+ so the UI can label it differently
+                    "replanning": thinking_rounds > 1,
                 }));
             }
 
@@ -134,29 +138,60 @@ impl ConversationRuntime {
                 break;
             }
 
+            // Notify UI: execution phase starting (agent has a plan, now running tools)
+            if let Some(tx) = ws_tx {
+                let tool_names: Vec<&str> = tool_calls.iter().map(|(_, n, _)| n.as_str()).collect();
+                let _ = tx.send(serde_json::json!({
+                    "type": "executing",
+                    "iteration": thinking_rounds,
+                    "tool_count": tool_calls.len(),
+                    "tools": tool_names,
+                }));
+            }
+
             // Execute each tool and collect results as a single user turn
             let mut result_blocks: Vec<InputContentBlock> = Vec::new();
-            for (id, name, input) in &tool_calls {
-                // Notify UI: tool starting
+            for (tool_idx, (id, name, input)) in tool_calls.iter().enumerate() {
+                // Notify UI: individual tool starting
                 if let Some(tx) = ws_tx {
                     let _ = tx.send(serde_json::json!({
                         "type": "tool_call",
                         "name": name,
                         "args": input,
+                        "iteration": thinking_rounds,
+                        "step": tool_idx + 1,
+                        "total_steps": tool_calls.len(),
                     }));
                 }
 
+                let start = std::time::Instant::now();
                 let (output, is_error) = match tool_executor.execute(name, input.clone()).await {
                     Ok(result) => (result, false),
                     Err(e) => (format!("Error: {e}"), true),
                 };
+                let elapsed_ms = start.elapsed().as_millis() as u64;
+                total_tools_done += 1;
 
-                // Notify UI: tool done
+                // Send a snippet of the output so the UI can preview it (cap at 200 chars)
+                let snippet: String = output.chars().take(200).collect();
+                let snippet = if output.len() > 200 {
+                    format!("{snippet}…")
+                } else {
+                    snippet
+                };
+                // Strip leading/trailing whitespace and newlines from snippet
+                let snippet = snippet.trim().to_string();
+
+                // Notify UI: tool done with result preview
                 if let Some(tx) = ws_tx {
                     let _ = tx.send(serde_json::json!({
                         "type": "tool_result",
                         "name": name,
                         "success": !is_error,
+                        "output_snippet": snippet,
+                        "elapsed_ms": elapsed_ms,
+                        "iteration": thinking_rounds,
+                        "tools_done_total": total_tools_done,
                     }));
                 }
 

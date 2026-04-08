@@ -22,3 +22,4 @@ target/
 .claude/settings.local.json
 /.claude
 .remember/tmp/save-session.pid
+/web/dist
