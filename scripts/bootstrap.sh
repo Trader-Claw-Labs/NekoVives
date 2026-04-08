@@ -186,7 +186,7 @@ install_prebuilt_binary() {
     return 1
   fi
 
-  archive_url="https://github.com/traderclaw-labs/traderclaw/releases/latest/download/traderclaw-${target}.tar.gz"
+  archive_url="https://github.com/Trader-Claw-Labs/Trader-Claw/releases/latest/download/traderclaw-${target}.tar.gz"
   temp_dir="$(mktemp -d -t traderclaw-prebuilt-XXXXXX)"
   archive_path="$temp_dir/traderclaw-${target}.tar.gz"
 
@@ -721,7 +721,7 @@ MSG
 SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" >/dev/null 2>&1 && pwd || pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." >/dev/null 2>&1 && pwd || pwd)"
-REPO_URL="https://github.com/traderclaw-labs/traderclaw.git"
+REPO_URL="https://github.com/Trader-Claw-Labs/Trader-Claw.git"
 ORIGINAL_ARG_COUNT=$#
 GUIDED_MODE="auto"
 

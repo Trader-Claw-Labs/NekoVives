@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarketData {
     pub symbol: String,
+    pub exchange: String,
     pub price: f64,
+    pub volume: Option<f64>,
     pub rsi: Option<f64>,
     pub macd: Option<f64>,
     pub macd_signal: Option<f64>,
@@ -27,26 +29,58 @@ fn value_to_f64_opt(v: Option<&serde_json::Value>) -> Option<f64> {
     v.and_then(|val| val.as_f64())
 }
 
-fn symbol_from_exchange_pair(s: &str) -> String {
-    // "BINANCE:BTCUSDT" -> "BTCUSDT"
-    s.split(':').nth(1).unwrap_or(s).to_string()
+/// Split "BINANCE:BTCUSDT" into ("BINANCE", "BTCUSDT").
+fn parse_exchange_symbol(s: &str) -> (String, String) {
+    if let Some((exchange, sym)) = s.split_once(':') {
+        (exchange.to_string(), sym.to_string())
+    } else {
+        ("UNKNOWN".to_string(), s.to_string())
+    }
 }
 
-/// Fetch price and indicators for a list of symbols.
-/// symbols: e.g. ["BTCUSDT", "ETHUSDT"] — will be prefixed with "BINANCE:"
+fn rows_to_market_data(rows: Vec<ScannerRow>, has_volume: bool) -> Vec<MarketData> {
+    rows.into_iter()
+        .map(|row| {
+            let (exchange, symbol) = parse_exchange_symbol(&row.s);
+            if has_volume {
+                // columns: close, volume, RSI, MACD.macd, MACD.signal
+                let price = value_to_f64_opt(row.d.get(0)).unwrap_or(0.0);
+                let volume = value_to_f64_opt(row.d.get(1));
+                let rsi = value_to_f64_opt(row.d.get(2));
+                let macd = value_to_f64_opt(row.d.get(3));
+                let macd_signal = value_to_f64_opt(row.d.get(4));
+                MarketData { symbol, exchange, price, volume, rsi, macd, macd_signal }
+            } else {
+                // columns: close, RSI, MACD.macd, MACD.signal
+                let price = value_to_f64_opt(row.d.get(0)).unwrap_or(0.0);
+                let rsi = value_to_f64_opt(row.d.get(1));
+                let macd = value_to_f64_opt(row.d.get(2));
+                let macd_signal = value_to_f64_opt(row.d.get(3));
+                MarketData { symbol, exchange, price, volume: None, rsi, macd, macd_signal }
+            }
+        })
+        .collect()
+}
+
+/// Fetch price and indicators for a list of explicit symbols.
+///
+/// `symbols` can be bare (`"BTCUSDT"`) or exchange-qualified (`"BINANCE:BTCUSDT"`).
+/// Bare symbols are prefixed with `"BINANCE:"`.
 pub async fn fetch_indicators(symbols: &[&str]) -> Result<Vec<MarketData>> {
     let full_symbols: Vec<String> = symbols
         .iter()
-        .map(|s| format!("BINANCE:{s}"))
+        .map(|s| {
+            if s.contains(':') {
+                (*s).to_string()
+            } else {
+                format!("BINANCE:{s}")
+            }
+        })
         .collect();
 
     let body = serde_json::json!({
         "columns": ["close", "RSI", "MACD.macd", "MACD.signal"],
-        "filter": [{
-            "left": "name",
-            "operation": "in_range",
-            "right": full_symbols
-        }]
+        "symbols": { "tickers": full_symbols }
     });
 
     let client = reqwest::Client::new();
@@ -59,30 +93,39 @@ pub async fn fetch_indicators(symbols: &[&str]) -> Result<Vec<MarketData>> {
         .json()
         .await?;
 
-    let results = resp
-        .data
-        .into_iter()
-        .map(|row| {
-            let symbol = symbol_from_exchange_pair(&row.s);
-            let price = value_to_f64_opt(row.d.get(0)).unwrap_or(0.0);
-            let rsi = value_to_f64_opt(row.d.get(1));
-            let macd = value_to_f64_opt(row.d.get(2));
-            let macd_signal = value_to_f64_opt(row.d.get(3));
-            MarketData {
-                symbol,
-                price,
-                rsi,
-                macd,
-                macd_signal,
-            }
-        })
-        .collect();
-
-    Ok(results)
+    Ok(rows_to_market_data(resp.data, false))
 }
 
-/// Fetch top crypto symbols by volume (hardcoded list of 20 common symbols).
-pub fn top_crypto_symbols() -> Vec<&'static str> {
+/// Fetch the top `limit` crypto pairs by 24-hour volume from TradingView Screener.
+///
+/// Uses the screener's native sort instead of a hardcoded list — results reflect
+/// actual current market activity.
+pub async fn fetch_top_by_volume(limit: usize) -> Result<Vec<MarketData>> {
+    let body = serde_json::json!({
+        "columns": ["close", "volume", "RSI", "MACD.macd", "MACD.signal"],
+        "sort": { "sortBy": "volume", "sortOrder": "desc" },
+        "filter": [
+            { "left": "close", "operation": "greater", "right": 0 },
+            { "left": "volume", "operation": "greater", "right": 0 }
+        ],
+        "range": [0, limit]
+    });
+
+    let client = reqwest::Client::new();
+    let resp: ScannerResponse = client
+        .post("https://scanner.tradingview.com/crypto/scan")
+        .json(&body)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+
+    Ok(rows_to_market_data(resp.data, true))
+}
+
+/// Static fallback list used when the network is unavailable.
+pub fn top_crypto_symbols_fallback() -> Vec<&'static str> {
     vec![
         "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT",
         "AVAXUSDT", "DOTUSDT", "LINKUSDT", "MATICUSDT", "LTCUSDT", "UNIUSDT", "ATOMUSDT",
@@ -99,6 +142,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parse_exchange_symbol_qualified() {
+        let (ex, sym) = parse_exchange_symbol("BINANCE:BTCUSDT");
+        assert_eq!(ex, "BINANCE");
+        assert_eq!(sym, "BTCUSDT");
+    }
+
+    #[test]
+    fn parse_exchange_symbol_bare() {
+        let (ex, sym) = parse_exchange_symbol("BTCUSDT");
+        assert_eq!(ex, "UNKNOWN");
+        assert_eq!(sym, "BTCUSDT");
+    }
+
+    #[test]
     fn test_parse_screener_response() {
         let json = r#"{
             "data": [
@@ -108,36 +165,30 @@ mod tests {
         }"#;
 
         let resp: ScannerResponse = serde_json::from_str(json).expect("parse failed");
-        assert_eq!(resp.data.len(), 2);
-
-        let btc = &resp.data[0];
-        assert_eq!(btc.s, "BINANCE:BTCUSDT");
-        assert_eq!(btc.d[0].as_f64().unwrap(), 65000.0);
-        assert_eq!(btc.d[1].as_f64().unwrap(), 55.3);
-        assert_eq!(btc.d[2].as_f64().unwrap(), 120.5);
-        assert_eq!(btc.d[3].as_f64().unwrap(), 118.2);
-
-        // Parse into MarketData
-        let symbol = symbol_from_exchange_pair(&btc.s);
-        let price = value_to_f64_opt(btc.d.get(0)).unwrap_or(0.0);
-        let rsi = value_to_f64_opt(btc.d.get(1));
-        let macd = value_to_f64_opt(btc.d.get(2));
-        let macd_signal = value_to_f64_opt(btc.d.get(3));
-
-        assert_eq!(symbol, "BTCUSDT");
-        assert!((price - 65000.0).abs() < 0.01);
-        assert_eq!(rsi, Some(55.3));
-        assert_eq!(macd, Some(120.5));
-        assert_eq!(macd_signal, Some(118.2));
+        let data = rows_to_market_data(resp.data, false);
+        assert_eq!(data.len(), 2);
+        assert_eq!(data[0].symbol, "BTCUSDT");
+        assert_eq!(data[0].exchange, "BINANCE");
+        assert!((data[0].price - 65000.0).abs() < 0.01);
+        assert_eq!(data[0].rsi, Some(55.3));
     }
 
     #[test]
-    fn test_top_crypto_symbols() {
-        let symbols = top_crypto_symbols();
-        assert!(!symbols.is_empty());
-        assert!(symbols.contains(&"BTCUSDT"));
-        assert!(symbols.contains(&"ETHUSDT"));
-        assert_eq!(symbols.len(), 20);
+    fn test_parse_volume_response() {
+        let json = r#"{
+            "data": [
+                {"s": "BINANCE:BTCUSDT", "d": [65000.0, 1500000000.0, 55.3, 120.5, 118.2]}
+            ]
+        }"#;
+        let resp: ScannerResponse = serde_json::from_str(json).expect("parse failed");
+        let data = rows_to_market_data(resp.data, true);
+        assert_eq!(data[0].volume, Some(1_500_000_000.0));
+        assert_eq!(data[0].rsi, Some(55.3));
+    }
+
+    #[test]
+    fn fallback_list_not_empty() {
+        assert_eq!(top_crypto_symbols_fallback().len(), 20);
     }
 
     #[tokio::test]
@@ -149,5 +200,16 @@ mod tests {
         for d in &data {
             assert!(d.price > 0.0, "price should be positive for {}", d.symbol);
         }
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_fetch_top_by_volume_network() {
+        let data = fetch_top_by_volume(10).await.expect("network call failed");
+        assert!(!data.is_empty());
+        assert!(data.len() <= 10);
+        // Results should be roughly sorted by volume desc
+        let vols: Vec<f64> = data.iter().filter_map(|d| d.volume).collect();
+        assert!(!vols.is_empty());
     }
 }

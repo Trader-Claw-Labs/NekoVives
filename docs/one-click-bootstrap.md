@@ -13,7 +13,7 @@ brew install traderclaw
 ## Option A (Recommended): Clone + local script
 
 ```bash
-git clone https://github.com/traderclaw-labs/traderclaw.git
+git clone https://github.com/Trader-Claw-Labs/Trader-Claw.git
 cd traderclaw
 ./bootstrap.sh
 ```

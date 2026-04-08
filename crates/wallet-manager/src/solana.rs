@@ -176,6 +176,20 @@ pub fn export_mnemonic(encrypted_key: &[u8], password: &str) -> Result<String> {
     String::from_utf8(mnemonic_bytes).context("mnemonic is not valid UTF-8")
 }
 
+/// Decrypt and return the raw 32-byte private key.
+pub fn export_private_key(encrypted_key: &[u8], password: &str) -> Result<Vec<u8>> {
+    let wallet_data: SolanaEncryptedData =
+        serde_json::from_slice(encrypted_key).context("deserializing encrypted wallet data")?;
+
+    let privkey_bytes = open_payload(&wallet_data.privkey_ct, password)
+        .map_err(|_| anyhow!("decryption failed — check your password"))?;
+
+    if privkey_bytes.len() != 32 {
+        return Err(anyhow!("unexpected private key length after decryption"));
+    }
+    Ok(privkey_bytes)
+}
+
 // ---------------------------------------------------------------------------
 // SQLite helpers
 // ---------------------------------------------------------------------------

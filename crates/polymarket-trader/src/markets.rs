@@ -118,22 +118,33 @@ fn apply_filter(markets: Vec<GammaMarket>, filter: &MarketFilter) -> Vec<Market>
 }
 
 /// List markets from Gamma API.
-/// GET https://gamma-api.polymarket.com/markets
-/// Params: active=true&closed=false&limit=100
+/// Handles both flat `[...]` and paginated `{"data":[...]}` response shapes.
 pub async fn list_markets(filter: MarketFilter) -> Result<Vec<Market>> {
     let client = reqwest::Client::new();
-    let mut url = "https://gamma-api.polymarket.com/markets?limit=100".to_string();
+    let mut url = "https://gamma-api.polymarket.com/markets?limit=100&order=volume&ascending=false".to_string();
     if filter.active_only {
         url.push_str("&active=true&closed=false");
     }
 
-    let raw: Vec<GammaMarket> = client
+    let bytes = client
         .get(&url)
+        .timeout(std::time::Duration::from_secs(15))
         .send()
         .await?
         .error_for_status()?
-        .json()
+        .bytes()
         .await?;
+
+    // Try flat array first, then paginated wrapper
+    let raw: Vec<GammaMarket> = if let Ok(v) = serde_json::from_slice::<Vec<GammaMarket>>(&bytes) {
+        v
+    } else {
+        #[derive(serde::Deserialize)]
+        struct Paged { data: Vec<GammaMarket> }
+        serde_json::from_slice::<Paged>(&bytes)
+            .map(|p| p.data)
+            .map_err(|e| anyhow::anyhow!("Gamma API parse error: {e}\nBody: {}", String::from_utf8_lossy(&bytes[..bytes.len().min(300)])))?
+    };
 
     Ok(apply_filter(raw, &filter))
 }

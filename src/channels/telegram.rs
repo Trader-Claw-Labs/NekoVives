@@ -13,6 +13,25 @@ use tokio::fs;
 
 /// Telegram's maximum message length for text messages
 const TELEGRAM_MAX_MESSAGE_LENGTH: usize = 4096;
+
+// ── Recent messages ring-buffer (shared with the gateway for /api/channels/telegram/messages) ──
+
+const RECENT_MSG_CAPACITY: usize = 50;
+
+#[derive(Clone, serde::Serialize)]
+pub struct RecentTelegramMessage {
+    pub from: String,
+    pub text: String,
+    pub date: String, // ISO-8601 UTC
+}
+
+static RECENT_MSGS: std::sync::LazyLock<Mutex<std::collections::VecDeque<RecentTelegramMessage>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::VecDeque::with_capacity(RECENT_MSG_CAPACITY)));
+
+/// Read the latest received Telegram messages (for the dashboard).
+pub fn recent_telegram_messages() -> Vec<RecentTelegramMessage> {
+    RECENT_MSGS.lock().iter().cloned().collect()
+}
 /// Reserve space for continuation markers added by send_text_chunks:
 /// worst case is "(continued)\n\n" + chunk + "\n\n(continues...)" = 30 extra chars
 const TELEGRAM_CONTINUATION_OVERHEAD: usize = 30;
@@ -431,7 +450,7 @@ impl TelegramChannel {
     }
 
     fn normalize_identity(value: &str) -> String {
-        value.trim().trim_start_matches('@').to_string()
+        value.trim().trim_start_matches('@').to_lowercase()
     }
 
     fn normalize_allowed_users(allowed_users: Vec<String>) -> Vec<String> {
@@ -1294,16 +1313,40 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             content
         };
 
+        let timestamp_secs = message
+            .get("date")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64
+            });
+        let date_iso = chrono::DateTime::<chrono::Utc>::from_timestamp(timestamp_secs, 0)
+            .map(|dt| dt.to_rfc3339())
+            .unwrap_or_default();
+
+        // Push to the dashboard ring-buffer
+        {
+            let mut buf = RECENT_MSGS.lock();
+            if buf.len() == RECENT_MSG_CAPACITY {
+                buf.pop_front();
+            }
+            buf.push_back(RecentTelegramMessage {
+                from: username.clone(),
+                text: content.clone(),
+                date: date_iso,
+            });
+        }
+
+        let channel_ts = timestamp_secs as u64;
         Some(ChannelMessage {
             id: format!("telegram_{chat_id}_{message_id}"),
             sender: sender_identity,
             reply_target,
             content,
             channel: "telegram".to_string(),
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
+            timestamp: channel_ts,
             thread_ts: thread_id,
         })
     }

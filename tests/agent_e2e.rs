@@ -5,7 +5,7 @@
 //! external service dependencies. They complement the unit tests in
 //! `src/agent/tests.rs` by running at the integration test boundary.
 //!
-//! Ref: https://github.com/traderclaw-labs/traderclaw/issues/618 (item 6)
+//! Ref: https://github.com/Trader-Claw-Labs/Trader-Claw/issues/618 (item 6)
 
 use anyhow::Result;
 use async_trait::async_trait;

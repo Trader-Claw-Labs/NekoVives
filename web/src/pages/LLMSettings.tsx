@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useQuery, useMutation } from '@tanstack/react-query'
 import { apiFetch } from '../hooks/useApi'
-import { Brain, Save } from 'lucide-react'
+import { Brain, Save, Eye, EyeOff } from 'lucide-react'
 
 interface ConfigResponse {
   format?: string
@@ -51,9 +51,10 @@ const MODELS_BY_PROVIDER: Record<string, string[]> = {
     'mistral-small-latest',
   ],
   gemini: [
-    'gemini-1.5-pro',
-    'gemini-1.5-flash',
+    'gemini-2.5-flash',
+    'gemini-2.5-pro',
     'gemini-2.0-flash',
+    'gemini-2.0-flash-lite',
   ],
   ollama: ['llama3.2', 'mistral', 'qwen2.5'],
   custom: [],
@@ -62,9 +63,11 @@ const MODELS_BY_PROVIDER: Record<string, string[]> = {
 export default function LLMSettings() {
   const [provider, setProvider] = useState('openrouter')
   const [model, setModel] = useState('anthropic/claude-sonnet-4')
-  const [customModel, setCustomModel] = useState('')
+  const [apiKey, setApiKey] = useState('')
+  const [apiUrl, setApiUrl] = useState('')
+  const [showApiKey, setShowApiKey] = useState(false)
   const [temperature, setTemperature] = useState(0.7)
-  const [maxTokens, setMaxTokens] = useState(8192)
+  const [maxTokens, setMaxTokens] = useState(131072)
   const [systemPrompt, setSystemPrompt] = useState('')
   const [saveMsg, setSaveMsg] = useState('')
   const [saveErr, setSaveErr] = useState('')
@@ -84,11 +87,15 @@ export default function LLMSettings() {
     const tempMatch = content.match(/default_temperature\s*=\s*([\d.]+)/)
     const promptMatch = content.match(/system_prompt\s*=\s*"""([\s\S]*?)"""/)
       ?? content.match(/system_prompt\s*=\s*"([^"]*)"/)
+    const apiKeyMatch = content.match(/^api_key\s*=\s*"([^"]*)"/m)
+    const apiUrlMatch = content.match(/^api_url\s*=\s*"([^"]*)"/m)
 
     if (providerMatch) setProvider(providerMatch[1])
     if (modelMatch) setModel(modelMatch[1])
     if (tempMatch) setTemperature(parseFloat(tempMatch[1]))
     if (promptMatch) setSystemPrompt(promptMatch[1].trim())
+    if (apiKeyMatch && apiKeyMatch[1] && !apiKeyMatch[1].startsWith('•')) setApiKey(apiKeyMatch[1])
+    if (apiUrlMatch) setApiUrl(apiUrlMatch[1])
   }, [configData])
 
   const saveMutation = useMutation({
@@ -96,12 +103,33 @@ export default function LLMSettings() {
       if (!configData?.content) throw new Error('No config loaded')
       let toml = configData.content
 
-      const effectiveModel = provider === 'custom' ? customModel : model
+      const effectiveModel = model
 
       // Update fields in TOML
       toml = toml.replace(/default_provider\s*=\s*"[^"]*"/, `default_provider = "${provider}"`)
       toml = toml.replace(/default_model\s*=\s*"[^"]*"/, `default_model = "${effectiveModel}"`)
       toml = toml.replace(/default_temperature\s*=\s*[\d.]+/, `default_temperature = ${temperature}`)
+
+      // Update or append api_key (only if user typed something)
+      if (apiKey) {
+        if (/^api_key\s*=/m.test(toml)) {
+          toml = toml.replace(/^api_key\s*=\s*"[^"]*"/m, `api_key = "${apiKey}"`)
+        } else {
+          toml = `api_key = "${apiKey}"\n` + toml
+        }
+      }
+
+      // Update or append api_url (only if set)
+      if (apiUrl) {
+        if (/^api_url\s*=/m.test(toml)) {
+          toml = toml.replace(/^api_url\s*=\s*"[^"]*"/m, `api_url = "${apiUrl}"`)
+        } else {
+          toml = `api_url = "${apiUrl}"\n` + toml
+        }
+      } else if (/^api_url\s*=/m.test(toml)) {
+        // Remove api_url line if cleared
+        toml = toml.replace(/^api_url\s*=\s*"[^"]*"\n?/m, '')
+      }
 
       const res = await fetch('/api/config', {
         method: 'PUT',
@@ -112,7 +140,7 @@ export default function LLMSettings() {
       return res.json()
     },
     onSuccess: () => {
-      setSaveMsg('Saved! Restart may be required for model changes to take effect.')
+      setSaveMsg('Saved! Model and temperature updated — no restart required.')
       setSaveErr('')
       setTimeout(() => setSaveMsg(''), 4000)
     },
@@ -142,11 +170,7 @@ export default function LLMSettings() {
           </label>
           <select
             value={provider}
-            onChange={(e) => {
-              setProvider(e.target.value)
-              const models = MODELS_BY_PROVIDER[e.target.value] ?? []
-              if (models.length > 0) setModel(models[0])
-            }}
+            onChange={(e) => setProvider(e.target.value)}
             className="w-full rounded px-3 py-2 text-sm"
           >
             {PROVIDERS.map((p) => (
@@ -160,34 +184,64 @@ export default function LLMSettings() {
           <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>
             Model
           </label>
-          {provider === 'custom' ? (
-            <input
-              type="text"
-              value={customModel}
-              onChange={(e) => setCustomModel(e.target.value)}
-              className="w-full rounded px-3 py-2 text-sm font-mono"
-              placeholder="custom-model-id"
-            />
-          ) : modelOptions.length > 0 ? (
-            <select
-              value={model}
-              onChange={(e) => setModel(e.target.value)}
-              className="w-full rounded px-3 py-2 text-sm font-mono"
-            >
-              {modelOptions.map((m) => (
-                <option key={m} value={m}>{m}</option>
-              ))}
-            </select>
-          ) : (
-            <input
-              type="text"
-              value={model}
-              onChange={(e) => setModel(e.target.value)}
-              className="w-full rounded px-3 py-2 text-sm font-mono"
-              placeholder="model-name"
-            />
+          <datalist id="model-suggestions">
+            {modelOptions.map((m) => <option key={m} value={m} />)}
+          </datalist>
+          <input
+            type="text"
+            list="model-suggestions"
+            value={model}
+            onChange={(e) => setModel(e.target.value)}
+            className="w-full rounded px-3 py-2 text-sm font-mono"
+            placeholder="Type or select a model..."
+            autoComplete="off"
+          />
+          {modelOptions.length > 0 && (
+            <p className="text-xs mt-1" style={{ color: 'var(--color-text-muted)' }}>
+              Suggestions: {modelOptions.join(' · ')}
+            </p>
           )}
         </div>
+
+        {/* API Key */}
+        <div>
+          <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>
+            API Key
+          </label>
+          <div className="relative">
+            <input
+              type={showApiKey ? 'text' : 'password'}
+              value={apiKey}
+              onChange={(e) => setApiKey(e.target.value)}
+              className="w-full rounded px-3 py-2 text-sm pr-10 font-mono"
+              placeholder={`${provider} API key...`}
+            />
+            <button
+              type="button"
+              className="absolute right-2 top-1/2 -translate-y-1/2"
+              onClick={() => setShowApiKey((s) => !s)}
+              style={{ color: 'var(--color-text-muted)' }}
+            >
+              {showApiKey ? <EyeOff size={14} /> : <Eye size={14} />}
+            </button>
+          </div>
+        </div>
+
+        {/* Base URL (custom or ollama) */}
+        {(provider === 'custom' || provider === 'ollama') && (
+          <div>
+            <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>
+              Base URL {provider === 'ollama' ? '(e.g. http://localhost:11434)' : '(custom endpoint)'}
+            </label>
+            <input
+              type="text"
+              value={apiUrl}
+              onChange={(e) => setApiUrl(e.target.value)}
+              className="w-full rounded px-3 py-2 text-sm font-mono"
+              placeholder={provider === 'ollama' ? 'http://localhost:11434' : 'https://api.example.com/v1'}
+            />
+          </div>
+        )}
 
         {/* Temperature */}
         <div>
@@ -229,8 +283,12 @@ export default function LLMSettings() {
             onChange={(e) => setMaxTokens(parseInt(e.target.value, 10))}
             min={256}
             max={200000}
+            step={1024}
             className="w-full rounded px-3 py-2 text-sm font-mono"
           />
+          <p className="text-xs mt-1" style={{ color: 'var(--color-text-muted)' }}>
+            128k = 131072 · 64k = 65536 · 32k = 32768
+          </p>
         </div>
 
         {/* System prompt */}

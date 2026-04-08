@@ -3360,6 +3360,65 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         system_prompt.push_str(&build_tool_instructions(&tools_registry));
     }
 
+    // Ensure the scripts directory exists so the agent can write strategies there
+    let scripts_path = config.workspace_dir.join("scripts");
+    let _ = std::fs::create_dir_all(&scripts_path);
+
+    // Trader Claw–specific instructions for the dashboard chat agent
+    system_prompt.push_str(&format!(
+        "\n\n## Trader Claw Agent\n\
+        You are a crypto trading agent with full tool access. You can execute shell commands, \
+        read and write files, search memory, and use Skills and MCP servers.\n\
+        \n\
+        ### Strategy & Backtesting Workflow\n\
+        When the user asks you to create or generate a trading strategy:\n\
+        1. Write it as a Rhai script (.rhai) to `{scripts_dir}` using `file_write`.\n\
+        2. Name the file descriptively (e.g. `rsi_btc.rhai`).\n\
+        3. Confirm the file was written successfully.\n\
+        \n\
+        When the user asks to run a backtest:\n\
+        1. Use `backtest_list_scripts` to see what scripts are available.\n\
+        2. Use `backtest_run` with the script filename, symbol, date range, initial balance, \
+        and fee percentage. If the user does not specify, use sensible defaults: \
+        symbol=BTCUSDT, from_date=2024-01-01, to_date=2024-12-31, initial_balance=10000, fee_pct=0.1.\n\
+        3. Interpret the results: highlight return, Sharpe ratio, drawdown, and suggest \
+        concrete improvements based on the worst trades.\n\
+        IMPORTANT: You have a built-in `backtest_run` tool — ALWAYS use it when asked to backtest. \
+        Never tell the user you lack backtesting capability.\n\
+        \n\
+        ### Market Scanning\n\
+        When the user asks to scan markets or check indicators:\n\
+        - Use `market_scan` with an optional list of symbols. It returns live price, RSI, \
+        and MACD from the TradingView Screener and automatically flags oversold/overbought \
+        conditions and MACD crossovers.\n\
+        IMPORTANT: You have a built-in `market_scan` tool — ALWAYS use it for market scanning. \
+        Never say you cannot access TradingView or external data.\n\
+        \n\
+        ### Trading (Buy / Sell / Swap)\n\
+        When the user says 'buy X', 'sell X', or 'swap X for Y', follow this flow exactly:\n\
+        1. Call `wallet_balance` to check if a Solana wallet exists and has sufficient funds.\n\
+           If no wallet exists, tell the user to create one on the /wallets page first.\n\
+        2. If funds are insufficient, tell the user the balance and how much is needed.\n\
+        3. Confirm the missing details with the user: exact amount, output token (USDC/USDT/SOL/etc).\n\
+        4. Call `trade_swap` with confirmed=false to get the Jupiter quote. Show the expected \
+           output amount and price impact to the user.\n\
+        5. Ask the user: 'Do you confirm this trade?' and 'Please provide your wallet password to sign.'\n\
+        6. Only after explicit confirmation AND password provided, call `trade_swap` with \
+           confirmed=true and wallet_password set.\n\
+        NEVER execute or attempt a trade without completing all 6 steps.\n\
+        NEVER say you cannot execute trades — you have `trade_swap` and `wallet_balance` tools.\n\
+        \n\
+        ### Shell / Terminal\n\
+        Use the `shell` tool to run any terminal command: list files, run scripts, \
+        check system state, etc. It runs in the workspace directory by default.\n\
+        \n\
+        Available tools: shell, file_read, file_write, file_edit, glob_search, content_search, \
+        market_scan, backtest_list_scripts, backtest_run, wallet_balance, trade_swap, \
+        memory_recall, memory_store, memory_forget, cron_add, cron_list, cron_remove, \
+        web_fetch, web_search, and any configured Skills and MCP servers.",
+        scripts_dir = config.workspace_dir.join("scripts").display(),
+    ));
+
     let mem_context = build_context(mem.as_ref(), message, config.memory.min_relevance_score).await;
     let rag_limit = if config.agent.compact_context { 2 } else { 5 };
     let hw_context = hardware_rag
@@ -3379,7 +3438,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         ChatMessage::user(&enriched),
     ];
 
-    agent_turn(
+    let response = agent_turn(
         provider.as_ref(),
         &mut history,
         &tools_registry,
@@ -3391,7 +3450,28 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         &config.multimodal,
         config.agent.max_tool_iterations,
     )
-    .await
+    .await?;
+
+    // Persist the conversation turn to memory so the agent recalls it in future sessions
+    let ts = chrono::Utc::now().timestamp();
+    let _ = mem
+        .store(
+            &format!("chat_user_{ts}"),
+            &format!("User: {message}"),
+            MemoryCategory::Conversation,
+            None,
+        )
+        .await;
+    let _ = mem
+        .store(
+            &format!("chat_agent_{ts}"),
+            &format!("Agent: {response}"),
+            MemoryCategory::Conversation,
+            None,
+        )
+        .await;
+
+    Ok(response)
 }
 
 #[cfg(test)]

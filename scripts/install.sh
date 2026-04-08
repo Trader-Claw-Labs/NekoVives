@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" >/dev/null 2>&1 && pwd || pwd)"
 INSTALLER_LOCAL="$(cd "$SCRIPT_DIR/.." >/dev/null 2>&1 && pwd || pwd)/traderclaw_install.sh"
 BOOTSTRAP_LOCAL="$SCRIPT_DIR/bootstrap.sh"
-REPO_URL="https://github.com/traderclaw-labs/traderclaw.git"
+REPO_URL="https://github.com/Trader-Claw-Labs/Trader-Claw.git"
 
 echo "[deprecated] scripts/install.sh -> ./traderclaw_install.sh" >&2
 

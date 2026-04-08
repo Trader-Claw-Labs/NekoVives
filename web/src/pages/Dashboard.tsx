@@ -71,7 +71,7 @@ const quickLinks = [
   { to: '/polymarket',     icon: <BarChart2 size={16} />,    label: 'Polymarket',   desc: 'Prediction market trading' },
   { to: '/telegram',       icon: <Send size={16} />,         label: 'Telegram',     desc: 'Bot commands & alerts' },
   { to: '/skills',         icon: <Zap size={16} />,          label: 'Strategies',   desc: 'Scheduled cron jobs' },
-  { to: '/chat',           icon: <MessageSquare size={16} />,label: 'Multi-Chat',   desc: 'Parallel AI trading sessions' },
+  { to: '/chat',           icon: <MessageSquare size={16} />,label: 'Terminal',     desc: 'Parallel AI trading sessions' },
   { to: '/settings/llm',  icon: <Brain size={16} />,         label: 'LLM',          desc: 'Model & provider config' },
   { to: '/settings/config',icon: <Settings size={16} />,     label: 'Config',       desc: 'Advanced settings' },
 ]
@@ -108,7 +108,16 @@ export default function Dashboard() {
       apiFetch<CronData>('/api/cron').catch(() => ({ jobs: [] })),
   })
 
-  const telegramOnline = !!(status?.channels?.['telegram'])
+  const telegramConfigured = !!(status?.channels?.['telegram'])
+  const telegramHealth = status?.health?.components?.['channel:telegram']
+  const telegramOnline = telegramHealth?.status === 'ok'
+  const telegramDotStatus: 'online' | 'offline' | 'warning' = !telegramConfigured
+    ? 'offline'
+    : telegramHealth?.status === 'ok'
+    ? 'online'
+    : telegramHealth?.status === 'error'
+    ? 'offline'
+    : 'warning'
   const uptime = status?.health?.uptime_seconds ?? 0
   const walletCount = wallets?.wallets?.length ?? 0
   const skillCount = cronData?.jobs?.length ?? 0
@@ -129,9 +138,9 @@ export default function Dashboard() {
     },
     {
       label: 'Telegram',
-      value: telegramOnline ? 'Online' : 'Offline',
+      value: !telegramConfigured ? 'Not set up' : telegramOnline ? 'Online' : telegramHealth?.status === 'error' ? 'Error' : 'Starting',
       icon: <Send size={16} />,
-      status: telegramOnline ? 'online' : 'offline',
+      status: telegramDotStatus,
     },
     {
       label: 'LLM Model',
@@ -147,18 +156,27 @@ export default function Dashboard() {
   return (
     <div className="p-6 max-w-6xl mx-auto">
       {/* Header */}
-      <div className="flex items-center justify-between mb-6">
-        <div>
-          <h1 className="text-xl font-bold" style={{ color: 'var(--color-accent)' }}>
-            TRADER CLAW
-          </h1>
-          <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
+      <div className="mb-6">
+        {/* ASCII Logo */}
+        <pre
+          className="text-xs leading-tight font-mono mb-3 select-none"
+          style={{ color: 'var(--color-accent)', opacity: 0.85 }}
+        >{`
+  ████████╗██████╗  █████╗ ██████╗ ███████╗██████╗      ██████╗██╗      █████╗ ██╗    ██╗
+  ╚══██╔══╝██╔══██╗██╔══██╗██╔══██╗██╔════╝██╔══██╗    ██╔════╝██║     ██╔══██╗██║    ██║
+     ██║   ██████╔╝███████║██║  ██║█████╗  ██████╔╝    ██║     ██║     ███████║██║ █╗ ██║
+     ██║   ██╔══██╗██╔══██║██║  ██║██╔══╝  ██╔══██╗    ██║     ██║     ██╔══██║██║███╗██║
+     ██║   ██║  ██║██║  ██║██████╔╝███████╗██║  ██║    ╚██████╗███████╗██║  ██║╚███╔███╔╝
+     ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═╝╚═════╝ ╚══════╝╚═╝  ╚═╝     ╚═════╝╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝ `}</pre>
+
+        <div className="flex items-center justify-between">
+          <p className="text-xs" style={{ color: 'var(--color-text-muted)' }}>
             Crypto Trading Agent Dashboard
           </p>
-        </div>
-        <div className="flex items-center gap-2 text-xs" style={{ color: 'var(--color-text-muted)' }}>
-          <Clock size={12} />
-          <span>Uptime: {formatUptime(uptime)}</span>
+          <div className="flex items-center gap-2 text-xs" style={{ color: 'var(--color-text-muted)' }}>
+            <Clock size={12} />
+            <span>Uptime: {formatUptime(uptime)}</span>
+          </div>
         </div>
       </div>
 

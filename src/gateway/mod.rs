@@ -38,6 +38,90 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 use uuid::Uuid;
 
+/// Wallet entry stored in-memory and persisted to disk.
+#[derive(Clone)]
+pub struct StoredWallet {
+    pub chain: String,
+    pub address: String,
+    pub label: String,
+    /// AES-256-GCM encrypted key material (JSON-serialized `WalletEncryptedData`).
+    pub encrypted_key: Vec<u8>,
+}
+
+/// On-disk representation of a wallet (encrypted_key stored as base64).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct DiskWallet {
+    chain: String,
+    address: String,
+    label: String,
+    encrypted_key_b64: String,
+}
+
+/// Derive the wallets JSON file path from the config file path.
+fn wallets_file_path(config_path: &std::path::Path) -> std::path::PathBuf {
+    config_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("wallets.json")
+}
+
+/// Load wallets from the JSON file. Returns empty vec on any error.
+fn load_wallets_from_disk(path: &std::path::Path) -> Vec<StoredWallet> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    let data = match std::fs::read_to_string(path) {
+        Ok(d) => d,
+        Err(_) => return Vec::new(),
+    };
+    let disk: Vec<DiskWallet> = match serde_json::from_str(&data) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("Failed to parse wallets.json: {e}");
+            return Vec::new();
+        }
+    };
+    disk.into_iter()
+        .filter_map(|d| {
+            let encrypted_key = STANDARD.decode(&d.encrypted_key_b64).ok()?;
+            Some(StoredWallet {
+                chain: d.chain,
+                address: d.address,
+                label: d.label,
+                encrypted_key,
+            })
+        })
+        .collect()
+}
+
+/// Persist all wallets to the JSON file atomically (write + rename).
+pub fn save_wallets_to_disk(wallets: &[StoredWallet], path: &std::path::Path) {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    let disk: Vec<DiskWallet> = wallets
+        .iter()
+        .map(|w| DiskWallet {
+            chain: w.chain.clone(),
+            address: w.address.clone(),
+            label: w.label.clone(),
+            encrypted_key_b64: STANDARD.encode(&w.encrypted_key),
+        })
+        .collect();
+    let json = match serde_json::to_string_pretty(&disk) {
+        Ok(j) => j,
+        Err(e) => {
+            tracing::error!("Failed to serialize wallets: {e}");
+            return;
+        }
+    };
+    // Write to a temp file first, then rename for atomicity
+    let tmp = path.with_extension("json.tmp");
+    if let Err(e) = std::fs::write(&tmp, &json) {
+        tracing::error!("Failed to write wallets temp file: {e}");
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        tracing::error!("Failed to rename wallets file: {e}");
+    }
+}
+
 /// Maximum request body size (64KB) — prevents memory exhaustion
 pub const MAX_BODY_SIZE: usize = 65_536;
 /// Request timeout (30s) — prevents slow-loris attacks
@@ -261,8 +345,8 @@ fn normalize_max_keys(configured: usize, fallback: usize) -> usize {
 pub struct AppState {
     pub config: Arc<Mutex<Config>>,
     pub provider: Arc<dyn Provider>,
-    pub model: String,
-    pub temperature: f64,
+    pub model: Arc<Mutex<String>>,
+    pub temperature: Arc<Mutex<f64>>,
     pub mem: Arc<dyn Memory>,
     pub auto_save: bool,
     /// SHA-256 hash of `X-Webhook-Secret` (hex-encoded), never plaintext.
@@ -279,6 +363,10 @@ pub struct AppState {
     pub cost_tracker: Option<Arc<CostTracker>>,
     /// SSE broadcast channel for real-time events
     pub event_tx: tokio::sync::broadcast::Sender<serde_json::Value>,
+    /// In-memory wallet store (backed by wallets.json on disk)
+    pub wallets: Arc<Mutex<Vec<StoredWallet>>>,
+    /// Path to the wallets.json persistence file
+    pub wallets_path: Arc<std::path::PathBuf>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -464,8 +552,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     let state = AppState {
         config: config_state,
         provider,
-        model,
-        temperature,
+        model: Arc::new(Mutex::new(model)),
+        temperature: Arc::new(Mutex::new(temperature)),
         mem,
         auto_save: config.memory.auto_save,
         webhook_secret_hash,
@@ -477,6 +565,15 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         tools_registry,
         cost_tracker,
         event_tx,
+        wallets: Arc::new(Mutex::new({
+            let p = wallets_file_path(&config.config_path);
+            let loaded = load_wallets_from_disk(&p);
+            if !loaded.is_empty() {
+                tracing::info!("Loaded {} wallet(s) from disk", loaded.len());
+            }
+            loaded
+        })),
+        wallets_path: Arc::new(wallets_file_path(&config.config_path)),
     };
 
     // Config PUT needs larger body limit (1MB)
@@ -494,6 +591,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         // ── Web Dashboard API routes ──
         .route("/api/status", get(api::handle_api_status))
         .route("/api/config", get(api::handle_api_config_get))
+        .route("/api/onboarding", get(api::handle_api_onboarding_status))
+        .route("/api/onboarding/complete", post(api::handle_api_onboarding_complete))
         .route("/api/tools", get(api::handle_api_tools))
         .route("/api/cron", get(api::handle_api_cron_list))
         .route("/api/cron", post(api::handle_api_cron_add))
@@ -512,6 +611,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         // ── Degen Web Dashboard routes ──
         .route("/api/wallets", get(api::handle_api_wallets_list))
         .route("/api/wallets/create", post(api::handle_api_wallets_create))
+        .route("/api/wallets/export", post(api::handle_api_wallets_export))
         .route(
             "/api/wallets/{address}/balance",
             get(api::handle_api_wallet_balance),
@@ -522,11 +622,27 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         )
         .route(
             "/api/polymarket/configure",
-            post(api::handle_api_polymarket_configure),
+            get(api::handle_api_polymarket_configure_get).post(api::handle_api_polymarket_configure),
         )
         .route(
             "/api/polymarket/test",
             post(api::handle_api_polymarket_test),
+        )
+        .route(
+            "/api/polymarket/positions",
+            get(api::handle_api_polymarket_positions),
+        )
+        .route(
+            "/api/polymarket/orders",
+            get(api::handle_api_polymarket_orders),
+        )
+        .route(
+            "/api/polymarket/order",
+            post(api::handle_api_polymarket_order_create),
+        )
+        .route(
+            "/api/polymarket/order/{id}",
+            delete(api::handle_api_polymarket_order_cancel),
         )
         // ── TradingView ──
         .route("/api/tradingview/scan", get(api::handle_api_tradingview_scan))
@@ -535,11 +651,15 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/backtest/run", post(api::handle_api_backtest_run))
         .route(
             "/api/channels/telegram/configure",
-            post(api::handle_api_telegram_configure),
+            get(api::handle_api_telegram_get).post(api::handle_api_telegram_configure),
         )
         .route(
             "/api/channels/telegram/test",
             post(api::handle_api_telegram_test),
+        )
+        .route(
+            "/api/channels/telegram/messages",
+            get(api::handle_api_telegram_messages),
         )
         .route("/api/chat", post(api::handle_api_chat))
         // ── SSE event stream ──
@@ -560,7 +680,20 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         // ── SPA fallback: non-API GET requests serve index.html ──
         .fallback(get(static_files::handle_spa_fallback));
 
-    // Run the server
+    // Spawn Telegram (and any other configured channels) alongside the HTTP server.
+    // start_channels() runs the long-poll loop; if no channels are configured it exits
+    // immediately and that's fine — no channels means nothing to do.
+    if config.channels_config.telegram.as_ref().map(|t| !t.bot_token.is_empty()).unwrap_or(false) {
+        let channels_cfg = config.clone();
+        tokio::spawn(async move {
+            tracing::info!("Starting Telegram channel listener…");
+            if let Err(e) = crate::channels::start_channels(channels_cfg).await {
+                tracing::error!("Telegram/channels loop exited with error: {e}");
+            }
+        });
+    }
+
+    // Run the HTTP server (blocks until shutdown)
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -697,7 +830,7 @@ async fn run_gateway_chat_simple(state: &AppState, message: &str) -> anyhow::Res
         let config_guard = state.config.lock();
         crate::channels::build_system_prompt(
             &config_guard.workspace_dir,
-            &state.model,
+            &state.model.lock().clone(),
             &[], // tools - empty for simple chat
             &[], // skills
             Some(&config_guard.identity),
@@ -713,9 +846,14 @@ async fn run_gateway_chat_simple(state: &AppState, message: &str) -> anyhow::Res
     let prepared =
         crate::multimodal::prepare_messages_for_provider(&messages, &multimodal_config).await?;
 
+    let (model_snap, temp_snap) = {
+        let m = state.model.lock().clone();
+        let t = *state.temperature.lock();
+        (m, t)
+    };
     state
         .provider
-        .chat_with_history(&prepared.messages, &state.model, state.temperature)
+        .chat_with_history(&prepared.messages, &model_snap, temp_snap)
         .await
 }
 
@@ -829,7 +967,7 @@ async fn handle_webhook(
         .default_provider
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
-    let model_label = state.model.clone();
+    let model_label = state.model.lock().clone();
     let started_at = Instant::now();
 
     state
@@ -873,7 +1011,7 @@ async fn handle_webhook(
                     cost_usd: None,
                 });
 
-            let body = serde_json::json!({"response": response, "model": state.model});
+            let body = serde_json::json!({"response": response, "model": state.model.lock().clone()});
             (StatusCode::OK, Json(body))
         }
         Err(e) => {
@@ -979,8 +1117,8 @@ mod tests {
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
             provider: Arc::new(MockProvider::default()),
-            model: "test-model".into(),
-            temperature: 0.0,
+            model: Arc::new(Mutex::new("test-model".into())),
+            temperature: Arc::new(Mutex::new(0.0)),
             mem: Arc::new(MockMemory),
             auto_save: false,
             webhook_secret_hash: None,
@@ -999,6 +1137,8 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            wallets: Arc::new(Mutex::new(Vec::new())),
+            wallets_path: Arc::new(std::env::temp_dir().join("traderclaw_test_wallets.json")),
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1028,8 +1168,8 @@ mod tests {
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
             provider: Arc::new(MockProvider::default()),
-            model: "test-model".into(),
-            temperature: 0.0,
+            model: Arc::new(Mutex::new("test-model".into())),
+            temperature: Arc::new(Mutex::new(0.0)),
             mem: Arc::new(MockMemory),
             auto_save: false,
             webhook_secret_hash: None,
@@ -1048,6 +1188,8 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            wallets: Arc::new(Mutex::new(Vec::new())),
+            wallets_path: Arc::new(std::env::temp_dir().join("traderclaw_test_wallets.json")),
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1394,8 +1536,8 @@ mod tests {
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
             provider,
-            model: "test-model".into(),
-            temperature: 0.0,
+            model: Arc::new(Mutex::new("test-model".into())),
+            temperature: Arc::new(Mutex::new(0.0)),
             mem: memory,
             auto_save: false,
             webhook_secret_hash: None,
@@ -1414,6 +1556,8 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            wallets: Arc::new(Mutex::new(Vec::new())),
+            wallets_path: Arc::new(std::env::temp_dir().join("traderclaw_test_wallets.json")),
         };
 
         let mut headers = HeaderMap::new();
@@ -1458,8 +1602,8 @@ mod tests {
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
             provider,
-            model: "test-model".into(),
-            temperature: 0.0,
+            model: Arc::new(Mutex::new("test-model".into())),
+            temperature: Arc::new(Mutex::new(0.0)),
             mem: memory,
             auto_save: true,
             webhook_secret_hash: None,
@@ -1478,6 +1622,8 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            wallets: Arc::new(Mutex::new(Vec::new())),
+            wallets_path: Arc::new(std::env::temp_dir().join("traderclaw_test_wallets.json")),
         };
 
         let headers = HeaderMap::new();
@@ -1534,8 +1680,8 @@ mod tests {
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
             provider,
-            model: "test-model".into(),
-            temperature: 0.0,
+            model: Arc::new(Mutex::new("test-model".into())),
+            temperature: Arc::new(Mutex::new(0.0)),
             mem: memory,
             auto_save: false,
             webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&secret))),
@@ -1554,6 +1700,8 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            wallets: Arc::new(Mutex::new(Vec::new())),
+            wallets_path: Arc::new(std::env::temp_dir().join("traderclaw_test_wallets.json")),
         };
 
         let response = handle_webhook(
@@ -1582,8 +1730,8 @@ mod tests {
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
             provider,
-            model: "test-model".into(),
-            temperature: 0.0,
+            model: Arc::new(Mutex::new("test-model".into())),
+            temperature: Arc::new(Mutex::new(0.0)),
             mem: memory,
             auto_save: false,
             webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&valid_secret))),
@@ -1602,6 +1750,8 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            wallets: Arc::new(Mutex::new(Vec::new())),
+            wallets_path: Arc::new(std::env::temp_dir().join("traderclaw_test_wallets.json")),
         };
 
         let mut headers = HeaderMap::new();
@@ -1635,8 +1785,8 @@ mod tests {
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
             provider,
-            model: "test-model".into(),
-            temperature: 0.0,
+            model: Arc::new(Mutex::new("test-model".into())),
+            temperature: Arc::new(Mutex::new(0.0)),
             mem: memory,
             auto_save: false,
             webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&secret))),
@@ -1655,6 +1805,8 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            wallets: Arc::new(Mutex::new(Vec::new())),
+            wallets_path: Arc::new(std::env::temp_dir().join("traderclaw_test_wallets.json")),
         };
 
         let mut headers = HeaderMap::new();
@@ -1693,8 +1845,8 @@ mod tests {
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
             provider,
-            model: "test-model".into(),
-            temperature: 0.0,
+            model: Arc::new(Mutex::new("test-model".into())),
+            temperature: Arc::new(Mutex::new(0.0)),
             mem: memory,
             auto_save: false,
             webhook_secret_hash: None,
@@ -1713,6 +1865,8 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            wallets: Arc::new(Mutex::new(Vec::new())),
+            wallets_path: Arc::new(std::env::temp_dir().join("traderclaw_test_wallets.json")),
         };
 
         let response = handle_nextcloud_talk_webhook(
@@ -1747,8 +1901,8 @@ mod tests {
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
             provider,
-            model: "test-model".into(),
-            temperature: 0.0,
+            model: Arc::new(Mutex::new("test-model".into())),
+            temperature: Arc::new(Mutex::new(0.0)),
             mem: memory,
             auto_save: false,
             webhook_secret_hash: None,
@@ -1767,6 +1921,8 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            wallets: Arc::new(Mutex::new(Vec::new())),
+            wallets_path: Arc::new(std::env::temp_dir().join("traderclaw_test_wallets.json")),
         };
 
         let mut headers = HeaderMap::new();

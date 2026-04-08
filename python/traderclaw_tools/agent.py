@@ -17,7 +17,7 @@ Be concise and helpful. Execute tools directly when needed without excessive exp
 GLM_DEFAULT_BASE_URL = "https://api.z.ai/api/coding/paas/v4"
 
 
-class DegenclawAgent:
+class TraderClawAgent:
     """
     LangGraph-based agent with consistent tool calling behavior.
 
@@ -115,8 +115,8 @@ class DegenclawAgent:
             return asyncio.run(self.ainvoke(input, config))
 
         raise RuntimeError(
-            "DegenclawAgent.invoke() cannot be called inside an active event loop. "
-            "Use 'await DegenclawAgent.ainvoke(...)' instead."
+            "TraderClawAgent.invoke() cannot be called inside an active event loop. "
+            "Use 'await TraderClawAgent.ainvoke(...)' instead."
         )
 
 
@@ -127,7 +127,7 @@ def create_agent(
     base_url: Optional[str] = None,
     temperature: float = 0.7,
     system_prompt: Optional[str] = None,
-) -> DegenclawAgent:
+) -> TraderClawAgent:
     """
     Create a TraderClaw agent with LangGraph-based tool calling.
 
@@ -140,7 +140,7 @@ def create_agent(
         system_prompt: Custom system prompt
 
     Returns:
-        Configured DegenclawAgent instance
+        Configured TraderClawAgent instance
 
     Example:
         ```python
@@ -163,7 +163,7 @@ def create_agent(
 
         tools = [shell, file_read, file_write]
 
-    return DegenclawAgent(
+    return TraderClawAgent(
         tools=tools,
         model=model,
         api_key=api_key,

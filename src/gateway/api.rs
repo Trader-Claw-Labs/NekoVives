@@ -88,8 +88,8 @@ pub async fn handle_api_status(
 
     let body = serde_json::json!({
         "provider": config.default_provider,
-        "model": state.model,
-        "temperature": state.temperature,
+        "model": state.model.lock().clone(),
+        "temperature": *state.temperature.lock(),
         "uptime_seconds": health.uptime_seconds,
         "gateway_port": config.gateway.port,
         "locale": "en",
@@ -175,9 +175,81 @@ pub async fn handle_api_config_put(
             .into_response();
     }
 
-    // Update in-memory config
+    // Update in-memory config and hot-reload model/temperature
+    if let Some(ref m) = new_config.default_model {
+        *state.model.lock() = m.clone();
+    }
+    *state.temperature.lock() = new_config.default_temperature;
     *state.config.lock() = new_config;
 
+    Json(serde_json::json!({"status": "ok"})).into_response()
+}
+
+/// GET /api/onboarding — returns onboarding status (requires auth)
+pub async fn handle_api_onboarding_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let config = state.config.lock().clone();
+    let onboarded = config.gateway.dashboard_onboarded;
+    let api_key_set = config.api_key.as_deref().map(|k| !k.is_empty()).unwrap_or(false);
+    let provider = config.default_provider.clone().unwrap_or_else(|| "openrouter".to_string());
+    let model = config.default_model.clone().unwrap_or_default();
+
+    Json(serde_json::json!({
+        "onboarded": onboarded,
+        "api_key_set": api_key_set,
+        "provider": provider,
+        "model": model,
+    }))
+    .into_response()
+}
+
+/// POST /api/onboarding/complete — mark onboarding done and optionally save api_key/provider/model
+pub async fn handle_api_onboarding_complete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let mut config = state.config.lock().clone();
+    config.gateway.dashboard_onboarded = true;
+
+    if let Some(key) = body.get("api_key").and_then(|v| v.as_str()) {
+        if !key.is_empty() {
+            config.api_key = Some(key.to_string());
+        }
+    }
+    if let Some(provider) = body.get("provider").and_then(|v| v.as_str()) {
+        if !provider.is_empty() {
+            config.default_provider = Some(provider.to_string());
+        }
+    }
+    if let Some(model) = body.get("model").and_then(|v| v.as_str()) {
+        if !model.is_empty() {
+            config.default_model = Some(model.to_string());
+        }
+    }
+    if let Some(url) = body.get("api_url").and_then(|v| v.as_str()) {
+        if !url.is_empty() {
+            config.api_url = Some(url.to_string());
+        }
+    }
+
+    if let Err(e) = config.save().await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to save config: {e}")})),
+        )
+            .into_response();
+    }
+
+    *state.config.lock() = config;
     Json(serde_json::json!({"status": "ok"})).into_response()
 }
 
@@ -524,6 +596,14 @@ pub async fn handle_api_health(
 pub struct CreateWalletBody {
     pub chain: String,
     pub password: String,
+    pub label: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct ExportWalletBody {
+    pub address: String,
+    pub password: String,
+    pub export_type: String, // "mnemonic" | "private_key"
 }
 
 #[derive(Deserialize)]
@@ -546,7 +626,7 @@ pub struct ChatBody {
     pub message: String,
 }
 
-/// GET /api/wallets — list wallets (stub: returns empty list)
+/// GET /api/wallets — list wallets
 pub async fn handle_api_wallets_list(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -554,10 +634,15 @@ pub async fn handle_api_wallets_list(
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
-    Json(serde_json::json!({"wallets": []})).into_response()
+    let store = state.wallets.lock();
+    let wallets: Vec<serde_json::Value> = store
+        .iter()
+        .map(|w| serde_json::json!({ "chain": w.chain, "address": w.address, "label": w.label }))
+        .collect();
+    Json(serde_json::json!({"wallets": wallets})).into_response()
 }
 
-/// POST /api/wallets/create — create a new wallet (stub)
+/// POST /api/wallets/create — create a new wallet with real key generation
 pub async fn handle_api_wallets_create(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -566,25 +651,140 @@ pub async fn handle_api_wallets_create(
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
-    // Stub: return a placeholder address
+    if body.password.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Password is required"})),
+        )
+            .into_response();
+    }
+
     let chain = body.chain.to_lowercase();
-    let stub_address = match chain.as_str() {
-        "evm" => "0x0000000000000000000000000000000000000000".to_string(),
-        "solana" => "11111111111111111111111111111111".to_string(),
-        "ton" => "EQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAlDH_o".to_string(),
-        other => format!("stub-{other}-address"),
+    let label = body.label.unwrap_or_default();
+
+    let (address, mnemonic, encrypted_key) = match chain.as_str() {
+        "evm" => {
+            match wallet_manager::evm::create_wallet(0, &body.password) {
+                Ok(info) => {
+                    let m = info.mnemonic.clone().unwrap_or_default();
+                    (info.address, m, info.encrypted_private_key)
+                }
+                Err(e) => return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("EVM wallet error: {e}")})),
+                ).into_response(),
+            }
+        }
+        "solana" => {
+            match wallet_manager::solana::create_wallet(0, &body.password) {
+                Ok(info) => {
+                    let m = info.mnemonic.clone().unwrap_or_default();
+                    (info.address, m, info.encrypted_private_key)
+                }
+                Err(e) => return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("Solana wallet error: {e}")})),
+                ).into_response(),
+            }
+        }
+        "ton" => {
+            match wallet_manager::ton::create_wallet(&body.password) {
+                Ok(info) => {
+                    let m = info.mnemonic.clone().unwrap_or_default();
+                    (info.address, m, info.encrypted_private_key)
+                }
+                Err(e) => return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("TON wallet error: {e}")})),
+                ).into_response(),
+            }
+        }
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Unsupported chain: {other}")})),
+            )
+                .into_response();
+        }
     };
+
+    {
+        let mut store = state.wallets.lock();
+        store.push(super::StoredWallet {
+            chain: chain.clone(),
+            address: address.clone(),
+            label: label.clone(),
+            encrypted_key,
+        });
+        super::save_wallets_to_disk(&store, &state.wallets_path);
+    }
+
     Json(serde_json::json!({
         "status": "ok",
         "wallet": {
-            "address": stub_address,
+            "address": address,
             "chain": chain,
+            "label": label,
+            "mnemonic": mnemonic,
         }
     }))
     .into_response()
 }
 
-/// GET /api/wallets/:address/balance — stub balance
+/// POST /api/wallets/export — decrypt and return mnemonic or private key
+pub async fn handle_api_wallets_export(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ExportWalletBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let store = state.wallets.lock();
+    let wallet = match store.iter().find(|w| w.address == body.address) {
+        Some(w) => w.clone(),
+        None => return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Wallet not found"})),
+        ).into_response(),
+    };
+    drop(store);
+
+    let result: Result<String, String> = match body.export_type.as_str() {
+        "mnemonic" => match wallet.chain.as_str() {
+            "evm" => wallet_manager::evm::export_mnemonic(&wallet.encrypted_key, &body.password)
+                .map_err(|e| e.to_string()),
+            "solana" => wallet_manager::solana::export_mnemonic(&wallet.encrypted_key, &body.password)
+                .map_err(|e| e.to_string()),
+            "ton" => wallet_manager::ton::export_mnemonic(&wallet.encrypted_key, &body.password)
+                .map_err(|e| e.to_string()),
+            c => Err(format!("Unsupported chain: {c}")),
+        },
+        "private_key" => match wallet.chain.as_str() {
+            "evm" => wallet_manager::evm::export_private_key(&wallet.encrypted_key, &body.password)
+                .map(|b| hex::encode(b))
+                .map_err(|e| e.to_string()),
+            "solana" => wallet_manager::solana::export_private_key(&wallet.encrypted_key, &body.password)
+                .map(|b| hex::encode(b))
+                .map_err(|e| e.to_string()),
+            "ton" => wallet_manager::ton::export_private_key(&wallet.encrypted_key, &body.password)
+                .map(|b| hex::encode(b))
+                .map_err(|e| e.to_string()),
+            c => Err(format!("Unsupported chain: {c}")),
+        },
+        t => Err(format!("Unknown export_type: {t}")),
+    };
+
+    match result {
+        Ok(value) => Json(serde_json::json!({ "value": value })).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e})),
+        ).into_response(),
+    }
+}
+
+/// GET /api/wallets/:address/balance — live on-chain balance
 pub async fn handle_api_wallet_balance(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -593,15 +793,92 @@ pub async fn handle_api_wallet_balance(
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
-    Json(serde_json::json!({
-        "address": address,
-        "balance": "0.00",
-        "currency": "USD",
-    }))
-    .into_response()
+
+    // Find the wallet to determine its chain
+    let chain = {
+        let wallets = state.wallets.lock();
+        wallets
+            .iter()
+            .find(|w| w.address.eq_ignore_ascii_case(&address))
+            .map(|w| w.chain.to_lowercase())
+    };
+
+    let chain = match chain {
+        Some(c) => c,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "wallet not found"})),
+            )
+                .into_response();
+        }
+    };
+
+    let trader = solana_trader::SolanaTrader::new(None);
+
+    match chain.as_str() {
+        "solana" => {
+            let sol = trader.get_sol_balance(&address).await;
+            let tokens = trader.get_token_balances(&address).await.unwrap_or_default();
+            let token_list: Vec<_> = tokens
+                .iter()
+                .map(|t| serde_json::json!({"mint": t.mint, "symbol": t.symbol, "amount": t.amount}))
+                .collect();
+            match sol {
+                Ok(balance) => Json(serde_json::json!({
+                    "address": address,
+                    "chain": "solana",
+                    "balance": balance,
+                    "currency": "SOL",
+                    "tokens": token_list,
+                }))
+                .into_response(),
+                Err(e) => (
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({"error": e.to_string()})),
+                )
+                    .into_response(),
+            }
+        }
+        "evm" => {
+            let chains_rpc = state.config.lock().chains_rpc.clone();
+            let chain_balances = crate::tools::wallet_balance::evm_multichain_balances(
+                &address, &chains_rpc,
+            ).await;
+            // Primary balance = Ethereum mainnet (first result) or first chain found
+            let primary_balance = chain_balances.first().map(|(_, b, _, _)| *b).unwrap_or(0.0);
+            let chains: Vec<serde_json::Value> = chain_balances
+                .iter()
+                .map(|(name, bal, sym, explorer)| serde_json::json!({
+                    "chain": name,
+                    "balance": bal,
+                    "symbol": sym,
+                    "explorer": explorer,
+                }))
+                .collect();
+            Json(serde_json::json!({
+                "address": address,
+                "chain": "evm",
+                "balance": primary_balance,
+                "currency": "ETH",
+                "chains": chains,
+                "tokens": [],
+            }))
+            .into_response()
+        }
+        _ => Json(serde_json::json!({
+            "address": address,
+            "chain": chain,
+            "balance": 0.0,
+            "currency": chain.to_uppercase(),
+            "tokens": [],
+            "note": "Balance query not yet implemented for this chain",
+        }))
+        .into_response(),
+    }
 }
 
-/// GET /api/polymarket/markets — stub markets list
+/// GET /api/polymarket/markets — fetch top markets from Gamma API
 pub async fn handle_api_polymarket_markets(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -609,70 +886,515 @@ pub async fn handle_api_polymarket_markets(
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
-    let stub_markets = serde_json::json!([
-        {
-            "id": "stub-1",
-            "question": "Will BTC exceed $100k by end of 2025?",
-            "yes_price": 0.62,
-            "volume": 1_500_000,
-            "end_date": "2025-12-31T00:00:00Z"
-        },
-        {
-            "id": "stub-2",
-            "question": "Will ETH reach $5k before July 2025?",
-            "yes_price": 0.38,
-            "volume": 890_000,
-            "end_date": "2025-07-01T00:00:00Z"
-        },
-        {
-            "id": "stub-3",
-            "question": "Will SOL flip ETH by market cap in 2025?",
-            "yes_price": 0.15,
-            "volume": 450_000,
-            "end_date": "2025-12-31T00:00:00Z"
+    let filter = polymarket_trader::markets::MarketFilter {
+        active_only: true,
+        ..Default::default()
+    };
+    match polymarket_trader::markets::list_markets(filter).await {
+        Ok(markets) => {
+            let mut sorted = markets;
+            sorted.sort_by(|a, b| b.volume.partial_cmp(&a.volume).unwrap_or(std::cmp::Ordering::Equal));
+            let top: Vec<_> = sorted.into_iter().take(20).collect();
+
+            // Fetch YES prices in parallel (best-effort — ignore failures)
+            let price_futs: Vec<_> = top
+                .iter()
+                .map(|m| polymarket_trader::markets::get_market_price(&m.yes_token_id))
+                .collect();
+            let prices = futures_util::future::join_all(price_futs).await;
+
+            let result: Vec<serde_json::Value> = top
+                .into_iter()
+                .zip(prices)
+                .map(|(m, price_res)| {
+                    serde_json::json!({
+                        "id": m.condition_id,
+                        "question": m.question,
+                        "yes_price": price_res.ok(),
+                        "volume": m.volume,
+                        "end_date": m.end_date_iso,
+                    })
+                })
+                .collect();
+
+            Json(serde_json::json!({"markets": result})).into_response()
         }
-    ]);
-    Json(serde_json::json!({"markets": stub_markets})).into_response()
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error": format!("Polymarket Gamma API error: {e}")})),
+        )
+            .into_response(),
+    }
 }
 
-/// POST /api/polymarket/configure — save polymarket credentials (stub)
+/// GET /api/polymarket/configure — return saved credentials (masked)
+pub async fn handle_api_polymarket_configure_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let cfg = state.config.lock();
+    let pm = &cfg.polymarket;
+    fn mask(s: &Option<String>) -> Option<String> {
+        s.as_deref().filter(|v| !v.is_empty()).map(|v| {
+            if v.len() <= 8 { "••••••••".to_string() }
+            else { format!("{}…{}", &v[..4], &v[v.len()-4..]) }
+        })
+    }
+    Json(serde_json::json!({
+        "configured": pm.api_key.as_deref().map(|k| !k.is_empty()).unwrap_or(false),
+        "api_key_masked": mask(&pm.api_key),
+        "wallet_address": pm.wallet_address,
+        "has_secret": pm.secret.as_deref().map(|s| !s.is_empty()).unwrap_or(false),
+        "has_passphrase": pm.passphrase.as_deref().map(|p| !p.is_empty()).unwrap_or(false),
+    }))
+    .into_response()
+}
+
+/// POST /api/polymarket/configure — validate against CLOB API and save credentials
 pub async fn handle_api_polymarket_configure(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(_body): Json<PolymarketConfigBody>,
+    Json(body): Json<PolymarketConfigBody>,
 ) -> impl IntoResponse {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
-    Json(serde_json::json!({"status": "ok"})).into_response()
-}
 
-/// POST /api/polymarket/test — test polymarket connection (stub)
-pub async fn handle_api_polymarket_test(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(_body): Json<PolymarketConfigBody>,
-) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
+    let api_key = body.api_key.as_deref().unwrap_or("").to_string();
+    let secret = body.secret.clone().unwrap_or_default();
+    let passphrase = body.passphrase.clone().unwrap_or_default();
+    let wallet_address = body.wallet_address.clone();
+
+    // Save to config (validation is handled separately via POST /api/polymarket/test)
+    let mut config = state.config.lock().clone();
+    config.polymarket = crate::config::schema::PolymarketConfig {
+        api_key: if api_key.is_empty() { None } else { Some(api_key) },
+        secret: if secret.is_empty() { None } else { Some(secret) },
+        passphrase: if passphrase.is_empty() { None } else { Some(passphrase) },
+        wallet_address,
+    };
+    if let Err(e) = config.save().await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to save config: {e}")})),
+        )
+            .into_response();
     }
-    Json(serde_json::json!({"status": "ok", "message": "Polymarket connection stub OK"}))
+    *state.config.lock() = config;
+
+    Json(serde_json::json!({"status": "ok", "message": "Polymarket credentials saved"}))
         .into_response()
 }
 
-/// POST /api/channels/telegram/configure — configure telegram bot (stub)
-pub async fn handle_api_telegram_configure(
+/// POST /api/polymarket/test — validate API key against Polymarket CLOB API
+pub async fn handle_api_polymarket_test(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(_body): Json<TelegramConfigBody>,
+    Json(body): Json<PolymarketConfigBody>,
 ) -> impl IntoResponse {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
-    Json(serde_json::json!({"status": "ok"})).into_response()
+
+    let api_key = match body.api_key.as_deref().filter(|k| !k.is_empty()) {
+        Some(k) => k.to_string(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "API key is required to test connection"})),
+            )
+                .into_response();
+        }
+    };
+    let secret = body.secret.clone().unwrap_or_default();
+    let passphrase = body.passphrase.clone().unwrap_or_default();
+
+    // Verify the CLOB API is reachable via a public endpoint, then validate credentials
+    // with a lightweight L2-authenticated request to GET /sampling/simplifiedmarkets
+    let client = reqwest::Client::new();
+
+    // Step 1: ping CLOB
+    let ping = client
+        .get("https://clob.polymarket.com/markets?limit=1")
+        .timeout(std::time::Duration::from_secs(8))
+        .send()
+        .await;
+
+    match ping {
+        Err(e) => return (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error": format!("Cannot reach Polymarket CLOB: {e}")})),
+        ).into_response(),
+        Ok(r) if !r.status().is_success() => return (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error": format!("Polymarket CLOB returned {}", r.status())})),
+        ).into_response(),
+        _ => {}
+    }
+
+    // Step 2: authenticated request — GET /auth/api-key with L2 headers
+    let creds = polymarket_trader::auth::PolyCredentials {
+        api_key: api_key.clone(),
+        secret,
+        passphrase,
+    };
+    let l2 = polymarket_trader::auth::create_l2_headers(&creds, "GET", "/auth/api-key", None);
+    let mut req = client
+        .get("https://clob.polymarket.com/auth/api-key")
+        .timeout(std::time::Duration::from_secs(8));
+    for (k, v) in &l2 {
+        req = req.header(k.as_str(), v.as_str());
+    }
+
+    match req.send().await {
+        Ok(resp) if resp.status().is_success() => Json(serde_json::json!({
+            "status": "ok",
+            "message": "Connected — Polymarket CLOB authenticated successfully",
+        })).into_response(),
+        Ok(resp) if resp.status().as_u16() == 401 || resp.status().as_u16() == 403 => (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "Invalid API key, secret, or passphrase"})),
+        ).into_response(),
+        Ok(resp) if resp.status().as_u16() == 405 => {
+            // Some CLOB versions don't support GET /auth/api-key — fall back to connectivity-only check
+            Json(serde_json::json!({
+                "status": "ok",
+                "message": "Polymarket CLOB is reachable. Credentials will be validated on first order.",
+            })).into_response()
+        }
+        Ok(resp) => {
+            let status = resp.status();
+            let body_text = resp.text().await.unwrap_or_default();
+            (StatusCode::BAD_GATEWAY, Json(serde_json::json!({
+                "error": format!("CLOB API returned {status}: {body_text}")
+            }))).into_response()
+        }
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({
+            "error": format!("Cannot reach Polymarket CLOB: {e}")
+        }))).into_response(),
+    }
 }
 
-/// POST /api/channels/telegram/test — test telegram connection
+// ── Polymarket orders / positions helpers ────────────────────────
+
+fn get_poly_creds(state: &AppState) -> Option<polymarket_trader::auth::PolyCredentials> {
+    let cfg = state.config.lock();
+    let pm = &cfg.polymarket;
+    let api_key = pm.api_key.clone().filter(|k| !k.is_empty())?;
+    Some(polymarket_trader::auth::PolyCredentials {
+        api_key,
+        secret: pm.secret.clone().unwrap_or_default(),
+        passphrase: pm.passphrase.clone().unwrap_or_default(),
+    })
+}
+
+/// GET /api/polymarket/positions — open positions
+pub async fn handle_api_polymarket_positions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let wallet_address = {
+        let cfg = state.config.lock();
+        cfg.polymarket.wallet_address.clone()
+    };
+    let address = match wallet_address {
+        Some(a) if !a.is_empty() => a,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "No Polymarket wallet address configured. Set it via /api/polymarket/configure."})),
+            )
+                .into_response();
+        }
+    };
+    // Positions endpoint is public — query by user address
+    let url = format!("https://clob.polymarket.com/positions?user={address}");
+    match reqwest::Client::new()
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            let status = resp.status();
+            match resp.json::<serde_json::Value>().await {
+                Ok(data) => Json(serde_json::json!({"positions": data})).into_response(),
+                Err(e) => (
+                    StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+                    Json(serde_json::json!({"error": e.to_string()})),
+                )
+                    .into_response(),
+            }
+        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /api/polymarket/orders — open CLOB orders
+pub async fn handle_api_polymarket_orders(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let creds = match get_poly_creds(&state) {
+        Some(c) => c,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Polymarket not configured. Call /api/polymarket/configure first."})),
+            )
+                .into_response();
+        }
+    };
+    let client = polymarket_trader::orders::ClobClient::new(creds);
+    match client.get_open_orders().await {
+        Ok(orders) => {
+            let data: Vec<serde_json::Value> = orders
+                .iter()
+                .map(|o| serde_json::json!({
+                    "id": o.id,
+                    "token_id": o.token_id,
+                    "side": o.side,
+                    "price": o.price,
+                    "size": o.size,
+                    "status": o.status,
+                }))
+                .collect();
+            Json(serde_json::json!({"orders": data})).into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct PlaceOrderBody {
+    pub token_id: String,
+    pub side: String, // "buy" or "sell"
+    pub price: f64,
+    pub size: Option<f64>,
+    pub amount_usdc: Option<f64>,
+    pub order_type: Option<String>, // "limit" | "market"
+}
+
+/// POST /api/polymarket/order — place a limit or market order
+pub async fn handle_api_polymarket_order_create(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<PlaceOrderBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let creds = match get_poly_creds(&state) {
+        Some(c) => c,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Polymarket not configured."})),
+            )
+                .into_response();
+        }
+    };
+    let side = if body.side.to_lowercase() == "sell" {
+        polymarket_trader::orders::Side::Sell
+    } else {
+        polymarket_trader::orders::Side::Buy
+    };
+    let client = polymarket_trader::orders::ClobClient::new(creds);
+    let order_type = body.order_type.as_deref().unwrap_or("limit");
+
+    let result = if order_type == "market" {
+        let amount = match body.amount_usdc {
+            Some(a) => a,
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "amount_usdc required for market orders"})),
+                )
+                    .into_response();
+            }
+        };
+        client.create_market_order(&body.token_id, side, amount, body.price).await
+    } else {
+        let size = match body.size {
+            Some(s) => s,
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "size required for limit orders"})),
+                )
+                    .into_response();
+            }
+        };
+        client.create_limit_order(&body.token_id, side, body.price, size).await
+    };
+
+    match result {
+        Ok(resp) => Json(serde_json::json!({
+            "order_id": resp.order_id,
+            "status": resp.status,
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// DELETE /api/polymarket/order/:id — cancel an open order
+pub async fn handle_api_polymarket_order_cancel(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(order_id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let creds = match get_poly_creds(&state) {
+        Some(c) => c,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Polymarket not configured."})),
+            )
+                .into_response();
+        }
+    };
+    let client = polymarket_trader::orders::ClobClient::new(creds);
+    match client.cancel_order(&order_id).await {
+        Ok(()) => Json(serde_json::json!({"status": "cancelled", "order_id": order_id}))
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /api/channels/telegram/configure — return current Telegram config (token masked)
+pub async fn handle_api_telegram_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let config = state.config.lock();
+    match config.channels_config.telegram.as_ref() {
+        None => Json(serde_json::json!({ "configured": false })).into_response(),
+        Some(tg) => {
+            // Mask all but the last 4 chars of the token so the UI can show "configured"
+            // without leaking the secret.
+            let masked = if tg.bot_token.len() > 4 {
+                format!("{}…{}", &tg.bot_token[..8].replace(|_: char| true, "*"), &tg.bot_token[tg.bot_token.len()-4..])
+            } else {
+                "****".to_string()
+            };
+            Json(serde_json::json!({
+                "configured": true,
+                "bot_token_masked": masked,
+                "allowed_users": tg.allowed_users,
+            }))
+            .into_response()
+        }
+    }
+}
+
+/// POST /api/channels/telegram/configure — save bot token and allowed users
+pub async fn handle_api_telegram_configure(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<TelegramConfigBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let mut config = state.config.lock().clone();
+
+    // "__keep__" sentinel means "don't change the existing token"
+    let keep_existing = body.bot_token.as_deref() == Some("__keep__");
+
+    let token = if keep_existing {
+        // Preserve the existing token
+        config
+            .channels_config
+            .telegram
+            .as_ref()
+            .map(|t| t.bot_token.clone())
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| {
+                return String::new(); // will be caught below
+            })
+    } else {
+        match body.bot_token.as_deref() {
+            Some(t) if !t.is_empty() => t.to_string(),
+            _ => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "bot_token is required"})),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    if token.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "No bot_token configured yet — provide a token"})),
+        )
+            .into_response();
+    }
+
+    // Update or create the telegram config, preserving existing fields
+    let existing = config.channels_config.telegram.take();
+    let mut tg = existing.unwrap_or_else(|| crate::config::schema::TelegramConfig {
+        bot_token: String::new(),
+        allowed_users: Vec::new(),
+        stream_mode: Default::default(),
+        draft_update_interval_ms: 1500,
+        interrupt_on_new_message: false,
+        mention_only: false,
+    });
+    tg.bot_token = token;
+    if let Some(users) = body.allowed_users {
+        tg.allowed_users = users.into_iter().filter(|u| !u.is_empty()).collect();
+    }
+    config.channels_config.telegram = Some(tg);
+
+    if let Err(e) = config.save().await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to save config: {e}")})),
+        )
+            .into_response();
+    }
+
+    *state.config.lock() = config;
+    Json(serde_json::json!({"status": "ok", "message": "Telegram bot configured"})).into_response()
+}
+
+/// POST /api/channels/telegram/test — verify bot token against Telegram's getMe API
 pub async fn handle_api_telegram_test(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -680,24 +1402,85 @@ pub async fn handle_api_telegram_test(
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
-    let config = state.config.lock().clone();
-    let telegram_configured = config
-        .channels_config
-        .telegram
-        .as_ref()
-        .map(|t| !t.bot_token.is_empty())
-        .unwrap_or(false);
 
-    if telegram_configured {
-        Json(serde_json::json!({"status": "ok", "message": "Telegram bot configured"}))
-            .into_response()
-    } else {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "Telegram not configured — set bot_token in config"})),
+    let token = {
+        let config = state.config.lock();
+        config
+            .channels_config
+            .telegram
+            .as_ref()
+            .map(|t| t.bot_token.clone())
+            .filter(|t| !t.is_empty())
+    };
+
+    let token = match token {
+        Some(t) => t,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Telegram not configured — save a bot token first"})),
+            )
+                .into_response();
+        }
+    };
+
+    // Call Telegram Bot API to verify the token
+    let url = format!("https://api.telegram.org/bot{token}/getMe");
+    match reqwest::Client::new()
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(8))
+        .send()
+        .await
+    {
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error": format!("Network error: {e}")})),
         )
-            .into_response()
+            .into_response(),
+        Ok(resp) => {
+            let status = resp.status();
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            if status.is_success() && body.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                let username = body
+                    .pointer("/result/username")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let name = body
+                    .pointer("/result/first_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                Json(serde_json::json!({
+                    "status": "ok",
+                    "message": format!("Connected — bot @{username} ({name}) is active"),
+                    "bot_username": username,
+                    "bot_name": name,
+                }))
+                .into_response()
+            } else {
+                let description = body
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("invalid token");
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": format!("Telegram rejected the token: {description}")})),
+                )
+                    .into_response()
+            }
+        }
     }
+}
+
+/// GET /api/channels/telegram/messages — last 50 received messages (for dashboard)
+pub async fn handle_api_telegram_messages(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let messages = crate::channels::telegram::recent_telegram_messages();
+    Json(serde_json::json!({ "messages": messages })).into_response()
 }
 
 /// POST /api/chat — HTTP fallback for chat (when WS unavailable)
@@ -711,15 +1494,9 @@ pub async fn handle_api_chat(
     }
 
     let session = body.session_id.clone().unwrap_or_else(|| "default".to_string());
+    let config = state.config.lock().clone();
 
-    match crate::providers::Provider::simple_chat(
-        state.provider.as_ref(),
-        &body.message,
-        &state.model,
-        state.temperature,
-    )
-    .await
-    {
+    match crate::agent::process_message(config, &body.message).await {
         Ok(text) => Json(serde_json::json!({
             "session_id": session,
             "response": text,
@@ -727,7 +1504,7 @@ pub async fn handle_api_chat(
         .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("LLM error: {e}")})),
+            Json(serde_json::json!({"error": format!("Agent error: {e}")})),
         )
             .into_response(),
     }
@@ -1198,30 +1975,32 @@ pub async fn handle_api_tradingview_scan(
     }
 
     let symbols_str = params.symbols.unwrap_or_default();
-    let symbols: Vec<&str> = symbols_str
+    let explicit_symbols: Vec<&str> = symbols_str
         .split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .collect();
 
-    let target: Vec<&str> = if symbols.is_empty() {
-        market_analyzer::screener::top_crypto_symbols()
+    // When no symbols given, fetch top-20 by volume live instead of hardcoded list
+    let data_result = if explicit_symbols.is_empty() {
+        market_analyzer::screener::fetch_top_by_volume(20).await
     } else {
-        symbols
+        market_analyzer::screener::fetch_indicators(&explicit_symbols).await
     };
 
-    match market_analyzer::screener::fetch_indicators(&target).await {
+    match data_result {
         Ok(data) => {
             let rows: Vec<serde_json::Value> = data
                 .into_iter()
                 .map(|d| {
                     serde_json::json!({
                         "symbol": d.symbol,
+                        "exchange": d.exchange,
                         "price": d.price,
+                        "volume": d.volume,
                         "rsi": d.rsi,
                         "macd": d.macd,
                         "macd_signal": d.macd_signal,
-                        "change_pct": null,
                     })
                 })
                 .collect();
@@ -1250,7 +2029,9 @@ pub async fn handle_api_backtest_scripts(
         return e.into_response();
     }
 
-    let scripts_dir = state.config.lock().workspace_dir.join("../scripts");
+    let scripts_dir = state.config.lock().workspace_dir.join("scripts");
+    // Create the directory if it doesn't exist yet
+    let _ = std::fs::create_dir_all(&scripts_dir);
     let mut scripts = Vec::new();
 
     if let Ok(entries) = std::fs::read_dir(&scripts_dir) {
@@ -1295,7 +2076,7 @@ pub struct BacktestRunBody {
     pub fee_pct: f64,
 }
 
-/// POST /api/backtest/run — run a backtest (stub — returns simulated metrics)
+/// POST /api/backtest/run — run a real backtest using Binance OHLCV + Rhai engine
 pub async fn handle_api_backtest_run(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1305,39 +2086,64 @@ pub async fn handle_api_backtest_run(
         return e.into_response();
     }
 
-    // Validate script path exists
-    if !std::path::Path::new(&body.script).exists() {
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+
+    // Resolve script path: try as-is, then relative to scripts/ dir
+    let script_path = {
+        let p = std::path::Path::new(&body.script);
+        if p.is_absolute() || p.exists() {
+            p.to_path_buf()
+        } else {
+            workspace_dir.join("scripts").join(&body.script)
+        }
+    };
+
+    if !script_path.exists() {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "Script not found" })),
+            Json(serde_json::json!({ "error": format!("Script not found: {}", script_path.display()) })),
         )
             .into_response();
     }
 
-    // Stub result — the full Rhai engine integration is wired via the backtest crate
-    let result = serde_json::json!({
+    let metrics = crate::tools::backtest::run_backtest_engine(
+        &script_path,
+        &body.symbol,
+        &body.from_date,
+        &body.to_date,
+        body.initial_balance,
+        body.fee_pct,
+        &workspace_dir,
+    )
+    .await;
+
+    let worst_trades: Vec<serde_json::Value> = metrics
+        .worst_trades
+        .iter()
+        .map(|t| serde_json::json!({
+            "timestamp": t.timestamp,
+            "side": t.side,
+            "price": t.price,
+            "pnl": t.pnl,
+        }))
+        .collect();
+
+    Json(serde_json::json!({
         "script": body.script,
         "symbol": body.symbol,
         "from_date": body.from_date,
         "to_date": body.to_date,
         "initial_balance": body.initial_balance,
         "fee_pct": body.fee_pct,
-        "total_return_pct": 12.4,
-        "sharpe_ratio": 1.32,
-        "max_drawdown_pct": 8.7,
-        "win_rate_pct": 54.0,
-        "total_trades": 87,
-        "worst_trades": [
-            {"timestamp": "2024-11-03T14:22:00Z", "side": "buy", "price": 68200.0, "size": 0.05, "pnl": -340.0},
-            {"timestamp": "2024-10-15T09:10:00Z", "side": "buy", "price": 62800.0, "size": 0.04, "pnl": -210.0},
-            {"timestamp": "2024-12-01T11:45:00Z", "side": "sell", "price": 95100.0, "size": 0.03, "pnl": -180.0},
-            {"timestamp": "2024-09-28T16:30:00Z", "side": "buy", "price": 58400.0, "size": 0.06, "pnl": -155.0},
-            {"timestamp": "2024-08-20T08:05:00Z", "side": "sell", "price": 57200.0, "size": 0.05, "pnl": -120.0},
-        ],
-        "analysis": "Strategy shows a positive Sharpe ratio of 1.32. The 8.7% max drawdown is within acceptable range. Consider reducing position size during high-volatility periods to improve the win rate beyond 54%. The worst losses cluster around rapid reversals — adding a stop-loss at 2% could reduce MDD significantly."
-    });
-
-    Json(result).into_response()
+        "total_return_pct": metrics.total_return_pct,
+        "sharpe_ratio": metrics.sharpe_ratio,
+        "max_drawdown_pct": metrics.max_drawdown_pct,
+        "win_rate_pct": metrics.win_rate_pct,
+        "total_trades": metrics.total_trades,
+        "worst_trades": worst_trades,
+        "analysis": metrics.analysis,
+    }))
+    .into_response()
 }
 
 #[cfg(test)]

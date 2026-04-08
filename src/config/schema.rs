@@ -162,6 +162,14 @@ pub struct Config {
     #[serde(default)]
     pub composio: ComposioConfig,
 
+    /// Polymarket CLOB API credentials (`[polymarket]`).
+    #[serde(default)]
+    pub polymarket: PolymarketConfig,
+
+    /// Custom RPC endpoints per chain (`[chains_rpc]`).
+    #[serde(default)]
+    pub chains_rpc: ChainsRpcConfig,
+
     /// Secrets encryption configuration (`[secrets]`).
     #[serde(default)]
     pub secrets: SecretsConfig,
@@ -789,6 +797,11 @@ pub struct GatewayConfig {
     #[serde(default)]
     pub trust_forwarded_headers: bool,
 
+    /// Whether the web dashboard onboarding wizard has been completed.
+    /// Set to true automatically when the user finishes setup.
+    #[serde(default)]
+    pub dashboard_onboarded: bool,
+
     /// Maximum distinct client keys tracked by gateway rate limiter maps.
     #[serde(default = "default_gateway_rate_limit_max_keys")]
     pub rate_limit_max_keys: usize,
@@ -848,8 +861,74 @@ impl Default for GatewayConfig {
             rate_limit_max_keys: default_gateway_rate_limit_max_keys(),
             idempotency_ttl_secs: default_idempotency_ttl_secs(),
             idempotency_max_keys: default_gateway_idempotency_max_keys(),
+            dashboard_onboarded: false,
         }
     }
+}
+
+// ── Custom chain RPC endpoints ───────────────────────────────────
+
+/// Per-chain RPC URL overrides (`[chains_rpc]` section).
+///
+/// Each key is the chain name (e.g. `ethereum`, `arbitrum`), and the value is
+/// the full RPC endpoint URL. Trader Claw uses well-known public nodes by
+/// default; set these to a private Alchemy/Infura/Flashbots endpoint to avoid
+/// front-running and improve reliability.
+///
+/// Example:
+/// ```toml
+/// [chains_rpc]
+/// ethereum = "https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY"
+/// arbitrum = "https://arb-mainnet.g.alchemy.com/v2/YOUR_KEY"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct ChainsRpcConfig {
+    /// Ethereum mainnet RPC (default: cloudflare-eth.com)
+    #[serde(default)]
+    pub ethereum: Option<String>,
+    /// Arbitrum One RPC
+    #[serde(default)]
+    pub arbitrum: Option<String>,
+    /// Optimism RPC
+    #[serde(default)]
+    pub optimism: Option<String>,
+    /// Base RPC
+    #[serde(default)]
+    pub base: Option<String>,
+    /// BNB Smart Chain RPC
+    #[serde(default)]
+    pub bnb: Option<String>,
+    /// Polygon PoS RPC
+    #[serde(default)]
+    pub polygon: Option<String>,
+    /// Unichain RPC
+    #[serde(default)]
+    pub unichain: Option<String>,
+    /// Ethereum Classic RPC
+    #[serde(default)]
+    pub etc: Option<String>,
+    /// Solana RPC (used for wallet balance + swap)
+    #[serde(default)]
+    pub solana: Option<String>,
+}
+
+// ── Polymarket CLOB credentials ──────────────────────────────────
+
+/// Polymarket CLOB API credentials (`[polymarket]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct PolymarketConfig {
+    /// Polymarket CLOB API key
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// HMAC secret for L2 request signing
+    #[serde(default)]
+    pub secret: Option<String>,
+    /// API passphrase
+    #[serde(default)]
+    pub passphrase: Option<String>,
+    /// Polygon wallet address used for Polymarket activity
+    #[serde(default)]
+    pub wallet_address: Option<String>,
 }
 
 // ── Composio (managed tool surface) ─────────────────────────────
@@ -1149,7 +1228,7 @@ pub enum ProxyScope {
     Environment,
     /// Apply proxy to all TraderClaw-managed HTTP traffic (default).
     #[default]
-    Degenclaw,
+    TraderClaw,
     /// Apply proxy only to explicitly listed service selectors.
     Services,
 }
@@ -1188,7 +1267,7 @@ impl Default for ProxyConfig {
             https_proxy: None,
             all_proxy: None,
             no_proxy: Vec::new(),
-            scope: ProxyScope::Degenclaw,
+            scope: ProxyScope::TraderClaw,
             services: Vec::new(),
         }
     }
@@ -1261,7 +1340,7 @@ impl ProxyConfig {
 
         match self.scope {
             ProxyScope::Environment => false,
-            ProxyScope::Degenclaw => true,
+            ProxyScope::TraderClaw => true,
             ProxyScope::Services => {
                 let service_key = service_key.trim().to_ascii_lowercase();
                 if service_key.is_empty() {
@@ -1590,7 +1669,7 @@ pub fn build_runtime_proxy_client_with_timeouts(
 fn parse_proxy_scope(raw: &str) -> Option<ProxyScope> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "environment" | "env" => Some(ProxyScope::Environment),
-        "traderclaw" | "internal" | "core" => Some(ProxyScope::Degenclaw),
+        "traderclaw" | "internal" | "core" => Some(ProxyScope::TraderClaw),
         "services" | "service" => Some(ProxyScope::Services),
         _ => None,
     }
@@ -3615,6 +3694,8 @@ impl Default for Config {
             hardware: HardwareConfig::default(),
             query_classification: QueryClassificationConfig::default(),
             transcription: TranscriptionConfig::default(),
+            chains_rpc: ChainsRpcConfig::default(),
+            polymarket: PolymarketConfig::default(),
         }
     }
 }

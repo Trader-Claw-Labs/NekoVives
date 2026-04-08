@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import { useQuery, useMutation } from '@tanstack/react-query'
 import { apiFetch } from '../hooks/useApi'
 import { Settings, Save, RefreshCw, Copy, Check } from 'lucide-react'
@@ -8,11 +8,122 @@ interface ConfigResponse {
   content?: string
 }
 
+// ── TOML syntax highlighter ───────────────────────────────────────────────────
+
+function highlightTomlValue(value: string): React.ReactNode {
+  const trimmed = value.trimStart()
+
+  // Inline comment at end (after value)
+  const commentIdx = (() => {
+    let inStr = false
+    let strChar = ''
+    for (let i = 0; i < trimmed.length; i++) {
+      const c = trimmed[i]
+      if (!inStr && (c === '"' || c === "'")) { inStr = true; strChar = c }
+      else if (inStr && c === strChar && trimmed[i - 1] !== '\\') inStr = false
+      else if (!inStr && c === '#') return i
+    }
+    return -1
+  })()
+
+  const raw = commentIdx >= 0 ? trimmed.slice(0, commentIdx).trimEnd() : trimmed
+  const comment = commentIdx >= 0 ? trimmed.slice(commentIdx) : ''
+  const leading = value.slice(0, value.length - trimmed.length)
+
+  let valueNode: React.ReactNode
+  // Quoted string (single or multi-line start)
+  if (/^("""|'''|"|')/.test(raw)) {
+    valueNode = <span style={{ color: '#86efac' }}>{raw}</span>
+  // Array or inline table
+  } else if (/^\[/.test(raw) || /^\{/.test(raw)) {
+    valueNode = <span style={{ color: '#e2e8f0' }}>{raw}</span>
+  // Boolean
+  } else if (raw === 'true' || raw === 'false') {
+    valueNode = <span style={{ color: '#f9a8d4' }}>{raw}</span>
+  // Number (int, float, hex, special)
+  } else if (/^-?(0x[\da-fA-F_]+|\d[\d_]*(\.\d+)?([eE][+-]?\d+)?|nan|inf)$/.test(raw)) {
+    valueNode = <span style={{ color: '#fcd34d' }}>{raw}</span>
+  } else {
+    valueNode = <span>{raw}</span>
+  }
+
+  return (
+    <>
+      {leading}
+      {valueNode}
+      {comment && <span style={{ color: 'var(--color-text-muted)', opacity: 0.6 }}>{' ' + comment}</span>}
+    </>
+  )
+}
+
+function highlightTomlLine(line: string, idx: number): React.ReactNode {
+  // Blank line
+  if (!line.trim()) return <span key={idx}>{'\n'}</span>
+
+  // Full-line comment
+  if (/^\s*#/.test(line)) {
+    return (
+      <span key={idx} style={{ color: 'var(--color-text-muted)', opacity: 0.55 }}>
+        {line}{'\n'}
+      </span>
+    )
+  }
+
+  // Section header [section] or [[array-of-tables]]
+  const sectionMatch = line.match(/^(\s*)(\[{1,2})([^\]]+)(\]{1,2})(.*)$/)
+  if (sectionMatch) {
+    const [, indent, open, name, close, rest] = sectionMatch
+    return (
+      <span key={idx}>
+        {indent}
+        <span style={{ color: 'var(--color-text-muted)' }}>{open}</span>
+        <span style={{ color: 'var(--color-accent)', fontWeight: 600 }}>{name}</span>
+        <span style={{ color: 'var(--color-text-muted)' }}>{close}</span>
+        {rest && <span style={{ color: 'var(--color-text-muted)', opacity: 0.55 }}>{rest}</span>}
+        {'\n'}
+      </span>
+    )
+  }
+
+  // Key = value  (handles dotted keys and quoted keys)
+  const kvMatch = line.match(/^(\s*)((?:"[^"]*"|'[^']*'|[\w.-]+)(?:\s*\.\s*(?:"[^"]*"|'[^']*'|[\w.-]+))*)(\s*=\s*)(.*)$/)
+  if (kvMatch) {
+    const [, indent, key, eq, value] = kvMatch
+    return (
+      <span key={idx}>
+        {indent}
+        <span style={{ color: '#7dd3fc' }}>{key}</span>
+        <span style={{ color: 'var(--color-text-muted)' }}>{eq}</span>
+        {highlightTomlValue(value)}
+        {'\n'}
+      </span>
+    )
+  }
+
+  // Continuation / anything else
+  return <span key={idx}>{line}{'\n'}</span>
+}
+
+function TomlHighlight({ content }: { content: string }) {
+  const lines = content.split('\n')
+  // Remove trailing empty line added by split
+  if (lines[lines.length - 1] === '') lines.pop()
+  return (
+    <>
+      {lines.map((line, i) => highlightTomlLine(line, i))}
+    </>
+  )
+}
+
+// ── Page ─────────────────────────────────────────────────────────────────────
+
 export default function Config() {
   const [content, setContent] = useState('')
   const [saveMsg, setSaveMsg] = useState('')
   const [saveErr, setSaveErr] = useState('')
   const [copied, setCopied] = useState(false)
+  const textareaRef = useRef<HTMLTextAreaElement>(null)
+  const preRef = useRef<HTMLPreElement>(null)
 
   const { data, isLoading, refetch } = useQuery<ConfigResponse>({
     queryKey: ['config'],
@@ -20,10 +131,16 @@ export default function Config() {
   })
 
   useEffect(() => {
-    if (data?.content) {
-      setContent(data.content)
-    }
+    if (data?.content) setContent(data.content)
   }, [data])
+
+  // Keep pre and textarea scroll in sync
+  const syncScroll = useCallback(() => {
+    if (textareaRef.current && preRef.current) {
+      preRef.current.scrollTop = textareaRef.current.scrollTop
+      preRef.current.scrollLeft = textareaRef.current.scrollLeft
+    }
+  }, [])
 
   const saveMutation = useMutation({
     mutationFn: async () => {
@@ -56,6 +173,16 @@ export default function Config() {
   }
 
   const lineCount = content.split('\n').length
+
+  const editorFontStyle: React.CSSProperties = {
+    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
+    fontSize: '12px',
+    lineHeight: '20px',
+    tabSize: 2,
+    whiteSpace: 'pre',
+    overflowWrap: 'normal',
+    wordBreak: 'normal',
+  }
 
   return (
     <div className="p-6 max-w-4xl mx-auto">
@@ -103,32 +230,63 @@ export default function Config() {
           <span>{lineCount} lines</span>
         </div>
 
-        {/* Editor */}
-        <div className="relative flex">
+        {/* Editor body */}
+        <div className="relative flex" style={{ backgroundColor: 'var(--color-base)' }}>
           {/* Line numbers */}
           <div
-            className="select-none text-right py-3 px-3 text-xs leading-5 min-w-[3rem]"
-            style={{ backgroundColor: 'var(--color-base)', color: 'var(--color-text-muted)', borderRight: '1px solid var(--color-border)' }}
+            className="select-none text-right py-3 px-3 leading-5 min-w-[3rem] flex-shrink-0 overflow-hidden"
+            style={{
+              ...editorFontStyle,
+              backgroundColor: 'var(--color-base)',
+              color: 'var(--color-text-muted)',
+              opacity: 0.45,
+              borderRight: '1px solid var(--color-border)',
+              height: '500px',
+            }}
           >
             {Array.from({ length: lineCount }, (_, i) => (
               <div key={i}>{i + 1}</div>
             ))}
           </div>
 
-          {/* Textarea */}
-          <textarea
-            value={content}
-            onChange={(e) => setContent(e.target.value)}
-            className="flex-1 py-3 px-4 text-xs leading-5 resize-none font-mono min-h-[500px]"
-            style={{
-              backgroundColor: 'transparent',
-              color: 'var(--color-text)',
-              border: 'none',
-              outline: 'none',
-            }}
-            spellCheck={false}
-            placeholder={isLoading ? 'Loading config...' : '# config.toml content here...'}
-          />
+          {/* Highlighted pre + transparent textarea overlay */}
+          <div className="relative flex-1 overflow-hidden">
+            {/* Highlighted layer */}
+            <pre
+              ref={preRef}
+              aria-hidden
+              className="absolute inset-0 py-3 px-4 m-0 overflow-auto pointer-events-none"
+              style={{
+                ...editorFontStyle,
+                color: 'var(--color-text)',
+                backgroundColor: 'transparent',
+                height: '500px',
+              }}
+            >
+              <TomlHighlight content={content || (isLoading ? '' : '# config.toml content here...')} />
+            </pre>
+
+            {/* Editable overlay */}
+            <textarea
+              ref={textareaRef}
+              value={content}
+              onChange={(e) => setContent(e.target.value)}
+              onScroll={syncScroll}
+              className="absolute inset-0 py-3 px-4 resize-none"
+              style={{
+                ...editorFontStyle,
+                color: 'transparent',
+                caretColor: 'var(--color-accent)',
+                backgroundColor: 'transparent',
+                border: 'none',
+                outline: 'none',
+                height: '500px',
+                width: '100%',
+              }}
+              spellCheck={false}
+              placeholder=""
+            />
+          </div>
         </div>
 
         {/* Footer */}

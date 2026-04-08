@@ -51,10 +51,10 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/traderclaw-labs/traderclaw"
-Documentation = "https://github.com/traderclaw-labs/traderclaw/tree/main/python"
-Repository = "https://github.com/traderclaw-labs/traderclaw"
-Issues = "https://github.com/traderclaw-labs/traderclaw/issues"
+Homepage = "https://github.com/Trader-Claw-Labs/Trader-Claw"
+Documentation = "https://github.com/Trader-Claw-Labs/Trader-Claw/tree/main/python"
+Repository = "https://github.com/Trader-Claw-Labs/Trader-Claw"
+Issues = "https://github.com/Trader-Claw-Labs/Trader-Claw/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["traderclaw_tools"]

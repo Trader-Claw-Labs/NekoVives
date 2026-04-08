@@ -1,6 +1,6 @@
 # traderclaw-tools
 
-Gói Python đồng hành cho [TraderClaw](https://github.com/traderclaw-labs/traderclaw) — gọi công cụ dựa trên LangGraph cho thực thi agent LLM nhất quán.
+Gói Python đồng hành cho [TraderClaw](https://github.com/Trader-Claw-Labs/Trader-Claw) — gọi công cụ dựa trên LangGraph cho thực thi agent LLM nhất quán.
 
 ## Tại sao cần gói này?
 

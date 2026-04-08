@@ -5,7 +5,7 @@ This package provides a reliable tool-calling layer for LLM providers that may h
 inconsistent native tool calling behavior. Built on LangGraph for guaranteed execution.
 """
 
-from .agent import create_agent, DegenclawAgent
+from .agent import create_agent, TraderClawAgent
 from .tools import (
     shell,
     file_read,
@@ -20,7 +20,7 @@ from .tools.base import tool
 __version__ = "0.1.0"
 __all__ = [
     "create_agent",
-    "DegenclawAgent",
+    "TraderClawAgent",
     "tool",
     "shell",
     "file_read",

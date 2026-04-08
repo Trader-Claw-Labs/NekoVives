@@ -31,7 +31,7 @@ const navItems: NavItem[] = [
   { to: '/polymarket', icon: <BarChart2 size={18} />, label: 'Polymarket' },
   { to: '/telegram', icon: <Send size={18} />, label: 'Telegram' },
   { to: '/skills', icon: <Zap size={18} />, label: 'Skills' },
-  { to: '/chat', icon: <MessageSquare size={18} />, label: 'Multi-chat' },
+  { to: '/chat', icon: <MessageSquare size={18} />, label: 'Terminal' },
   { to: '/tradingview', icon: <TrendingUp size={18} />, label: 'TradingView' },
   { to: '/backtesting', icon: <FlaskConical size={18} />, label: 'Backtesting' },
   { to: '/settings/llm', icon: <Brain size={18} />, label: 'LLM Settings' },
@@ -47,7 +47,15 @@ export default function Sidebar() {
     refetchInterval: 10_000,
   })
 
-  const telegramOnline = !!(status?.channels && typeof status.channels === 'object' && (status.channels as Record<string, boolean>)['telegram'])
+  const telegramConfigured = !!(status?.channels && typeof status.channels === 'object' && (status.channels as Record<string, boolean>)['telegram'])
+  const telegramHealth = (status as any)?.health?.components?.['channel:telegram']
+  const telegramStatus: 'online' | 'offline' | 'warning' = !telegramConfigured
+    ? 'offline'
+    : telegramHealth?.status === 'ok'
+    ? 'online'
+    : telegramHealth?.status === 'error'
+    ? 'offline'
+    : 'warning'
   const llmOnline = !!status?.provider
 
   return (
@@ -86,7 +94,7 @@ export default function Sidebar() {
           style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-muted)' }}
         >
           <div className="flex items-center gap-1">
-            <span className={clsx('status-dot', telegramOnline ? 'online' : 'offline')} />
+            <span className={clsx('status-dot', telegramStatus)} />
             <span>TG</span>
           </div>
           <div className="flex items-center gap-1">

@@ -15,7 +15,12 @@
 //! To add a new tool, implement [`Tool`] in a new submodule and register it in
 //! [`all_tools_with_runtime`]. See `AGENTS.md` §7.3 for the full change playbook.
 
+pub mod backtest;
 pub mod browser;
+pub mod market_scan;
+pub mod shell_exec;
+pub mod trade_swap;
+pub mod wallet_balance;
 pub mod cli_discovery;
 pub mod content_search;
 pub mod cron_add;
@@ -50,7 +55,12 @@ pub mod traits;
 pub mod web_fetch;
 pub mod web_search_tool;
 
+pub use backtest::{BacktestListScriptsTool, BacktestRunTool};
 pub use browser::{BrowserTool, ComputerUseConfig};
+pub use market_scan::MarketScanTool;
+pub use shell_exec::ShellExecTool;
+pub use trade_swap::TradeSwapTool;
+pub use wallet_balance::WalletBalanceTool;
 pub use content_search::ContentSearchTool;
 pub use cron_add::CronAddTool;
 pub use cron_list::CronListTool;
@@ -223,6 +233,15 @@ pub fn all_tools_with_runtime(
             security.clone(),
             workspace_dir.to_path_buf(),
         )),
+        Arc::new(BacktestListScriptsTool::new(workspace_dir.to_path_buf())),
+        Arc::new(BacktestRunTool::new(workspace_dir.to_path_buf())),
+        Arc::new(MarketScanTool),
+        Arc::new(ShellExecTool::new(security.clone(), workspace_dir.to_path_buf())),
+        Arc::new(WalletBalanceTool::with_chains_rpc(
+            root_config.config_path.clone(),
+            root_config.chains_rpc.clone(),
+        )),
+        Arc::new(TradeSwapTool::new(root_config.config_path.clone())),
     ];
 
     if browser_config.enabled {

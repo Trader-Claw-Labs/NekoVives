@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { apiFetch } from '../hooks/useApi'
 import {
-  TrendingUp, TrendingDown, Minus, RefreshCw, AlertCircle, Activity,
+  TrendingUp, TrendingDown, Minus, RefreshCw, AlertCircle, Activity, X, BarChart2,
 } from 'lucide-react'
 import clsx from 'clsx'
 
@@ -36,7 +36,52 @@ function macdSignal(macd: number | null, signal: number | null): { text: string;
   return { text: `${macd.toFixed(2)} / ${cross}`, color }
 }
 
-function PriceRow({ d }: { d: MarketData }) {
+// ── TradingView Chart Widget ───────────────────────────────────────────────
+
+function ChartPanel({ symbol, onClose }: { symbol: string; onClose: () => void }) {
+  // TradingView widget URL — no API key needed, uses public TradingView embed
+  const src = `https://s.tradingview.com/widgetembed/?symbol=BINANCE%3A${encodeURIComponent(symbol)}&interval=1H&hidesidetoolbar=0&symboledit=1&saveimage=0&toolbarbg=000000&studies=RSI%40tv-basicstudies%2FMACD%40tv-basicstudies&theme=dark&style=1&timezone=Etc%2FUTC&withdateranges=1&showpopupbutton=0&locale=en`
+
+  return (
+    <div
+      className="rounded-lg border overflow-hidden mt-4"
+      style={{ backgroundColor: 'var(--color-surface)', borderColor: 'var(--color-border)' }}
+    >
+      <div
+        className="flex items-center justify-between px-4 py-2.5 border-b"
+        style={{ borderColor: 'var(--color-border)' }}
+      >
+        <div className="flex items-center gap-2">
+          <BarChart2 size={14} style={{ color: 'var(--color-accent)' }} />
+          <span className="text-sm font-bold" style={{ color: 'var(--color-accent)' }}>
+            {symbol}
+          </span>
+          <span className="text-xs" style={{ color: 'var(--color-text-muted)' }}>· 1H · RSI · MACD</span>
+        </div>
+        <button
+          onClick={onClose}
+          className="p-1 rounded hover:bg-white/10"
+          style={{ color: 'var(--color-text-muted)' }}
+        >
+          <X size={14} />
+        </button>
+      </div>
+      <iframe
+        src={src}
+        title={`${symbol} chart`}
+        width="100%"
+        height="480"
+        frameBorder="0"
+        allowFullScreen
+        style={{ display: 'block' }}
+      />
+    </div>
+  )
+}
+
+// ── Price Row ─────────────────────────────────────────────────────────────
+
+function PriceRow({ d, onChartClick }: { d: MarketData; onChartClick: (sym: string) => void }) {
   const rsi = rsiLabel(d.rsi)
   const macd = macdSignal(d.macd, d.macd_signal)
   const change = d.change_pct
@@ -52,9 +97,20 @@ function PriceRow({ d }: { d: MarketData }) {
         color: 'var(--color-text)',
       }}
     >
-      <span className="font-bold font-mono" style={{ color: 'var(--color-accent)' }}>
-        {d.symbol}
-      </span>
+      <button
+        onClick={() => onChartClick(d.symbol)}
+        className="flex items-center gap-1.5 group text-left"
+        title="View chart"
+      >
+        <span className="font-bold font-mono" style={{ color: 'var(--color-accent)' }}>
+          {d.symbol}
+        </span>
+        <BarChart2
+          size={11}
+          className="opacity-0 group-hover:opacity-100 transition-opacity"
+          style={{ color: 'var(--color-accent)' }}
+        />
+      </button>
       <span className="font-mono text-right pr-4">
         ${d.price.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
       </span>
@@ -112,6 +168,7 @@ function SignalBadge({ d }: { d: MarketData }) {
 export default function TradingViewPage() {
   const [symbols, setSymbols] = useState(DEFAULT_SYMBOLS.join(', '))
   const [submitted, setSubmitted] = useState(DEFAULT_SYMBOLS)
+  const [chartSymbol, setChartSymbol] = useState<string | null>(null)
 
   const { data, isLoading, error, refetch, isFetching, dataUpdatedAt } =
     useQuery<ScreenerResponse>({
@@ -127,6 +184,10 @@ export default function TradingViewPage() {
       .map((s) => s.trim().toUpperCase())
       .filter(Boolean)
     if (parsed.length > 0) setSubmitted(parsed)
+  }
+
+  function handleChartClick(sym: string) {
+    setChartSymbol((prev) => (prev === sym ? null : sym))
   }
 
   const rows = data?.data ?? []
@@ -145,7 +206,7 @@ export default function TradingViewPage() {
             TradingView Screener
           </h1>
           <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
-            Real-time indicators via TradingView Screener API · auto-refresh 60s
+            Real-time indicators via TradingView Screener API · auto-refresh 60s · click a pair to view chart
           </p>
         </div>
         <button
@@ -220,9 +281,13 @@ export default function TradingViewPage() {
           <div className="space-y-2">
             {activeSignals.map((d) => (
               <div key={d.symbol} className="flex items-center gap-3">
-                <span className="text-xs font-mono font-bold" style={{ color: 'var(--color-accent)' }}>
+                <button
+                  className="text-xs font-mono font-bold hover:underline"
+                  style={{ color: 'var(--color-accent)' }}
+                  onClick={() => handleChartClick(d.symbol)}
+                >
                   {d.symbol}
-                </span>
+                </button>
                 <SignalBadge d={d} />
               </div>
             ))}
@@ -262,10 +327,17 @@ export default function TradingViewPage() {
               No data
             </p>
           ) : (
-            rows.map((d) => <PriceRow key={d.symbol} d={d} />)
+            rows.map((d) => (
+              <PriceRow key={d.symbol} d={d} onChartClick={handleChartClick} />
+            ))
           )}
         </div>
       </div>
+
+      {/* Inline chart */}
+      {chartSymbol && (
+        <ChartPanel symbol={chartSymbol} onClose={() => setChartSymbol(null)} />
+      )}
 
       {dataUpdatedAt > 0 && (
         <p className="text-xs mt-2 text-right" style={{ color: 'var(--color-text-muted)' }}>

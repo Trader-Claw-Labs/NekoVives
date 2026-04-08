@@ -78,73 +78,32 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             continue;
         }
 
-        // Process message with the LLM provider
-        let provider_label = state
-            .config
-            .lock()
+        // Run the full agentic loop (tools, skills, MCP, shell, file I/O, memory)
+        let config = state.config.lock().clone();
+        let provider_label = config
             .default_provider
             .clone()
             .unwrap_or_else(|| "unknown".to_string());
 
-        // Broadcast agent_start event
+        let model_snap = state.model.lock().clone();
         let _ = state.event_tx.send(serde_json::json!({
             "type": "agent_start",
             "provider": provider_label,
-            "model": state.model,
+            "model": model_snap,
         }));
 
-        // Simple single-turn chat (no streaming for now — use provider.chat_with_system)
-        let system_prompt = {
-            let config_guard = state.config.lock();
-            crate::channels::build_system_prompt(
-                &config_guard.workspace_dir,
-                &state.model,
-                &[],
-                &[],
-                Some(&config_guard.identity),
-                None,
-            )
-        };
-
-        let messages = vec![
-            crate::providers::ChatMessage::system(system_prompt),
-            crate::providers::ChatMessage::user(&content),
-        ];
-
-        let multimodal_config = state.config.lock().multimodal.clone();
-        let prepared =
-            match crate::multimodal::prepare_messages_for_provider(&messages, &multimodal_config)
-                .await
-            {
-                Ok(p) => p,
-                Err(e) => {
-                    let err = serde_json::json!({
-                        "type": "error",
-                        "message": format!("Multimodal prep failed: {e}")
-                    });
-                    let _ = sender.send(Message::Text(err.to_string().into())).await;
-                    continue;
-                }
-            };
-
-        match state
-            .provider
-            .chat_with_history(&prepared.messages, &state.model, state.temperature)
-            .await
-        {
+        match crate::agent::process_message(config, &content).await {
             Ok(response) => {
-                // Send the full response as a done message
                 let done = serde_json::json!({
                     "type": "done",
                     "full_response": response,
                 });
                 let _ = sender.send(Message::Text(done.to_string().into())).await;
 
-                // Broadcast agent_end event
                 let _ = state.event_tx.send(serde_json::json!({
                     "type": "agent_end",
                     "provider": provider_label,
-                    "model": state.model,
+                    "model": model_snap,
                 }));
             }
             Err(e) => {
@@ -155,7 +114,6 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 });
                 let _ = sender.send(Message::Text(err.to_string().into())).await;
 
-                // Broadcast error event
                 let _ = state.event_tx.send(serde_json::json!({
                     "type": "error",
                     "component": "ws_chat",

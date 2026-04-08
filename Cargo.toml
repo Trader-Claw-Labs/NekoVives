@@ -17,7 +17,7 @@ edition = "2021"
 authors = ["theonlyhennygod"]
 license = "MIT OR Apache-2.0"
 description = "Rust crypto trading agent for degens on EVM, Solana, and TON networks."
-repository = "https://github.com/traderclaw-labs/traderclaw"
+repository = "https://github.com/Trader-Claw-Labs/Trader-Claw"
 readme = "README.md"
 keywords = ["ai", "agent", "cli", "assistant", "chatbot"]
 categories = ["command-line-utilities", "api-bindings"]
@@ -96,9 +96,14 @@ async-trait = "0.1"
 # HMAC-SHA256 (Zhipu/GLM JWT auth)
 ring = "0.17"
 
+# Rhai scripting engine for strategy backtesting (sync = Send+Sync for async usage)
+rhai = { version = "1", features = ["sync"] }
+
 # Degen Agent workspace crates
 market-analyzer = { path = "crates/market-analyzer" }
 polymarket-trader = { path = "crates/polymarket-trader" }
+wallet-manager = { path = "crates/wallet-manager" }
+solana-trader = { path = "crates/solana-trader" }
 
 # Memory / persistence
 rusqlite = { version = "0.37", features = ["bundled"] }

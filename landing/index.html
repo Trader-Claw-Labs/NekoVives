@@ -1,0 +1,1621 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Trader Claw — The Rust AI Trading Agent</title>
+  <meta name="description" content="Trader Claw is a 100% Rust AI trading agent. Trade EVM, Solana, TON and Polymarket prediction markets with blazing-fast execution, sandboxed strategy backtesting, and Telegram integration." />
+
+  <!-- Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+
+  <style>
+    /* ── Reset & base ──────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:         #09090b;
+      --surface:    #111113;
+      --surface2:   #1a1a1f;
+      --border:     rgba(255,255,255,0.08);
+      --accent:     #00ff88;
+      --accent-dim: rgba(0,255,136,0.12);
+      --accent2:    #7c3aed;
+      --text:       #f4f4f5;
+      --muted:      #71717a;
+      --danger:     #ef4444;
+      --warning:    #f59e0b;
+      --radius:     12px;
+      --glow:       0 0 40px rgba(0,255,136,0.18);
+    }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      font-family: 'Inter', system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+      overflow-x: hidden;
+    }
+
+    a { color: inherit; text-decoration: none; }
+    img { max-width: 100%; }
+
+    /* ── Noise texture overlay ─────────────────────────────────────── */
+    body::before {
+      content: '';
+      position: fixed;
+      inset: 0;
+      background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)' opacity='0.03'/%3E%3C/svg%3E");
+      pointer-events: none;
+      z-index: 0;
+      opacity: 0.4;
+    }
+
+    /* ── Grid background ───────────────────────────────────────────── */
+    .grid-bg {
+      position: absolute;
+      inset: 0;
+      background-image:
+        linear-gradient(rgba(255,255,255,0.03) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,0.03) 1px, transparent 1px);
+      background-size: 40px 40px;
+      pointer-events: none;
+    }
+
+    /* ── Layout helpers ────────────────────────────────────────────── */
+    .container { max-width: 1100px; margin: 0 auto; padding: 0 24px; }
+    .section    { padding: 96px 0; position: relative; }
+    .section-sm { padding: 64px 0; position: relative; }
+
+    /* ── NAV ───────────────────────────────────────────────────────── */
+    nav {
+      position: fixed;
+      top: 0; left: 0; right: 0;
+      z-index: 100;
+      background: rgba(9,9,11,0.85);
+      backdrop-filter: blur(16px);
+      border-bottom: 1px solid var(--border);
+    }
+
+    .nav-inner {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      height: 60px;
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 0 24px;
+    }
+
+    .logo {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-weight: 700;
+      font-size: 1.05rem;
+      letter-spacing: -0.01em;
+    }
+
+    .logo-icon {
+      width: 32px; height: 32px;
+      background: var(--accent-dim);
+      border: 1px solid rgba(0,255,136,0.3);
+      border-radius: 8px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 18px;
+    }
+
+    .logo span { color: var(--accent); }
+
+    .nav-links {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      list-style: none;
+    }
+
+    .nav-links a {
+      padding: 6px 14px;
+      border-radius: 8px;
+      font-size: 0.875rem;
+      color: var(--muted);
+      transition: color 0.15s, background 0.15s;
+    }
+    .nav-links a:hover { color: var(--text); background: rgba(255,255,255,0.05); }
+
+    .nav-cta {
+      padding: 7px 18px;
+      border-radius: 8px;
+      font-size: 0.875rem;
+      font-weight: 600;
+      background: var(--accent);
+      color: #000 !important;
+      transition: opacity 0.15s, transform 0.15s;
+    }
+    .nav-cta:hover { opacity: 0.9; transform: translateY(-1px); background: var(--accent) !important; }
+
+    @media (max-width: 640px) {
+      .nav-links { display: none; }
+    }
+
+    /* ── HERO ──────────────────────────────────────────────────────── */
+    .hero {
+      padding: 160px 0 100px;
+      position: relative;
+      overflow: hidden;
+      text-align: center;
+    }
+
+    .hero-glow {
+      position: absolute;
+      top: -100px; left: 50%;
+      transform: translateX(-50%);
+      width: 700px; height: 500px;
+      background: radial-gradient(ellipse, rgba(0,255,136,0.12) 0%, transparent 70%);
+      pointer-events: none;
+    }
+
+    .hero-glow-2 {
+      position: absolute;
+      top: 50px; left: 30%;
+      width: 400px; height: 400px;
+      background: radial-gradient(ellipse, rgba(124,58,237,0.08) 0%, transparent 70%);
+      pointer-events: none;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 5px 14px;
+      border-radius: 999px;
+      background: var(--accent-dim);
+      border: 1px solid rgba(0,255,136,0.25);
+      font-size: 0.78rem;
+      font-weight: 600;
+      color: var(--accent);
+      letter-spacing: 0.02em;
+      text-transform: uppercase;
+      margin-bottom: 28px;
+    }
+
+    .badge-dot {
+      width: 6px; height: 6px;
+      border-radius: 50%;
+      background: var(--accent);
+      box-shadow: 0 0 6px var(--accent);
+      animation: pulse 2s ease-in-out infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+
+    h1 {
+      font-size: clamp(2.6rem, 6vw, 4.5rem);
+      font-weight: 900;
+      line-height: 1.08;
+      letter-spacing: -0.03em;
+      margin-bottom: 24px;
+    }
+
+    h1 .accent { color: var(--accent); }
+    h1 .dim    { color: var(--muted); font-weight: 300; }
+
+    .hero-sub {
+      font-size: clamp(1rem, 2vw, 1.2rem);
+      color: var(--muted);
+      max-width: 600px;
+      margin: 0 auto 40px;
+      line-height: 1.7;
+    }
+
+    .hero-actions {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 14px;
+      flex-wrap: wrap;
+      margin-bottom: 64px;
+    }
+
+    .btn-primary {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 13px 28px;
+      border-radius: var(--radius);
+      font-size: 0.95rem;
+      font-weight: 700;
+      background: var(--accent);
+      color: #000;
+      transition: all 0.15s;
+      border: none;
+      cursor: pointer;
+    }
+    .btn-primary:hover { transform: translateY(-2px); box-shadow: 0 8px 30px rgba(0,255,136,0.3); }
+
+    .btn-secondary {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 13px 28px;
+      border-radius: var(--radius);
+      font-size: 0.95rem;
+      font-weight: 600;
+      background: transparent;
+      color: var(--text);
+      border: 1px solid var(--border);
+      transition: all 0.15s;
+      cursor: pointer;
+    }
+    .btn-secondary:hover { background: rgba(255,255,255,0.05); border-color: rgba(255,255,255,0.15); }
+
+    /* Terminal preview */
+    .terminal {
+      max-width: 680px;
+      margin: 0 auto;
+      border-radius: var(--radius);
+      border: 1px solid var(--border);
+      overflow: hidden;
+      background: var(--surface);
+      box-shadow: 0 24px 60px rgba(0,0,0,0.6), var(--glow);
+      text-align: left;
+    }
+
+    .terminal-bar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 12px 16px;
+      background: var(--surface2);
+      border-bottom: 1px solid var(--border);
+    }
+
+    .dot { width: 12px; height: 12px; border-radius: 50%; }
+    .dot-r { background: #ff5f57; }
+    .dot-y { background: #febc2e; }
+    .dot-g { background: #28c840; }
+
+    .terminal-title {
+      flex: 1;
+      text-align: center;
+      font-size: 0.78rem;
+      color: var(--muted);
+      font-family: 'JetBrains Mono', monospace;
+    }
+
+    .terminal-body {
+      padding: 20px 24px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.82rem;
+      line-height: 1.8;
+    }
+
+    .t-prompt { color: var(--accent); }
+    .t-cmd    { color: var(--text); }
+    .t-out    { color: var(--muted); }
+    .t-ok     { color: var(--accent); }
+    .t-val    { color: #7dd3fc; }
+    .t-warn   { color: var(--warning); }
+    .t-cursor {
+      display: inline-block;
+      width: 8px; height: 14px;
+      background: var(--accent);
+      vertical-align: middle;
+      animation: blink 1.1s step-end infinite;
+    }
+
+    @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
+
+    /* ── STATS BAR ─────────────────────────────────────────────────── */
+    .stats-bar {
+      border-top: 1px solid var(--border);
+      border-bottom: 1px solid var(--border);
+      background: var(--surface);
+      padding: 32px 0;
+    }
+
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: 0;
+    }
+
+    .stat-item {
+      text-align: center;
+      padding: 8px 24px;
+      border-right: 1px solid var(--border);
+    }
+    .stat-item:last-child { border-right: none; }
+
+    .stat-num {
+      font-size: 2rem;
+      font-weight: 900;
+      letter-spacing: -0.04em;
+      color: var(--accent);
+      line-height: 1;
+      margin-bottom: 4px;
+    }
+
+    .stat-label {
+      font-size: 0.78rem;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+
+    /* ── ASCII BANNER ──────────────────────────────────────────────── */
+    .ascii-title {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: clamp(6px, 1.05vw, 11px);
+      line-height: 1.2;
+      white-space: pre;
+      user-select: none;
+      letter-spacing: 0;
+    }
+
+    .ascii-title .t1 { color: var(--accent); }
+    .ascii-title .t2 { color: #7dd3fc; }
+    .ascii-title .t3 { color: var(--muted); }
+
+    /* ── SECTION HEADERS ───────────────────────────────────────────── */
+    .section-tag {
+      display: inline-block;
+      font-size: 0.72rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+      color: var(--accent);
+      margin-bottom: 12px;
+    }
+
+    h2 {
+      font-size: clamp(1.8rem, 4vw, 2.8rem);
+      font-weight: 800;
+      letter-spacing: -0.03em;
+      line-height: 1.15;
+      margin-bottom: 16px;
+    }
+
+    .section-lead {
+      font-size: 1.05rem;
+      color: var(--muted);
+      max-width: 540px;
+      line-height: 1.7;
+    }
+
+    /* ── FEATURES GRID ─────────────────────────────────────────────── */
+    .features-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+      gap: 1px;
+      background: var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+      margin-top: 56px;
+      border: 1px solid var(--border);
+    }
+
+    .feature-card {
+      background: var(--surface);
+      padding: 32px 28px;
+      transition: background 0.2s;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .feature-card::before {
+      content: '';
+      position: absolute;
+      top: 0; left: 0;
+      right: 0; height: 2px;
+      background: linear-gradient(90deg, transparent, var(--accent), transparent);
+      opacity: 0;
+      transition: opacity 0.3s;
+    }
+
+    .feature-card:hover { background: var(--surface2); }
+    .feature-card:hover::before { opacity: 1; }
+
+    .feature-icon {
+      width: 44px; height: 44px;
+      border-radius: 10px;
+      background: var(--accent-dim);
+      border: 1px solid rgba(0,255,136,0.2);
+      display: flex; align-items: center; justify-content: center;
+      font-size: 22px;
+      margin-bottom: 18px;
+    }
+
+    .feature-card h3 {
+      font-size: 1rem;
+      font-weight: 700;
+      margin-bottom: 8px;
+      letter-spacing: -0.01em;
+    }
+
+    .feature-card p {
+      font-size: 0.875rem;
+      color: var(--muted);
+      line-height: 1.65;
+    }
+
+    /* ── HOW IT WORKS ──────────────────────────────────────────────── */
+    .how-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 64px;
+      align-items: center;
+      margin-top: 56px;
+    }
+
+    @media (max-width: 768px) { .how-grid { grid-template-columns: 1fr; gap: 40px; } }
+
+    .steps {
+      display: flex;
+      flex-direction: column;
+      gap: 28px;
+    }
+
+    .step {
+      display: flex;
+      gap: 20px;
+    }
+
+    .step-num {
+      flex-shrink: 0;
+      width: 36px; height: 36px;
+      border-radius: 50%;
+      background: var(--accent-dim);
+      border: 1px solid rgba(0,255,136,0.3);
+      display: flex; align-items: center; justify-content: center;
+      font-size: 0.8rem;
+      font-weight: 700;
+      color: var(--accent);
+      font-family: 'JetBrains Mono', monospace;
+    }
+
+    .step-body h4 {
+      font-size: 0.95rem;
+      font-weight: 700;
+      margin-bottom: 5px;
+    }
+
+    .step-body p {
+      font-size: 0.855rem;
+      color: var(--muted);
+      line-height: 1.6;
+    }
+
+    /* ── CHAIN BADGES ──────────────────────────────────────────────── */
+    .chains-section { text-align: center; }
+
+    .chain-logos {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      gap: 12px;
+      margin-top: 40px;
+    }
+
+    .chain-badge {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 18px;
+      border-radius: 999px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      font-size: 0.85rem;
+      font-weight: 600;
+      color: var(--text);
+      transition: all 0.2s;
+    }
+
+    .chain-badge:hover {
+      border-color: rgba(0,255,136,0.3);
+      background: var(--accent-dim);
+      color: var(--accent);
+      transform: translateY(-2px);
+    }
+
+    .chain-icon { font-size: 20px; }
+
+    /* ── BACKTESTING SECTION ───────────────────────────────────────── */
+    .backtest-wrap {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 48px;
+      align-items: center;
+      margin-top: 56px;
+    }
+
+    @media (max-width: 768px) { .backtest-wrap { grid-template-columns: 1fr; } }
+
+    .metrics-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+
+    .metric-card {
+      padding: 18px 20px;
+      border-radius: var(--radius);
+      background: var(--surface);
+      border: 1px solid var(--border);
+    }
+
+    .metric-label {
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+
+    .metric-val {
+      font-size: 1.5rem;
+      font-weight: 800;
+      font-family: 'JetBrains Mono', monospace;
+      letter-spacing: -0.03em;
+    }
+
+    .metric-val.pos { color: var(--accent); }
+    .metric-val.neg { color: var(--danger); }
+    .metric-val.neu { color: var(--warning); }
+
+    /* ── SECURITY SECTION ──────────────────────────────────────────── */
+    .security-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+      gap: 16px;
+      margin-top: 48px;
+    }
+
+    .sec-card {
+      padding: 24px;
+      border-radius: var(--radius);
+      background: var(--surface);
+      border: 1px solid var(--border);
+      display: flex;
+      gap: 16px;
+      align-items: flex-start;
+      transition: border-color 0.2s, background 0.2s;
+    }
+
+    .sec-card:hover {
+      border-color: rgba(0,255,136,0.2);
+      background: var(--surface2);
+    }
+
+    .sec-icon {
+      font-size: 24px;
+      flex-shrink: 0;
+      margin-top: 2px;
+    }
+
+    .sec-card h4 {
+      font-size: 0.9rem;
+      font-weight: 700;
+      margin-bottom: 4px;
+    }
+
+    .sec-card p {
+      font-size: 0.82rem;
+      color: var(--muted);
+      line-height: 1.55;
+    }
+
+    /* ── TELEGRAM SECTION ──────────────────────────────────────────── */
+    .telegram-wrap {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 64px;
+      align-items: center;
+      margin-top: 56px;
+    }
+
+    @media (max-width: 768px) { .telegram-wrap { grid-template-columns: 1fr; gap: 40px; } }
+
+    .tg-chat {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+      box-shadow: 0 20px 50px rgba(0,0,0,0.4);
+    }
+
+    .tg-header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 14px 18px;
+      background: var(--surface2);
+      border-bottom: 1px solid var(--border);
+    }
+
+    .tg-avatar {
+      width: 34px; height: 34px;
+      border-radius: 50%;
+      background: linear-gradient(135deg, var(--accent), #00b4d8);
+      display: flex; align-items: center; justify-content: center;
+      font-size: 16px;
+    }
+
+    .tg-name { font-size: 0.9rem; font-weight: 700; }
+    .tg-status { font-size: 0.75rem; color: var(--accent); }
+
+    .tg-body { padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+
+    .tg-msg {
+      max-width: 85%;
+      padding: 10px 14px;
+      border-radius: 12px;
+      font-size: 0.83rem;
+      line-height: 1.55;
+    }
+
+    .tg-msg.user {
+      align-self: flex-end;
+      background: #1d4ed8;
+      color: #fff;
+      border-bottom-right-radius: 4px;
+    }
+
+    .tg-msg.bot {
+      align-self: flex-start;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-bottom-left-radius: 4px;
+    }
+
+    .tg-msg .cmd { color: var(--accent); font-family: 'JetBrains Mono', monospace; font-weight: 600; }
+    .tg-msg .val { color: #7dd3fc; font-family: 'JetBrains Mono', monospace; }
+
+    /* ── INSTALL SECTION ───────────────────────────────────────────── */
+    .install-wrap {
+      max-width: 640px;
+      margin: 48px auto 0;
+    }
+
+    .install-tabs {
+      display: flex;
+      gap: 2px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 4px;
+      margin-bottom: 16px;
+    }
+
+    .install-tab {
+      flex: 1;
+      padding: 8px 16px;
+      border-radius: 7px;
+      font-size: 0.82rem;
+      font-weight: 600;
+      color: var(--muted);
+      cursor: pointer;
+      text-align: center;
+      transition: all 0.15s;
+      border: none;
+      background: none;
+    }
+
+    .install-tab.active {
+      background: var(--accent-dim);
+      color: var(--accent);
+      border: 1px solid rgba(0,255,136,0.2);
+    }
+
+    .install-code {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+    }
+
+    .install-code-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 16px;
+      background: var(--surface2);
+      border-bottom: 1px solid var(--border);
+      font-size: 0.75rem;
+      color: var(--muted);
+      font-family: 'JetBrains Mono', monospace;
+    }
+
+    .copy-btn {
+      padding: 3px 10px;
+      border-radius: 5px;
+      background: var(--accent-dim);
+      border: 1px solid rgba(0,255,136,0.2);
+      color: var(--accent);
+      font-size: 0.72rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .copy-btn:hover { background: rgba(0,255,136,0.2); }
+
+    .install-code pre {
+      padding: 18px 20px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.83rem;
+      line-height: 1.7;
+      overflow-x: auto;
+      color: var(--text);
+    }
+
+    .install-code .comment { color: var(--muted); }
+    .install-code .kw      { color: var(--accent); }
+    .install-code .str     { color: #86efac; }
+
+    /* ── CTA SECTION ───────────────────────────────────────────────── */
+    .cta-section {
+      text-align: center;
+      padding: 120px 0;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .cta-glow {
+      position: absolute;
+      bottom: -100px; left: 50%;
+      transform: translateX(-50%);
+      width: 600px; height: 400px;
+      background: radial-gradient(ellipse, rgba(0,255,136,0.1) 0%, transparent 70%);
+      pointer-events: none;
+    }
+
+    .cta-section h2 {
+      font-size: clamp(2rem, 5vw, 3.5rem);
+      margin-bottom: 20px;
+    }
+
+    .cta-section p {
+      font-size: 1.05rem;
+      color: var(--muted);
+      margin-bottom: 40px;
+    }
+
+    /* ── FOOTER ────────────────────────────────────────────────────── */
+    footer {
+      border-top: 1px solid var(--border);
+      padding: 48px 0 32px;
+    }
+
+    .footer-inner {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 40px;
+      flex-wrap: wrap;
+      margin-bottom: 40px;
+    }
+
+    .footer-brand p {
+      font-size: 0.83rem;
+      color: var(--muted);
+      margin-top: 10px;
+      max-width: 260px;
+      line-height: 1.6;
+    }
+
+    .footer-col h5 {
+      font-size: 0.8rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+      margin-bottom: 14px;
+    }
+
+    .footer-col ul { list-style: none; display: flex; flex-direction: column; gap: 10px; }
+
+    .footer-col a {
+      font-size: 0.855rem;
+      color: var(--muted);
+      transition: color 0.15s;
+    }
+    .footer-col a:hover { color: var(--text); }
+
+    .footer-bottom {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding-top: 24px;
+      border-top: 1px solid var(--border);
+      font-size: 0.8rem;
+      color: var(--muted);
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+
+    .rust-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      font-size: 0.78rem;
+      color: var(--muted);
+    }
+
+    .rust-badge span { color: #f97316; font-weight: 700; }
+
+    /* ── Divider ───────────────────────────────────────────────────── */
+    .divider {
+      height: 1px;
+      background: linear-gradient(90deg, transparent, var(--border), transparent);
+    }
+
+    /* ── Scroll fade-in ────────────────────────────────────────────── */
+    .fade-in {
+      opacity: 0;
+      transform: translateY(24px);
+      transition: opacity 0.6s ease, transform 0.6s ease;
+    }
+    .fade-in.visible { opacity: 1; transform: translateY(0); }
+
+    /* ── Code highlight ────────────────────────────────────────────── */
+    code {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.85em;
+      background: var(--accent-dim);
+      border: 1px solid rgba(0,255,136,0.15);
+      padding: 1px 6px;
+      border-radius: 4px;
+      color: var(--accent);
+    }
+
+    /* ── Dashboard preview ─────────────────────────────────────────── */
+    .dashboard-preview {
+      padding: 80px 0;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .dashboard-preview::before {
+      content: '';
+      position: absolute;
+      top: 50%; left: 50%;
+      transform: translate(-50%, -50%);
+      width: 800px; height: 400px;
+      background: radial-gradient(ellipse, rgba(0,255,136,0.07) 0%, transparent 70%);
+      pointer-events: none;
+    }
+
+    .dashboard-frame {
+      position: relative;
+      border-radius: 14px;
+      overflow: hidden;
+      border: 1px solid rgba(0,255,136,0.25);
+      box-shadow:
+        0 0 0 1px rgba(0,255,136,0.1),
+        0 30px 80px rgba(0,0,0,0.6),
+        0 0 60px rgba(0,255,136,0.06);
+      margin-top: 48px;
+    }
+
+    .dashboard-frame-bar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 16px;
+      background: #0d0d0f;
+      border-bottom: 1px solid rgba(255,255,255,0.06);
+    }
+
+    .dashboard-frame-bar .dot { width: 11px; height: 11px; border-radius: 50%; }
+    .dashboard-frame-bar .dot-r { background: #ef4444; }
+    .dashboard-frame-bar .dot-y { background: #f59e0b; }
+    .dashboard-frame-bar .dot-g { background: #22c55e; }
+
+    .dashboard-frame-url {
+      flex: 1;
+      text-align: center;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.72rem;
+      color: var(--muted);
+    }
+
+    .dashboard-frame img {
+      display: block;
+      width: 100%;
+      height: auto;
+    }
+  </style>
+</head>
+<body>
+
+<!-- ── NAV ──────────────────────────────────────────────────────────── -->
+<nav>
+  <div class="nav-inner">
+    <a href="#" class="logo">
+      <div class="logo-icon">🦀</div>
+      Trader<span>Claw</span>
+    </a>
+    <ul class="nav-links">
+      <li><a href="#dashboard">Dashboard</a></li>
+      <li><a href="#features">Features</a></li>
+      <li><a href="#chains">Chains</a></li>
+      <li><a href="#backtesting">Backtesting</a></li>
+      <li><a href="#security">Security</a></li>
+      <li><a href="#install">Install</a></li>
+      <li><a href="https://github.com/Trader-Claw-Labs/Trader-Claw" class="nav-cta">GitHub →</a></li>
+    </ul>
+  </div>
+</nav>
+
+<!-- ── HERO ─────────────────────────────────────────────────────────── -->
+<section class="hero">
+  <div class="grid-bg"></div>
+  <div class="hero-glow"></div>
+  <div class="hero-glow-2"></div>
+  <div class="container" style="position:relative;z-index:1;">
+
+    <!-- ASCII title banner -->
+    <div style="overflow-x:auto;margin-bottom:36px;">
+      <div class="ascii-title" aria-label="TRADER CLAW" style="display:inline-block;text-align:left;"><span class="t1">████████╗██████╗  █████╗ ██████╗ ███████╗██████╗  </span><span class="t2"> ██████╗██╗      █████╗ ██╗    ██╗</span>
+<span class="t1">╚══██╔══╝██╔══██╗██╔══██╗██╔══██╗██╔════╝██╔══██╗</span><span class="t2">██╔════╝██║     ██╔══██╗██║    ██║</span>
+<span class="t1">   ██║   ██████╔╝███████║██║  ██║█████╗  ██████╔╝</span><span class="t2">██║     ██║     ███████║██║ █╗ ██║</span>
+<span class="t1">   ██║   ██╔══██╗██╔══██║██║  ██║██╔══╝  ██╔══██╗</span><span class="t2">██║     ██║     ██╔══██║██║███╗██║</span>
+<span class="t1">   ██║   ██║  ██║██║  ██║██████╔╝███████╗██║  ██║</span><span class="t2">╚██████╗███████╗██║  ██║╚███╔███╔╝</span>
+<span class="t3">   ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═╝╚═════╝ ╚══════╝╚═╝  ╚═╝ ╚═════╝╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝ </span>
+<span class="t3">  // 100% Rust · EVM · Solana · TON · Polymarket</span></div>
+    </div>
+
+    <div class="badge">
+      <div class="badge-dot"></div>
+      Built entirely in Rust · Blazing fast · Open source
+    </div>
+
+    <h1>
+      Trade Web3 &amp; Predict Markets<br>
+      <span class="accent">at Rust speed.</span>
+    </h1>
+
+    <p class="hero-sub">
+      Trader Claw is an AI-powered trading agent written 100% in Rust.
+      Execute swaps on EVM, Solana, and TON — and trade Polymarket prediction markets —
+      all from a single secure, sandboxed environment.
+    </p>
+
+    <div class="hero-actions">
+      <a href="#install" class="btn-primary">
+        🚀 Get Started
+      </a>
+      <a href="https://github.com/Trader-Claw-Labs/Trader-Claw" class="btn-secondary">
+        ⭐ Star on GitHub
+      </a>
+    </div>
+
+    <!-- Terminal preview -->
+    <div class="terminal fade-in visible">
+      <div class="terminal-bar">
+        <div class="dot dot-r"></div>
+        <div class="dot dot-y"></div>
+        <div class="dot dot-g"></div>
+        <div class="terminal-title">trader-claw — gateway</div>
+      </div>
+      <div class="terminal-body">
+        <div><span class="t-prompt">$</span> <span class="t-cmd">trader-claw gateway</span></div>
+        <div class="t-out">  🦀 Trader Claw v0.1.7 — Rust AI Trading Agent</div>
+        <div class="t-out">  ✓ Config loaded from ~/.traderclaw/config.toml</div>
+        <div class="t-out">  ✓ Wallets: <span class="t-val">3 registered</span> (EVM · Solana · TON)</div>
+        <div class="t-out">  ✓ Chains:  <span class="t-val">8 EVM chains</span> + Solana + TON</div>
+        <div class="t-out">  ✓ Polymarket CLOB: <span class="t-ok">connected</span></div>
+        <div class="t-out">  ✓ Telegram bot: <span class="t-ok">@traderclaw_bot online</span></div>
+        <div class="t-out">  ✓ Backtesting engine: <span class="t-val">Rhai sandbox ready</span></div>
+        <div class="t-out">  🌐 Dashboard: <span class="t-val">http://127.0.0.1:3000</span></div>
+        <div style="margin-top:4px"><span class="t-prompt">▶</span> <span class="t-out">Waiting for instructions...</span> <span class="t-cursor"></span></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── STATS BAR ─────────────────────────────────────────────────────── -->
+<div class="stats-bar">
+  <div class="container">
+    <div class="stats-grid">
+      <div class="stat-item">
+        <div class="stat-num">100%</div>
+        <div class="stat-label">Pure Rust</div>
+      </div>
+      <div class="stat-item">
+        <div class="stat-num">8+</div>
+        <div class="stat-label">EVM Chains</div>
+      </div>
+      <div class="stat-item">
+        <div class="stat-num">&lt;50ms</div>
+        <div class="stat-label">Execution</div>
+      </div>
+      <div class="stat-item">
+        <div class="stat-num">∞</div>
+        <div class="stat-label">Strategies</div>
+      </div>
+      <div class="stat-item">
+        <div class="stat-num">0</div>
+        <div class="stat-label">Key exposure</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── DASHBOARD PREVIEW ──────────────────────────────────────────────── -->
+<section class="dashboard-preview" id="dashboard">
+  <div class="container">
+    <div class="fade-in" style="text-align:center;">
+      <div class="section-tag">Dashboard</div>
+      <h2>A fully featured trading<br>dashboard, built in.</h2>
+      <p class="section-lead">
+        Monitor wallets, scan markets, configure strategies, and analyze performance —
+        all from a clean, real-time web UI served directly by the Rust binary.
+      </p>
+    </div>
+    <div class="dashboard-frame fade-in">
+      <div class="dashboard-frame-bar">
+        <div class="dot dot-r"></div>
+        <div class="dot dot-y"></div>
+        <div class="dot dot-g"></div>
+        <div class="dashboard-frame-url">http://127.0.0.1:3000 — Trader Claw Dashboard</div>
+      </div>
+      <img src="screenshot.png" alt="Trader Claw Dashboard — showing stat cards, system health, market scanner, and quick access panel" loading="lazy" />
+    </div>
+  </div>
+</section>
+
+<!-- ── FEATURES ──────────────────────────────────────────────────────── -->
+<section class="section" id="features">
+  <div class="container">
+    <div class="fade-in">
+      <div class="section-tag">Features</div>
+      <h2>Everything you need to trade<br>at machine speed.</h2>
+      <p class="section-lead">
+        A complete trading stack — AI agent, multi-chain execution, prediction markets,
+        backtesting engine, and Telegram bot — compiled into a single binary.
+      </p>
+    </div>
+
+    <div class="features-grid fade-in">
+
+      <div class="feature-card">
+        <div class="feature-icon">🦀</div>
+        <h3>100% Rust, Zero Compromise</h3>
+        <p>Every component — wallet manager, execution engine, web gateway, AI loop — is written in safe, blazing-fast Rust. No Python runtime, no Node bloat. Compile once, run anywhere.</p>
+      </div>
+
+      <div class="feature-card">
+        <div class="feature-icon">🤖</div>
+        <h3>AI Agent Loop</h3>
+        <p>Powered by Claude / OpenAI / any OpenRouter model. The agent reads market data, manages your wallets, executes trades, and explains every decision in plain English.</p>
+      </div>
+
+      <div class="feature-card">
+        <div class="feature-icon">🌐</div>
+        <h3>Multi-Chain EVM Trading</h3>
+        <p>Trade natively on Ethereum, Arbitrum, Optimism, Base, BNB Chain, Polygon, Unichain, and ETC via Uniswap V2/V3/V4. Parallel chain balance queries with live block-explorer links.</p>
+      </div>
+
+      <div class="feature-card">
+        <div class="feature-icon">◎</div>
+        <h3>Solana &amp; SPL Tokens</h3>
+        <p>Buy and sell Solana tokens via Jupiter v6 aggregator with real-time quotes. Full SPL token balance tracking, PumpFun and Raydium DEX support.</p>
+      </div>
+
+      <div class="feature-card">
+        <div class="feature-icon">💎</div>
+        <h3>Polymarket Prediction Markets</h3>
+        <p>Trade real-money prediction markets with L2 HMAC authentication. Place limit and market orders, track positions and open orders, all from the dashboard or Telegram.</p>
+      </div>
+
+      <div class="feature-card">
+        <div class="feature-icon">📊</div>
+        <h3>Strategy Backtesting</h3>
+        <p>Write strategies in Rhai scripts. Backtest against real Binance OHLCV historical data with live RSI, MACD, and EMA indicators. Get Sharpe ratio, max drawdown, and win rate.</p>
+      </div>
+
+      <div class="feature-card">
+        <div class="feature-icon">✈️</div>
+        <h3>Telegram Integration</h3>
+        <p>Control Trader Claw from any Telegram app. Query balances, browse markets, place orders and get trade confirmations — all via natural language commands or structured slash commands.</p>
+      </div>
+
+      <div class="feature-card">
+        <div class="feature-icon">⚙️</div>
+        <h3>Cron Strategies</h3>
+        <p>Schedule automated strategies with cron syntax. Set DCA orders, rebalance triggers, or alert jobs that run on your schedule. All managed from the web dashboard.</p>
+      </div>
+
+      <div class="feature-card">
+        <div class="feature-icon">🖥️</div>
+        <h3>Web Dashboard</h3>
+        <p>A React + Vite dashboard embedded directly into the binary via rust-embed. Zero external dependencies to serve the UI — open a browser and trade.</p>
+      </div>
+
+    </div>
+  </div>
+</section>
+
+<!-- ── CHAINS ────────────────────────────────────────────────────────── -->
+<section class="section-sm" id="chains">
+  <div class="divider"></div>
+  <div style="height:64px"></div>
+  <div class="container chains-section fade-in">
+    <div class="section-tag">Supported Networks</div>
+    <h2>One agent. Every chain.</h2>
+    <p class="section-lead" style="margin:0 auto;">
+      Trader Claw connects to every major blockchain with custom RPC override support per chain.
+    </p>
+
+    <div class="chain-logos">
+      <div class="chain-badge"><span class="chain-icon">⟠</span> Ethereum</div>
+      <div class="chain-badge"><span class="chain-icon">🔵</span> Arbitrum</div>
+      <div class="chain-badge"><span class="chain-icon">🔴</span> Optimism</div>
+      <div class="chain-badge"><span class="chain-icon">🔷</span> Base</div>
+      <div class="chain-badge"><span class="chain-icon">🟡</span> BNB Chain</div>
+      <div class="chain-badge"><span class="chain-icon">🟣</span> Polygon</div>
+      <div class="chain-badge"><span class="chain-icon">🦄</span> Unichain</div>
+      <div class="chain-badge"><span class="chain-icon">🟢</span> ETC</div>
+      <div class="chain-badge"><span class="chain-icon">◎</span> Solana</div>
+      <div class="chain-badge"><span class="chain-icon">💎</span> TON</div>
+      <div class="chain-badge"><span class="chain-icon">🔮</span> Polymarket</div>
+    </div>
+  </div>
+  <div style="height:64px"></div>
+  <div class="divider"></div>
+</section>
+
+<!-- ── HOW IT WORKS ──────────────────────────────────────────────────── -->
+<section class="section" id="how">
+  <div class="container">
+    <div class="fade-in">
+      <div class="section-tag">How It Works</div>
+      <h2>From idea to live trade<br>in minutes.</h2>
+    </div>
+
+    <div class="how-grid">
+      <div class="steps fade-in">
+        <div class="step">
+          <div class="step-num">01</div>
+          <div class="step-body">
+            <h4>Install &amp; configure</h4>
+            <p>Download the binary or build from source with <code>cargo build --release</code>. Edit <code>config.toml</code> to add your LLM API key and preferred chains.</p>
+          </div>
+        </div>
+        <div class="step">
+          <div class="step-num">02</div>
+          <div class="step-body">
+            <h4>Add wallets</h4>
+            <p>Create or import EVM, Solana, and TON wallets directly from the dashboard. All private keys are encrypted with AES-256-GCM + Argon2id — never stored in plain text.</p>
+          </div>
+        </div>
+        <div class="step">
+          <div class="step-num">03</div>
+          <div class="step-body">
+            <h4>Write or ask for a strategy</h4>
+            <p>Type "buy 0.1 SOL worth of BONK when RSI drops below 30" — the AI agent writes the strategy, backtests it, and confirms before executing.</p>
+          </div>
+        </div>
+        <div class="step">
+          <div class="step-num">04</div>
+          <div class="step-body">
+            <h4>Monitor &amp; automate</h4>
+            <p>Set cron jobs for recurring strategies. Get Telegram alerts for fills and PnL updates. Track everything from the real-time web dashboard.</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="terminal fade-in">
+        <div class="terminal-bar">
+          <div class="dot dot-r"></div>
+          <div class="dot dot-y"></div>
+          <div class="dot dot-g"></div>
+          <div class="terminal-title">AI Agent · conversation</div>
+        </div>
+        <div class="terminal-body">
+          <div style="margin-bottom:10px">
+            <div style="color:#7dd3fc;margin-bottom:4px">You:</div>
+            <div class="t-out" style="color:var(--text)">Buy $50 of SOL on Solana when RSI goes below 28, then sell when it crosses 65.</div>
+          </div>
+          <div style="margin-bottom:10px">
+            <div style="color:var(--accent);margin-bottom:4px">🦀 TraderClaw:</div>
+            <div class="t-out">Strategy understood. Let me backtest first…</div>
+            <div class="t-out" style="margin-top:4px">📊 Backtest (90d): <span class="t-ok">+31.4% PnL</span> · Sharpe <span class="t-val">1.82</span> · Win rate <span class="t-val">71%</span></div>
+            <div class="t-out" style="margin-top:4px">Looks solid. Shall I activate this strategy?</div>
+          </div>
+          <div>
+            <div style="color:#7dd3fc;margin-bottom:4px">You:</div>
+            <div class="t-out" style="color:var(--text)">Yes, activate it.</div>
+          </div>
+          <div style="margin-top:10px">
+            <div style="color:var(--accent);margin-bottom:4px">🦀 TraderClaw:</div>
+            <div class="t-out"><span class="t-ok">✓</span> Cron strategy scheduled. Watching RSI on SOL/USDT.</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── BACKTESTING ───────────────────────────────────────────────────── -->
+<section class="section" id="backtesting" style="background:var(--surface);">
+  <div class="container">
+    <div class="fade-in">
+      <div class="section-tag">Backtesting Engine</div>
+      <h2>Test before you risk<br>real money.</h2>
+      <p class="section-lead">
+        Replay your strategies against real historical OHLCV data from Binance.
+        The Rhai scripting engine runs fully sandboxed — no network access, no side effects.
+      </p>
+    </div>
+
+    <div class="backtest-wrap">
+      <div class="fade-in">
+        <div style="margin-bottom:20px">
+          <p style="font-size:0.875rem;color:var(--muted);margin-bottom:16px;">Example strategy output — BTCUSDT 90-day backtest:</p>
+        </div>
+        <div class="metrics-grid">
+          <div class="metric-card">
+            <div class="metric-label">Total PnL</div>
+            <div class="metric-val pos">+38.2%</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label">Sharpe Ratio</div>
+            <div class="metric-val neu">2.14</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label">Max Drawdown</div>
+            <div class="metric-val neg">-8.7%</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label">Win Rate</div>
+            <div class="metric-val pos">73%</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label">Total Trades</div>
+            <div class="metric-val" style="color:var(--text)">142</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label">Avg Hold Time</div>
+            <div class="metric-val" style="color:var(--text)">4.2h</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="fade-in">
+        <div class="terminal">
+          <div class="terminal-bar">
+            <div class="dot dot-r"></div>
+            <div class="dot dot-y"></div>
+            <div class="dot dot-g"></div>
+            <div class="terminal-title">strategy.rhai</div>
+          </div>
+          <div class="terminal-body" style="font-size:0.8rem;">
+            <div><span style="color:var(--muted)">// RSI mean-reversion strategy</span></div>
+            <div><span style="color:var(--muted)">// Variables injected per candle:</span></div>
+            <div><span style="color:var(--muted)">// open, high, low, close, volume</span></div>
+            <div><span style="color:var(--muted)">// rsi, macd, signal, balance</span></div>
+            <div>&nbsp;</div>
+            <div><span style="color:#f9a8d4">if</span> rsi <span style="color:var(--muted)">&lt;</span> <span style="color:#fcd34d">28.0</span> <span style="color:#f9a8d4">&amp;&amp;</span> macd <span style="color:var(--muted)">&gt;</span> signal {</div>
+            <div>&nbsp;&nbsp;<span style="color:var(--accent)">"buy"</span></div>
+            <div>} <span style="color:#f9a8d4">else if</span> rsi <span style="color:var(--muted)">&gt;</span> <span style="color:#fcd34d">68.0</span> {</div>
+            <div>&nbsp;&nbsp;<span style="color:var(--accent)">"sell"</span></div>
+            <div>} <span style="color:#f9a8d4">else</span> {</div>
+            <div>&nbsp;&nbsp;<span style="color:var(--accent)">"hold"</span></div>
+            <div>}</div>
+          </div>
+        </div>
+        <p style="font-size:0.8rem;color:var(--muted);margin-top:12px;text-align:center;">
+          Scripts run sandboxed — memory &amp; time limited. Ask the AI to write one for you.
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── TELEGRAM ──────────────────────────────────────────────────────── -->
+<section class="section" id="telegram">
+  <div class="container">
+    <div class="fade-in">
+      <div class="section-tag">Telegram Integration</div>
+      <h2>Trade from anywhere.<br>Your phone is the terminal.</h2>
+      <p class="section-lead">
+        Connect your Telegram bot in seconds. Get real-time alerts, check balances,
+        and place orders — all without opening the dashboard.
+      </p>
+    </div>
+
+    <div class="telegram-wrap">
+      <!-- Telegram mock chat -->
+      <div class="tg-chat fade-in">
+        <div class="tg-header">
+          <div class="tg-avatar">🦀</div>
+          <div>
+            <div class="tg-name">TraderClaw Bot</div>
+            <div class="tg-status">● online</div>
+          </div>
+        </div>
+        <div class="tg-body">
+          <div class="tg-msg user">/balance</div>
+          <div class="tg-msg bot">
+            <span class="cmd">💼 Wallets</span><br>
+            <span class="val">Main EVM</span> · 0.42 ETH ($1,482)<br>
+            <span class="val">Solana</span> · 12.3 SOL ($2,103)<br>
+            <span class="val">Poly</span> · $340 USDC
+          </div>
+          <div class="tg-msg user">/poly markets</div>
+          <div class="tg-msg bot">
+            🔮 <span class="cmd">Top Markets</span><br>
+            <span class="val">BTC $100k in 2025</span> — YES 67%<br>
+            <span class="val">ETH ETF by June</span> — YES 44%<br>
+            <span class="val">Fed rate cut March</span> — YES 38%
+          </div>
+          <div class="tg-msg user">/poly buy "BTC $100k in 2025" YES $25</div>
+          <div class="tg-msg bot">
+            ✅ <span class="cmd">Order placed</span><br>
+            Bought <span class="val">37.3 YES shares</span> @ $0.67<br>
+            Cost: <span class="val">$25.00 USDC</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="fade-in">
+        <h3 style="font-size:1.3rem;font-weight:700;margin-bottom:20px;letter-spacing:-0.02em;">
+          Every command you need, right in Telegram.
+        </h3>
+        <div style="display:flex;flex-direction:column;gap:14px;">
+          <div style="display:flex;gap:14px;align-items:flex-start;">
+            <div style="font-size:20px;flex-shrink:0;">💰</div>
+            <div>
+              <div style="font-weight:600;font-size:0.9rem;margin-bottom:3px;">Balance &amp; Portfolio</div>
+              <div style="font-size:0.83rem;color:var(--muted);">Check all wallet balances across every chain in one command.</div>
+            </div>
+          </div>
+          <div style="display:flex;gap:14px;align-items:flex-start;">
+            <div style="font-size:20px;flex-shrink:0;">🔮</div>
+            <div>
+              <div style="font-weight:600;font-size:0.9rem;margin-bottom:3px;">Polymarket Trading</div>
+              <div style="font-size:0.83rem;color:var(--muted);">Browse markets, check prices, buy and sell prediction shares instantly.</div>
+            </div>
+          </div>
+          <div style="display:flex;gap:14px;align-items:flex-start;">
+            <div style="font-size:20px;flex-shrink:0;">📈</div>
+            <div>
+              <div style="font-weight:600;font-size:0.9rem;margin-bottom:3px;">Live Alerts</div>
+              <div style="font-size:0.83rem;color:var(--muted);">Get notified when RSI triggers, orders fill, or strategies activate.</div>
+            </div>
+          </div>
+          <div style="display:flex;gap:14px;align-items:flex-start;">
+            <div style="font-size:20px;flex-shrink:0;">🔐</div>
+            <div>
+              <div style="font-weight:600;font-size:0.9rem;margin-bottom:3px;">Whitelist-Only Access</div>
+              <div style="font-size:0.83rem;color:var(--muted);">Only your Telegram username can send commands. Case-insensitive, @ optional.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── SECURITY ──────────────────────────────────────────────────────── -->
+<section class="section" id="security" style="background:var(--surface);">
+  <div class="container">
+    <div class="fade-in">
+      <div class="section-tag">Security</div>
+      <h2>Your keys. Your rules.<br>Zero compromise.</h2>
+      <p class="section-lead">
+        Trader Claw runs entirely on your machine. No cloud custody, no shared infrastructure.
+        Every secret is encrypted before it ever touches disk.
+      </p>
+    </div>
+
+    <div class="security-grid fade-in">
+      <div class="sec-card">
+        <div class="sec-icon">🔒</div>
+        <div>
+          <h4>AES-256-GCM Encryption</h4>
+          <p>All private keys and API credentials are encrypted at rest using AES-256-GCM with Argon2id key derivation. Never stored in plain text.</p>
+        </div>
+      </div>
+      <div class="sec-card">
+        <div class="sec-icon">📦</div>
+        <div>
+          <h4>Sandboxed Script Execution</h4>
+          <p>Rhai strategy scripts run in a fully sandboxed VM — no network access, no file system access, enforced memory and CPU time limits.</p>
+        </div>
+      </div>
+      <div class="sec-card">
+        <div class="sec-icon">🏠</div>
+        <div>
+          <h4>100% Local by Default</h4>
+          <p>Binds to 127.0.0.1 only. Refuses to expose to the public internet unless explicitly opted in. No telemetry, no remote control.</p>
+        </div>
+      </div>
+      <div class="sec-card">
+        <div class="sec-icon">✅</div>
+        <div>
+          <h4>Amount Validation</h4>
+          <p>Every trade amount is validated before signing. The agent cannot sign a transaction it was not explicitly authorized to execute.</p>
+        </div>
+      </div>
+      <div class="sec-card">
+        <div class="sec-icon">🔑</div>
+        <div>
+          <h4>Zero Key Logging</h4>
+          <p>Private keys and mnemonics are never logged, never serialized as strings, and never included in error messages or debug output.</p>
+        </div>
+      </div>
+      <div class="sec-card">
+        <div class="sec-icon">🛡️</div>
+        <div>
+          <h4>Bearer Token Auth</h4>
+          <p>The web dashboard and API require a paired Bearer token. Unpaired requests are rejected before any handler logic runs.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── INSTALL ───────────────────────────────────────────────────────── -->
+<section class="section" id="install">
+  <div class="container" style="text-align:center;">
+    <div class="fade-in">
+      <div class="section-tag">Get Started</div>
+      <h2>Up and running<br>in under 2 minutes.</h2>
+      <p class="section-lead" style="margin:0 auto 0;">
+        Build from source or download a pre-built binary. Requires Rust 1.86+.
+      </p>
+    </div>
+
+    <div class="install-wrap fade-in">
+      <div class="install-code">
+        <div class="install-code-bar">
+          <span>bash</span>
+          <button class="copy-btn" onclick="copyInstall()">Copy</button>
+        </div>
+        <pre id="install-pre"><span class="comment"># 1. Clone the repo</span>
+<span class="kw">git</span> clone https://github.com/Trader-Claw-Labs/Trader-Claw
+<span class="kw">cd</span> traderclaw
+
+<span class="comment"># 2. Build the web dashboard</span>
+<span class="kw">cd</span> web && <span class="kw">npm</span> install && <span class="kw">npm</span> run build && <span class="kw">cd</span> ..
+
+<span class="comment"># 3. Build the Rust binary</span>
+<span class="kw">cargo</span> build --release
+
+<span class="comment"># 4. Start the gateway</span>
+./target/release/<span class="str">trader-claw</span> gateway
+
+<span class="comment"># 5. Open the dashboard</span>
+<span class="comment"># → http://127.0.0.1:3000</span></pre>
+      </div>
+
+      <p style="font-size:0.83rem;color:var(--muted);margin-top:20px;">
+        On first launch, Trader Claw prints a one-time pairing code.
+        Enter it in the dashboard to authenticate and start trading.
+      </p>
+    </div>
+  </div>
+</section>
+
+<!-- ── CTA ───────────────────────────────────────────────────────────── -->
+<section class="cta-section">
+  <div class="cta-glow"></div>
+  <div class="container" style="position:relative;z-index:1;">
+    <div class="badge">
+      <div class="badge-dot"></div>
+      Open source · MIT License
+    </div>
+    <h2>Start trading at<br><span style="color:var(--accent)">Rust speed.</span></h2>
+    <p>Join traders building the future of algorithmic trading with Rust and AI.</p>
+    <div style="display:flex;gap:14px;justify-content:center;flex-wrap:wrap;">
+      <a href="#install" class="btn-primary">🚀 Install Now</a>
+      <a href="https://github.com/Trader-Claw-Labs/Trader-Claw" class="btn-secondary">📖 Read the Docs</a>
+    </div>
+  </div>
+</section>
+
+<!-- ── FOOTER ────────────────────────────────────────────────────────── -->
+<footer>
+  <div class="container">
+    <div class="footer-inner">
+      <div class="footer-brand">
+        <div class="logo">
+          <div class="logo-icon">🦀</div>
+          Trader<span style="color:var(--accent)">Claw</span>
+        </div>
+        <p>A 100% Rust AI trading agent for EVM, Solana, TON, and Polymarket prediction markets.</p>
+      </div>
+
+      <div class="footer-col">
+        <h5>Product</h5>
+        <ul>
+          <li><a href="#features">Features</a></li>
+          <li><a href="#backtesting">Backtesting</a></li>
+          <li><a href="#security">Security</a></li>
+          <li><a href="#install">Installation</a></li>
+        </ul>
+      </div>
+
+      <div class="footer-col">
+        <h5>Networks</h5>
+        <ul>
+          <li><a href="#chains">EVM Chains</a></li>
+          <li><a href="#chains">Solana</a></li>
+          <li><a href="#chains">TON</a></li>
+          <li><a href="#chains">Polymarket</a></li>
+        </ul>
+      </div>
+
+      <div class="footer-col">
+        <h5>Resources</h5>
+        <ul>
+          <li><a href="https://github.com/Trader-Claw-Labs/Trader-Claw">GitHub</a></li>
+          <li><a href="#install">Quick Start</a></li>
+          <li><a href="#telegram">Telegram Bot</a></li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="footer-bottom">
+      <div>© 2025 Trader Claw. Open source under MIT License.</div>
+      <div class="rust-badge">Built with <span>♥</span> in <span>Rust</span></div>
+    </div>
+  </div>
+</footer>
+
+<script>
+  // ── Scroll fade-in observer ─────────────────────────────────────────
+  const observer = new IntersectionObserver((entries) => {
+    entries.forEach(entry => {
+      if (entry.isIntersecting) {
+        entry.target.classList.add('visible');
+        observer.unobserve(entry.target);
+      }
+    });
+  }, { threshold: 0.12 });
+
+  document.querySelectorAll('.fade-in').forEach(el => observer.observe(el));
+
+  // ── Copy install command ────────────────────────────────────────────
+  function copyInstall() {
+    const text = document.getElementById('install-pre').innerText;
+    navigator.clipboard.writeText(text).then(() => {
+      const btn = document.querySelector('.copy-btn');
+      btn.textContent = 'Copied!';
+      btn.style.color = 'var(--accent)';
+      setTimeout(() => { btn.textContent = 'Copy'; btn.style.color = ''; }, 2000);
+    });
+  }
+
+  // ── Smooth active nav highlight ─────────────────────────────────────
+  const sections = document.querySelectorAll('section[id], div[id]');
+  const navLinks = document.querySelectorAll('.nav-links a');
+
+  window.addEventListener('scroll', () => {
+    let current = '';
+    sections.forEach(section => {
+      if (window.scrollY >= section.offsetTop - 80) {
+        current = section.getAttribute('id');
+      }
+    });
+    navLinks.forEach(link => {
+      link.style.color = '';
+      if (link.getAttribute('href') === `#${current}`) {
+        link.style.color = 'var(--text)';
+      }
+    });
+  }, { passive: true });
+</script>
+
+</body>
+</html>

@@ -3,6 +3,7 @@ import type { ReactNode } from 'react'
 import { Routes, Route } from 'react-router-dom'
 import Sidebar from './components/Sidebar'
 import PairingModal from './components/PairingModal'
+import OnboardingModal from './components/OnboardingModal'
 import Dashboard from './pages/Dashboard'
 import Wallets from './pages/Wallets'
 import Polymarket from './pages/Polymarket'
@@ -13,7 +14,7 @@ import LLMSettings from './pages/LLMSettings'
 import Config from './pages/Config'
 import TradingViewPage from './pages/TradingView'
 import Backtesting from './pages/Backtesting'
-import { getAuthToken } from './hooks/useApi'
+import { apiFetch, getAuthToken } from './hooks/useApi'
 
 // ── Error boundary ────────────────────────────────────────────────
 class ErrorBoundary extends Component<
@@ -60,26 +61,65 @@ class ErrorBoundary extends Component<
   }
 }
 
+// ── Onboarding status check ────────────────────────────────────────
+
+interface OnboardingStatus {
+  onboarded: boolean
+  api_key_set: boolean
+  provider: string
+  model: string
+}
+
+async function fetchOnboardingStatus(): Promise<OnboardingStatus> {
+  return apiFetch<OnboardingStatus>('/api/onboarding')
+}
+
 // ── App ───────────────────────────────────────────────────────────
 export default function App() {
   const [showPairing, setShowPairing] = useState(false)
+  const [showOnboarding, setShowOnboarding] = useState(false)
 
+  // On mount: check pairing, then check onboarding
   useEffect(() => {
     fetch('/health')
       .then((r) => r.json())
       .then((data: { require_pairing?: boolean }) => {
         if (data.require_pairing && !getAuthToken()) {
           setShowPairing(true)
+        } else {
+          // Already authenticated — check if onboarding is needed
+          checkOnboarding()
         }
       })
       .catch(() => {
-        if (!getAuthToken()) setShowPairing(true)
+        if (!getAuthToken()) {
+          setShowPairing(true)
+        } else {
+          checkOnboarding()
+        }
       })
   }, [])
 
+  async function checkOnboarding() {
+    try {
+      const status = await fetchOnboardingStatus()
+      // Show onboarding if: not yet completed OR api_key not set
+      if (!status.onboarded || !status.api_key_set) {
+        setShowOnboarding(true)
+      }
+    } catch {
+      // If the check fails (no auth, server error), skip onboarding silently
+    }
+  }
+
   function handlePaired() {
-    // Token is now in localStorage — reload so all queries start fresh with auth
-    window.location.reload()
+    setShowPairing(false)
+    // After pairing, always check onboarding for first-time users
+    checkOnboarding()
+  }
+
+  function handleOnboardingDone() {
+    setShowOnboarding(false)
   }
 
   return (
@@ -100,7 +140,11 @@ export default function App() {
             <Route path="/settings/config" element={<Config />} />
           </Routes>
         </main>
+
         {showPairing && <PairingModal onPaired={handlePaired} />}
+        {!showPairing && showOnboarding && (
+          <OnboardingModal onDone={handleOnboardingDone} />
+        )}
       </div>
     </ErrorBoundary>
   )

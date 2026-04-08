@@ -28,11 +28,11 @@ uname -m
 
 # Download the appropriate binary
 # For 64-bit (aarch64):
-curl -LO https://github.com/traderclaw-labs/traderclaw/releases/latest/download/traderclaw-aarch64-linux-android.tar.gz
+curl -LO https://github.com/Trader-Claw-Labs/Trader-Claw/releases/latest/download/traderclaw-aarch64-linux-android.tar.gz
 tar xzf traderclaw-aarch64-linux-android.tar.gz
 
 # For 32-bit (armv7):
-curl -LO https://github.com/traderclaw-labs/traderclaw/releases/latest/download/traderclaw-armv7-linux-androideabi.tar.gz
+curl -LO https://github.com/Trader-Claw-Labs/Trader-Claw/releases/latest/download/traderclaw-armv7-linux-androideabi.tar.gz
 tar xzf traderclaw-armv7-linux-androideabi.tar.gz
 ```
 

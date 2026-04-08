@@ -1,6 +1,6 @@
 # traderclaw-tools
 
-Python companion package for [TraderClaw](https://github.com/traderclaw-labs/traderclaw) — LangGraph-based tool calling for consistent LLM agent execution.
+Python companion package for [TraderClaw](https://github.com/Trader-Claw-Labs/Trader-Claw) — LangGraph-based tool calling for consistent LLM agent execution.
 
 ## Why This Package?
 
