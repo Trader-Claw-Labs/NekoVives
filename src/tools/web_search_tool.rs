@@ -184,7 +184,7 @@ fn strip_tags(content: &str) -> String {
 #[async_trait]
 impl Tool for WebSearchTool {
     fn name(&self) -> &str {
-        "web_search_tool"
+        "web_search"
     }
 
     fn description(&self) -> &str {

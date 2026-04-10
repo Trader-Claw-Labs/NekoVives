@@ -87,6 +87,14 @@ impl ConversationRuntime {
         session: &mut Session,
         ws_tx: Option<&tokio::sync::mpsc::UnboundedSender<Value>>,
     ) -> Result<String> {
+        // Log user prompt at debug level
+        tracing::debug!(
+            model = %self.model,
+            prompt_len = user_message.len(),
+            prompt = %user_message,
+            "Agent turn: user prompt"
+        );
+
         // Append user turn
         session.history.push(InputMessage::user_text(user_message));
         // Keep history bounded
@@ -96,9 +104,22 @@ impl ConversationRuntime {
         let mut thinking_rounds = 0u32;
         let mut total_tools_done = 0u32;
 
+        // Detect stuck-loop: track the last tool+args that failed so we can
+        // bail out early when the model keeps calling the same broken tool.
+        let mut last_failed_call: Option<String> = None; // "toolname:{args_json}"
+        let mut consecutive_identical_failures: u32 = 0;
+        const MAX_IDENTICAL_FAILURES: u32 = 3;
+
         for iteration in 0..MAX_TOOL_ITERATIONS {
             // Notify UI: LLM round starting (round 2+ means the agent is re-evaluating after tools)
             thinking_rounds += 1;
+            tracing::debug!(
+                model = %self.model,
+                round = thinking_rounds,
+                history_len = session.history.len(),
+                tools_available = tools.len(),
+                "Agent loop: starting LLM round"
+            );
             if let Some(tx) = ws_tx {
                 let _ = tx.send(serde_json::json!({
                     "type": "thinking",
@@ -122,8 +143,22 @@ impl ConversationRuntime {
             };
 
             // Stream and accumulate one assistant turn
-            let (assistant_blocks, tool_calls) =
-                self.stream_turn(&request, &mut final_text, ws_tx).await?;
+            let (assistant_blocks, tool_calls) = match self
+                .stream_turn(&request, &mut final_text, ws_tx)
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!(
+                        model = %self.model,
+                        round = thinking_rounds,
+                        error = %e,
+                        error_debug = ?e,
+                        "Agent loop: LLM stream failed"
+                    );
+                    return Err(e.into());
+                }
+            };
 
             // Append assistant message to history
             if !assistant_blocks.is_empty() {
@@ -135,12 +170,19 @@ impl ConversationRuntime {
 
             // If no tools were requested, we're done
             if tool_calls.is_empty() {
+                tracing::debug!(model = %self.model, round = thinking_rounds, "Agent loop: no tool calls, finishing");
                 break;
             }
 
             // Notify UI: execution phase starting (agent has a plan, now running tools)
+            let tool_names: Vec<&str> = tool_calls.iter().map(|(_, n, _)| n.as_str()).collect();
+            tracing::info!(
+                model = %self.model,
+                round = thinking_rounds,
+                tools = ?tool_names,
+                "Agent loop: executing {} tool(s)", tool_calls.len()
+            );
             if let Some(tx) = ws_tx {
-                let tool_names: Vec<&str> = tool_calls.iter().map(|(_, n, _)| n.as_str()).collect();
                 let _ = tx.send(serde_json::json!({
                     "type": "executing",
                     "iteration": thinking_rounds,
@@ -152,6 +194,14 @@ impl ConversationRuntime {
             // Execute each tool and collect results as a single user turn
             let mut result_blocks: Vec<InputContentBlock> = Vec::new();
             for (tool_idx, (id, name, input)) in tool_calls.iter().enumerate() {
+                tracing::debug!(
+                    model = %self.model,
+                    round = thinking_rounds,
+                    tool = %name,
+                    step = tool_idx + 1,
+                    input = %input,
+                    "Agent loop: calling tool"
+                );
                 // Notify UI: individual tool starting
                 if let Some(tx) = ws_tx {
                     let _ = tx.send(serde_json::json!({
@@ -166,11 +216,40 @@ impl ConversationRuntime {
 
                 let start = std::time::Instant::now();
                 let (output, is_error) = match tool_executor.execute(name, input.clone()).await {
-                    Ok(result) => (result, false),
-                    Err(e) => (format!("Error: {e}"), true),
+                    Ok(result) => {
+                        // Successful call resets the stuck-loop counter.
+                        last_failed_call = None;
+                        consecutive_identical_failures = 0;
+                        (result, false)
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            model = %self.model,
+                            round = thinking_rounds,
+                            tool = %name,
+                            error = %e,
+                            "Agent loop: tool execution failed"
+                        );
+                        let args_key = format!("{name}:{input}");
+                        if last_failed_call.as_ref().is_some_and(|k| k == &args_key) {
+                            consecutive_identical_failures += 1;
+                        } else {
+                            last_failed_call = Some(args_key);
+                            consecutive_identical_failures = 1;
+                        }
+                        (format!("Error: {e}"), true)
+                    }
                 };
                 let elapsed_ms = start.elapsed().as_millis() as u64;
                 total_tools_done += 1;
+                tracing::debug!(
+                    model = %self.model,
+                    tool = %name,
+                    elapsed_ms,
+                    is_error,
+                    output_len = output.len(),
+                    "Agent loop: tool completed"
+                );
 
                 // Send a snippet of the output so the UI can preview it (cap at 200 chars)
                 let snippet: String = output.chars().take(200).collect();
@@ -210,6 +289,28 @@ impl ConversationRuntime {
                 });
             }
 
+            // Stuck-loop guard: if the model called the exact same broken tool N
+            // times in a row without fixing its args, give up rather than burning
+            // through all 20 iterations.
+            if consecutive_identical_failures >= MAX_IDENTICAL_FAILURES {
+                tracing::warn!(
+                    model = %self.model,
+                    round = thinking_rounds,
+                    consecutive_identical_failures,
+                    "Agent stuck — same tool call failed {consecutive_identical_failures}x in a row, stopping"
+                );
+                // Append a synthetic assistant message so the conversation ends
+                // with something useful rather than silence.
+                if final_text.is_empty() {
+                    final_text = format!(
+                        "I encountered a repeated error and was unable to complete the task. \
+                        The tool kept failing with the same arguments. Please rephrase your \
+                        request or provide more specific details."
+                    );
+                }
+                break;
+            }
+
             // Safety: prevent runaway loops
             if iteration + 1 >= MAX_TOOL_ITERATIONS {
                 tracing::warn!(
@@ -219,6 +320,16 @@ impl ConversationRuntime {
                 break;
             }
         }
+
+        // Log final response at debug level
+        tracing::debug!(
+            model = %self.model,
+            response_len = final_text.len(),
+            rounds = thinking_rounds,
+            tools_done = total_tools_done,
+            response = %final_text,
+            "Agent turn: final response"
+        );
 
         Ok(final_text)
     }
@@ -281,13 +392,9 @@ impl ConversationRuntime {
                     ContentBlockDelta::SignatureDelta { .. } => {}
                 },
 
-                StreamEvent::ContentBlockStop(e) => {
-                    // Finalize tool input JSON
-                    if let Some((id, name)) = tool_use_ids.get(&e.index) {
-                        let json_str = input_json_bufs.remove(&e.index).unwrap_or_default();
-                        // Store finalized JSON; we'll process after MessageStop
-                        let _ = (id, name, json_str); // kept in tool_use_ids
-                    }
+                StreamEvent::ContentBlockStop(_) => {
+                    // Nothing to do: input_json_bufs keeps accumulating until
+                    // MessageStop, where we read the final JSON per tool index.
                 }
 
                 StreamEvent::MessageStop(_) => break,

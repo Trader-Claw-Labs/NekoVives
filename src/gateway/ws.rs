@@ -107,10 +107,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         });
 
         // Hard timeout: 5 minutes max per agent turn
+        let turn_start = std::time::Instant::now();
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(300),
             crate::agent::process_message_with_events(config, &content, event_tx, &mut session),
         ).await;
+        let turn_elapsed = turn_start.elapsed();
 
         // Recover the sender from the forwarder task (task cannot panic — safe to unwrap).
         let Ok(recovered) = forward_handle.await else { break };
@@ -118,6 +120,13 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
         match result {
             Ok(Ok(response)) => {
+                tracing::info!(
+                    provider = %provider_label,
+                    model = %model_snap,
+                    elapsed_ms = turn_elapsed.as_millis() as u64,
+                    response_len = response.len(),
+                    "Agent turn completed"
+                );
                 let done = serde_json::json!({
                     "type": "done",
                     "full_response": response,
@@ -130,32 +139,65 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     "model": model_snap,
                 }));
             }
-            Ok(Err(e)) => {
-                let sanitized = crate::providers::sanitize_api_error(&e.to_string());
+            Ok(Err(ref e)) => {
+                // Log the full error server-side (unsanitized, for debugging)
+                tracing::error!(
+                    provider = %provider_label,
+                    model = %model_snap,
+                    elapsed_ms = turn_elapsed.as_millis() as u64,
+                    error = %e,
+                    error_debug = ?e,
+                    "Agent turn failed"
+                );
+
+                // Build a human-readable message with context
+                let raw = e.to_string();
+                let detail = if raw.trim().is_empty() || raw == "408: " || raw.ends_with(": ") {
+                    // Empty or truncated error — describe by type
+                    format!(
+                        "Provider {} returned HTTP 408 (Request Timeout). \
+                        The model or upstream server did not respond in time. \
+                        Check that your API key is valid and the model '{}' is available.",
+                        provider_label, model_snap
+                    )
+                } else {
+                    crate::providers::sanitize_api_error(&raw)
+                };
+
+                tracing::error!(
+                    provider = %provider_label,
+                    model = %model_snap,
+                    "Agent error detail: {detail}"
+                );
+
                 let err = serde_json::json!({
                     "type": "error",
-                    "message": sanitized,
+                    "message": detail,
+                    "provider": provider_label,
+                    "model": model_snap,
                 });
                 let _ = sender.send(Message::Text(err.to_string().into())).await;
 
                 let _ = state.event_tx.send(serde_json::json!({
                     "type": "error",
                     "component": "ws_chat",
-                    "message": sanitized,
+                    "message": detail,
                 }));
             }
             Err(_elapsed) => {
+                tracing::error!(
+                    provider = %provider_label,
+                    model = %model_snap,
+                    "Agent turn hit the 5-minute gateway timeout"
+                );
                 let err = serde_json::json!({
                     "type": "error",
                     "message": "Agent timed out after 5 minutes. The request may have stalled — please try again.",
                     "timeout": true,
+                    "provider": provider_label,
+                    "model": model_snap,
                 });
                 let _ = sender.send(Message::Text(err.to_string().into())).await;
-                tracing::warn!(
-                    provider = provider_label,
-                    model = model_snap,
-                    "Agent turn timed out after 5 minutes"
-                );
             }
         }
     }

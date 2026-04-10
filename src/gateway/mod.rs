@@ -647,7 +647,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         // ── TradingView ──
         .route("/api/tradingview/scan", get(api::handle_api_tradingview_scan))
         // ── Backtesting ──
-        .route("/api/backtest/scripts", get(api::handle_api_backtest_scripts))
+        .route("/api/backtest/scripts", get(api::handle_api_backtest_scripts).delete(api::handle_api_backtest_scripts_delete))
+        .route("/api/backtest/scripts/rename", post(api::handle_api_backtest_scripts_rename))
+        .route("/api/backtest/scripts/description", post(api::handle_api_backtest_scripts_description))
+        .route("/api/backtest/scripts/stats", post(api::handle_api_backtest_scripts_stats))
         .route("/api/backtest/run", post(api::handle_api_backtest_run))
         .route(
             "/api/channels/telegram/configure",

@@ -217,6 +217,10 @@ Examples:
         /// Host to bind to; defaults to config gateway.host
         #[arg(long)]
         host: Option<String>,
+
+        /// Enable verbose debug logging (agent loop, HTTP requests, tool calls, stream events)
+        #[arg(long)]
+        debug: bool,
     },
 
     /// Start long-running autonomous runtime (gateway + channels + heartbeat + scheduler)
@@ -243,6 +247,10 @@ Examples:
         /// Host to bind to; defaults to config gateway.host
         #[arg(long)]
         host: Option<String>,
+
+        /// Enable verbose debug logging (agent loop, HTTP requests, tool calls, stream events)
+        #[arg(long)]
+        debug: bool,
     },
 
     /// Manage OS service lifecycle (launchd/systemd user service)
@@ -684,14 +692,26 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Initialize logging - respects RUST_LOG env var, defaults to INFO
+    // Determine if --debug was passed to gateway or daemon before initializing logging.
+    let debug_mode = matches!(
+        &cli.command,
+        Commands::Gateway { debug: true, .. } | Commands::Daemon { debug: true, .. }
+    );
+
+    // Initialize logging - respects RUST_LOG env var, defaults to INFO (or DEBUG with --debug)
+    let default_filter = if debug_mode { "debug" } else { "info" };
     let subscriber = fmt::Subscriber::builder()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new(default_filter)),
         )
         .finish();
 
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
+
+    if debug_mode {
+        tracing::info!("Debug logging enabled — all agent loop, HTTP and tool events will be printed");
+    }
 
     // Onboard runs quick setup by default, or the interactive wizard with --interactive.
     // The onboard wizard uses reqwest::blocking internally, which creates its own
@@ -787,7 +807,7 @@ async fn main() -> Result<()> {
         .await
         .map(|_| ()),
 
-        Commands::Gateway { port, host } => {
+        Commands::Gateway { port, host, .. } => {
             let port = port.unwrap_or(config.gateway.port);
             let host = host.unwrap_or_else(|| config.gateway.host.clone());
             if port == 0 {
@@ -798,7 +818,7 @@ async fn main() -> Result<()> {
             gateway::run_gateway(&host, port, config).await
         }
 
-        Commands::Daemon { port, host } => {
+        Commands::Daemon { port, host, .. } => {
             let port = port.unwrap_or(config.gateway.port);
             let host = host.unwrap_or_else(|| config.gateway.host.clone());
             if port == 0 {

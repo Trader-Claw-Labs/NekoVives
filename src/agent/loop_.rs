@@ -3617,11 +3617,62 @@ impl crate::agent::runtime::ToolExecutor for TraderToolExecutor {
         name: &str,
         input: serde_json::Value,
     ) -> Result<String, String> {
+        // Normalise common LLM hallucinations / aliases to real tool names.
+        let name = match name {
+            "web_search" | "search" | "google" | "brave_search" => "web_search",
+            "bash" | "run_shell" | "execute_command" | "run_command" => "shell",
+            "read_file" | "readfile" | "open_file" => "file_read",
+            "write_file" | "writefile" | "create_file" | "save_file" => "file_write",
+            "edit_file" | "modify_file" | "patch_file" => "file_edit",
+            "fetch" | "web_fetch" | "curl" | "http_get" => "web_fetch",
+            "grep" | "search_code" | "find_in_files" => "content_search",
+            "glob" | "find_files" | "list_files" => "glob_search",
+            other => other,
+        };
         let tool = self
             .tools
             .iter()
             .find(|t| t.name() == name)
-            .ok_or_else(|| format!("Tool not found: {name}"))?;
+            .ok_or_else(|| format!("Tool not found: {name}. Available tools: {}", self.tools.iter().map(|t| t.name()).collect::<Vec<_>>().join(", ")))?;
+
+        // Validate required parameters BEFORE calling the tool so we return a
+        // helpful error that lists what the model should have provided.
+        if let Some(required) = tool
+            .parameters_schema()
+            .get("required")
+            .and_then(|r| r.as_array())
+        {
+            let missing: Vec<&str> = required
+                .iter()
+                .filter_map(|v| v.as_str())
+                .filter(|param| input.get(param).is_none())
+                .collect();
+
+            if !missing.is_empty() {
+                let schema = tool.parameters_schema();
+                let props = schema.get("properties");
+                let hints: Vec<String> = missing
+                    .iter()
+                    .map(|p| {
+                        let desc = props
+                            .and_then(|ps| ps.get(p))
+                            .and_then(|pd| pd.get("description"))
+                            .and_then(|d| d.as_str())
+                            .unwrap_or("");
+                        if desc.is_empty() {
+                            format!("  - \"{p}\" (required)")
+                        } else {
+                            format!("  - \"{p}\": {desc}")
+                        }
+                    })
+                    .collect();
+                return Err(format!(
+                    "Missing required parameter(s) for tool '{name}':\n{}\nYou MUST include these in the tool_call arguments JSON.",
+                    hints.join("\n")
+                ));
+            }
+        }
+
         match tool.execute(input).await {
             Ok(result) => Ok(if result.success {
                 result.output

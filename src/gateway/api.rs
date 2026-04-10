@@ -2044,8 +2044,9 @@ pub async fn handle_api_backtest_scripts(
                     .unwrap_or("")
                     .to_string();
                 let path_str = path.to_string_lossy().to_string();
-                // Read first comment line as description
-                let description = std::fs::read_to_string(&path)
+
+                // Read first comment line as fallback description
+                let file_description = std::fs::read_to_string(&path)
                     .ok()
                     .and_then(|content| {
                         content
@@ -2054,10 +2055,27 @@ pub async fn handle_api_backtest_scripts(
                             .map(|l| l.trim_start_matches("//").trim().to_string())
                     })
                     .filter(|s| !s.is_empty());
+
+                // Read meta file for description and stats
+                let meta_path = path.with_extension("rhai.meta.json");
+                let meta: serde_json::Value = std::fs::read_to_string(&meta_path)
+                    .ok()
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_else(|| serde_json::json!({}));
+
+                // Prefer meta description over file comment
+                let description = meta.get("description")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .or(file_description);
+
+                let last_run_stats = meta.get("last_run_stats").cloned();
+
                 scripts.push(serde_json::json!({
                     "name": name,
                     "path": path_str,
                     "description": description,
+                    "last_run_stats": last_run_stats,
                 }));
             }
         }
@@ -2069,11 +2087,23 @@ pub async fn handle_api_backtest_scripts(
 #[derive(serde::Deserialize)]
 pub struct BacktestRunBody {
     pub script: String,
+    #[serde(default = "default_market_type")]
+    pub market_type: String,
     pub symbol: String,
+    #[serde(default = "default_interval")]
+    pub interval: String,
     pub from_date: String,
     pub to_date: String,
     pub initial_balance: f64,
     pub fee_pct: f64,
+}
+
+fn default_market_type() -> String {
+    "crypto".to_string()
+}
+
+fn default_interval() -> String {
+    "1m".to_string()
 }
 
 /// POST /api/backtest/run — run a real backtest using Binance OHLCV + Rhai engine
@@ -2108,7 +2138,9 @@ pub async fn handle_api_backtest_run(
 
     let metrics = crate::tools::backtest::run_backtest_engine(
         &script_path,
+        &body.market_type,
         &body.symbol,
+        &body.interval,
         &body.from_date,
         &body.to_date,
         body.initial_balance,
@@ -2130,7 +2162,9 @@ pub async fn handle_api_backtest_run(
 
     Json(serde_json::json!({
         "script": body.script,
+        "market_type": body.market_type,
         "symbol": body.symbol,
+        "interval": body.interval,
         "from_date": body.from_date,
         "to_date": body.to_date,
         "initial_balance": body.initial_balance,
@@ -2144,6 +2178,194 @@ pub async fn handle_api_backtest_run(
         "analysis": metrics.analysis,
     }))
     .into_response()
+}
+
+#[derive(serde::Deserialize)]
+pub struct DeleteScriptQuery {
+    pub path: String,
+}
+
+/// DELETE /api/backtest/scripts — delete a .rhai script
+pub async fn handle_api_backtest_scripts_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<DeleteScriptQuery>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let path = std::path::Path::new(&query.path);
+    if !path.exists() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "Script not found" })),
+        )
+            .into_response();
+    }
+
+    // Only allow deleting .rhai files in scripts directory
+    if path.extension().and_then(|e| e.to_str()) != Some("rhai") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "Can only delete .rhai files" })),
+        )
+            .into_response();
+    }
+
+    match std::fs::remove_file(path) {
+        Ok(_) => {
+            // Also remove the meta file if exists
+            let meta_path = path.with_extension("rhai.meta.json");
+            let _ = std::fs::remove_file(meta_path);
+            Json(serde_json::json!({ "success": true })).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("Failed to delete: {e}") })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct RenameScriptBody {
+    pub old_path: String,
+    pub new_name: String,
+}
+
+/// POST /api/backtest/scripts/rename — rename a .rhai script
+pub async fn handle_api_backtest_scripts_rename(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<RenameScriptBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let old_path = std::path::Path::new(&body.old_path);
+    if !old_path.exists() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "Script not found" })),
+        )
+            .into_response();
+    }
+
+    // Ensure new name has .rhai extension
+    let new_name = if body.new_name.ends_with(".rhai") {
+        body.new_name.clone()
+    } else {
+        format!("{}.rhai", body.new_name)
+    };
+
+    let new_path = old_path.parent().unwrap_or(old_path).join(&new_name);
+
+    match std::fs::rename(old_path, &new_path) {
+        Ok(_) => {
+            // Also rename meta file if exists
+            let old_meta = old_path.with_extension("rhai.meta.json");
+            if old_meta.exists() {
+                let new_meta = new_path.with_extension("rhai.meta.json");
+                let _ = std::fs::rename(old_meta, new_meta);
+            }
+            Json(serde_json::json!({ "success": true, "new_path": new_path.to_string_lossy() })).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("Failed to rename: {e}") })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct UpdateDescriptionBody {
+    pub path: String,
+    pub description: String,
+}
+
+/// POST /api/backtest/scripts/description — update script description (stored in meta file)
+pub async fn handle_api_backtest_scripts_description(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<UpdateDescriptionBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let script_path = std::path::Path::new(&body.path);
+    if !script_path.exists() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "Script not found" })),
+        )
+            .into_response();
+    }
+
+    // Store description in a sidecar .meta.json file
+    let meta_path = script_path.with_extension("rhai.meta.json");
+    let mut meta: serde_json::Value = std::fs::read_to_string(&meta_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    meta["description"] = serde_json::json!(body.description);
+
+    match std::fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap()) {
+        Ok(_) => Json(serde_json::json!({ "success": true })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("Failed to save: {e}") })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct UpdateStatsBody {
+    pub path: String,
+    pub stats: serde_json::Value,
+}
+
+/// POST /api/backtest/scripts/stats — save last run stats to meta file
+pub async fn handle_api_backtest_scripts_stats(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<UpdateStatsBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let script_path = std::path::Path::new(&body.path);
+    if !script_path.exists() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "Script not found" })),
+        )
+            .into_response();
+    }
+
+    // Store stats in a sidecar .meta.json file
+    let meta_path = script_path.with_extension("rhai.meta.json");
+    let mut meta: serde_json::Value = std::fs::read_to_string(&meta_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    meta["last_run_stats"] = body.stats;
+
+    match std::fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap()) {
+        Ok(_) => Json(serde_json::json!({ "success": true })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("Failed to save: {e}") })),
+        )
+            .into_response(),
+    }
 }
 
 #[cfg(test)]

@@ -25,6 +25,8 @@ pub struct OpenAiCompatClient {
     base_url: String,
     provider_name: String,
     max_retries: u32,
+    /// True when talking to Ollama — strips unsupported fields from the request.
+    is_ollama: bool,
 }
 
 impl OpenAiCompatClient {
@@ -34,12 +36,26 @@ impl OpenAiCompatClient {
         base_url: impl Into<String>,
         provider_name: impl Into<String>,
     ) -> Self {
+        let provider_name = provider_name.into();
+        // Local providers (Ollama) need a long read timeout — models can take minutes to
+        // generate the first token. Remote providers get 10 minutes as a safety cap.
+        let timeout = if provider_name == "ollama" {
+            Duration::from_secs(600) // 10 min — local model may be slow to load
+        } else {
+            Duration::from_secs(600)
+        };
+        let is_ollama = provider_name == "ollama";
+        let http = reqwest::Client::builder()
+            .timeout(timeout)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
-            http: reqwest::Client::new(),
+            http,
             api_key: api_key.into(),
             base_url: base_url.into(),
-            provider_name: provider_name.into(),
+            provider_name,
             max_retries: DEFAULT_MAX_RETRIES,
+            is_ollama,
         }
     }
 
@@ -48,9 +64,18 @@ impl OpenAiCompatClient {
         request: &MessageRequest,
     ) -> Result<MessageStream, ApiError> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let payload = build_chat_completion_request(request);
+        let payload = build_chat_completion_request_for(request, self.is_ollama);
 
         for attempt in 0..=self.max_retries {
+            tracing::debug!(
+                provider = %self.provider_name,
+                model = %request.model,
+                url = %url,
+                attempt,
+                is_ollama = self.is_ollama,
+                "Sending chat completion request"
+            );
+
             let resp = self
                 .http
                 .post(&url)
@@ -59,9 +84,24 @@ impl OpenAiCompatClient {
                 .json(&payload)
                 .send()
                 .await
-                .map_err(ApiError::Http)?;
+                .map_err(|e| {
+                    tracing::error!(
+                        provider = %self.provider_name,
+                        model = %request.model,
+                        url = %url,
+                        error = %e,
+                        "HTTP send failed (connection refused / timeout / DNS)"
+                    );
+                    ApiError::Http(e)
+                })?;
 
             let status = resp.status();
+            tracing::debug!(
+                provider = %self.provider_name,
+                model = %request.model,
+                status = status.as_u16(),
+                "Got HTTP response"
+            );
             if status.is_success() {
                 let request_id = resp
                     .headers()
@@ -85,9 +125,30 @@ impl OpenAiCompatClient {
 
             let body = resp.text().await.unwrap_or_default();
             let (error_type, message) = parse_error_body(&body);
-            let retryable = status.as_u16() == 429 || status.as_u16() >= 500;
+            // 408 = request timeout (Ollama / slow model), 429 = rate limit, 5xx = server error
+            let retryable = matches!(status.as_u16(), 408 | 429 | 500..=599);
+
+            tracing::error!(
+                provider = %self.provider_name,
+                model = %request.model,
+                url = %url,
+                status = status.as_u16(),
+                retryable,
+                attempt,
+                body = %body,
+                error_type = ?error_type,
+                message = ?message,
+                "Provider returned non-2xx response"
+            );
 
             if retryable && attempt < self.max_retries {
+                tracing::warn!(
+                    provider = %self.provider_name,
+                    status = status.as_u16(),
+                    attempt,
+                    max_retries = self.max_retries,
+                    "Retryable error — backing off before retry"
+                );
                 let delay = jittered_backoff(attempt, INITIAL_BACKOFF, MAX_BACKOFF);
                 tokio::time::sleep(delay).await;
                 continue;
@@ -167,8 +228,11 @@ impl MessageStream {
                                     self.queue.extend(events);
                                 }
                                 Err(e) => {
-                                    // Skip unknown chunks silently
-                                    let _ = e;
+                                    tracing::debug!(
+                                        data = %data,
+                                        error = %e,
+                                        "Failed to parse SSE chunk — skipping"
+                                    );
                                 }
                             }
                         }
@@ -461,7 +525,7 @@ impl ToolCallState {
 
 // ── Request building: InputMessage → OpenAI format ───────────────────────────
 
-fn build_chat_completion_request(request: &MessageRequest) -> Value {
+fn build_chat_completion_request_for(request: &MessageRequest, is_ollama: bool) -> Value {
     let mut messages = Vec::new();
 
     if let Some(system) = request.system.as_ref().filter(|s| !s.is_empty()) {
@@ -474,14 +538,23 @@ fn build_chat_completion_request(request: &MessageRequest) -> Value {
 
     let mut payload = json!({
         "model": request.model,
-        "max_tokens": request.max_tokens,
         "messages": messages,
         "stream": request.stream,
-        "stream_options": { "include_usage": true },
     });
 
+    // Ollama uses num_predict instead of max_tokens, and doesn't support stream_options.
+    // Other OpenAI-compat providers use max_tokens + stream_options.
+    if is_ollama {
+        payload["num_predict"] = json!(request.max_tokens);
+    } else {
+        payload["max_tokens"] = json!(request.max_tokens);
+        payload["stream_options"] = json!({ "include_usage": true });
+    }
+
     if let Some(tools) = &request.tools {
-        payload["tools"] = Value::Array(tools.iter().map(openai_tool_definition).collect());
+        if !tools.is_empty() {
+            payload["tools"] = Value::Array(tools.iter().map(openai_tool_definition).collect());
+        }
     }
     if let Some(tool_choice) = &request.tool_choice {
         payload["tool_choice"] = openai_tool_choice(tool_choice);
