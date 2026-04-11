@@ -3,6 +3,28 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::path::PathBuf;
 
+// ── Bundled default strategy scripts (embedded at compile time) ──────────────
+
+const POLYMARKET_4MIN_SCRIPT: &str = include_str!("scripts/polymarket_4min.rhai");
+const STRATEGY_REFERENCE_SCRIPT: &str = include_str!("scripts/strategy_reference.rhai");
+
+/// Write bundled default scripts to `<workspace>/scripts/` if they don't exist yet.
+/// Called by both backtest tools so the scripts are always available on first run.
+pub fn ensure_default_scripts(workspace_dir: &std::path::Path) {
+    let scripts_dir = workspace_dir.join("scripts");
+    let _ = std::fs::create_dir_all(&scripts_dir);
+    let defaults = [
+        ("polymarket_4min.rhai", POLYMARKET_4MIN_SCRIPT),
+        ("strategy_reference.rhai", STRATEGY_REFERENCE_SCRIPT),
+    ];
+    for (name, content) in &defaults {
+        let path = scripts_dir.join(name);
+        if !path.exists() {
+            let _ = std::fs::write(&path, content);
+        }
+    }
+}
+
 // ── backtest_list_scripts ────────────────────────────────────────────
 
 /// List available .rhai strategy scripts the agent can run backtests on.
@@ -35,6 +57,7 @@ impl Tool for BacktestListScriptsTool {
     }
 
     async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        ensure_default_scripts(&self.workspace_dir);
         let scripts_dir = self.workspace_dir.join("scripts");
         let _ = std::fs::create_dir_all(&scripts_dir);
 
@@ -200,6 +223,8 @@ impl Tool for BacktestRunTool {
             .get("interval")
             .and_then(|v| v.as_str())
             .unwrap_or("1m");
+
+        ensure_default_scripts(&self.workspace_dir);
 
         // Resolve path: if input is just a filename, look in scripts/
         let script_path = {
@@ -414,8 +439,8 @@ async fn fetch_candles(
             break;
         }
 
-        // Small delay to avoid rate limiting (Binance allows ~20 req/s)
-        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        // Small delay to avoid rate limiting
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
     tracing::info!("[BACKTEST] Fetched {} total candles in {} requests", all_candles.len(), request_count);
@@ -752,6 +777,8 @@ fn run_rhai_backtest(
         kv:          std::collections::HashMap<String, f64>,
         pending_buy:  bool,
         pending_sell: bool,
+        stop_loss:    f64,  // 0 = inactive
+        take_profit:  f64,  // 0 = inactive
     }
 
     let state = Arc::new(Mutex::new(State {
@@ -763,6 +790,8 @@ fn run_rhai_backtest(
         kv: std::collections::HashMap::new(),
         pending_buy: false,
         pending_sell: false,
+        stop_loss: 0.0,
+        take_profit: 0.0,
     }));
 
     // Clones for closures
@@ -792,6 +821,55 @@ fn run_rhai_backtest(
             .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
             .unwrap_or_else(|| c.open_time_ms.to_string());
 
+        // ── Stop-loss / Take-profit enforcement ──────────────────────────────
+        {
+            let mut s = state.lock().unwrap();
+            if s.position > 0.0 {
+                let price = c.close;
+                let hit_sl = s.stop_loss  > 0.0 && price <= s.stop_loss;
+                let hit_tp = s.take_profit > 0.0 && price >= s.take_profit;
+                if hit_sl || hit_tp {
+                    let fee_factor = 1.0 - fee_pct / 100.0;
+                    let pos     = s.position;
+                    let proceeds = pos * price * fee_factor;
+                    let pnl      = proceeds - s.entry_price * pos;
+                    s.trades.push(Trade {
+                        timestamp: ts.clone(),
+                        side: if hit_sl { "stop_loss".into() } else { "take_profit".into() },
+                        price,
+                        size: pos,
+                        pnl,
+                    });
+                    s.balance     = proceeds;
+                    s.position    = 0.0;
+                    s.entry_price = 0.0;
+                    s.stop_loss   = 0.0;
+                    s.take_profit = 0.0;
+                }
+            } else if s.position < 0.0 {
+                let price = c.close;
+                let hit_sl = s.stop_loss  > 0.0 && price >= s.stop_loss;
+                let hit_tp = s.take_profit > 0.0 && price <= s.take_profit;
+                if hit_sl || hit_tp {
+                    let fee_factor = 1.0 - fee_pct / 100.0;
+                    let pos_abs = s.position.abs();
+                    let pnl = (s.entry_price - price) * pos_abs * fee_factor;
+                    s.trades.push(Trade {
+                        timestamp: ts.clone(),
+                        side: if hit_sl { "short_stop_loss".into() } else { "short_take_profit".into() },
+                        price,
+                        size: pos_abs,
+                        pnl,
+                    });
+                    s.balance    += pnl;
+                    s.position    = 0.0;
+                    s.entry_price = 0.0;
+                    s.stop_loss   = 0.0;
+                    s.take_profit = 0.0;
+                }
+            }
+        }
+
         if has_on_candle {
             // ── ctx-based API ────────────────────────────────────────
             let (cur_balance, cur_position, cur_entry_price, cur_entry_index) = {
@@ -799,18 +877,21 @@ fn run_rhai_backtest(
                 (s.balance, s.position, s.entry_price, s.entry_index)
             };
 
+            let cur_open_positions: i64 = if cur_position != 0.0 { 1 } else { 0 };
+
             // Build ctx map
             let mut ctx = Map::new();
-            ctx.insert("close".into(),       Dynamic::from(c.close));
-            ctx.insert("open".into(),        Dynamic::from(c.open));
-            ctx.insert("high".into(),        Dynamic::from(c.high));
-            ctx.insert("low".into(),         Dynamic::from(c.low));
-            ctx.insert("volume".into(),      Dynamic::from(c.volume));
-            ctx.insert("index".into(),       Dynamic::from(i as i64));
-            ctx.insert("position".into(),    Dynamic::from(cur_position));
-            ctx.insert("entry_price".into(), Dynamic::from(cur_entry_price));
-            ctx.insert("entry_index".into(), Dynamic::from(cur_entry_index));
-            ctx.insert("balance".into(),     Dynamic::from(cur_balance));
+            ctx.insert("close".into(),          Dynamic::from(c.close));
+            ctx.insert("open".into(),           Dynamic::from(c.open));
+            ctx.insert("high".into(),           Dynamic::from(c.high));
+            ctx.insert("low".into(),            Dynamic::from(c.low));
+            ctx.insert("volume".into(),         Dynamic::from(c.volume));
+            ctx.insert("index".into(),          Dynamic::from(i as i64));
+            ctx.insert("position".into(),       Dynamic::from(cur_position));
+            ctx.insert("entry_price".into(),    Dynamic::from(cur_entry_price));
+            ctx.insert("entry_index".into(),    Dynamic::from(cur_entry_index));
+            ctx.insert("balance".into(),        Dynamic::from(cur_balance));
+            ctx.insert("open_positions".into(), Dynamic::from(cur_open_positions));
 
             // close_at(idx) — returns close price at a past index
             let closes_c = closes_arc.clone();
@@ -911,6 +992,8 @@ let ctx = #{
             let state_sell = state.clone();
             let state_set  = state.clone();
             let state_get  = state.clone();
+            let state_ssl  = state.clone();
+            let state_stp  = state.clone();
             let cur_i      = i;
 
             // ctx.close_at(idx) → f64
@@ -921,6 +1004,28 @@ let ctx = #{
             let volumes_fn2 = volumes_arc.clone();
             eng2.register_fn("volume_at_impl", move |idx: i64| -> f64 {
                 volumes_fn2.get(idx as usize).copied().unwrap_or(0.0)
+            });
+
+            // ctx.high_at(idx) → f64
+            let highs_fn = highs_arc.clone();
+            eng2.register_fn("high_at_impl", move |idx: i64| -> f64 {
+                highs_fn.get(idx as usize).copied().unwrap_or(0.0)
+            });
+
+            // ctx.low_at(idx) → f64
+            let lows_fn = lows_arc.clone();
+            eng2.register_fn("low_at_impl", move |idx: i64| -> f64 {
+                lows_fn.get(idx as usize).copied().unwrap_or(0.0)
+            });
+
+            // ctx.set_stop_loss(price)
+            eng2.register_fn("set_stop_loss_impl", move |price: f64| {
+                state_ssl.lock().unwrap().stop_loss = price;
+            });
+
+            // ctx.set_take_profit(price)
+            eng2.register_fn("set_take_profit_impl", move |price: f64| {
+                state_stp.lock().unwrap().take_profit = price;
             });
 
             // rsi(period) computed inline
@@ -976,6 +1081,8 @@ let ctx = #{
                     s.balance     = 0.0;
                     s.entry_price = buy_price;
                     s.entry_index = cur_i as i64;
+                    s.stop_loss   = 0.0;
+                    s.take_profit = 0.0;
                 }
             });
 
@@ -1002,6 +1109,8 @@ let ctx = #{
                     s.balance     = proceeds;
                     s.position    = 0.0;
                     s.entry_price = 0.0;
+                    s.stop_loss   = 0.0;
+                    s.take_profit = 0.0;
                 } else if s.position < 0.0 {
                     // Close short
                     let fee_factor = 1.0 - sell_fee / 100.0;
@@ -1017,6 +1126,8 @@ let ctx = #{
                     s.balance    += pnl;
                     s.position    = 0.0;
                     s.entry_price = 0.0;
+                    s.stop_loss   = 0.0;
+                    s.take_profit = 0.0;
                 }
             });
 
@@ -1083,62 +1194,56 @@ on_candle_shim();
             // user script to replace ctx.rsi(n) → rsi_impl(n), ctx.ema(n) → ema_impl(n), etc.
 
             let patched_script = script_content
-                .replace("ctx.rsi(",       "rsi_impl(")
-                .replace("ctx.ema(",       "ema_impl(")
-                .replace("ctx.atr(",       "atr_impl(")
-                .replace("ctx.close_at(",  "close_at_impl(")
-                .replace("ctx.volume_at(", "volume_at_impl(")
-                .replace("ctx.buy(",       "buy_impl(")
-                .replace("ctx.sell(",      "sell_impl(")
-                .replace("ctx.set(",       "set_impl(")
-                .replace("ctx.get(",       "get_impl(");
-
-            // Format floats with decimal point to ensure Rhai treats them as floats
-            let fmt_float = |f: f64| -> String {
-                let s = format!("{}", f);
-                if s.contains('.') || s.contains('e') { s } else { format!("{}.0", s) }
-            };
+                .replace("ctx.rsi(",            "rsi_impl(")
+                .replace("ctx.ema(",            "ema_impl(")
+                .replace("ctx.atr(",            "atr_impl(")
+                .replace("ctx.close_at(",       "close_at_impl(")
+                .replace("ctx.high_at(",        "high_at_impl(")
+                .replace("ctx.low_at(",         "low_at_impl(")
+                .replace("ctx.volume_at(",      "volume_at_impl(")
+                .replace("ctx.set_stop_loss(",  "set_stop_loss_impl(")
+                .replace("ctx.set_take_profit(","set_take_profit_impl(")
+                .replace("ctx.buy(",            "buy_impl(")
+                .replace("ctx.sell(",           "sell_impl(")
+                .replace("ctx.set(",            "set_impl(")
+                .replace("ctx.get(",            "get_impl(");
 
             let full_script = format!(r#"
 {patched_script}
 
 let ctx = #{{}};
-ctx.close       = {close};
-ctx.open        = {open};
-ctx.high        = {high};
-ctx.low         = {low};
-ctx.volume      = {volume};
-ctx.index       = {index};
-ctx.position    = {position};
-ctx.entry_price = {entry_price};
-ctx.entry_index = {entry_index};
-ctx.balance     = {balance};
+ctx.close          = {close};
+ctx.open           = {open};
+ctx.high           = {high};
+ctx.low            = {low};
+ctx.volume         = {volume};
+ctx.index          = {index};
+ctx.position       = {position};
+ctx.entry_price    = {entry_price};
+ctx.entry_index    = {entry_index};
+ctx.balance        = {balance};
+ctx.open_positions = {open_positions};
 on_candle(ctx);
 "#,
-                patched_script = patched_script,
-                close       = fmt_float(c.close),
-                open        = fmt_float(c.open),
-                high        = fmt_float(c.high),
-                low         = fmt_float(c.low),
-                volume      = fmt_float(c.volume),
-                index       = i,
-                position    = fmt_float(cur_pos),
-                entry_price = fmt_float(cur_ep),
-                entry_index = cur_ei,
-                balance     = fmt_float(cur_bal),
+                patched_script  = patched_script,
+                close           = c.close,
+                open            = c.open,
+                high            = c.high,
+                low             = c.low,
+                volume          = c.volume,
+                index           = i,
+                position        = cur_pos,
+                entry_price     = cur_ep,
+                entry_index     = cur_ei,
+                balance         = cur_bal,
+                open_positions  = cur_open_positions,
             );
-
-            // Log the full script for the first candle to debug
-            if i == 0 {
-                tracing::debug!("[BACKTEST-RHAI] Full script for candle 0:\n{}", full_script);
-            }
 
             let ast2 = match eng2.compile(&full_script) {
                 Ok(a) => a,
                 Err(e) => {
-                    // Log first 5 compile errors
-                    if i < 5 {
-                        tracing::error!("[BACKTEST-RHAI] Failed to compile at candle {}: {}", i, e);
+                    if i == 0 {
+                        tracing::error!("[BACKTEST-RHAI] Failed to compile patched script at candle {}: {}", i, e);
                         tracing::debug!("[BACKTEST-RHAI] Patched script:\n{}", full_script);
                     }
                     continue;
@@ -1146,17 +1251,9 @@ on_candle(ctx);
             };
             let mut scope2 = Scope::new();
             if let Err(e) = eng2.eval_ast_with_scope::<Dynamic>(&mut scope2, &ast2) {
-                // Log first 5 errors and then every 1000th
-                if i < 5 || i % 1000 == 0 {
-                    tracing::warn!("[BACKTEST-RHAI] on_candle error at candle {}: {}", i, e);
+                if i == 0 {
+                    tracing::warn!("[BACKTEST-RHAI] on_candle execution error at candle {}: {}", i, e);
                 }
-            }
-
-            // Log first trade attempt for debugging
-            if i == 11 {
-                let s = state.lock().unwrap();
-                tracing::info!("[BACKTEST-RHAI] After candle 11: position={}, balance={}, trades={}",
-                    s.position, s.balance, s.trades.len());
             }
         } else {
             // ── Legacy signal-based API ───────────────────────────────
