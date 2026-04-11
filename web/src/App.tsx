@@ -9,6 +9,7 @@ import Wallets from './pages/Wallets'
 import Polymarket from './pages/Polymarket'
 import Telegram from './pages/Telegram'
 import Skills from './pages/Skills'
+import ScheduledJobs from './pages/ScheduledJobs'
 import Chat from './pages/Chat'
 import LLMSettings from './pages/LLMSettings'
 import Config from './pages/Config'
@@ -133,6 +134,7 @@ export default function App() {
             <Route path="/polymarket" element={<Polymarket />} />
             <Route path="/telegram" element={<Telegram />} />
             <Route path="/skills" element={<Skills />} />
+            <Route path="/scheduled-jobs" element={<ScheduledJobs />} />
             <Route path="/chat" element={<Chat />} />
             <Route path="/tradingview" element={<TradingViewPage />} />
             <Route path="/backtesting" element={<Backtesting />} />

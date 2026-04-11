@@ -581,6 +581,15 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/config", put(api::handle_api_config_put))
         .layer(RequestBodyLimitLayer::new(1_048_576));
 
+    // Backtest run needs longer timeout (5 minutes) for fetching large datasets
+    let backtest_run_router = Router::new()
+        .route("/api/backtest/run", post(api::handle_api_backtest_run))
+        .with_state(state.clone())
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(300), // 5 minutes
+        ));
+
     // Build router with middleware
     let app = Router::new()
         // ── Existing routes ──
@@ -596,7 +605,11 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/tools", get(api::handle_api_tools))
         .route("/api/cron", get(api::handle_api_cron_list))
         .route("/api/cron", post(api::handle_api_cron_add))
+        .route("/api/cron/agent", post(api::handle_api_cron_agent_add))
         .route("/api/cron/{id}", delete(api::handle_api_cron_delete))
+        .route("/api/cron/{id}", put(api::handle_api_cron_update))
+        .route("/api/skills", get(api::handle_api_skills_list))
+        .route("/api/skills/content", get(api::handle_api_skills_content))
         .route("/api/integrations", get(api::handle_api_integrations))
         .route(
             "/api/doctor",
@@ -651,7 +664,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/backtest/scripts/rename", post(api::handle_api_backtest_scripts_rename))
         .route("/api/backtest/scripts/description", post(api::handle_api_backtest_scripts_description))
         .route("/api/backtest/scripts/stats", post(api::handle_api_backtest_scripts_stats))
-        .route("/api/backtest/run", post(api::handle_api_backtest_run))
+        .route("/api/backtest/scripts/content", get(api::handle_api_backtest_scripts_content_get).post(api::handle_api_backtest_scripts_content_post))
         .route(
             "/api/channels/telegram/configure",
             get(api::handle_api_telegram_get).post(api::handle_api_telegram_configure),
@@ -687,7 +700,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/ws/chat", get(ws::handle_ws_chat))
         .with_state(state);
 
-    let app = ws_router.merge(app);
+    // Merge all routers: WS (no timeout) + backtest/run (5min timeout) + main (30s timeout)
+    let app = ws_router.merge(backtest_run_router).merge(app);
 
     // Spawn Telegram (and any other configured channels) alongside the HTTP server.
     // start_channels() runs the long-poll loop; if no channels are configured it exits

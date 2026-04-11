@@ -296,9 +296,11 @@ pub async fn handle_api_cron_list(
                         "id": job.id,
                         "name": job.name,
                         "command": job.command,
+                        "prompt": job.prompt,
                         "next_run": job.next_run.to_rfc3339(),
                         "last_run": job.last_run.map(|t| t.to_rfc3339()),
                         "last_status": job.last_status,
+                        "last_output": job.last_output,
                         "enabled": job.enabled,
                     })
                 })
@@ -364,6 +366,111 @@ pub async fn handle_api_cron_delete(
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("Failed to remove cron job: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct CronAgentBody {
+    pub name: Option<String>,
+    pub schedule: String,
+    pub prompt: String,
+}
+
+/// POST /api/cron/agent — add a new agent job (with prompt)
+pub async fn handle_api_cron_agent_add(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<CronAgentBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let config = state.config.lock().clone();
+    let schedule = crate::cron::Schedule::Cron {
+        expr: body.schedule,
+        tz: None,
+    };
+
+    match crate::cron::add_agent_job(
+        &config,
+        body.name,
+        schedule,
+        &body.prompt,
+        crate::cron::SessionTarget::Isolated,
+        None,
+        None,
+        false,
+    ) {
+        Ok(job) => Json(serde_json::json!({
+            "status": "ok",
+            "job": {
+                "id": job.id,
+                "name": job.name,
+                "prompt": job.prompt,
+                "enabled": job.enabled,
+            }
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to add agent job: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct CronUpdateBody {
+    pub enabled: Option<bool>,
+    pub name: Option<String>,
+    pub schedule: Option<String>,
+    pub prompt: Option<String>,
+    pub command: Option<String>,
+}
+
+/// PUT /api/cron/:id — update a cron job (enable/disable, rename, etc.)
+pub async fn handle_api_cron_update(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<CronUpdateBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let config = state.config.lock().clone();
+
+    let schedule = body.schedule.map(|expr| crate::cron::Schedule::Cron {
+        expr,
+        tz: None,
+    });
+
+    let patch = crate::cron::CronJobPatch {
+        enabled: body.enabled,
+        name: body.name,
+        schedule,
+        command: body.command,
+        prompt: body.prompt,
+        ..crate::cron::CronJobPatch::default()
+    };
+
+    match crate::cron::update_job(&config, &id, patch) {
+        Ok(job) => Json(serde_json::json!({
+            "status": "ok",
+            "job": {
+                "id": job.id,
+                "name": job.name,
+                "enabled": job.enabled,
+            }
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to update cron job: {e}")})),
         )
             .into_response(),
     }
@@ -1957,6 +2064,98 @@ fn hydrate_config_for_save(
     incoming
 }
 
+// ── Agent Skills ─────────────────────────────────────────────────
+
+/// GET /api/skills — list installed agent skills
+pub async fn handle_api_skills_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let skills = crate::skills::load_skills(&workspace_dir);
+
+    let skills_json: Vec<serde_json::Value> = skills
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "name": s.name,
+                "description": s.description,
+                "version": s.version,
+                "author": s.author,
+                "tags": s.tags,
+                "location": s.location.as_ref().map(|p| p.to_string_lossy().to_string()).unwrap_or_default(),
+            })
+        })
+        .collect();
+
+    Json(serde_json::json!({ "skills": skills_json })).into_response()
+}
+
+#[derive(serde::Deserialize)]
+pub struct SkillContentQuery {
+    pub path: String,
+}
+
+/// GET /api/skills/content — read skill file content
+pub async fn handle_api_skills_content(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<SkillContentQuery>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let path = std::path::Path::new(&query.path);
+
+    // Security: only allow reading from skills directory
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let skills_dir = workspace_dir.join("skills");
+
+    // Also check open-skills directory if enabled
+    let is_valid_path = path.starts_with(&skills_dir)
+        || path.ancestors().any(|p| p.file_name().map(|n| n == "skills").unwrap_or(false));
+
+    if !is_valid_path {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "Can only read files from skills directories" })),
+        )
+            .into_response();
+    }
+
+    if !path.exists() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "Skill file not found" })),
+        )
+            .into_response();
+    }
+
+    // Only allow reading SKILL.md or SKILL.toml files
+    let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if filename != "SKILL.md" && filename != "SKILL.toml" {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "Can only read SKILL.md or SKILL.toml files" })),
+        )
+            .into_response();
+    }
+
+    match std::fs::read_to_string(path) {
+        Ok(content) => Json(serde_json::json!({ "content": content })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("Failed to read: {e}") })),
+        )
+            .into_response(),
+    }
+}
+
 // ── TradingView Screener ─────────────────────────────────────────
 
 #[derive(serde::Deserialize)]
@@ -2359,6 +2558,91 @@ pub async fn handle_api_backtest_scripts_stats(
     meta["last_run_stats"] = body.stats;
 
     match std::fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap()) {
+        Ok(_) => Json(serde_json::json!({ "success": true })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("Failed to save: {e}") })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct GetScriptContentQuery {
+    pub path: String,
+}
+
+/// GET /api/backtest/scripts/content — read script content
+pub async fn handle_api_backtest_scripts_content_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<GetScriptContentQuery>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let script_path = std::path::Path::new(&query.path);
+    if !script_path.exists() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "Script not found" })),
+        )
+            .into_response();
+    }
+
+    // Only allow reading .rhai files
+    if script_path.extension().and_then(|e| e.to_str()) != Some("rhai") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "Can only read .rhai files" })),
+        )
+            .into_response();
+    }
+
+    match std::fs::read_to_string(script_path) {
+        Ok(content) => Json(serde_json::json!({ "content": content })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("Failed to read: {e}") })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct SaveScriptContentBody {
+    pub path: String,
+    pub content: String,
+}
+
+/// POST /api/backtest/scripts/content — save script content
+pub async fn handle_api_backtest_scripts_content_post(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<SaveScriptContentBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let script_path = std::path::Path::new(&body.path);
+
+    // Only allow writing .rhai files
+    if script_path.extension().and_then(|e| e.to_str()) != Some("rhai") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "Can only write .rhai files" })),
+        )
+            .into_response();
+    }
+
+    // Create parent directories if needed
+    if let Some(parent) = script_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    match std::fs::write(script_path, &body.content) {
         Ok(_) => Json(serde_json::json!({ "success": true })).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,

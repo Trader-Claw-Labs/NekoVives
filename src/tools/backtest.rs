@@ -414,8 +414,8 @@ async fn fetch_candles(
             break;
         }
 
-        // Small delay to avoid rate limiting
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // Small delay to avoid rate limiting (Binance allows ~20 req/s)
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
     }
 
     tracing::info!("[BACKTEST] Fetched {} total candles in {} requests", all_candles.len(), request_count);
@@ -1093,6 +1093,12 @@ on_candle_shim();
                 .replace("ctx.set(",       "set_impl(")
                 .replace("ctx.get(",       "get_impl(");
 
+            // Format floats with decimal point to ensure Rhai treats them as floats
+            let fmt_float = |f: f64| -> String {
+                let s = format!("{}", f);
+                if s.contains('.') || s.contains('e') { s } else { format!("{}.0", s) }
+            };
+
             let full_script = format!(r#"
 {patched_script}
 
@@ -1110,23 +1116,29 @@ ctx.balance     = {balance};
 on_candle(ctx);
 "#,
                 patched_script = patched_script,
-                close       = c.close,
-                open        = c.open,
-                high        = c.high,
-                low         = c.low,
-                volume      = c.volume,
+                close       = fmt_float(c.close),
+                open        = fmt_float(c.open),
+                high        = fmt_float(c.high),
+                low         = fmt_float(c.low),
+                volume      = fmt_float(c.volume),
                 index       = i,
-                position    = cur_pos,
-                entry_price = cur_ep,
+                position    = fmt_float(cur_pos),
+                entry_price = fmt_float(cur_ep),
                 entry_index = cur_ei,
-                balance     = cur_bal,
+                balance     = fmt_float(cur_bal),
             );
+
+            // Log the full script for the first candle to debug
+            if i == 0 {
+                tracing::debug!("[BACKTEST-RHAI] Full script for candle 0:\n{}", full_script);
+            }
 
             let ast2 = match eng2.compile(&full_script) {
                 Ok(a) => a,
                 Err(e) => {
-                    if i == 0 {
-                        tracing::error!("[BACKTEST-RHAI] Failed to compile patched script at candle {}: {}", i, e);
+                    // Log first 5 compile errors
+                    if i < 5 {
+                        tracing::error!("[BACKTEST-RHAI] Failed to compile at candle {}: {}", i, e);
                         tracing::debug!("[BACKTEST-RHAI] Patched script:\n{}", full_script);
                     }
                     continue;
@@ -1134,9 +1146,17 @@ on_candle(ctx);
             };
             let mut scope2 = Scope::new();
             if let Err(e) = eng2.eval_ast_with_scope::<Dynamic>(&mut scope2, &ast2) {
-                if i == 0 {
-                    tracing::warn!("[BACKTEST-RHAI] on_candle execution error at candle {}: {}", i, e);
+                // Log first 5 errors and then every 1000th
+                if i < 5 || i % 1000 == 0 {
+                    tracing::warn!("[BACKTEST-RHAI] on_candle error at candle {}: {}", i, e);
                 }
+            }
+
+            // Log first trade attempt for debugging
+            if i == 11 {
+                let s = state.lock().unwrap();
+                tracing::info!("[BACKTEST-RHAI] After candle 11: position={}, balance={}, trades={}",
+                    s.position, s.balance, s.trades.len());
             }
         } else {
             // ── Legacy signal-based API ───────────────────────────────

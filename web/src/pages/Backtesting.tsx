@@ -1,10 +1,11 @@
 import { useState, useEffect } from 'react'
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { useQuery, useMutation } from '@tanstack/react-query'
 import { apiFetch, apiPost, apiDelete } from '../hooks/useApi'
+import { useBacktestState, type BacktestConfig, type ProgressState, type MarketType, type BacktestResult } from '../hooks/useBacktestState'
 import {
   FlaskConical, Play, FileCode2, BarChart2, TrendingDown,
   AlertCircle, ChevronDown, ChevronRight, RefreshCw, Trash2,
-  Pencil, Save, X, FolderOpen, Activity, Check, Bitcoin, Vote,
+  Pencil, Save, X, FolderOpen, Activity, Check, Eye, Code2,
 } from 'lucide-react'
 import clsx from 'clsx'
 
@@ -22,19 +23,6 @@ interface BacktestScript {
     total_trades: number
     run_date: string
   }
-}
-
-type MarketType = 'crypto' | 'polymarket'
-
-interface BacktestConfig {
-  script: string
-  market_type: MarketType
-  symbol: string
-  interval: string
-  from_date: string
-  to_date: string
-  initial_balance: number
-  fee_pct: number
 }
 
 const CRYPTO_INTERVALS = [
@@ -61,25 +49,14 @@ const POLYMARKET_INTERVALS = [
   { value: '1d', label: '1d' },
 ]
 
-interface TradeLog {
-  timestamp: string
-  side: string
-  price: number
-  size: number
-  pnl: number
-}
-
-interface BacktestResult {
-  script: string
-  symbol: string
-  total_return_pct: number
-  sharpe_ratio: number | null
-  max_drawdown_pct: number
-  win_rate_pct: number
-  total_trades: number
-  worst_trades: TradeLog[]
-  analysis?: string
-}
+// Popular Polymarket markets (condition token IDs)
+const POPULAR_POLYMARKET_MARKETS = [
+  { id: '0x', label: 'Custom (enter manually)' },
+  { id: '21742633143463906290569050155826241533067272736897614950488156847949938836455', label: 'Presidential Election 2024' },
+  { id: '52114319501245915516055106046884209969926127482827954674443846427813813222426', label: 'Fed Rate Decision' },
+  { id: '48331043336612883890938759509493159234755048973500640148014422747788308965732', label: 'Bitcoin Price $100k' },
+  { id: '69236923137512312461235512361235123612351236123512361235123612351236123512351', label: 'ETH Price $5000' },
+]
 
 // ── Helpers ───────────────────────────────────────────────────────
 
@@ -250,13 +227,6 @@ function ResultPanel({ result }: { result: BacktestResult }) {
 
 // ── Progress Panel ────────────────────────────────────────────────
 
-interface ProgressState {
-  step: 'idle' | 'preparing' | 'fetching' | 'running' | 'analyzing' | 'done' | 'error'
-  message: string
-  progress?: number
-  startTime?: number
-}
-
 function ProgressPanel({ state }: { state: ProgressState }) {
   const [elapsed, setElapsed] = useState(0)
 
@@ -350,13 +320,15 @@ function ProgressPanel({ state }: { state: ProgressState }) {
 interface ScriptItemProps {
   script: BacktestScript
   isSelected: boolean
+  isRunning: boolean
   onSelect: () => void
   onDelete: () => void
   onRename: (newName: string) => void
   onUpdateDescription: (desc: string) => void
+  onView: () => void
 }
 
-function ScriptItem({ script, isSelected, onSelect, onDelete, onRename, onUpdateDescription }: ScriptItemProps) {
+function ScriptItem({ script, isSelected, isRunning, onSelect, onDelete, onRename, onUpdateDescription, onView }: ScriptItemProps) {
   const [isEditing, setIsEditing] = useState(false)
   const [editName, setEditName] = useState(script.name)
   const [editDesc, setEditDesc] = useState(script.description || '')
@@ -444,17 +416,35 @@ function ScriptItem({ script, isSelected, onSelect, onDelete, onRename, onUpdate
       )}
       style={{ backgroundColor: 'var(--color-surface-2)' }}
     >
-      <FileCode2
-        size={16}
-        className="mt-0.5 flex-shrink-0"
-        style={{
-          color: isSelected ? 'var(--color-accent)' : 'var(--color-text-muted)',
-        }}
-      />
+      {isRunning ? (
+        <RefreshCw
+          size={16}
+          className="mt-0.5 flex-shrink-0 animate-spin"
+          style={{ color: 'var(--color-accent)' }}
+        />
+      ) : (
+        <FileCode2
+          size={16}
+          className="mt-0.5 flex-shrink-0"
+          style={{
+            color: isSelected ? 'var(--color-accent)' : 'var(--color-text-muted)',
+          }}
+        />
+      )}
       <div className="min-w-0 flex-1">
-        <p className="text-sm font-mono font-semibold truncate" style={{ color: 'var(--color-text)' }}>
-          {script.name}
-        </p>
+        <div className="flex items-center gap-2">
+          <p className="text-sm font-mono font-semibold truncate" style={{ color: 'var(--color-text)' }}>
+            {script.name}
+          </p>
+          {isRunning && (
+            <span
+              className="text-[10px] px-1.5 py-0.5 rounded font-semibold uppercase tracking-wider"
+              style={{ backgroundColor: 'var(--color-accent)', color: '#000' }}
+            >
+              Running
+            </span>
+          )}
+        </div>
         {script.description && (
           <p className="text-xs mt-0.5 line-clamp-2" style={{ color: 'var(--color-text-muted)' }}>
             {script.description}
@@ -472,9 +462,16 @@ function ScriptItem({ script, isSelected, onSelect, onDelete, onRename, onUpdate
       </div>
       <div className="flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity" onClick={(e) => e.stopPropagation()}>
         <button
+          onClick={onView}
+          className="p-1.5 rounded hover:bg-[var(--color-surface)]"
+          title="View/Edit Code"
+        >
+          <Eye size={12} style={{ color: 'var(--color-text-muted)' }} />
+        </button>
+        <button
           onClick={() => setIsEditing(true)}
           className="p-1.5 rounded hover:bg-[var(--color-surface)]"
-          title="Edit"
+          title="Edit Name/Description"
         >
           <Pencil size={12} style={{ color: 'var(--color-text-muted)' }} />
         </button>
@@ -490,26 +487,185 @@ function ScriptItem({ script, isSelected, onSelect, onDelete, onRename, onUpdate
   )
 }
 
+// ── Script Viewer Modal ───────────────────────────────────────────
+
+interface ScriptViewerProps {
+  script: BacktestScript | null
+  onClose: () => void
+  onSave: (path: string, content: string) => void
+}
+
+function ScriptViewer({ script, onClose, onSave }: ScriptViewerProps) {
+  const [content, setContent] = useState('')
+  const [originalContent, setOriginalContent] = useState('')
+  const [isLoading, setIsLoading] = useState(true)
+  const [isSaving, setIsSaving] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (!script) return
+
+    setIsLoading(true)
+    setError(null)
+
+    apiFetch<{ content: string }>(`/api/backtest/scripts/content?path=${encodeURIComponent(script.path)}`)
+      .then((data) => {
+        setContent(data.content)
+        setOriginalContent(data.content)
+        setIsLoading(false)
+      })
+      .catch((err) => {
+        setError(err.message || 'Failed to load script')
+        setIsLoading(false)
+      })
+  }, [script])
+
+  if (!script) return null
+
+  const hasChanges = content !== originalContent
+
+  const handleSave = async () => {
+    setIsSaving(true)
+    try {
+      await onSave(script.path, content)
+      setOriginalContent(content)
+    } catch (err) {
+      setError((err as Error).message || 'Failed to save')
+    }
+    setIsSaving(false)
+  }
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center p-4"
+      style={{ backgroundColor: 'rgba(0,0,0,0.8)' }}
+      onClick={onClose}
+    >
+      <div
+        className="w-full max-w-4xl max-h-[90vh] rounded-lg border flex flex-col"
+        style={{ backgroundColor: 'var(--color-surface)', borderColor: 'var(--color-border)' }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        {/* Header */}
+        <div
+          className="flex items-center justify-between px-4 py-3 border-b"
+          style={{ borderColor: 'var(--color-border)' }}
+        >
+          <div className="flex items-center gap-3">
+            <Code2 size={18} style={{ color: 'var(--color-accent)' }} />
+            <div>
+              <h3 className="text-sm font-semibold font-mono" style={{ color: 'var(--color-text)' }}>
+                {script.name}
+              </h3>
+              {script.description && (
+                <p className="text-xs" style={{ color: 'var(--color-text-muted)' }}>
+                  {script.description}
+                </p>
+              )}
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            {hasChanges && (
+              <span className="text-xs px-2 py-0.5 rounded" style={{ backgroundColor: 'var(--color-warning)', color: '#000' }}>
+                Unsaved changes
+              </span>
+            )}
+            <button
+              onClick={onClose}
+              className="p-1.5 rounded hover:bg-[var(--color-surface-2)]"
+              title="Close"
+            >
+              <X size={16} style={{ color: 'var(--color-text-muted)' }} />
+            </button>
+          </div>
+        </div>
+
+        {/* Content */}
+        <div className="flex-1 overflow-hidden p-4">
+          {isLoading ? (
+            <div className="flex items-center justify-center h-64">
+              <RefreshCw size={24} className="animate-spin" style={{ color: 'var(--color-accent)' }} />
+            </div>
+          ) : error ? (
+            <div
+              className="flex items-center gap-2 p-4 rounded"
+              style={{ backgroundColor: 'rgba(255,68,68,0.1)', color: 'var(--color-danger)' }}
+            >
+              <AlertCircle size={16} />
+              <span className="text-sm">{error}</span>
+            </div>
+          ) : (
+            <textarea
+              value={content}
+              onChange={(e) => setContent(e.target.value)}
+              className="w-full h-full min-h-[400px] rounded p-3 font-mono text-sm resize-none"
+              style={{
+                backgroundColor: 'var(--color-surface-2)',
+                border: '1px solid var(--color-border)',
+                color: 'var(--color-text)',
+              }}
+              spellCheck={false}
+            />
+          )}
+        </div>
+
+        {/* Footer */}
+        <div
+          className="flex items-center justify-between px-4 py-3 border-t"
+          style={{ borderColor: 'var(--color-border)' }}
+        >
+          <p className="text-xs" style={{ color: 'var(--color-text-muted)' }}>
+            {content.split('\n').length} lines · Rhai Script
+          </p>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={onClose}
+              className="px-3 py-1.5 rounded text-sm"
+              style={{ color: 'var(--color-text-muted)' }}
+            >
+              Cancel
+            </button>
+            <button
+              onClick={handleSave}
+              disabled={!hasChanges || isSaving}
+              className="px-3 py-1.5 rounded text-sm font-semibold flex items-center gap-1.5 disabled:opacity-40"
+              style={{ backgroundColor: 'var(--color-accent)', color: '#000' }}
+            >
+              {isSaving ? (
+                <>
+                  <RefreshCw size={12} className="animate-spin" />
+                  Saving...
+                </>
+              ) : (
+                <>
+                  <Save size={12} />
+                  Save Changes
+                </>
+              )}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // ── Main page ─────────────────────────────────────────────────────
 
-const TODAY = new Date().toISOString().slice(0, 10)
-const THREE_MONTHS_AGO = new Date(Date.now() - 90 * 86400 * 1000).toISOString().slice(0, 10)
-
 export default function Backtesting() {
-  const queryClient = useQueryClient()
-  const [config, setConfig] = useState<BacktestConfig>({
-    script: '',
-    market_type: 'crypto',
-    symbol: 'BTCUSDT',
-    interval: '1m',
-    from_date: THREE_MONTHS_AGO,
-    to_date: TODAY,
-    initial_balance: 10000,
-    fee_pct: 0.1,
-  })
-  const [result, setResult] = useState<BacktestResult | null>(null)
+  // Use persisted backtest state hook - survives navigation
+  const {
+    config,
+    result,
+    progress,
+    isRunning,
+    setConfig: setConfigField,
+    runBacktest,
+  } = useBacktestState()
+
+  // Local UI state (doesn't need to persist)
   const [scriptsExpanded, setScriptsExpanded] = useState(true)
-  const [progress, setProgress] = useState<ProgressState>({ step: 'idle', message: '' })
+  const [viewingScript, setViewingScript] = useState<BacktestScript | null>(null)
 
   // Load available scripts
   const { data: scriptsData, isLoading: scriptsLoading, refetch: refetchScripts } = useQuery<{ scripts: BacktestScript[] }>({
@@ -532,7 +688,7 @@ export default function Backtesting() {
       log('Script deleted successfully')
       refetchScripts()
       if (config.script && !scripts.find(s => s.path !== config.script)) {
-        setConfig(c => ({ ...c, script: '' }))
+        setConfigField('script', '')
       }
     },
     onError: (err) => {
@@ -570,41 +726,33 @@ export default function Backtesting() {
     }
   })
 
-  // Run backtest
-  const mutation = useMutation({
-    mutationFn: async (cfg: BacktestConfig) => {
-      log('Starting backtest with config:', cfg)
-
-      setProgress({ step: 'preparing', message: 'Validating configuration...', startTime: Date.now() })
-      await new Promise(r => setTimeout(r, 300))
-
-      setProgress({ step: 'fetching', message: `Fetching ${cfg.symbol} ${cfg.interval} candles from Binance (${cfg.from_date} to ${cfg.to_date})...`, startTime: Date.now() })
-
-      const response = await apiPost<BacktestResult>('/api/backtest/run', cfg)
-
-      setProgress({ step: 'running', message: 'Executing Rhai strategy engine...', startTime: Date.now() })
-      await new Promise(r => setTimeout(r, 200))
-
-      setProgress({ step: 'analyzing', message: 'Computing metrics and analysis...', startTime: Date.now() })
-      await new Promise(r => setTimeout(r, 200))
-
-      log('Backtest complete:', response)
-      return response
+  // Save script content mutation
+  const saveScriptMutation = useMutation({
+    mutationFn: ({ path, content }: { path: string; content: string }) => {
+      log('Saving script content:', path)
+      return apiPost('/api/backtest/scripts/content', { path, content })
     },
-    onSuccess: (data) => {
-      setProgress({ step: 'done', message: 'Backtest complete!' })
-      setResult(data)
+    onSuccess: () => {
+      log('Script content saved successfully')
+      refetchScripts()
+    },
+    onError: (err) => {
+      log('Save script error:', err)
+    }
+  })
 
-      // Save stats to the script
+  // Save stats to script after successful backtest
+  useEffect(() => {
+    if (result && config.script) {
       const selectedScript = scripts.find(s => s.path === config.script)
       if (selectedScript) {
         apiPost('/api/backtest/scripts/stats', {
           path: config.script,
           stats: {
-            total_return_pct: data.total_return_pct,
-            sharpe_ratio: data.sharpe_ratio,
-            win_rate_pct: data.win_rate_pct,
-            total_trades: data.total_trades,
+            total_return_pct: result.total_return_pct,
+            sharpe_ratio: result.sharpe_ratio,
+            win_rate_pct: result.win_rate_pct,
+            total_trades: result.total_trades,
             run_date: new Date().toISOString(),
           }
         }).then(() => {
@@ -614,18 +762,14 @@ export default function Backtesting() {
           log('Failed to save stats:', err)
         })
       }
-    },
-    onError: (err) => {
-      log('Backtest error:', err)
-      setProgress({ step: 'error', message: `Error: ${(err as Error)?.message ?? String(err)}` })
-    },
-  })
+    }
+  }, [result?.total_return_pct]) // Only run when result changes
 
   function set<K extends keyof BacktestConfig>(k: K, v: BacktestConfig[K]) {
-    setConfig((c) => ({ ...c, [k]: v }))
+    setConfigField(k, v)
   }
 
-  const canRun = config.script && !mutation.isPending
+  const canRun = config.script && !isRunning
 
   return (
     <div className="p-6 max-w-6xl mx-auto">
@@ -652,43 +796,32 @@ export default function Backtesting() {
         </h2>
 
         <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-9 gap-3 items-end">
-          {/* Market Type Toggle */}
+          {/* Market Type Select */}
           <div>
             <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>Market</label>
-            <div className="flex rounded overflow-hidden" style={{ border: '1px solid var(--color-border)' }}>
-              <button
-                onClick={() => {
-                  set('market_type', 'crypto')
+            <select
+              value={config.market_type}
+              onChange={(e) => {
+                const newType = e.target.value as MarketType
+                set('market_type', newType)
+                if (newType === 'crypto') {
                   set('symbol', 'BTCUSDT')
                   set('interval', '1m')
-                }}
-                className={clsx(
-                  'flex-1 flex items-center justify-center gap-1.5 py-2 px-2 text-xs font-semibold transition-colors',
-                  config.market_type === 'crypto'
-                    ? 'bg-[var(--color-accent)] text-black'
-                    : 'bg-[var(--color-surface-2)] text-[var(--color-text-muted)] hover:text-[var(--color-text)]'
-                )}
-              >
-                <Bitcoin size={12} />
-                Crypto
-              </button>
-              <button
-                onClick={() => {
-                  set('market_type', 'polymarket')
+                } else {
                   set('symbol', '')
                   set('interval', '1h')
-                }}
-                className={clsx(
-                  'flex-1 flex items-center justify-center gap-1.5 py-2 px-2 text-xs font-semibold transition-colors',
-                  config.market_type === 'polymarket'
-                    ? 'bg-[var(--color-accent)] text-black'
-                    : 'bg-[var(--color-surface-2)] text-[var(--color-text-muted)] hover:text-[var(--color-text)]'
-                )}
-              >
-                <Vote size={12} />
-                Polymarket
-              </button>
-            </div>
+                }
+              }}
+              className="w-full rounded px-2 py-2 text-sm"
+              style={{
+                backgroundColor: 'var(--color-surface-2)',
+                border: '1px solid var(--color-border)',
+                color: 'var(--color-text)',
+              }}
+            >
+              <option value="crypto">Crypto</option>
+              <option value="polymarket">Polymarket</option>
+            </select>
           </div>
 
           {/* Script select */}
@@ -730,23 +863,63 @@ export default function Backtesting() {
             )}
           </div>
 
-          {/* Symbol / Market ID */}
-          <div>
-            <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>
-              {config.market_type === 'crypto' ? 'Symbol' : 'Condition ID'}
-            </label>
-            <input
-              value={config.symbol}
-              onChange={(e) => set('symbol', config.market_type === 'crypto' ? e.target.value.toUpperCase() : e.target.value)}
-              placeholder={config.market_type === 'crypto' ? 'BTCUSDT' : '0x1234...'}
-              className="w-full rounded px-3 py-2 text-sm font-mono"
-              style={{
-                backgroundColor: 'var(--color-surface-2)',
-                border: '1px solid var(--color-border)',
-                color: 'var(--color-text)',
-              }}
-            />
-          </div>
+          {/* Symbol (Crypto) or Market Select (Polymarket) */}
+          {config.market_type === 'crypto' ? (
+            <div>
+              <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>Symbol</label>
+              <input
+                value={config.symbol}
+                onChange={(e) => set('symbol', e.target.value.toUpperCase())}
+                placeholder="BTCUSDT"
+                className="w-full rounded px-3 py-2 text-sm font-mono"
+                style={{
+                  backgroundColor: 'var(--color-surface-2)',
+                  border: '1px solid var(--color-border)',
+                  color: 'var(--color-text)',
+                }}
+              />
+            </div>
+          ) : (
+            <div className="col-span-2">
+              <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>Market</label>
+              <select
+                value={POPULAR_POLYMARKET_MARKETS.find(m => m.id === config.symbol) ? config.symbol : '0x'}
+                onChange={(e) => {
+                  if (e.target.value === '0x') {
+                    set('symbol', '')
+                  } else {
+                    set('symbol', e.target.value)
+                  }
+                }}
+                className="w-full rounded px-2 py-2 text-sm"
+                style={{
+                  backgroundColor: 'var(--color-surface-2)',
+                  border: '1px solid var(--color-border)',
+                  color: 'var(--color-text)',
+                }}
+              >
+                {POPULAR_POLYMARKET_MARKETS.map((m) => (
+                  <option key={m.id} value={m.id}>
+                    {m.label}
+                  </option>
+                ))}
+              </select>
+              {/* Custom input when "Custom" is selected */}
+              {!POPULAR_POLYMARKET_MARKETS.slice(1).find(m => m.id === config.symbol) && (
+                <input
+                  value={config.symbol}
+                  onChange={(e) => set('symbol', e.target.value)}
+                  placeholder="Enter condition token ID..."
+                  className="w-full rounded px-3 py-1.5 text-xs font-mono mt-1.5"
+                  style={{
+                    backgroundColor: 'var(--color-surface-2)',
+                    border: '1px solid var(--color-border)',
+                    color: 'var(--color-text)',
+                  }}
+                />
+              )}
+            </div>
+          )}
 
           {/* Interval */}
           <div>
@@ -821,12 +994,12 @@ export default function Backtesting() {
           {/* Run button */}
           <div>
             <button
-              onClick={() => mutation.mutate(config)}
+              onClick={() => runBacktest()}
               disabled={!canRun}
               className="w-full flex items-center justify-center gap-2 py-2.5 rounded font-semibold text-sm transition-opacity disabled:opacity-40"
               style={{ backgroundColor: 'var(--color-accent)', color: '#000' }}
             >
-              {mutation.isPending ? (
+              {isRunning ? (
                 <>
                   <RefreshCw size={14} className="animate-spin" />
                   Running
@@ -890,10 +1063,12 @@ export default function Backtesting() {
                       key={s.path}
                       script={s}
                       isSelected={config.script === s.path}
+                      isRunning={isRunning && config.script === s.path}
                       onSelect={() => set('script', s.path)}
                       onDelete={() => deleteMutation.mutate(s.path)}
                       onRename={(newName) => renameMutation.mutate({ oldPath: s.path, newName })}
                       onUpdateDescription={(desc) => updateDescMutation.mutate({ path: s.path, description: desc })}
+                      onView={() => setViewingScript(s)}
                     />
                   ))}
                 </div>
@@ -914,10 +1089,10 @@ export default function Backtesting() {
             </div>
 
             {/* Show progress when running */}
-            {mutation.isPending && <ProgressPanel state={progress} />}
+            {isRunning && <ProgressPanel state={progress} />}
 
             {/* Show error */}
-            {mutation.isError && progress.step === 'error' && (
+            {progress.step === 'error' && (
               <div
                 className="flex flex-col gap-2 text-sm px-4 py-3 rounded"
                 style={{ backgroundColor: 'rgba(255,68,68,0.1)', color: 'var(--color-danger)', border: '1px solid rgba(255,68,68,0.2)' }}
@@ -927,7 +1102,7 @@ export default function Backtesting() {
                   Backtest failed
                 </div>
                 <p className="font-mono text-xs break-all opacity-80">
-                  {(mutation.error as Error)?.message ?? String(mutation.error)}
+                  {progress.message.replace('Error: ', '')}
                 </p>
                 <p className="text-xs mt-1" style={{ color: 'var(--color-text-muted)' }}>
                   Check the browser console (F12) for detailed debug logs.
@@ -936,7 +1111,7 @@ export default function Backtesting() {
             )}
 
             {/* Show results */}
-            {!mutation.isPending && result && (
+            {!isRunning && result && (
               <>
                 <div className="mb-3 text-xs" style={{ color: 'var(--color-text-muted)' }}>
                   <span className="font-mono">{result.script.split('/').pop()}</span> / {result.symbol}
@@ -946,7 +1121,7 @@ export default function Backtesting() {
             )}
 
             {/* Empty state */}
-            {!mutation.isPending && !result && !mutation.isError && (
+            {!isRunning && !result && progress.step !== 'error' && (
               <div className="flex flex-col items-center justify-center py-16 text-center gap-3">
                 <BarChart2 size={48} style={{ color: 'var(--color-border)' }} />
                 <p className="text-sm" style={{ color: 'var(--color-text-muted)' }}>
@@ -961,6 +1136,15 @@ export default function Backtesting() {
           </div>
         </div>
       </div>
+
+      {/* Script Viewer Modal */}
+      {viewingScript && (
+        <ScriptViewer
+          script={viewingScript}
+          onClose={() => setViewingScript(null)}
+          onSave={(path, content) => saveScriptMutation.mutateAsync({ path, content })}
+        />
+      )}
     </div>
   )
 }

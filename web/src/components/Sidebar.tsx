@@ -31,6 +31,7 @@ const navItems: NavItem[] = [
   { to: '/polymarket', icon: <BarChart2 size={18} />, label: 'Polymarket' },
   { to: '/telegram', icon: <Send size={18} />, label: 'Telegram' },
   { to: '/skills', icon: <Zap size={18} />, label: 'Skills' },
+  { to: '/scheduled-jobs', icon: <Activity size={18} />, label: 'Scheduled Jobs' },
   { to: '/chat', icon: <MessageSquare size={18} />, label: 'Terminal' },
   { to: '/tradingview', icon: <TrendingUp size={18} />, label: 'TradingView' },
   { to: '/backtesting', icon: <FlaskConical size={18} />, label: 'Backtesting' },
