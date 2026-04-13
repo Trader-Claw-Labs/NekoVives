@@ -11,6 +11,7 @@ import Telegram from './pages/Telegram'
 import Skills from './pages/Skills'
 import ScheduledJobs from './pages/ScheduledJobs'
 import Chat from './pages/Chat'
+import { ChatProvider } from './context/ChatContext'
 import LLMSettings from './pages/LLMSettings'
 import Config from './pages/Config'
 import TradingViewPage from './pages/TradingView'
@@ -128,6 +129,7 @@ export default function App() {
       <div className="flex h-screen overflow-hidden" style={{ backgroundColor: 'var(--color-base)' }}>
         <Sidebar />
         <main className="flex-1 overflow-auto">
+          <ChatProvider>
           <Routes>
             <Route path="/" element={<Dashboard />} />
             <Route path="/wallets" element={<Wallets />} />
@@ -141,6 +143,7 @@ export default function App() {
             <Route path="/settings/llm" element={<LLMSettings />} />
             <Route path="/settings/config" element={<Config />} />
           </Routes>
+          </ChatProvider>
         </main>
 
         {showPairing && <PairingModal onPaired={handlePaired} />}

@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 const POLYMARKET_4MIN_SCRIPT: &str = include_str!("scripts/polymarket_4min.rhai");
 const STRATEGY_REFERENCE_SCRIPT: &str = include_str!("scripts/strategy_reference.rhai");
+const STRATEGY_SCRIPT: &str = include_str!("scripts/strategy.rhai");
 
 /// Write bundled default scripts to `<workspace>/scripts/` if they don't exist yet.
 /// Called by both backtest tools so the scripts are always available on first run.
@@ -16,6 +17,7 @@ pub fn ensure_default_scripts(workspace_dir: &std::path::Path) {
     let defaults = [
         ("polymarket_4min.rhai", POLYMARKET_4MIN_SCRIPT),
         ("strategy_reference.rhai", STRATEGY_REFERENCE_SCRIPT),
+        ("strategy.rhai", STRATEGY_SCRIPT),
     ];
     for (name, content) in &defaults {
         let path = scripts_dir.join(name);

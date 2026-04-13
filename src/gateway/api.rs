@@ -297,6 +297,7 @@ pub async fn handle_api_cron_list(
                         "name": job.name,
                         "command": job.command,
                         "prompt": job.prompt,
+                        "schedule": job.expression,
                         "next_run": job.next_run.to_rfc3339(),
                         "last_run": job.last_run.map(|t| t.to_rfc3339()),
                         "last_status": job.last_status,

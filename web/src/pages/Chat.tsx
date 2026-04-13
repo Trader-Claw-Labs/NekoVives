@@ -1,12 +1,14 @@
-import { useState, useRef, useEffect, useCallback, forwardRef, useImperativeHandle } from 'react'
+import { useState, useRef, useEffect } from 'react'
 import {
   Plus, X, Wifi, WifiOff, Pencil, Send,
   Zap, BarChart2, Search, Wallet, BookOpen, Settings2, Terminal,
   ChevronDown, ChevronRight, AlertCircle,
 } from 'lucide-react'
-import { useWebSocket, WsMessage } from '../hooks/useWebSocket'
+import type { WsMessage } from '../hooks/useWebSocket'
 import { apiPost } from '../hooks/useApi'
 import clsx from 'clsx'
+import { useChatContext } from '../context/ChatContext'
+import type { Message, Session, ToolEvent } from '../context/ChatContext'
 
 // ── Slash commands ──────────────────────────────────────────────────
 
@@ -49,39 +51,7 @@ const QUICK_PROMPTS = [
   { label: 'Browse Polymarket', prompt: 'Show me the top 5 Polymarket prediction markets by volume with current prices', icon: <BarChart2 size={15} /> },
 ]
 
-// ── Types ────────────────────────────────────────────────────────────
-
-interface ToolEvent {
-  type: 'tool_call' | 'tool_result' | 'thinking' | 'executing'
-  name: string
-  summary?: string
-  args?: Record<string, unknown>
-  outputSnippet?: string
-  success?: boolean
-  iteration?: number
-  step?: number
-  totalSteps?: number
-  toolCount?: number
-  tools?: string[]
-  elapsedMs?: number
-  replanning?: boolean
-  toolsDone?: number
-}
-
-interface Message {
-  role: 'user' | 'assistant'
-  content: string
-  timestamp: number
-  streaming?: boolean
-  toolEvents?: ToolEvent[]
-  agentStartedAt?: number
-}
-
-interface Session {
-  id: string
-  label: string
-  messages: Message[]
-}
+// ── Local helpers ────────────────────────────────────────────────────
 
 function generateId(): string {
   return Math.random().toString(36).slice(2, 10)
@@ -507,20 +477,14 @@ interface ChatWindowProps {
   send: (msg: WsMessage) => void
 }
 
-export interface ChatWindowHandle {
-  deliver: (msg: WsMessage) => void
-}
-
-const ChatWindow = forwardRef<ChatWindowHandle, ChatWindowProps>(function ChatWindow(
-  { session, onUpdate, connected, send }, ref
-) {
-  const [input, setInput]     = useState('')
-  const [sending, setSending] = useState(false)
+function ChatWindow({ session, onUpdate, connected, send }: ChatWindowProps) {
+  const [input, setInput]       = useState('')
   const [cmdIndex, setCmdIndex] = useState(0)
   const bottomRef  = useRef<HTMLDivElement>(null)
   const inputRef   = useRef<HTMLTextAreaElement>(null)
-  const sessionRef = useRef(session)
-  useEffect(() => { sessionRef.current = session }, [session])
+
+  // Derive sending from whether the last assistant message is still streaming
+  const sending = session.messages.some((m) => m.streaming)
 
   const slashMatch  = input.match(/^(\/\S*)/)
   const slashQuery  = slashMatch ? slashMatch[1].toLowerCase() : null
@@ -531,82 +495,6 @@ const ChatWindow = forwardRef<ChatWindowHandle, ChatWindowProps>(function ChatWi
     : []
   const showPalette = slashQuery !== null && filteredCmds.length > 0
   useEffect(() => { setCmdIndex(0) }, [slashQuery])
-
-  const onWsMessage = useCallback((msg: WsMessage) => {
-    const cur = sessionRef.current
-    if (msg.type === 'thinking') {
-      onUpdate({ ...cur, messages: cur.messages.map((m, i) =>
-        i === cur.messages.length - 1 && m.role === 'assistant' && m.streaming
-          ? { ...m, toolEvents: [...(m.toolEvents ?? []), {
-              type: 'thinking' as const, name: 'thinking',
-              iteration: Number(msg.iteration ?? 1),
-              replanning: Boolean(msg.replanning),
-              toolsDone: Number(msg.tools_done ?? 0),
-            }] }
-          : m
-      )})
-    } else if (msg.type === 'executing') {
-      onUpdate({ ...cur, messages: cur.messages.map((m, i) =>
-        i === cur.messages.length - 1 && m.role === 'assistant' && m.streaming
-          ? { ...m, toolEvents: [...(m.toolEvents ?? []), {
-              type: 'executing' as const, name: 'executing',
-              iteration: Number(msg.iteration ?? 1),
-              toolCount: Number(msg.tool_count ?? 0),
-              tools: Array.isArray(msg.tools) ? (msg.tools as string[]) : [],
-            }] }
-          : m
-      )})
-    } else if (msg.type === 'chunk' && typeof msg.content === 'string') {
-      onUpdate({ ...cur, messages: cur.messages.map((m, i) =>
-        i === cur.messages.length - 1 && m.role === 'assistant' && m.streaming
-          ? { ...m, content: m.content + msg.content }
-          : m
-      )})
-    } else if (msg.type === 'tool_call') {
-      const rawArgs = msg.args && typeof msg.args === 'object'
-        ? msg.args as Record<string, unknown>
-        : undefined
-      onUpdate({ ...cur, messages: cur.messages.map((m, i) =>
-        i === cur.messages.length - 1 && m.role === 'assistant' && m.streaming
-          ? { ...m, toolEvents: [...(m.toolEvents ?? []), {
-              type: 'tool_call' as const,
-              name: String(msg.name ?? ''),
-              summary: summariseArgs(msg.args),
-              args: rawArgs,
-              iteration: Number(msg.iteration ?? 1),
-              step: Number(msg.step ?? 1),
-              totalSteps: Number(msg.total_steps ?? 1),
-            }] }
-          : m
-      )})
-    } else if (msg.type === 'tool_result') {
-      onUpdate({ ...cur, messages: cur.messages.map((m, i) =>
-        i === cur.messages.length - 1 && m.role === 'assistant' && m.streaming
-          ? { ...m, toolEvents: [...(m.toolEvents ?? []), {
-              type: 'tool_result' as const,
-              name: String(msg.name ?? ''),
-              outputSnippet: String(msg.output_snippet ?? ''),
-              success: Boolean(msg.success ?? true),
-              elapsedMs: Number(msg.elapsed_ms ?? 0),
-              iteration: Number(msg.iteration ?? 1),
-            }] }
-          : m
-      )})
-    } else if (msg.type === 'done') {
-      const full = typeof msg.full_response === 'string' ? msg.full_response : undefined
-      onUpdate({ ...cur, messages: cur.messages.map((m) =>
-        m.streaming ? { ...m, content: full ?? m.content, streaming: false } : m
-      )})
-      setSending(false)
-    } else if (msg.type === 'error') {
-      onUpdate({ ...cur, messages: cur.messages.map((m) =>
-        m.streaming ? { ...m, content: `error: ${msg.message ?? 'unknown error'}`, streaming: false } : m
-      )})
-      setSending(false)
-    }
-  }, [onUpdate])
-
-  useImperativeHandle(ref, () => ({ deliver: onWsMessage }), [onWsMessage])
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -626,7 +514,6 @@ const ChatWindow = forwardRef<ChatWindowHandle, ChatWindowProps>(function ChatWi
       streaming: true, toolEvents: [], agentStartedAt: Date.now() }
     const updated: Session = { ...session, messages: [...session.messages, userMsg, assistantMsg] }
     onUpdate(updated)
-    setSending(true)
     setInput('')
 
     if (connected) {
@@ -644,8 +531,6 @@ const ChatWindow = forwardRef<ChatWindowHandle, ChatWindowProps>(function ChatWi
         onUpdate({ ...updated, messages: updated.messages.map((m) =>
           m.streaming ? { ...m, content: `error: ${String(e)}`, streaming: false } : m
         )})
-      } finally {
-        setSending(false)
       }
     }
   }
@@ -825,7 +710,7 @@ const ChatWindow = forwardRef<ChatWindowHandle, ChatWindowProps>(function ChatWi
       </div>
     </div>
   )
-})
+}
 
 // ── Session tab ──────────────────────────────────────────────────────
 
@@ -914,14 +799,6 @@ function truncate(s: string, max: number): string {
   return s.length <= max ? s : s.slice(0, max) + '…'
 }
 
-function summariseArgs(args: unknown): string {
-  if (!args || typeof args !== 'object') return ''
-  const obj = args as Record<string, unknown>
-  const first = Object.values(obj)[0]
-  if (typeof first === 'string') return truncate(first, 80)
-  return ''
-}
-
 /** Extract the most meaningful single argument for a tool call — the thing the user cares about. */
 function argsLabel(toolName: string, args?: Record<string, unknown>): string | null {
   if (!args) return null
@@ -960,76 +837,13 @@ function argsLabel(toolName: string, args?: Record<string, unknown>): string | n
   return first ? truncate(first as string, 80) : null
 }
 
-// ── Persistence ──────────────────────────────────────────────────────
-
-const STORAGE_KEY = 'traderclaw_chat_sessions'
-const ACTIVE_KEY  = 'traderclaw_chat_active'
-
-function loadSessions(): Session[] {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY)
-    if (raw) {
-      const parsed = JSON.parse(raw) as Session[]
-      if (Array.isArray(parsed) && parsed.length > 0) {
-        return parsed.map((s) => ({
-          ...s,
-          messages: s.messages.map((m) => ({ ...m, streaming: false })),
-        }))
-      }
-    }
-  } catch { /* ignore */ }
-  return [{ id: generateId(), label: 'New chat', messages: [] }]
-}
-
-function loadActiveId(sessions: Session[]): string {
-  try {
-    const saved = localStorage.getItem(ACTIVE_KEY)
-    if (saved && sessions.some((s) => s.id === saved)) return saved
-  } catch { /* ignore */ }
-  return sessions[0].id
-}
-
 // ── Root ─────────────────────────────────────────────────────────────
 
 export default function Chat() {
-  const initial = loadSessions()
-  const [sessions, setSessions] = useState<Session[]>(initial)
-  const [activeId, setActiveId] = useState<string>(() => loadActiveId(initial))
-
-  const activeWindowRef = useRef<ChatWindowHandle>(null)
-  const { connected, send } = useWebSocket('/ws/chat', {
-    autoReconnect: true,
-    onMessage: (msg) => activeWindowRef.current?.deliver(msg),
-  })
-
-  useEffect(() => {
-    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(sessions)) } catch { /* quota */ }
-  }, [sessions])
-  useEffect(() => {
-    try { localStorage.setItem(ACTIVE_KEY, activeId) } catch { /* quota */ }
-  }, [activeId])
-
-  function addSession() {
-    const id = generateId()
-    const n  = sessions.length + 1
-    setSessions((s) => [...s, { id, label: `Chat ${n}`, messages: [] }])
-    setActiveId(id)
-  }
-
-  function removeSession(id: string) {
-    if (sessions.length === 1) return
-    const next = sessions.filter((s) => s.id !== id)
-    setSessions(next)
-    if (activeId === id) setActiveId(next[next.length - 1].id)
-  }
-
-  const updateSession = useCallback((updated: Session) => {
-    setSessions((s) => s.map((session) => session.id === updated.id ? updated : session))
-  }, [])
-
-  function renameSession(id: string, label: string) {
-    setSessions((s) => s.map((session) => session.id === id ? { ...session, label } : session))
-  }
+  const {
+    sessions, activeId, connected,
+    setActiveId, updateSession, addSession, removeSession, renameSession, send,
+  } = useChatContext()
 
   const activeSession = sessions.find((s) => s.id === activeId) ?? sessions[0]
 
@@ -1076,7 +890,6 @@ export default function Chat() {
       <div className="flex-1 overflow-hidden">
         <ChatWindow
           key={activeSession.id}
-          ref={activeWindowRef}
           session={activeSession}
           onUpdate={updateSession}
           connected={connected}
