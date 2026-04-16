@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
-import { useQuery, useMutation } from '@tanstack/react-query'
-import { apiFetch, apiPost } from '../hooks/useApi'
-import { BarChart2, Eye, EyeOff, Save, RefreshCw, TrendingUp, Plus, X, CheckCircle, AlertCircle, ChevronDown, ChevronUp, ExternalLink } from 'lucide-react'
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { apiFetch, apiPost, apiDelete } from '../hooks/useApi'
+import { BarChart2, Eye, EyeOff, Save, RefreshCw, TrendingUp, Plus, X, CheckCircle, AlertCircle, ChevronDown, ChevronUp, ExternalLink, Trash2 } from 'lucide-react'
 
 interface Market {
   id?: string
@@ -9,6 +9,7 @@ interface Market {
   yes_price?: number
   volume?: number
   end_date?: string
+  yes_token_id?: string
 }
 
 interface MarketsResponse {
@@ -72,6 +73,46 @@ function MaskedInput({
   )
 }
 
+// ── Sparkline ─────────────────────────────────────────────────────────
+
+interface SparkPoint { t: number; p: number }
+
+function Sparkline({ tokenId }: { tokenId: string }) {
+  const { data } = useQuery<{ history: SparkPoint[] }>({
+    queryKey: ['poly-sparkline', tokenId],
+    queryFn: () => apiFetch(`/api/polymarket/prices-history?token_id=${encodeURIComponent(tokenId)}&interval=1d`),
+    staleTime: 5 * 60_000,
+    retry: false,
+  })
+
+  const pts = data?.history ?? []
+  if (pts.length < 2) {
+    return <div className="w-20 h-8 opacity-20 text-xs flex items-center justify-center" style={{ color: 'var(--color-text-muted)' }}>—</div>
+  }
+
+  const prices = pts.map(p => p.p)
+  const min = Math.min(...prices)
+  const max = Math.max(...prices)
+  const range = max - min || 0.01
+  const W = 80, H = 32
+  const points = prices.map((p, i) => {
+    const x = (i / (prices.length - 1)) * W
+    const y = H - ((p - min) / range) * (H - 4) - 2
+    return `${x},${y}`
+  }).join(' ')
+
+  const first = prices[0]
+  const last = prices[prices.length - 1]
+  const up = last >= first
+  const color = up ? 'var(--color-accent)' : 'var(--color-danger)'
+
+  return (
+    <svg width={W} height={H} viewBox={`0 0 ${W} ${H}`} className="flex-shrink-0">
+      <polyline points={points} fill="none" stroke={color} strokeWidth="1.5" strokeLinejoin="round" strokeLinecap="round" />
+    </svg>
+  )
+}
+
 function PriceBar({ yes }: { yes: number }) {
   const pct = Math.round(yes * 100)
   return (
@@ -106,7 +147,239 @@ function genId() {
   return Math.random().toString(36).slice(2, 9)
 }
 
+// ── Orders & Positions types ──────────────────────────────────────────
+
+interface PolyOrder {
+  id: string
+  asset_id?: string
+  market?: string
+  side?: string
+  price?: number
+  size?: number
+  size_matched?: number
+  status?: string
+  created_at?: string
+}
+
+interface PolyPosition {
+  asset_id?: string
+  market?: string
+  outcome?: string
+  size?: number
+  avg_price?: number
+  value?: number
+}
+
+// ── Orders Tab ────────────────────────────────────────────────────────
+
+function OrdersTab() {
+  const qc = useQueryClient()
+  const { data, isLoading, refetch } = useQuery<{ orders: PolyOrder[] }>({
+    queryKey: ['poly-orders'],
+    queryFn: () => apiFetch<{ orders: PolyOrder[] }>('/api/polymarket/orders').catch(() => ({ orders: [] })),
+    refetchInterval: 15_000,
+  })
+
+  const cancelMutation = useMutation({
+    mutationFn: (id: string) => apiDelete(`/api/polymarket/order/${id}`),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['poly-orders'] }),
+  })
+
+  const orders = data?.orders ?? []
+
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-3">
+        <h2 className="text-sm font-semibold">Open Orders</h2>
+        <button onClick={() => refetch()} className="p-1.5 rounded hover:bg-white/5"
+          style={{ color: 'var(--color-text-muted)' }}>
+          <RefreshCw size={12} className={isLoading ? 'animate-spin' : ''} />
+        </button>
+      </div>
+      {isLoading ? (
+        <div className="p-6 text-center text-sm" style={{ color: 'var(--color-text-muted)' }}>Loading...</div>
+      ) : orders.length === 0 ? (
+        <div className="p-8 text-center text-sm" style={{ color: 'var(--color-text-muted)' }}>No open orders</div>
+      ) : (
+        <div className="space-y-2">
+          {orders.map(o => (
+            <div key={o.id} className="rounded-lg border p-3 flex items-center justify-between text-xs"
+              style={{ backgroundColor: 'var(--color-base)', borderColor: 'var(--color-border)' }}>
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2 mb-1">
+                  <span className="font-mono truncate max-w-32">{o.id}</span>
+                  <span className="px-1.5 py-0.5 rounded"
+                    style={{ backgroundColor: o.side === 'buy' ? 'rgba(74,222,128,0.1)' : 'rgba(239,68,68,0.1)',
+                      color: o.side === 'buy' ? 'var(--color-accent)' : 'var(--color-danger)' }}>
+                    {o.side?.toUpperCase() ?? '—'}
+                  </span>
+                  {o.status && <span style={{ color: 'var(--color-text-muted)' }}>{o.status}</span>}
+                </div>
+                <div className="flex gap-3" style={{ color: 'var(--color-text-muted)' }}>
+                  {o.price !== undefined && <span>Price: <b style={{ color: 'var(--color-text)' }}>{o.price}</b></span>}
+                  {o.size !== undefined && <span>Size: <b style={{ color: 'var(--color-text)' }}>{o.size}</b></span>}
+                  {o.size_matched !== undefined && <span>Filled: <b style={{ color: 'var(--color-text)' }}>{o.size_matched}</b></span>}
+                </div>
+              </div>
+              <button onClick={() => {
+                if (confirm(`Cancel order ${o.id}?`)) cancelMutation.mutate(o.id)
+              }} className="p-1.5 rounded hover:bg-white/5 ml-2" style={{ color: 'var(--color-danger)' }}
+                title="Cancel order">
+                <Trash2 size={13} />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ── Positions Tab ─────────────────────────────────────────────────────
+
+function PositionsTab() {
+  const { data, isLoading, refetch } = useQuery<{ positions: PolyPosition[] }>({
+    queryKey: ['poly-positions'],
+    queryFn: () => apiFetch<{ positions: PolyPosition[] }>('/api/polymarket/positions').catch(() => ({ positions: [] })),
+    refetchInterval: 15_000,
+  })
+
+  const positions = data?.positions ?? []
+
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-3">
+        <h2 className="text-sm font-semibold">Positions</h2>
+        <button onClick={() => refetch()} className="p-1.5 rounded hover:bg-white/5"
+          style={{ color: 'var(--color-text-muted)' }}>
+          <RefreshCw size={12} className={isLoading ? 'animate-spin' : ''} />
+        </button>
+      </div>
+      {isLoading ? (
+        <div className="p-6 text-center text-sm" style={{ color: 'var(--color-text-muted)' }}>Loading...</div>
+      ) : positions.length === 0 ? (
+        <div className="p-8 text-center text-sm" style={{ color: 'var(--color-text-muted)' }}>No positions</div>
+      ) : (
+        <div className="space-y-2">
+          {positions.map((p, i) => (
+            <div key={i} className="rounded-lg border p-3 text-xs"
+              style={{ backgroundColor: 'var(--color-base)', borderColor: 'var(--color-border)' }}>
+              <div className="flex justify-between mb-1">
+                <span className="font-semibold truncate max-w-64">{p.market ?? p.asset_id ?? '—'}</span>
+                <span className="px-1.5 py-0.5 rounded" style={{ backgroundColor: 'var(--color-surface)', color: 'var(--color-accent)' }}>
+                  {p.outcome ?? '—'}
+                </span>
+              </div>
+              <div className="flex gap-3" style={{ color: 'var(--color-text-muted)' }}>
+                {p.size !== undefined && <span>Size: <b style={{ color: 'var(--color-text)' }}>{p.size}</b></span>}
+                {p.avg_price !== undefined && <span>Avg: <b style={{ color: 'var(--color-text)' }}>{p.avg_price}</b></span>}
+                {p.value !== undefined && <span>Value: <b style={{ color: 'var(--color-accent)' }}>${p.value.toFixed(2)}</b></span>}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ── Place Order Tab ───────────────────────────────────────────────────
+
+function PlaceOrderTab() {
+  const [form, setForm] = useState({
+    token_id: '',
+    side: 'buy',
+    price: '',
+    size: '',
+    order_type: 'limit',
+  })
+  const [result, setResult] = useState<{ status: string; order_id?: string; error?: string } | null>(null)
+
+  const mutation = useMutation({
+    mutationFn: () => apiPost<{ status: string; order_id?: string; error?: string }>('/api/polymarket/order', {
+      token_id: form.token_id,
+      side: form.side,
+      price: form.order_type === 'market' ? undefined : parseFloat(form.price),
+      size: parseFloat(form.size),
+      order_type: form.order_type,
+    }),
+    onSuccess: (data) => setResult(data),
+    onError: (e: Error) => setResult({ status: 'error', error: e.message }),
+  })
+
+  function set(k: keyof typeof form, v: string) {
+    setForm(f => ({ ...f, [k]: v }))
+  }
+
+  const canSubmit = !!form.token_id && !!form.size && (form.order_type === 'market' || !!form.price)
+
+  return (
+    <div className="max-w-md">
+      <h2 className="text-sm font-semibold mb-4">Place Order</h2>
+      <div className="space-y-3">
+        <div>
+          <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>Token ID (CLOB token)</label>
+          <input className="w-full rounded px-3 py-2 text-sm font-mono" value={form.token_id}
+            onChange={e => set('token_id', e.target.value)} placeholder="71321045679252212..." />
+        </div>
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>Side</label>
+            <select className="w-full rounded px-3 py-2 text-sm" value={form.side}
+              onChange={e => set('side', e.target.value)}>
+              <option value="buy">Buy (YES)</option>
+              <option value="sell">Sell (NO)</option>
+            </select>
+          </div>
+          <div>
+            <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>Order Type</label>
+            <select className="w-full rounded px-3 py-2 text-sm" value={form.order_type}
+              onChange={e => set('order_type', e.target.value)}>
+              <option value="limit">Limit</option>
+              <option value="market">Market</option>
+            </select>
+          </div>
+        </div>
+        <div className="grid grid-cols-2 gap-3">
+          {form.order_type === 'limit' && (
+            <div>
+              <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>Price (0–1)</label>
+              <input type="number" step="0.01" min="0" max="1" className="w-full rounded px-3 py-2 text-sm"
+                value={form.price} onChange={e => set('price', e.target.value)} placeholder="0.65" />
+            </div>
+          )}
+          <div>
+            <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>Size (USDC)</label>
+            <input type="number" step="1" min="0" className="w-full rounded px-3 py-2 text-sm"
+              value={form.size} onChange={e => set('size', e.target.value)} placeholder="10" />
+          </div>
+        </div>
+
+        {result && (
+          <div className="rounded px-3 py-2 text-xs"
+            style={{
+              backgroundColor: result.status === 'ok' ? 'rgba(74,222,128,0.1)' : 'rgba(239,68,68,0.1)',
+              color: result.status === 'ok' ? 'var(--color-accent)' : 'var(--color-danger)',
+              border: `1px solid ${result.status === 'ok' ? 'rgba(74,222,128,0.3)' : 'rgba(239,68,68,0.3)'}`,
+            }}>
+            {result.status === 'ok'
+              ? `Order placed! ID: ${result.order_id ?? '—'}`
+              : result.error ?? 'Unknown error'}
+          </div>
+        )}
+
+        <button onClick={() => mutation.mutate()} disabled={!canSubmit || mutation.isPending}
+          className="w-full py-2 rounded text-sm font-medium disabled:opacity-50"
+          style={{ backgroundColor: form.side === 'buy' ? 'var(--color-accent)' : 'var(--color-danger)', color: '#000' }}>
+          {mutation.isPending ? 'Placing...' : `${form.side === 'buy' ? 'Buy' : 'Sell'} ${form.order_type}`}
+        </button>
+      </div>
+    </div>
+  )
+}
+
 export default function Polymarket() {
+  const [activeTab, setActiveTab] = useState<'markets' | 'orders' | 'positions' | 'place'>('markets')
   const [walletAddress, setWalletAddress] = useState('')
   const [apiKeys, setApiKeys] = useState<ApiKeyEntry[]>([
     { id: genId(), label: 'API Key 1', key: '', secret: '', passphrase: '', show: false, expanded: true },
@@ -215,10 +488,36 @@ export default function Polymarket() {
 
   return (
     <div className="p-6 max-w-4xl mx-auto">
-      <div className="flex items-center gap-2 mb-6">
+      <div className="flex items-center gap-2 mb-4">
         <BarChart2 size={18} style={{ color: 'var(--color-accent)' }} />
         <h1 className="text-lg font-bold">Polymarket</h1>
       </div>
+
+      {/* Tabs */}
+      <div className="flex gap-1 mb-5 p-1 rounded" style={{ backgroundColor: 'var(--color-surface)' }}>
+        {(['markets', 'orders', 'positions', 'place'] as const).map(tab => (
+          <button key={tab} onClick={() => setActiveTab(tab)}
+            className="flex-1 py-1.5 rounded text-sm font-medium transition-colors capitalize"
+            style={activeTab === tab
+              ? { backgroundColor: 'var(--color-accent)', color: '#000' }
+              : { color: 'var(--color-text-muted)' }}>
+            {tab === 'place' ? 'Place Order' : tab.charAt(0).toUpperCase() + tab.slice(1)}
+          </button>
+        ))}
+      </div>
+
+      {/* Non-markets tabs */}
+      {activeTab !== 'markets' && (
+        <div className="rounded-lg border p-5 mb-6"
+          style={{ backgroundColor: 'var(--color-surface)', borderColor: 'var(--color-border)' }}>
+          {activeTab === 'orders' && <OrdersTab />}
+          {activeTab === 'positions' && <PositionsTab />}
+          {activeTab === 'place' && <PlaceOrderTab />}
+        </div>
+      )}
+
+      {activeTab !== 'markets' ? null : <>
+
 
       {/* Config form */}
       <div
@@ -496,7 +795,7 @@ export default function Polymarket() {
         </div>
       </div>
 
-      {/* Markets */}
+      {/* Markets tab content */}
       <div
         className="rounded-lg border"
         style={{ backgroundColor: 'var(--color-surface)', borderColor: 'var(--color-border)' }}
@@ -546,13 +845,13 @@ export default function Polymarket() {
             {markets.map((m, i) => (
               <div key={m.id ?? i} className="px-5 py-4">
                 <div className="flex items-start justify-between gap-4 mb-2">
-                  <p className="text-sm leading-snug">{m.question ?? 'Unknown market'}</p>
-                  <span
-                    className="text-xs flex-shrink-0"
-                    style={{ color: 'var(--color-text-muted)' }}
-                  >
-                    {formatVolume(m.volume)}
-                  </span>
+                  <p className="text-sm leading-snug flex-1">{m.question ?? 'Unknown market'}</p>
+                  <div className="flex items-center gap-3 flex-shrink-0">
+                    {m.yes_token_id && <Sparkline tokenId={m.yes_token_id} />}
+                    <span className="text-xs" style={{ color: 'var(--color-text-muted)' }}>
+                      {formatVolume(m.volume)}
+                    </span>
+                  </div>
                 </div>
                 <PriceBar yes={m.yes_price ?? 0.5} />
               </div>
@@ -560,6 +859,7 @@ export default function Polymarket() {
           </div>
         )}
       </div>
+      </>}
     </div>
   )
 }

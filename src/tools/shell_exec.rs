@@ -163,7 +163,7 @@ mod tests {
     fn make_tool() -> (TempDir, ShellExecTool) {
         let tmp = TempDir::new().unwrap();
         let mut policy = SecurityPolicy::default();
-        policy.autonomy = crate::security::AutonomyLevel::AutoEdit;
+        policy.autonomy = crate::security::AutonomyLevel::Full;
         let tool = ShellExecTool::new(Arc::new(policy), tmp.path().to_path_buf());
         (tmp, tool)
     }

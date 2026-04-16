@@ -12,6 +12,7 @@ pub mod sse;
 pub mod static_files;
 pub mod ws;
 
+
 use crate::config::Config;
 use crate::cost::CostTracker;
 use crate::memory::{self, Memory, MemoryCategory};
@@ -367,6 +368,8 @@ pub struct AppState {
     pub wallets: Arc<Mutex<Vec<StoredWallet>>>,
     /// Path to the wallets.json persistence file
     pub wallets_path: Arc<std::path::PathBuf>,
+    /// Live strategy runner store
+    pub strategy_runner: Arc<crate::strategy_runner::StrategyRunnerStore>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -574,6 +577,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             loaded
         })),
         wallets_path: Arc::new(wallets_file_path(&config.config_path)),
+        strategy_runner: Arc::new(crate::strategy_runner::StrategyRunnerStore::new(
+            config.workspace_dir.clone(),
+        )),
     };
 
     // Config PUT needs larger body limit (1MB)
@@ -625,6 +631,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/wallets", get(api::handle_api_wallets_list))
         .route("/api/wallets/create", post(api::handle_api_wallets_create))
         .route("/api/wallets/export", post(api::handle_api_wallets_export))
+        .route("/api/wallets/quote", post(api::handle_api_wallets_quote))
+        .route("/api/wallets/swap", post(api::handle_api_wallets_swap))
+        .route("/api/wallets/transfer", post(api::handle_api_wallets_transfer))
         .route(
             "/api/wallets/{address}/balance",
             get(api::handle_api_wallet_balance),
@@ -632,6 +641,14 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route(
             "/api/polymarket/markets",
             get(api::handle_api_polymarket_markets),
+        )
+        .route(
+            "/api/polymarket/prices-history",
+            get(api::handle_api_polymarket_prices_history),
+        )
+        .route(
+            "/api/polymarket/markets/resolve",
+            get(api::handle_api_polymarket_resolve_slug),
         )
         .route(
             "/api/polymarket/configure",
@@ -678,6 +695,11 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             get(api::handle_api_telegram_messages),
         )
         .route("/api/chat", post(api::handle_api_chat))
+        // ── Live Strategy Runner ──
+        .route("/api/live/strategies", get(api::handle_api_live_list).post(api::handle_api_live_create))
+        .route("/api/live/strategies/{id}", get(api::handle_api_live_get).delete(api::handle_api_live_delete))
+        .route("/api/live/strategies/{id}/stop", post(api::handle_api_live_stop))
+        .route("/api/live/strategies/{id}/restart", post(api::handle_api_live_restart))
         // ── SSE event stream (no timeout — long-lived) ──
         .route("/api/events", get(sse::handle_sse_events))
         // ── Static assets (web dashboard) ──
@@ -1120,16 +1142,6 @@ mod tests {
     }
 
     #[test]
-    fn whatsapp_query_fields_are_optional() {
-        let q = WhatsAppVerifyQuery {
-            mode: None,
-            verify_token: None,
-            challenge: None,
-        };
-        assert!(q.mode.is_none());
-    }
-
-    #[test]
     fn app_state_is_clone() {
         fn assert_clone<T: Clone>() {}
         assert_clone::<AppState>();
@@ -1148,20 +1160,13 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
-            whatsapp: None,
-            whatsapp_app_secret: None,
-            linq: None,
-            linq_signing_secret: None,
-            nextcloud_talk: None,
-            nextcloud_talk_webhook_secret: None,
-            wati: None,
-            observer: Arc::new(crate::observability::NoopObserver),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),            observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             wallets: Arc::new(Mutex::new(Vec::new())),
             wallets_path: Arc::new(std::env::temp_dir().join("traderclaw_test_wallets.json")),
+            strategy_runner: Arc::new(crate::strategy_runner::StrategyRunnerStore::new(std::env::temp_dir())),
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1199,20 +1204,13 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
-            whatsapp: None,
-            whatsapp_app_secret: None,
-            linq: None,
-            linq_signing_secret: None,
-            nextcloud_talk: None,
-            nextcloud_talk_webhook_secret: None,
-            wati: None,
-            observer,
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),            observer,
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             wallets: Arc::new(Mutex::new(Vec::new())),
             wallets_path: Arc::new(std::env::temp_dir().join("traderclaw_test_wallets.json")),
+            strategy_runner: Arc::new(crate::strategy_runner::StrategyRunnerStore::new(std::env::temp_dir())),
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1401,22 +1399,6 @@ mod tests {
         assert_ne!(key1, key2);
     }
 
-    #[test]
-    fn whatsapp_memory_key_includes_sender_and_message_id() {
-        let msg = ChannelMessage {
-            id: "wamid-123".into(),
-            sender: "+1234567890".into(),
-            reply_target: "+1234567890".into(),
-            content: "hello".into(),
-            channel: "whatsapp".into(),
-            timestamp: 1,
-            thread_ts: None,
-        };
-
-        let key = whatsapp_memory_key(&msg);
-        assert_eq!(key, "whatsapp_+1234567890_wamid-123");
-    }
-
     #[derive(Default)]
     struct MockMemory;
 
@@ -1567,20 +1549,13 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
-            whatsapp: None,
-            whatsapp_app_secret: None,
-            linq: None,
-            linq_signing_secret: None,
-            nextcloud_talk: None,
-            nextcloud_talk_webhook_secret: None,
-            wati: None,
-            observer: Arc::new(crate::observability::NoopObserver),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),            observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             wallets: Arc::new(Mutex::new(Vec::new())),
             wallets_path: Arc::new(std::env::temp_dir().join("traderclaw_test_wallets.json")),
+            strategy_runner: Arc::new(crate::strategy_runner::StrategyRunnerStore::new(std::env::temp_dir())),
         };
 
         let mut headers = HeaderMap::new();
@@ -1633,20 +1608,13 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
-            whatsapp: None,
-            whatsapp_app_secret: None,
-            linq: None,
-            linq_signing_secret: None,
-            nextcloud_talk: None,
-            nextcloud_talk_webhook_secret: None,
-            wati: None,
-            observer: Arc::new(crate::observability::NoopObserver),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),            observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             wallets: Arc::new(Mutex::new(Vec::new())),
             wallets_path: Arc::new(std::env::temp_dir().join("traderclaw_test_wallets.json")),
+            strategy_runner: Arc::new(crate::strategy_runner::StrategyRunnerStore::new(std::env::temp_dir())),
         };
 
         let headers = HeaderMap::new();
@@ -1711,20 +1679,13 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
-            whatsapp: None,
-            whatsapp_app_secret: None,
-            linq: None,
-            linq_signing_secret: None,
-            nextcloud_talk: None,
-            nextcloud_talk_webhook_secret: None,
-            wati: None,
-            observer: Arc::new(crate::observability::NoopObserver),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),            observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             wallets: Arc::new(Mutex::new(Vec::new())),
             wallets_path: Arc::new(std::env::temp_dir().join("traderclaw_test_wallets.json")),
+            strategy_runner: Arc::new(crate::strategy_runner::StrategyRunnerStore::new(std::env::temp_dir())),
         };
 
         let response = handle_webhook(
@@ -1761,20 +1722,13 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
-            whatsapp: None,
-            whatsapp_app_secret: None,
-            linq: None,
-            linq_signing_secret: None,
-            nextcloud_talk: None,
-            nextcloud_talk_webhook_secret: None,
-            wati: None,
-            observer: Arc::new(crate::observability::NoopObserver),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),            observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             wallets: Arc::new(Mutex::new(Vec::new())),
             wallets_path: Arc::new(std::env::temp_dir().join("traderclaw_test_wallets.json")),
+            strategy_runner: Arc::new(crate::strategy_runner::StrategyRunnerStore::new(std::env::temp_dir())),
         };
 
         let mut headers = HeaderMap::new();
@@ -1816,20 +1770,13 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
-            whatsapp: None,
-            whatsapp_app_secret: None,
-            linq: None,
-            linq_signing_secret: None,
-            nextcloud_talk: None,
-            nextcloud_talk_webhook_secret: None,
-            wati: None,
-            observer: Arc::new(crate::observability::NoopObserver),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),            observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             wallets: Arc::new(Mutex::new(Vec::new())),
             wallets_path: Arc::new(std::env::temp_dir().join("traderclaw_test_wallets.json")),
+            strategy_runner: Arc::new(crate::strategy_runner::StrategyRunnerStore::new(std::env::temp_dir())),
         };
 
         let mut headers = HeaderMap::new();
@@ -1849,316 +1796,6 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
     }
-
-    fn compute_nextcloud_signature_hex(secret: &str, random: &str, body: &str) -> String {
-        use hmac::{Hmac, Mac};
-        use sha2::Sha256;
-
-        let payload = format!("{random}{body}");
-        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
-        mac.update(payload.as_bytes());
-        hex::encode(mac.finalize().into_bytes())
-    }
-
-    #[tokio::test]
-    async fn nextcloud_talk_webhook_returns_not_found_when_not_configured() {
-        let provider: Arc<dyn Provider> = Arc::new(MockProvider::default());
-        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
-
-        let state = AppState {
-            config: Arc::new(Mutex::new(Config::default())),
-            provider,
-            model: Arc::new(Mutex::new("test-model".into())),
-            temperature: Arc::new(Mutex::new(0.0)),
-            mem: memory,
-            auto_save: false,
-            webhook_secret_hash: None,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
-            trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
-            whatsapp: None,
-            whatsapp_app_secret: None,
-            linq: None,
-            linq_signing_secret: None,
-            nextcloud_talk: None,
-            nextcloud_talk_webhook_secret: None,
-            wati: None,
-            observer: Arc::new(crate::observability::NoopObserver),
-            tools_registry: Arc::new(Vec::new()),
-            cost_tracker: None,
-            event_tx: tokio::sync::broadcast::channel(16).0,
-            wallets: Arc::new(Mutex::new(Vec::new())),
-            wallets_path: Arc::new(std::env::temp_dir().join("traderclaw_test_wallets.json")),
-        };
-
-        let response = handle_nextcloud_talk_webhook(
-            State(state),
-            HeaderMap::new(),
-            Bytes::from_static(br#"{"type":"message"}"#),
-        )
-        .await
-        .into_response();
-
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn nextcloud_talk_webhook_rejects_invalid_signature() {
-        let provider_impl = Arc::new(MockProvider::default());
-        let provider: Arc<dyn Provider> = provider_impl.clone();
-        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
-
-        let channel = Arc::new(NextcloudTalkChannel::new(
-            "https://cloud.example.com".into(),
-            "app-token".into(),
-            vec!["*".into()],
-        ));
-
-        let secret = "nextcloud-test-secret";
-        let random = "seed-value";
-        let body = r#"{"type":"message","object":{"token":"room-token"},"message":{"actorType":"users","actorId":"user_a","message":"hello"}}"#;
-        let _valid_signature = compute_nextcloud_signature_hex(secret, random, body);
-        let invalid_signature = "deadbeef";
-
-        let state = AppState {
-            config: Arc::new(Mutex::new(Config::default())),
-            provider,
-            model: Arc::new(Mutex::new("test-model".into())),
-            temperature: Arc::new(Mutex::new(0.0)),
-            mem: memory,
-            auto_save: false,
-            webhook_secret_hash: None,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
-            trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
-            whatsapp: None,
-            whatsapp_app_secret: None,
-            linq: None,
-            linq_signing_secret: None,
-            nextcloud_talk: Some(channel),
-            nextcloud_talk_webhook_secret: Some(Arc::from(secret)),
-            wati: None,
-            observer: Arc::new(crate::observability::NoopObserver),
-            tools_registry: Arc::new(Vec::new()),
-            cost_tracker: None,
-            event_tx: tokio::sync::broadcast::channel(16).0,
-            wallets: Arc::new(Mutex::new(Vec::new())),
-            wallets_path: Arc::new(std::env::temp_dir().join("traderclaw_test_wallets.json")),
-        };
-
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "X-Nextcloud-Talk-Random",
-            HeaderValue::from_str(random).unwrap(),
-        );
-        headers.insert(
-            "X-Nextcloud-Talk-Signature",
-            HeaderValue::from_str(invalid_signature).unwrap(),
-        );
-
-        let response = handle_nextcloud_talk_webhook(State(state), headers, Bytes::from(body))
-            .await
-            .into_response();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
-    }
-
-    // ══════════════════════════════════════════════════════════
-    // WhatsApp Signature Verification Tests (CWE-345 Prevention)
-    // ══════════════════════════════════════════════════════════
-
-    fn compute_whatsapp_signature_hex(secret: &str, body: &[u8]) -> String {
-        use hmac::{Hmac, Mac};
-        use sha2::Sha256;
-
-        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
-        mac.update(body);
-        hex::encode(mac.finalize().into_bytes())
-    }
-
-    fn compute_whatsapp_signature_header(secret: &str, body: &[u8]) -> String {
-        format!("sha256={}", compute_whatsapp_signature_hex(secret, body))
-    }
-
-    #[test]
-    fn whatsapp_signature_valid() {
-        let app_secret = generate_test_secret();
-        let body = b"test body content";
-
-        let signature_header = compute_whatsapp_signature_header(&app_secret, body);
-
-        assert!(verify_whatsapp_signature(
-            &app_secret,
-            body,
-            &signature_header
-        ));
-    }
-
-    #[test]
-    fn whatsapp_signature_invalid_wrong_secret() {
-        let app_secret = generate_test_secret();
-        let wrong_secret = generate_test_secret();
-        let body = b"test body content";
-
-        let signature_header = compute_whatsapp_signature_header(&wrong_secret, body);
-
-        assert!(!verify_whatsapp_signature(
-            &app_secret,
-            body,
-            &signature_header
-        ));
-    }
-
-    #[test]
-    fn whatsapp_signature_invalid_wrong_body() {
-        let app_secret = generate_test_secret();
-        let original_body = b"original body";
-        let tampered_body = b"tampered body";
-
-        let signature_header = compute_whatsapp_signature_header(&app_secret, original_body);
-
-        // Verify with tampered body should fail
-        assert!(!verify_whatsapp_signature(
-            &app_secret,
-            tampered_body,
-            &signature_header
-        ));
-    }
-
-    #[test]
-    fn whatsapp_signature_missing_prefix() {
-        let app_secret = generate_test_secret();
-        let body = b"test body";
-
-        // Signature without "sha256=" prefix
-        let signature_header = "abc123def456";
-
-        assert!(!verify_whatsapp_signature(
-            &app_secret,
-            body,
-            signature_header
-        ));
-    }
-
-    #[test]
-    fn whatsapp_signature_empty_header() {
-        let app_secret = generate_test_secret();
-        let body = b"test body";
-
-        assert!(!verify_whatsapp_signature(&app_secret, body, ""));
-    }
-
-    #[test]
-    fn whatsapp_signature_invalid_hex() {
-        let app_secret = generate_test_secret();
-        let body = b"test body";
-
-        // Invalid hex characters
-        let signature_header = "sha256=not_valid_hex_zzz";
-
-        assert!(!verify_whatsapp_signature(
-            &app_secret,
-            body,
-            signature_header
-        ));
-    }
-
-    #[test]
-    fn whatsapp_signature_empty_body() {
-        let app_secret = generate_test_secret();
-        let body = b"";
-
-        let signature_header = compute_whatsapp_signature_header(&app_secret, body);
-
-        assert!(verify_whatsapp_signature(
-            &app_secret,
-            body,
-            &signature_header
-        ));
-    }
-
-    #[test]
-    fn whatsapp_signature_unicode_body() {
-        let app_secret = generate_test_secret();
-        let body = "Hello 🦀 World".as_bytes();
-
-        let signature_header = compute_whatsapp_signature_header(&app_secret, body);
-
-        assert!(verify_whatsapp_signature(
-            &app_secret,
-            body,
-            &signature_header
-        ));
-    }
-
-    #[test]
-    fn whatsapp_signature_json_payload() {
-        let app_secret = generate_test_secret();
-        let body = br#"{"entry":[{"changes":[{"value":{"messages":[{"from":"1234567890","text":{"body":"Hello"}}]}}]}]}"#;
-
-        let signature_header = compute_whatsapp_signature_header(&app_secret, body);
-
-        assert!(verify_whatsapp_signature(
-            &app_secret,
-            body,
-            &signature_header
-        ));
-    }
-
-    #[test]
-    fn whatsapp_signature_case_sensitive_prefix() {
-        let app_secret = generate_test_secret();
-        let body = b"test body";
-
-        let hex_sig = compute_whatsapp_signature_hex(&app_secret, body);
-
-        // Wrong case prefix should fail
-        let wrong_prefix = format!("SHA256={hex_sig}");
-        assert!(!verify_whatsapp_signature(&app_secret, body, &wrong_prefix));
-
-        // Correct prefix should pass
-        let correct_prefix = format!("sha256={hex_sig}");
-        assert!(verify_whatsapp_signature(
-            &app_secret,
-            body,
-            &correct_prefix
-        ));
-    }
-
-    #[test]
-    fn whatsapp_signature_truncated_hex() {
-        let app_secret = generate_test_secret();
-        let body = b"test body";
-
-        let hex_sig = compute_whatsapp_signature_hex(&app_secret, body);
-        let truncated = &hex_sig[..32]; // Only half the signature
-        let signature_header = format!("sha256={truncated}");
-
-        assert!(!verify_whatsapp_signature(
-            &app_secret,
-            body,
-            &signature_header
-        ));
-    }
-
-    #[test]
-    fn whatsapp_signature_extra_bytes() {
-        let app_secret = generate_test_secret();
-        let body = b"test body";
-
-        let hex_sig = compute_whatsapp_signature_hex(&app_secret, body);
-        let extended = format!("{hex_sig}deadbeef");
-        let signature_header = format!("sha256={extended}");
-
-        assert!(!verify_whatsapp_signature(
-            &app_secret,
-            body,
-            &signature_header
-        ));
-    }
-
     // ══════════════════════════════════════════════════════════
     // IdempotencyStore Edge-Case Tests
     // ══════════════════════════════════════════════════════════

@@ -14,6 +14,9 @@ import {
   Activity,
   TrendingUp,
   FlaskConical,
+  Bot,
+  Heart,
+  Database,
 } from 'lucide-react'
 import { useQuery } from '@tanstack/react-query'
 import { apiFetch } from '../hooks/useApi'
@@ -35,6 +38,9 @@ const navItems: NavItem[] = [
   { to: '/chat', icon: <MessageSquare size={18} />, label: 'Terminal' },
   { to: '/tradingview', icon: <TrendingUp size={18} />, label: 'TradingView' },
   { to: '/backtesting', icon: <FlaskConical size={18} />, label: 'Backtesting' },
+  { to: '/live', icon: <Bot size={18} />, label: 'Live Strategies' },
+  { to: '/health', icon: <Heart size={18} />, label: 'System Health' },
+  { to: '/memory', icon: <Database size={18} />, label: 'Memory' },
   { to: '/settings/llm', icon: <Brain size={18} />, label: 'LLM Settings' },
   { to: '/settings/config', icon: <Settings size={18} />, label: 'Config' },
 ]

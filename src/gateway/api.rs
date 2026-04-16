@@ -3,6 +3,7 @@
 //! All `/api/*` routes require bearer token authentication (PairingGuard).
 
 use super::AppState;
+
 use axum::{
     extract::{Path, Query, State},
     http::{header, HeaderMap, StatusCode},
@@ -986,6 +987,303 @@ pub async fn handle_api_wallet_balance(
     }
 }
 
+// ── Swap body types ───────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct SwapQuoteBody {
+    pub chain: String,
+    pub from_token: String,
+    pub to_token: String,
+    pub amount: f64,
+}
+
+#[derive(Deserialize)]
+pub struct SwapExecuteBody {
+    pub chain: String,
+    pub from_token: String,
+    pub to_token: String,
+    pub amount: f64,
+    pub wallet_address: String,
+    pub password: Option<String>,
+    pub slippage_bps: Option<u64>,
+}
+
+/// POST /api/wallets/quote — get a swap quote (EVM via Uniswap QuoterV2 or Solana via Jupiter)
+pub async fn handle_api_wallets_quote(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<SwapQuoteBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    match body.chain.as_str() {
+        "evm" => {
+            // EVM: use Uniswap QuoterV2 (chain_id 1 = Ethereum mainnet)
+            let amount_in = (body.amount * 1e18) as u128; // assume 18-decimal input token
+            match evm_trader::uniswap::get_quote(&body.from_token, &body.to_token, amount_in, 1).await {
+                Ok(q) => Json(serde_json::json!({
+                    "quote": {
+                        "in_amount": body.amount,
+                        "out_amount": q.amount_out_readable,
+                        "out_amount_min": q.amount_out_readable * 0.995,
+                        "price_impact_pct": q.price_impact_bps.map(|b| b as f64 / 100.0).unwrap_or(0.0),
+                        "route": format!("{} → UniV3(0.3%) → {}", body.from_token, body.to_token),
+                        "gas_estimate": q.gas_estimate,
+                    }
+                })).into_response(),
+                Err(e) => (StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({"error": format!("QuoterV2 error: {e}")}))).into_response(),
+            }
+        }
+        "solana" => {
+            // Solana: use Jupiter /v6/quote
+            let amount_lamports = (body.amount * 1e9) as u64; // assume SOL-like 9 decimals
+            let url = format!(
+                "https://quote-api.jup.ag/v6/quote?inputMint={}&outputMint={}&amount={}",
+                body.from_token, body.to_token, amount_lamports
+            );
+            let client = reqwest::Client::new();
+            match client.get(&url).send().await {
+                Ok(r) => {
+                    match r.json::<serde_json::Value>().await {
+                        Ok(jup) => {
+                            let out_amount = jup["outAmount"].as_str()
+                                .and_then(|s| s.parse::<f64>().ok())
+                                .unwrap_or(0.0) / 1e6; // assume 6-decimal output
+                            let price_impact = jup["priceImpactPct"].as_str()
+                                .and_then(|s| s.parse::<f64>().ok())
+                                .unwrap_or(0.0);
+                            let route = jup["routePlan"].as_array()
+                                .and_then(|r| r.first())
+                                .and_then(|s| s["swapInfo"]["label"].as_str())
+                                .unwrap_or("Jupiter")
+                                .to_string();
+                            Json(serde_json::json!({
+                                "quote": {
+                                    "in_amount": body.amount,
+                                    "out_amount": out_amount,
+                                    "out_amount_min": out_amount * 0.995,
+                                    "price_impact_pct": price_impact,
+                                    "route": route,
+                                    "_jupiter_quote": jup,
+                                }
+                            })).into_response()
+                        }
+                        Err(e) => (StatusCode::BAD_GATEWAY,
+                            Json(serde_json::json!({"error": format!("Jupiter parse error: {e}")}))).into_response(),
+                    }
+                }
+                Err(e) => (StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({"error": format!("Jupiter request error: {e}")}))).into_response(),
+            }
+        }
+        chain => (StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("Unsupported chain: {chain}")}))).into_response(),
+    }
+}
+
+/// POST /api/wallets/swap — execute a swap
+pub async fn handle_api_wallets_swap(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<SwapExecuteBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    match body.chain.as_str() {
+        "evm" => {
+            // EVM execute_swap requires signer integration not yet wired
+            (StatusCode::NOT_IMPLEMENTED, Json(serde_json::json!({
+                "error": "EVM swap execution requires signer integration. Use a hardware wallet or external signer. Quote via /api/wallets/quote and broadcast via your EVM wallet."
+            }))).into_response()
+        }
+        "solana" => {
+            // Find wallet and decrypt private key
+            let (encrypted_key, _) = {
+                let wallets = state.wallets.lock();
+                match wallets.iter().find(|w| w.address.eq_ignore_ascii_case(&body.wallet_address) && w.chain == "solana") {
+                    Some(w) => (w.encrypted_key.clone(), w.address.clone()),
+                    None => return (StatusCode::NOT_FOUND,
+                        Json(serde_json::json!({"error": "Solana wallet not found"}))).into_response(),
+                }
+            };
+
+            let password = match body.password.as_deref() {
+                Some(p) if !p.is_empty() => p.to_string(),
+                _ => return (StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "Wallet password required for Solana swap"}))).into_response(),
+            };
+
+            let privkey_bytes = match wallet_manager::solana::export_private_key(&encrypted_key, &password) {
+                Ok(b) => b,
+                Err(e) => return (StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": format!("Decrypt failed: {e}")}))).into_response(),
+            };
+
+            // First get a Jupiter quote, then execute
+            let amount_lamports = (body.amount * 1e9) as u64;
+            let quote_url = format!(
+                "https://quote-api.jup.ag/v6/quote?inputMint={}&outputMint={}&amount={}&slippageBps={}",
+                body.from_token, body.to_token, amount_lamports, body.slippage_bps.unwrap_or(50)
+            );
+            let client = reqwest::Client::new();
+            let quote = match client.get(&quote_url).send().await {
+                Ok(r) => match r.json::<serde_json::Value>().await {
+                    Ok(j) => j,
+                    Err(e) => return (StatusCode::BAD_GATEWAY,
+                        Json(serde_json::json!({"error": format!("Jupiter quote parse: {e}")}))).into_response(),
+                },
+                Err(e) => return (StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({"error": format!("Jupiter quote request: {e}")}))).into_response(),
+            };
+
+            let trader = solana_trader::SolanaTrader::new(None);
+            let mut key_arr = [0u8; 32];
+            if privkey_bytes.len() >= 32 {
+                key_arr.copy_from_slice(&privkey_bytes[..32]);
+            }
+            match trader.swap(&quote, &body.wallet_address, &key_arr).await {
+                Ok(sig) => Json(serde_json::json!({"status": "ok", "tx_hash": sig})).into_response(),
+                Err(e) => (StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({"error": format!("Swap failed: {e}")}))).into_response(),
+            }
+        }
+        chain => (StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("Unsupported chain: {chain}")}))).into_response(),
+    }
+}
+
+/// POST /api/wallets/transfer — send native token to another address
+#[derive(serde::Deserialize)]
+pub struct TransferBody {
+    pub from_address: String,
+    pub to_address: String,
+    pub amount: f64,
+    pub chain: String,
+    pub password: String,
+}
+
+pub async fn handle_api_wallets_transfer(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<TransferBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    if body.to_address.is_empty() || body.amount <= 0.0 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "Invalid to_address or amount"
+        }))).into_response();
+    }
+
+    match body.chain.as_str() {
+        "evm" => {
+            (StatusCode::NOT_IMPLEMENTED, Json(serde_json::json!({
+                "error": "EVM native transfers require signer integration. Use your EVM wallet (MetaMask, hardware wallet) to send ETH/MATIC directly."
+            }))).into_response()
+        }
+        "solana" => {
+            // Verify password is correct before showing "not implemented"
+            let encrypted_key = {
+                let wallets = state.wallets.lock();
+                match wallets.iter().find(|w| w.address.eq_ignore_ascii_case(&body.from_address) && w.chain == "solana") {
+                    Some(w) => w.encrypted_key.clone(),
+                    None => return (StatusCode::NOT_FOUND,
+                        Json(serde_json::json!({"error": "Solana wallet not found"}))).into_response(),
+                }
+            };
+            if let Err(e) = wallet_manager::solana::export_private_key(&encrypted_key, &body.password) {
+                return (StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": format!("Decrypt failed: {e}")}))).into_response();
+            }
+            (StatusCode::NOT_IMPLEMENTED, Json(serde_json::json!({
+                "error": "Solana native SOL transfers are coming soon. For now, use a Solana wallet (Phantom, Backpack) to send SOL. Your private key can be exported from the wallet page."
+            }))).into_response()
+        }
+        "ton" => {
+            (StatusCode::NOT_IMPLEMENTED, Json(serde_json::json!({
+                "error": "TON transfers are not yet implemented. Use the TON wallet app or tonkeeper.com."
+            }))).into_response()
+        }
+        chain => (StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("Unsupported chain: {chain}")}))).into_response(),
+    }
+}
+
+/// GET /api/polymarket/prices-history — proxy to Polymarket CLOB /prices-history
+/// Query params: token_id (required), interval (optional: 1h/6h/1d/1w/all, default 1d)
+pub async fn handle_api_polymarket_prices_history(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let token_id = match params.get("token_id") {
+        Some(t) => t.clone(),
+        None => return (StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "token_id query param required"}))).into_response(),
+    };
+    let interval = params.get("interval").map(String::as_str).unwrap_or("1d");
+
+    // Map interval to Polymarket CLOB fidelity + startTs
+    let (fidelity, start_offset_secs): (u64, u64) = match interval {
+        "1h"  => (1,    3_600),
+        "6h"  => (5,   21_600),
+        "1d"  => (10,  86_400),
+        "1w"  => (60, 604_800),
+        "all" => (1440, 0),
+        _     => (10,  86_400),
+    };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let start_ts = if start_offset_secs > 0 { now - start_offset_secs } else { 0 };
+
+    let url = if start_offset_secs > 0 {
+        format!(
+            "https://clob.polymarket.com/prices-history?market={}&interval={}&fidelity={}&startTs={}",
+            token_id, interval, fidelity, start_ts
+        )
+    } else {
+        format!(
+            "https://clob.polymarket.com/prices-history?market={}&interval={}&fidelity={}",
+            token_id, interval, fidelity
+        )
+    };
+
+    let client = reqwest::Client::new();
+    match client.get(&url).send().await {
+        Ok(r) => {
+            match r.json::<serde_json::Value>().await {
+                Ok(data) => {
+                    // Extract the history array (Polymarket returns {"history": [{t, p}, ...]})
+                    let history = data.get("history").cloned().unwrap_or(data);
+                    Json(serde_json::json!({
+                        "token_id": token_id,
+                        "interval": interval,
+                        "history": history,
+                    })).into_response()
+                }
+                Err(e) => (StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({"error": format!("Parse error: {e}")}))).into_response(),
+            }
+        }
+        Err(e) => (StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error": format!("CLOB request failed: {e}")}))).into_response(),
+    }
+}
+
 /// GET /api/polymarket/markets — fetch top markets from Gamma API
 pub async fn handle_api_polymarket_markets(
     State(state): State<AppState>,
@@ -1021,6 +1319,7 @@ pub async fn handle_api_polymarket_markets(
                         "yes_price": price_res.ok(),
                         "volume": m.volume,
                         "end_date": m.end_date_iso,
+                        "yes_token_id": m.yes_token_id,
                     })
                 })
                 .collect();
@@ -1395,6 +1694,45 @@ pub async fn handle_api_polymarket_order_cancel(
             Json(serde_json::json!({"error": e.to_string()})),
         )
             .into_response(),
+    }
+}
+
+/// GET /api/polymarket/markets/resolve?slug=... — resolve a Polymarket slug to condition_id
+pub async fn handle_api_polymarket_resolve_slug(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let slug = match query.get("slug") {
+        Some(s) => s.clone(),
+        None => {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "missing slug parameter"}))).into_response();
+        }
+    };
+
+    let url = format!("https://gamma-api.polymarket.com/markets?slug={}", slug);
+    match reqwest::Client::new().get(&url).timeout(std::time::Duration::from_secs(10)).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            match resp.json::<serde_json::Value>().await {
+                Ok(data) => {
+                    if let Some(market) = data.as_array().and_then(|a| a.first()) {
+                        Json(serde_json::json!({
+                            "condition_id": market.get("conditionId").and_then(|v| v.as_str()),
+                            "question": market.get("question").and_then(|v| v.as_str()),
+                            "slug": market.get("slug").and_then(|v| v.as_str()),
+                        })).into_response()
+                    } else {
+                        (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "market not found"}))).into_response()
+                    }
+                }
+                Err(e) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+            }
+        }
+        Ok(resp) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error": format!("Gamma API error: {}", resp.status())}))).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
     }
 }
 
@@ -2360,6 +2698,19 @@ pub async fn handle_api_backtest_run(
         }))
         .collect();
 
+    let all_trades: Vec<serde_json::Value> = metrics
+        .all_trades
+        .iter()
+        .map(|t| serde_json::json!({
+            "timestamp": t.timestamp,
+            "side": t.side,
+            "price": t.price,
+            "size": t.size,
+            "pnl": t.pnl,
+            "balance": t.balance,
+        }))
+        .collect();
+
     Json(serde_json::json!({
         "script": body.script,
         "market_type": body.market_type,
@@ -2375,6 +2726,7 @@ pub async fn handle_api_backtest_run(
         "win_rate_pct": metrics.win_rate_pct,
         "total_trades": metrics.total_trades,
         "worst_trades": worst_trades,
+        "all_trades": all_trades,
         "analysis": metrics.analysis,
     }))
     .into_response()
@@ -2653,6 +3005,122 @@ pub async fn handle_api_backtest_scripts_content_post(
     }
 }
 
+// ── Live Strategy Runner API ──────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+pub struct CreateRunnerBody {
+    pub name: Option<String>,
+    pub script: String,
+    pub market_type: String,
+    pub symbol: String,
+    pub interval: String,
+    pub mode: String,
+    pub initial_balance: f64,
+    pub fee_pct: Option<f64>,
+    pub warmup_days: Option<u32>,
+}
+
+/// GET /api/live/strategies — list all strategy runners
+pub async fn handle_api_live_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+    let runners = state.strategy_runner.list();
+    Json(serde_json::json!({ "runners": runners })).into_response()
+}
+
+/// POST /api/live/strategies — create & start a new runner
+pub async fn handle_api_live_create(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<CreateRunnerBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let config = crate::strategy_runner::RunnerConfig {
+        id: id.clone(),
+        name: body.name.unwrap_or_else(|| format!("{} on {}", body.script, body.symbol)),
+        script: body.script,
+        market_type: body.market_type,
+        symbol: body.symbol,
+        interval: body.interval,
+        mode: body.mode,
+        initial_balance: body.initial_balance,
+        fee_pct: body.fee_pct.unwrap_or(0.1),
+        warmup_days: body.warmup_days.unwrap_or(90),
+    };
+
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let runner = crate::strategy_runner::start_runner(
+        state.strategy_runner.clone(),
+        config,
+        workspace_dir,
+    );
+
+    (StatusCode::CREATED, Json(serde_json::json!({ "runner": runner }))).into_response()
+}
+
+/// GET /api/live/strategies/{id} — get single runner details
+pub async fn handle_api_live_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+    match state.strategy_runner.get(&id) {
+        Some(r) => Json(serde_json::json!({ "runner": r })).into_response(),
+        None => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "not found" }))).into_response(),
+    }
+}
+
+/// DELETE /api/live/strategies/{id} — stop and delete a runner
+pub async fn handle_api_live_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+    if state.strategy_runner.delete(&id) {
+        Json(serde_json::json!({ "success": true })).into_response()
+    } else {
+        (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "runner not found" }))).into_response()
+    }
+}
+
+/// POST /api/live/strategies/{id}/stop — stop a runner (keep it in list)
+pub async fn handle_api_live_stop(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+    state.strategy_runner.stop(&id);
+    Json(serde_json::json!({ "success": true })).into_response()
+}
+
+/// POST /api/live/strategies/{id}/restart — restart a stopped runner
+pub async fn handle_api_live_restart(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+
+    let config = match state.strategy_runner.get(&id) {
+        Some(r) => r.config.clone(),
+        None => return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "runner not found" }))).into_response(),
+    };
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let runner = crate::strategy_runner::start_runner(
+        state.strategy_runner.clone(),
+        config,
+        workspace_dir,
+    );
+    Json(serde_json::json!({ "runner": runner })).into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2681,19 +3149,6 @@ mod tests {
             allowed_users: vec!["*".to_string()],
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
-        });
-        cfg.channels_config.email = Some(crate::channels::email_channel::EmailConfig {
-            imap_host: "imap.example.com".to_string(),
-            imap_port: 993,
-            imap_folder: "INBOX".to_string(),
-            smtp_host: "smtp.example.com".to_string(),
-            smtp_port: 465,
-            smtp_tls: true,
-            username: "agent@example.com".to_string(),
-            password: "email-password-secret".to_string(),
-            from_address: "agent@example.com".to_string(),
-            idle_timeout_secs: 1740,
-            allowed_senders: vec!["*".to_string()],
         });
         cfg.model_routes = vec![crate::config::schema::ModelRouteConfig {
             hint: "reasoning".to_string(),
@@ -2774,14 +3229,6 @@ mod tests {
                 .and_then(|v| v.api_key.as_deref()),
             Some(MASKED_SECRET)
         );
-        assert_eq!(
-            parsed
-                .channels_config
-                .email
-                .as_ref()
-                .map(|v| v.password.as_str()),
-            Some(MASKED_SECRET)
-        );
     }
 
     #[test]
@@ -2814,19 +3261,6 @@ mod tests {
             allowed_users: vec!["*".to_string()],
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
-        });
-        current.channels_config.email = Some(crate::channels::email_channel::EmailConfig {
-            imap_host: "imap.example.com".to_string(),
-            imap_port: 993,
-            imap_folder: "INBOX".to_string(),
-            smtp_host: "smtp.example.com".to_string(),
-            smtp_port: 465,
-            smtp_tls: true,
-            username: "agent@example.com".to_string(),
-            password: "email-password-real".to_string(),
-            from_address: "agent@example.com".to_string(),
-            idle_timeout_secs: 1740,
-            allowed_senders: vec!["*".to_string()],
         });
         current.model_routes = vec![
             crate::config::schema::ModelRouteConfig {
@@ -2878,9 +3312,6 @@ mod tests {
             feishu.app_secret = MASKED_SECRET.to_string();
             feishu.encrypt_key = Some(MASKED_SECRET.to_string());
             feishu.verification_token = Some("feishu-verify-new".to_string());
-        }
-        if let Some(email) = incoming.channels_config.email.as_mut() {
-            email.password = MASKED_SECRET.to_string();
         }
         incoming.model_routes[1].api_key = Some("route-model-key-2-new".to_string());
         incoming.embedding_routes[1].api_key = Some("route-embed-key-2-new".to_string());
@@ -2966,14 +3397,6 @@ mod tests {
         assert_eq!(
             hydrated.embedding_routes[1].api_key.as_deref(),
             Some("route-embed-key-2-new")
-        );
-        assert_eq!(
-            hydrated
-                .channels_config
-                .email
-                .as_ref()
-                .map(|v| v.password.as_str()),
-            Some("email-password-real")
         );
     }
 

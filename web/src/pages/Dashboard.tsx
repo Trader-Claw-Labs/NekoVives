@@ -3,7 +3,7 @@ import { Link } from 'react-router-dom'
 import { apiFetch } from '../hooks/useApi'
 import {
   Wallet, Zap, Send, Brain, Activity, Clock, TrendingUp, Shield,
-  BarChart2, MessageSquare, Settings, ChevronRight, Timer,
+  BarChart2, MessageSquare, Settings, ChevronRight, Timer, Hash,
 } from 'lucide-react'
 import clsx from 'clsx'
 
@@ -30,6 +30,10 @@ interface StatusData {
 interface CronData {
   jobs?: { id: string; name: string; enabled: boolean; next_run?: string }[]
   market_scanner?: { enabled: boolean; interval_seconds: number }
+}
+
+interface CostData {
+  cost?: { total_tokens: number; request_count: number }
 }
 
 interface StatCard {
@@ -108,8 +112,15 @@ export default function Dashboard() {
       apiFetch<CronData>('/api/cron').catch(() => ({ jobs: [] })),
   })
 
-  const telegramConfigured = !!(status?.channels?.['telegram'])
+  const { data: costData } = useQuery<CostData>({
+    queryKey: ['cost'],
+    queryFn: (): Promise<CostData> =>
+      apiFetch<CostData>('/api/cost').catch(() => ({})),
+    refetchInterval: 30_000,
+  })
+
   const telegramHealth = status?.health?.components?.['channel:telegram']
+  const telegramConfigured = !!(status?.channels?.['telegram']) || !!(telegramHealth)
   const telegramOnline = telegramHealth?.status === 'ok'
   const telegramDotStatus: 'online' | 'offline' | 'warning' = !telegramConfigured
     ? 'offline'
@@ -122,6 +133,14 @@ export default function Dashboard() {
   const walletCount = wallets?.wallets?.length ?? 0
   const skillCount = cronData?.jobs?.length ?? 0
   const scanInterval = cronData?.market_scanner?.interval_seconds
+  const totalTokens = costData?.cost?.total_tokens ?? 0
+
+  function fmtTokens(n: number): string {
+    if (n === 0) return '0'
+    if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
+    if (n >= 1_000) return `${(n / 1_000).toFixed(0)}K`
+    return n.toLocaleString()
+  }
 
   const cards: StatCard[] = [
     {
@@ -148,6 +167,12 @@ export default function Dashboard() {
       icon: <Brain size={16} />,
       status: status?.provider ? 'online' : 'offline',
       sub: status?.provider ?? 'No provider',
+    },
+    {
+      label: 'Tokens Used',
+      value: fmtTokens(totalTokens),
+      icon: <Hash size={16} />,
+      sub: `${(costData?.cost?.request_count ?? 0).toLocaleString()} requests`,
     },
   ]
 
@@ -196,7 +221,7 @@ export default function Dashboard() {
       )}
 
       {/* Stat cards */}
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+      <div className="grid grid-cols-2 lg:grid-cols-5 gap-4 mb-6">
         {cards.map((card) => (
           <Card key={card.label} {...card} />
         ))}

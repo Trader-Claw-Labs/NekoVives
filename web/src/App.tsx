@@ -16,6 +16,9 @@ import LLMSettings from './pages/LLMSettings'
 import Config from './pages/Config'
 import TradingViewPage from './pages/TradingView'
 import Backtesting from './pages/Backtesting'
+import LiveStrategies from './pages/LiveStrategies'
+import SystemHealth from './pages/SystemHealth'
+import Memory from './pages/Memory'
 import { apiFetch, getAuthToken } from './hooks/useApi'
 
 // ── Error boundary ────────────────────────────────────────────────
@@ -140,6 +143,9 @@ export default function App() {
             <Route path="/chat" element={<Chat />} />
             <Route path="/tradingview" element={<TradingViewPage />} />
             <Route path="/backtesting" element={<Backtesting />} />
+            <Route path="/live" element={<LiveStrategies />} />
+            <Route path="/health" element={<SystemHealth />} />
+            <Route path="/memory" element={<Memory />} />
             <Route path="/settings/llm" element={<LLMSettings />} />
             <Route path="/settings/config" element={<Config />} />
           </Routes>

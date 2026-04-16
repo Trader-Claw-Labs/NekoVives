@@ -106,6 +106,7 @@ market-analyzer = { path = "crates/market-analyzer" }
 polymarket-trader = { path = "crates/polymarket-trader" }
 wallet-manager = { path = "crates/wallet-manager" }
 solana-trader = { path = "crates/solana-trader" }
+evm-trader = { path = "crates/evm-trader" }
 
 # Memory / persistence
 rusqlite = { version = "0.37", features = ["bundled"] }
@@ -219,7 +220,6 @@ panic = "abort"
 [dev-dependencies]
 tempfile = "3.14"
 criterion = { version = "0.8", features = ["async_tokio"] }
-wiremock = "0.6"
 scopeguard = "1.2"
 
 

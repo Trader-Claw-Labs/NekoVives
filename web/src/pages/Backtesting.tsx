@@ -1,11 +1,12 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { useQuery, useMutation } from '@tanstack/react-query'
 import { apiFetch, apiPost, apiDelete } from '../hooks/useApi'
-import { useBacktestState, type BacktestConfig, type ProgressState, type MarketType, type BacktestResult } from '../hooks/useBacktestState'
+import { useBacktestState, type BacktestConfig, type ProgressState, type MarketType, type BacktestResult, type TradeLog, POLY_BINARY_PRESETS } from '../hooks/useBacktestState'
 import {
   FlaskConical, Play, FileCode2, BarChart2, TrendingDown,
   AlertCircle, ChevronDown, ChevronRight, RefreshCw, Trash2,
   Pencil, Save, X, FolderOpen, Activity, Check, Eye, Code2,
+  Search, Info,
 } from 'lucide-react'
 import clsx from 'clsx'
 
@@ -49,14 +50,25 @@ const POLYMARKET_INTERVALS = [
   { value: '1d', label: '1d' },
 ]
 
-// Popular Polymarket markets (condition token IDs)
-const POPULAR_POLYMARKET_MARKETS = [
-  { id: '0x', label: 'Custom (enter manually)' },
-  { id: '21742633143463906290569050155826241533067272736897614950488156847949938836455', label: 'Presidential Election 2024' },
-  { id: '52114319501245915516055106046884209969926127482827954674443846427813813222426', label: 'Fed Rate Decision' },
-  { id: '48331043336612883890938759509493159234755048973500640148014422747788308965732', label: 'Bitcoin Price $100k' },
-  { id: '69236923137512312461235512361235123612351236123512361235123612351236123512351', label: 'ETH Price $5000' },
+// Window sizes for binary markets (resolution windows)
+const BINARY_WINDOW_INTERVALS = [
+  { value: '1m',  label: '1 min' },
+  { value: '2m',  label: '2 min' },
+  { value: '3m',  label: '3 min' },
+  { value: '4m',  label: '4 min' },
+  { value: '5m',  label: '5 min' },
+  { value: '10m', label: '10 min' },
+  { value: '15m', label: '15 min' },
+  { value: '30m', label: '30 min' },
+  { value: '1h',  label: '1 hour' },
 ]
+
+interface PolymarketMarket {
+  id: string
+  question: string
+  yes_price?: number
+  volume?: number
+}
 
 // ── Helpers ───────────────────────────────────────────────────────
 
@@ -106,8 +118,170 @@ function MetricCard({
   )
 }
 
+// ── Equity Curve Chart ────────────────────────────────────────────
+
+function EquityChart({ trades, initialBalance }: { trades: TradeLog[], initialBalance: number }) {
+  const svgRef = useRef<SVGSVGElement>(null)
+
+  if (trades.length === 0) return null
+
+  const W = 800
+  const H = 220
+  const PAD = { top: 16, right: 24, bottom: 36, left: 64 }
+
+  // Build equity curve: start at initialBalance, then each trade balance
+  const points: { x: number; y: number; trade?: TradeLog }[] = []
+  const allBalances = [initialBalance, ...trades.map(t => t.balance ?? initialBalance)]
+  const minB = Math.min(...allBalances) * 0.995
+  const maxB = Math.max(...allBalances) * 1.005
+
+  const chartW = W - PAD.left - PAD.right
+  const chartH = H - PAD.top - PAD.bottom
+
+  // First point = initial balance at time 0
+  points.push({ x: PAD.left, y: PAD.top + chartH - ((initialBalance - minB) / (maxB - minB)) * chartH })
+
+  trades.forEach((t, i) => {
+    const x = PAD.left + ((i + 1) / trades.length) * chartW
+    const bal = t.balance ?? initialBalance
+    const y = PAD.top + chartH - ((bal - minB) / (maxB - minB)) * chartH
+    points.push({ x, y, trade: t })
+  })
+
+  const polyline = points.map(p => `${p.x},${p.y}`).join(' ')
+
+  // Y axis labels
+  const yTicks = 4
+  const yLabels = Array.from({ length: yTicks + 1 }, (_, i) => {
+    const val = minB + (i / yTicks) * (maxB - minB)
+    const y = PAD.top + chartH - (i / yTicks) * chartH
+    return { val, y }
+  })
+
+  // X axis labels (dates)
+  const xTicks = Math.min(5, trades.length)
+  const xLabels = Array.from({ length: xTicks }, (_, i) => {
+    const idx = Math.floor((i / (xTicks - 1)) * (trades.length - 1))
+    const trade = trades[idx]
+    const x = PAD.left + ((idx + 1) / trades.length) * chartW
+    const label = trade ? new Date(trade.timestamp).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : ''
+    return { x, label }
+  })
+
+  return (
+    <div
+      className="rounded-lg border overflow-hidden"
+      style={{ backgroundColor: 'var(--color-surface)', borderColor: 'var(--color-border)' }}
+    >
+      <div className="px-4 py-3 border-b flex items-center gap-2" style={{ borderColor: 'var(--color-border)' }}>
+        <BarChart2 size={12} style={{ color: 'var(--color-accent)' }} />
+        <span className="text-xs font-semibold uppercase tracking-widest" style={{ color: 'var(--color-text-muted)' }}>
+          Equity Curve — {trades.length} trades
+        </span>
+      </div>
+      <div className="p-2 overflow-x-auto">
+        <svg ref={svgRef} viewBox={`0 0 ${W} ${H}`} style={{ width: '100%', minWidth: 400, height: H }}>
+          {/* Grid lines */}
+          {yLabels.map((l, i) => (
+            <g key={i}>
+              <line
+                x1={PAD.left} y1={l.y} x2={W - PAD.right} y2={l.y}
+                stroke="var(--color-border)" strokeWidth="0.5" strokeDasharray="4,4"
+              />
+              <text
+                x={PAD.left - 6} y={l.y + 4}
+                textAnchor="end" fontSize="9" fill="var(--color-text-muted)"
+              >
+                ${Math.round(l.val).toLocaleString()}
+              </text>
+            </g>
+          ))}
+
+          {/* X axis labels */}
+          {xLabels.map((l, i) => (
+            <text key={i} x={l.x} y={H - 4} textAnchor="middle" fontSize="9" fill="var(--color-text-muted)">
+              {l.label}
+            </text>
+          ))}
+
+          {/* Equity line fill */}
+          <defs>
+            <linearGradient id="equityGrad" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="var(--color-accent)" stopOpacity="0.25" />
+              <stop offset="100%" stopColor="var(--color-accent)" stopOpacity="0.02" />
+            </linearGradient>
+          </defs>
+          <polygon
+            points={`${PAD.left},${PAD.top + chartH} ${polyline} ${W - PAD.right},${PAD.top + chartH}`}
+            fill="url(#equityGrad)"
+          />
+
+          {/* Equity line */}
+          <polyline
+            points={polyline}
+            fill="none"
+            stroke="var(--color-accent)"
+            strokeWidth="1.5"
+          />
+
+          {/* Trade markers */}
+          {points.slice(1).map((p, i) => {
+            const t = p.trade!
+            const isWin = t.pnl >= 0
+            const color = isWin ? '#00ff88' : '#ff4444'
+            return (
+              <g key={i}>
+                {t.side === 'buy' ? (
+                  // Triangle up for buy
+                  <polygon
+                    points={`${p.x},${p.y - 8} ${p.x - 5},${p.y + 2} ${p.x + 5},${p.y + 2}`}
+                    fill={color}
+                    opacity="0.85"
+                  >
+                    <title>{t.side.toUpperCase()} @ ${t.price.toFixed(2)} | PnL: ${t.pnl.toFixed(2)}</title>
+                  </polygon>
+                ) : (
+                  // Triangle down for sell
+                  <polygon
+                    points={`${p.x},${p.y + 8} ${p.x - 5},${p.y - 2} ${p.x + 5},${p.y - 2}`}
+                    fill={color}
+                    opacity="0.85"
+                  >
+                    <title>{t.side.toUpperCase()} @ ${t.price.toFixed(2)} | PnL: ${t.pnl.toFixed(2)}</title>
+                  </polygon>
+                )}
+              </g>
+            )
+          })}
+
+          {/* Axes */}
+          <line x1={PAD.left} y1={PAD.top} x2={PAD.left} y2={PAD.top + chartH} stroke="var(--color-border)" strokeWidth="1" />
+          <line x1={PAD.left} y1={PAD.top + chartH} x2={W - PAD.right} y2={PAD.top + chartH} stroke="var(--color-border)" strokeWidth="1" />
+        </svg>
+
+        {/* Legend */}
+        <div className="flex gap-4 px-2 pb-1 text-xs" style={{ color: 'var(--color-text-muted)' }}>
+          <span className="flex items-center gap-1">
+            <span style={{ display: 'inline-block', width: 8, height: 8, background: '#00ff88', clipPath: 'polygon(50% 0%, 0% 100%, 100% 100%)' }} />
+            Win
+          </span>
+          <span className="flex items-center gap-1">
+            <span style={{ display: 'inline-block', width: 8, height: 8, background: '#ff4444', clipPath: 'polygon(50% 0%, 0% 100%, 100% 100%)' }} />
+            Loss
+          </span>
+          <span className="flex items-center gap-1">
+            <span style={{ display: 'inline-block', width: 16, height: 2, background: 'var(--color-accent)', marginBottom: 2 }} />
+            Equity
+          </span>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function ResultPanel({ result }: { result: BacktestResult }) {
   const [showTrades, setShowTrades] = useState(false)
+  const isBinary = result.avg_token_price != null
 
   return (
     <div className="space-y-4">
@@ -145,6 +319,34 @@ function ResultPanel({ result }: { result: BacktestResult }) {
         />
       </div>
 
+      {/* Binary-specific metrics row */}
+      {isBinary && (
+        <div className="grid grid-cols-3 gap-3">
+          <MetricCard
+            label="Avg Token Price"
+            value={`$${fmt(result.avg_token_price!, 3)}`}
+            sub="per YES/NO token"
+            color={result.avg_token_price! < 0.65 ? 'var(--color-accent)' : 'var(--color-warning)'}
+          />
+          <MetricCard
+            label="Break-even Rate"
+            value={`${fmt(result.break_even_win_rate!)}%`}
+            sub="win rate needed to profit"
+            color={
+              result.win_rate_pct > result.break_even_win_rate!
+                ? 'var(--color-accent)'
+                : 'var(--color-danger)'
+            }
+          />
+          <MetricCard
+            label="Direction Accuracy"
+            value={`${fmt(result.correct_direction_pct!)}%`}
+            sub="called direction correctly"
+            color={result.correct_direction_pct! >= 50 ? 'var(--color-accent)' : 'var(--color-warning)'}
+          />
+        </div>
+      )}
+
       {/* AI Analysis */}
       {result.analysis && (
         <div
@@ -161,6 +363,11 @@ function ResultPanel({ result }: { result: BacktestResult }) {
       )}
 
       {/* Worst trades */}
+      {/* Equity curve chart */}
+      {result.all_trades && result.all_trades.length > 0 && (
+        <EquityChart trades={result.all_trades} initialBalance={result.initial_balance ?? 10000} />
+      )}
+
       {result.worst_trades && result.worst_trades.length > 0 && (
         <div
           className="rounded-lg border overflow-hidden"
@@ -227,17 +434,29 @@ function ResultPanel({ result }: { result: BacktestResult }) {
 
 // ── Progress Panel ────────────────────────────────────────────────
 
+/**
+ * Estimates a download progress percentage (0–95) from elapsed seconds.
+ * Uses a logarithmic curve: fast at first, slows near 95%.
+ * At 5s → ~50%, 15s → ~75%, 60s → ~92%, never reaches 95 until done.
+ */
+function estimatePct(elapsedMs: number): number {
+  const t = elapsedMs / 1000
+  return Math.min(94, Math.round(95 * (1 - Math.exp(-t / 20))))
+}
+
 function ProgressPanel({ state }: { state: ProgressState }) {
-  const [elapsed, setElapsed] = useState(0)
+  const [elapsedMs, setElapsedMs] = useState(0)
 
   useEffect(() => {
     if (state.startTime && state.step !== 'done' && state.step !== 'error') {
-      const interval = setInterval(() => {
-        setElapsed(Math.floor((Date.now() - state.startTime!) / 1000))
+      const tick = setInterval(() => {
+        setElapsedMs(Date.now() - state.startTime!)
       }, 100)
-      return () => clearInterval(interval)
+      return () => clearInterval(tick)
     }
   }, [state.startTime, state.step])
+
+  const elapsed = Math.floor(elapsedMs / 1000)
 
   const steps = [
     { key: 'preparing', label: 'Preparing' },
@@ -247,6 +466,12 @@ function ProgressPanel({ state }: { state: ProgressState }) {
   ]
 
   const currentIdx = steps.findIndex(s => s.key === state.step)
+
+  // Calculate per-step progress bar
+  // - preparing / running / analyzing: spin across full width quickly
+  // - fetching: show estimated percentage of download
+  const isFetching = state.step === 'fetching'
+  const fetchPct = isFetching ? estimatePct(elapsedMs) : 0
 
   return (
     <div
@@ -303,6 +528,50 @@ function ProgressPanel({ state }: { state: ProgressState }) {
           )
         })}
       </div>
+
+      {/* Download progress bar — shown only during the fetching step */}
+      {isFetching && (
+        <div className="mb-3">
+          <div className="flex items-center justify-between mb-1">
+            <span className="text-xs" style={{ color: 'var(--color-text-muted)' }}>
+              Downloading dataset…
+            </span>
+            <span className="text-xs font-mono font-semibold" style={{ color: 'var(--color-accent)' }}>
+              {fetchPct}%
+            </span>
+          </div>
+          <div className="w-full h-1.5 rounded-full overflow-hidden" style={{ backgroundColor: 'var(--color-base)' }}>
+            <div
+              className="h-full rounded-full"
+              style={{
+                width: `${fetchPct}%`,
+                backgroundColor: 'var(--color-accent)',
+                transition: 'width 0.4s ease-out',
+              }}
+            />
+          </div>
+        </div>
+      )}
+
+      {/* Indeterminate sliding bar for non-fetch active steps */}
+      {!isFetching && state.step !== 'idle' && (
+        <div className="mb-3 w-full h-1.5 rounded-full overflow-hidden relative" style={{ backgroundColor: 'var(--color-base)' }}>
+          <div
+            className="absolute h-full rounded-full"
+            style={{
+              width: '35%',
+              backgroundColor: 'var(--color-accent)',
+              animation: 'indeterminate-slide 1.6s cubic-bezier(0.65,0.05,0.35,0.95) infinite',
+            }}
+          />
+          <style>{`
+            @keyframes indeterminate-slide {
+              0%   { left: -35%; }
+              100% { left: 100%; }
+            }
+          `}</style>
+        </div>
+      )}
 
       {/* Current message */}
       <div
@@ -659,13 +928,33 @@ export default function Backtesting() {
     result,
     progress,
     isRunning,
+    runningScriptPath,
+    scriptResults,
     setConfig: setConfigField,
+    setFullConfig,
     runBacktest,
   } = useBacktestState()
 
   // Local UI state (doesn't need to persist)
   const [scriptsExpanded, setScriptsExpanded] = useState(true)
   const [viewingScript, setViewingScript] = useState<BacktestScript | null>(null)
+  const [polySearch, setPolySearch] = useState('')
+
+  // Currently displayed result: active result or previously cached per-script result
+  const displayResult = result ?? (config.script ? scriptResults[config.script] ?? null : null)
+  const isShowingCachedResult = !result && !!displayResult
+
+  // Load Polymarket markets (only when polymarket CLOB mode is selected, not binary)
+  const { data: polyMarketsData, isLoading: polyMarketsLoading } = useQuery<{ markets: PolymarketMarket[] }>({
+    queryKey: ['polymarket-markets'],
+    queryFn: () => apiFetch('/api/polymarket/markets'),
+    enabled: config.market_type === 'polymarket',
+    staleTime: 5 * 60 * 1000,
+  })
+  const polyMarkets = polyMarketsData?.markets ?? []
+  const filteredPolyMarkets = polySearch
+    ? polyMarkets.filter(m => m.question.toLowerCase().includes(polySearch.toLowerCase()))
+    : polyMarkets
 
   // Load available scripts
   const { data: scriptsData, isLoading: scriptsLoading, refetch: refetchScripts } = useQuery<{ scripts: BacktestScript[] }>({
@@ -769,7 +1058,8 @@ export default function Backtesting() {
     setConfigField(k, v)
   }
 
-  const canRun = config.script && !isRunning
+  const needsSymbol = config.market_type === 'polymarket' ? !!config.symbol : true
+  const canRun = !!config.script && !isRunning && needsSymbol
 
   return (
     <div className="p-6 max-w-6xl mx-auto">
@@ -795,7 +1085,7 @@ export default function Backtesting() {
           Configuration
         </h2>
 
-        <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-9 gap-3 items-end">
+        <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-10 gap-3 items-end">
           {/* Market Type Select */}
           <div>
             <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>Market</label>
@@ -803,13 +1093,25 @@ export default function Backtesting() {
               value={config.market_type}
               onChange={(e) => {
                 const newType = e.target.value as MarketType
-                set('market_type', newType)
-                if (newType === 'crypto') {
-                  set('symbol', 'BTCUSDT')
-                  set('interval', '1m')
+                if (newType === 'polymarket_binary') {
+                  const preset = POLY_BINARY_PRESETS.find(p => p.id === (config.poly_binary_preset ?? 'btc_5m'))
+                    ?? POLY_BINARY_PRESETS[0]
+                  setFullConfig({
+                    ...config,
+                    market_type: newType,
+                    symbol: preset.symbol,
+                    interval: preset.defaultInterval,
+                    fee_pct: 1.5,
+                    poly_binary_preset: preset.id,
+                  })
                 } else {
-                  set('symbol', '')
-                  set('interval', '1h')
+                  setFullConfig({
+                    ...config,
+                    market_type: newType,
+                    symbol: newType === 'crypto' ? 'BTCUSDT' : '',
+                    interval: newType === 'crypto' ? '1m' : '5m',
+                    fee_pct: newType === 'crypto' ? 0.1 : 1.5,
+                  })
                 }
               }}
               className="w-full rounded px-2 py-2 text-sm"
@@ -820,7 +1122,8 @@ export default function Backtesting() {
               }}
             >
               <option value="crypto">Crypto</option>
-              <option value="polymarket">Polymarket</option>
+              <option value="polymarket_binary">Polymarket Binary</option>
+              <option value="polymarket">Polymarket CLOB</option>
             </select>
           </div>
 
@@ -863,7 +1166,7 @@ export default function Backtesting() {
             )}
           </div>
 
-          {/* Symbol (Crypto) or Market Select (Polymarket) */}
+          {/* Symbol / Market selector — adapts to market type */}
           {config.market_type === 'crypto' ? (
             <div>
               <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>Symbol</label>
@@ -879,16 +1182,20 @@ export default function Backtesting() {
                 }}
               />
             </div>
-          ) : (
+          ) : config.market_type === 'polymarket_binary' ? (
             <div className="col-span-2">
-              <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>Market</label>
+              <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>Underlying Asset</label>
               <select
-                value={POPULAR_POLYMARKET_MARKETS.find(m => m.id === config.symbol) ? config.symbol : '0x'}
+                value={config.poly_binary_preset ?? 'btc_5m'}
                 onChange={(e) => {
-                  if (e.target.value === '0x') {
-                    set('symbol', '')
-                  } else {
-                    set('symbol', e.target.value)
+                  const preset = POLY_BINARY_PRESETS.find(p => p.id === e.target.value)
+                  if (preset) {
+                    setFullConfig({
+                      ...config,
+                      poly_binary_preset: preset.id,
+                      symbol: preset.symbol,
+                      interval: preset.defaultInterval,
+                    })
                   }
                 }}
                 className="w-full rounded px-2 py-2 text-sm"
@@ -898,32 +1205,79 @@ export default function Backtesting() {
                   color: 'var(--color-text)',
                 }}
               >
-                {POPULAR_POLYMARKET_MARKETS.map((m) => (
-                  <option key={m.id} value={m.id}>
-                    {m.label}
-                  </option>
+                {POLY_BINARY_PRESETS.map(p => (
+                  <option key={p.id} value={p.id}>{p.label}</option>
                 ))}
               </select>
-              {/* Custom input when "Custom" is selected */}
-              {!POPULAR_POLYMARKET_MARKETS.slice(1).find(m => m.id === config.symbol) && (
+              {/* Show description */}
+              {(() => {
+                const preset = POLY_BINARY_PRESETS.find(p => p.id === (config.poly_binary_preset ?? 'btc_5m'))
+                return preset ? (
+                  <p className="text-[10px] mt-1 leading-tight" style={{ color: 'var(--color-text-muted)' }}>
+                    "{preset.description}" · Data: Binance {preset.symbol}
+                  </p>
+                ) : null
+              })()}
+            </div>
+          ) : (
+            <div className="col-span-2">
+              <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>Market</label>
+              <div className="relative mb-1.5">
+                <Search size={12} className="absolute left-2 top-1/2 -translate-y-1/2" style={{ color: 'var(--color-text-muted)' }} />
                 <input
-                  value={config.symbol}
-                  onChange={(e) => set('symbol', e.target.value)}
-                  placeholder="Enter condition token ID..."
-                  className="w-full rounded px-3 py-1.5 text-xs font-mono mt-1.5"
+                  value={polySearch}
+                  onChange={(e) => setPolySearch(e.target.value)}
+                  placeholder="Search markets..."
+                  className="w-full rounded pl-7 pr-2 py-1.5 text-xs"
                   style={{
                     backgroundColor: 'var(--color-surface-2)',
                     border: '1px solid var(--color-border)',
                     color: 'var(--color-text)',
                   }}
                 />
+              </div>
+              {polyMarketsLoading ? (
+                <div className="text-xs py-1" style={{ color: 'var(--color-text-muted)' }}>Loading markets...</div>
+              ) : (
+                <select
+                  value={config.symbol}
+                  onChange={(e) => set('symbol', e.target.value)}
+                  className="w-full rounded px-2 py-2 text-xs"
+                  style={{
+                    backgroundColor: 'var(--color-surface-2)',
+                    border: '1px solid var(--color-border)',
+                    color: 'var(--color-text)',
+                  }}
+                  size={Math.min(4, filteredPolyMarkets.length + 1)}
+                >
+                  <option value="">— select a market —</option>
+                  {filteredPolyMarkets.slice(0, 20).map((m) => (
+                    <option key={m.id} value={m.id} title={m.id}>
+                      {m.question.length > 50 ? m.question.slice(0, 50) + '…' : m.question}
+                      {m.yes_price != null ? ` (${(m.yes_price * 100).toFixed(0)}¢)` : ''}
+                    </option>
+                  ))}
+                </select>
               )}
+              <input
+                value={config.symbol}
+                onChange={(e) => set('symbol', e.target.value)}
+                placeholder="Or paste condition token ID..."
+                className="w-full rounded px-2 py-1.5 text-xs font-mono mt-1"
+                style={{
+                  backgroundColor: 'var(--color-surface-2)',
+                  border: '1px solid var(--color-border)',
+                  color: 'var(--color-text)',
+                }}
+              />
             </div>
           )}
 
-          {/* Interval */}
+          {/* Interval / Window */}
           <div>
-            <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>Interval</label>
+            <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>
+              {config.market_type === 'polymarket_binary' ? 'Window' : 'Interval'}
+            </label>
             <select
               value={config.interval}
               onChange={(e) => set('interval', e.target.value)}
@@ -934,7 +1288,12 @@ export default function Backtesting() {
                 color: 'var(--color-text)',
               }}
             >
-              {(config.market_type === 'crypto' ? CRYPTO_INTERVALS : POLYMARKET_INTERVALS).map((i) => (
+              {(config.market_type === 'crypto'
+                ? CRYPTO_INTERVALS
+                : config.market_type === 'polymarket_binary'
+                ? BINARY_WINDOW_INTERVALS
+                : POLYMARKET_INTERVALS
+              ).map((i) => (
                 <option key={i.value} value={i.value}>
                   {i.label}
                 </option>
@@ -991,6 +1350,33 @@ export default function Backtesting() {
             />
           </div>
 
+          {/* Fee % */}
+          <div>
+            <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>
+              Fee %
+              <span
+                className="ml-1 px-1 rounded text-[9px]"
+                style={{ backgroundColor: 'var(--color-surface-2)', color: 'var(--color-text-muted)' }}
+              >
+                {config.market_type === 'polymarket' ? '~1.5' : '~0.1'}
+              </span>
+            </label>
+            <input
+              type="number"
+              min={0}
+              max={10}
+              step={0.1}
+              value={config.fee_pct}
+              onChange={(e) => set('fee_pct', Number(e.target.value))}
+              className="w-full rounded px-2 py-2 text-sm font-mono"
+              style={{
+                backgroundColor: 'var(--color-surface-2)',
+                border: '1px solid var(--color-border)',
+                color: 'var(--color-text)',
+              }}
+            />
+          </div>
+
           {/* Run button */}
           <div>
             <button
@@ -1014,6 +1400,27 @@ export default function Backtesting() {
           </div>
         </div>
       </div>
+
+      {/* Binary mode info banner */}
+      {config.market_type === 'polymarket_binary' && (
+        <div
+          className="rounded-lg border px-4 py-3 mb-4 flex gap-3 items-start text-sm"
+          style={{
+            backgroundColor: 'rgba(0,255,136,0.04)',
+            borderColor: 'rgba(0,255,136,0.2)',
+          }}
+        >
+          <Info size={14} className="mt-0.5 flex-shrink-0" style={{ color: 'var(--color-accent)' }} />
+          <div style={{ color: 'var(--color-text-muted)' }}>
+            <span className="font-semibold" style={{ color: 'var(--color-accent)' }}>Binary simulation mode</span>
+            {' '}— Uses real BTC/ETH price data from Binance. Each bet is a simulated
+            Polymarket-style binary option: <em>bet YES</em> (price goes up) or <em>bet NO</em> (price goes down)
+            over the chosen window. Token prices are modeled from momentum — a strong
+            signal costs more (e.g. $0.80/token), meaning you need a higher win rate to profit.
+            No Polymarket account or condition ID needed.
+          </div>
+        </div>
+      )}
 
       {/* Main content - Scripts (left sidebar) + Results (right primary) */}
       <div className="flex gap-4">
@@ -1063,7 +1470,7 @@ export default function Backtesting() {
                       key={s.path}
                       script={s}
                       isSelected={config.script === s.path}
-                      isRunning={isRunning && config.script === s.path}
+                      isRunning={isRunning && runningScriptPath === s.path}
                       onSelect={() => set('script', s.path)}
                       onDelete={() => deleteMutation.mutate(s.path)}
                       onRename={(newName) => renameMutation.mutate({ oldPath: s.path, newName })}
@@ -1111,17 +1518,38 @@ export default function Backtesting() {
             )}
 
             {/* Show results */}
-            {!isRunning && result && (
+            {!isRunning && displayResult && (
               <>
-                <div className="mb-3 text-xs" style={{ color: 'var(--color-text-muted)' }}>
-                  <span className="font-mono">{result.script.split('/').pop()}</span> / {result.symbol}
+                <div className="mb-3 flex items-center justify-between">
+                  <div className="text-xs" style={{ color: 'var(--color-text-muted)' }}>
+                    <span className="font-mono">{displayResult.script.split('/').pop()}</span> / {displayResult.symbol}
+                    {isShowingCachedResult && (
+                      <span
+                        className="ml-2 px-1.5 py-0.5 rounded text-[10px] font-semibold uppercase tracking-wider"
+                        style={{ backgroundColor: 'var(--color-surface-2)', color: 'var(--color-text-muted)', border: '1px solid var(--color-border)' }}
+                      >
+                        Previous run
+                      </span>
+                    )}
+                  </div>
+                  {isShowingCachedResult && (
+                    <button
+                      onClick={() => runBacktest()}
+                      disabled={!canRun}
+                      className="flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-semibold disabled:opacity-40"
+                      style={{ backgroundColor: 'var(--color-accent)', color: '#000' }}
+                    >
+                      <Play size={11} />
+                      Run Again
+                    </button>
+                  )}
                 </div>
-                <ResultPanel result={result} />
+                <ResultPanel result={displayResult} />
               </>
             )}
 
             {/* Empty state */}
-            {!isRunning && !result && progress.step !== 'error' && (
+            {!isRunning && !displayResult && progress.step !== 'error' && (
               <div className="flex flex-col items-center justify-center py-16 text-center gap-3">
                 <BarChart2 size={48} style={{ color: 'var(--color-border)' }} />
                 <p className="text-sm" style={{ color: 'var(--color-text-muted)' }}>

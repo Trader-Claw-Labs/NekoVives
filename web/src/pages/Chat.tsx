@@ -2,13 +2,15 @@ import { useState, useRef, useEffect } from 'react'
 import {
   Plus, X, Wifi, WifiOff, Pencil, Send,
   Zap, BarChart2, Search, Wallet, BookOpen, Settings2, Terminal,
-  ChevronDown, ChevronRight, AlertCircle,
+  ChevronDown, ChevronRight, AlertCircle, Paperclip, FlaskConical,
 } from 'lucide-react'
 import type { WsMessage } from '../hooks/useWebSocket'
 import { apiPost } from '../hooks/useApi'
 import clsx from 'clsx'
 import { useChatContext } from '../context/ChatContext'
 import type { Message, Session, ToolEvent } from '../context/ChatContext'
+import { useBacktestState } from '../hooks/useBacktestState'
+import type { BacktestResult } from '../hooks/useBacktestState'
 
 // ── Slash commands ──────────────────────────────────────────────────
 
@@ -477,11 +479,27 @@ interface ChatWindowProps {
   send: (msg: WsMessage) => void
 }
 
+// ── Backtest attachment helpers ──────────────────────────────────────
+
+function formatBacktestAttachment(r: BacktestResult): string {
+  return `\n\n---\n**Attached Backtest Result** — ${r.script} (${r.symbol})\n` +
+    `- Return: ${r.total_return_pct >= 0 ? '+' : ''}${r.total_return_pct.toFixed(2)}%\n` +
+    `- Sharpe: ${r.sharpe_ratio?.toFixed(2) ?? 'N/A'}\n` +
+    `- Max Drawdown: ${r.max_drawdown_pct.toFixed(2)}%\n` +
+    `- Win Rate: ${r.win_rate_pct.toFixed(1)}%\n` +
+    `- Trades: ${r.total_trades}\n` +
+    (r.analysis ? `- Analysis: ${r.analysis}\n` : '') +
+    `---`
+}
+
 function ChatWindow({ session, onUpdate, connected, send }: ChatWindowProps) {
   const [input, setInput]       = useState('')
   const [cmdIndex, setCmdIndex] = useState(0)
+  const [showAttachMenu, setShowAttachMenu] = useState(false)
+  const [attachedResult, setAttachedResult] = useState<BacktestResult | null>(null)
   const bottomRef  = useRef<HTMLDivElement>(null)
   const inputRef   = useRef<HTMLTextAreaElement>(null)
+  const { scriptResults, result: latestResult } = useBacktestState()
 
   // Derive sending from whether the last assistant message is still streaming
   const sending = session.messages.some((m) => m.streaming)
@@ -509,19 +527,21 @@ function ChatWindow({ session, onUpdate, connected, send }: ChatWindowProps) {
 
   async function handleSend() {
     if (!input.trim() || sending) return
-    const userMsg: Message      = { role: 'user',      content: input.trim(), timestamp: Date.now() }
+    const fullContent = input.trim() + (attachedResult ? formatBacktestAttachment(attachedResult) : '')
+    const userMsg: Message      = { role: 'user',      content: fullContent, timestamp: Date.now() }
     const assistantMsg: Message = { role: 'assistant', content: '', timestamp: Date.now(),
       streaming: true, toolEvents: [], agentStartedAt: Date.now() }
     const updated: Session = { ...session, messages: [...session.messages, userMsg, assistantMsg] }
     onUpdate(updated)
     setInput('')
+    setAttachedResult(null)
 
     if (connected) {
-      send({ type: 'message', content: input.trim(), session_id: session.id })
+      send({ type: 'message', content: fullContent, session_id: session.id })
     } else {
       try {
         const res = await apiPost<{ response?: string; content?: string }>(
-          '/api/chat', { session_id: session.id, message: input.trim() }
+          '/api/chat', { session_id: session.id, message: fullContent }
         )
         const text = res.response ?? res.content ?? 'No response'
         onUpdate({ ...updated, messages: updated.messages.map((m) =>
@@ -651,6 +671,51 @@ function ChatWindow({ session, onUpdate, connected, send }: ChatWindowProps) {
 
       {/* ── Input bar ── */}
       <div className="px-4 pb-4 pt-2">
+        {/* Attached backtest pill */}
+        {attachedResult && (
+          <div className="flex items-center gap-2 mb-2 px-1">
+            <div className="flex items-center gap-1.5 text-xs px-2.5 py-1 rounded-full"
+              style={{ backgroundColor: 'rgba(74,222,128,0.12)', color: 'var(--color-accent)', border: '1px solid rgba(74,222,128,0.25)' }}>
+              <FlaskConical size={11} />
+              <span>{attachedResult.script} · {attachedResult.total_return_pct >= 0 ? '+' : ''}{attachedResult.total_return_pct.toFixed(2)}%</span>
+              <button onClick={() => setAttachedResult(null)} className="ml-1 hover:opacity-70">
+                <X size={10} />
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Attach menu (backtest results picker) */}
+        {showAttachMenu && (
+          <div className="mb-2 rounded-xl border overflow-hidden"
+            style={{ backgroundColor: 'var(--color-surface)', borderColor: 'var(--color-border)' }}>
+            <div className="px-3 py-2 text-xs font-semibold border-b flex items-center gap-2"
+              style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-muted)' }}>
+              <FlaskConical size={11} style={{ color: 'var(--color-accent)' }} />
+              Attach a backtest result
+            </div>
+            {latestResult || Object.keys(scriptResults).length > 0 ? (
+              <div className="max-h-40 overflow-y-auto">
+                {[...(latestResult ? [latestResult] : []),
+                  ...Object.values(scriptResults).filter(r => r.script !== latestResult?.script)
+                ].map(r => (
+                  <button key={r.script} className="w-full flex items-center justify-between px-3 py-2 text-xs hover:bg-white/5 text-left"
+                    onClick={() => { setAttachedResult(r); setShowAttachMenu(false) }}>
+                    <span className="font-mono truncate max-w-48">{r.script}</span>
+                    <span style={{ color: r.total_return_pct >= 0 ? 'var(--color-accent)' : 'var(--color-danger)', flexShrink: 0 }}>
+                      {r.total_return_pct >= 0 ? '+' : ''}{r.total_return_pct.toFixed(2)}%
+                    </span>
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <div className="px-3 py-3 text-xs" style={{ color: 'var(--color-text-muted)' }}>
+                No backtest results yet — run a backtest first
+              </div>
+            )}
+          </div>
+        )}
+
         <div
           className="flex items-end gap-2 rounded-2xl px-4 py-3 transition-shadow"
           style={{
@@ -667,6 +732,18 @@ function ChatWindow({ session, onUpdate, connected, send }: ChatWindowProps) {
             el.style.border = '1px solid rgba(255,255,255,0.1)'
           }}
         >
+          <button
+            onClick={() => setShowAttachMenu(v => !v)}
+            className="flex-shrink-0 flex items-center justify-center rounded-lg transition-colors hover:bg-white/10 mb-0.5"
+            style={{
+              width: 28, height: 28,
+              color: showAttachMenu || attachedResult ? 'var(--color-accent)' : 'rgba(255,255,255,0.3)',
+            }}
+            title="Attach backtest result"
+            type="button"
+          >
+            <Paperclip size={14} />
+          </button>
           <textarea
             ref={inputRef}
             value={input}

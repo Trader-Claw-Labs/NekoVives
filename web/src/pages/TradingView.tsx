@@ -1,8 +1,10 @@
 import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { apiFetch } from '../hooks/useApi'
+import { useNavigate } from 'react-router-dom'
+import { useBacktestState } from '../hooks/useBacktestState'
 import {
-  TrendingUp, TrendingDown, Minus, RefreshCw, AlertCircle, Activity, X, BarChart2,
+  TrendingUp, TrendingDown, Minus, RefreshCw, AlertCircle, Activity, X, BarChart2, FlaskConical,
 } from 'lucide-react'
 import clsx from 'clsx'
 
@@ -169,6 +171,8 @@ export default function TradingViewPage() {
   const [symbols, setSymbols] = useState(DEFAULT_SYMBOLS.join(', '))
   const [submitted, setSubmitted] = useState(DEFAULT_SYMBOLS)
   const [chartSymbol, setChartSymbol] = useState<string | null>(null)
+  const navigate = useNavigate()
+  const { setFullConfig, config: btConfig } = useBacktestState()
 
   const { data, isLoading, error, refetch, isFetching, dataUpdatedAt } =
     useQuery<ScreenerResponse>({
@@ -289,6 +293,18 @@ export default function TradingViewPage() {
                   {d.symbol}
                 </button>
                 <SignalBadge d={d} />
+                <button
+                  className="ml-auto flex items-center gap-1 text-xs px-2 py-0.5 rounded border hover:bg-white/5 transition-colors"
+                  style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-muted)' }}
+                  title="Open in Backtesting"
+                  onClick={() => {
+                    setFullConfig({ ...btConfig, symbol: d.symbol, market_type: 'crypto' })
+                    navigate('/backtesting')
+                  }}
+                >
+                  <FlaskConical size={10} />
+                  Backtest
+                </button>
               </div>
             ))}
           </div>
