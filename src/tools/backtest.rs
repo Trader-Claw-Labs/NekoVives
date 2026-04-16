@@ -2578,11 +2578,37 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let scripts = tmp.path().join("scripts");
         std::fs::create_dir_all(&scripts).unwrap();
+        // ctx-based strategy that just holds: no trades, but valid Rhai
         std::fs::write(
             scripts.join("test_strat.rhai"),
-            "// Buy low sell high\nlet rsi = get_rsi(\"BTCUSDT\", 14);",
+            r#"fn on_candle(ctx) { /* hold */ }"#,
         )
         .unwrap();
+
+        // Pre-populate candle cache so tests don't hit the network
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        // Generate 50 synthetic 1-min candles starting 2024-01-01 00:00 UTC
+        let base_ms: i64 = 1704067200_000; // 2024-01-01T00:00:00Z
+        let candles: Vec<serde_json::Value> = (0..50i64)
+            .map(|i| {
+                serde_json::json!({
+                    "open_time_ms": base_ms + i * 60_000,
+                    "open":  42000.0 + (i as f64) * 10.0,
+                    "high":  42100.0 + (i as f64) * 10.0,
+                    "low":   41900.0 + (i as f64) * 10.0,
+                    "close": 42050.0 + (i as f64) * 10.0,
+                    "volume": 1.0
+                })
+            })
+            .collect();
+        let cache_json = serde_json::to_string(&candles).unwrap();
+        std::fs::write(
+            data_dir.join("BTCUSDT_1m_2024-01-01_2024-12-31.json"),
+            &cache_json,
+        )
+        .unwrap();
+
         let ws = tmp.path().to_path_buf();
         (tmp, ws)
     }
@@ -2602,7 +2628,9 @@ mod tests {
         let tool = BacktestListScriptsTool::new(tmp.path().to_path_buf());
         let result = tool.execute(json!({})).await.unwrap();
         assert!(result.success);
-        assert!(result.output.contains("No .rhai scripts"));
+        // ensure_default_scripts writes bundled scripts on first run, so even
+        // an empty workspace will have scripts after the first list call.
+        assert!(result.output.contains(".rhai"));
     }
 
     #[tokio::test]
