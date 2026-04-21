@@ -1284,23 +1284,33 @@ pub async fn handle_api_polymarket_prices_history(
     }
 }
 
-/// GET /api/polymarket/markets — fetch top markets from Gamma API
+#[derive(serde::Deserialize, Default)]
+pub struct PolymarketsQuery {
+    pub q: Option<String>,
+    pub limit: Option<usize>,
+}
+
+/// GET /api/polymarket/markets — fetch markets from Gamma API, optional ?q=search
 pub async fn handle_api_polymarket_markets(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(params): Query<PolymarketsQuery>,
 ) -> impl IntoResponse {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
+    let limit = params.limit.unwrap_or(50).min(200);
     let filter = polymarket_trader::markets::MarketFilter {
         active_only: true,
+        query: params.q.clone(),
+        limit: Some(limit),
         ..Default::default()
     };
     match polymarket_trader::markets::list_markets(filter).await {
         Ok(markets) => {
             let mut sorted = markets;
             sorted.sort_by(|a, b| b.volume.partial_cmp(&a.volume).unwrap_or(std::cmp::Ordering::Equal));
-            let top: Vec<_> = sorted.into_iter().take(20).collect();
+            let top: Vec<_> = sorted.into_iter().take(limit).collect();
 
             // Fetch YES prices in parallel (best-effort — ignore failures)
             let price_futs: Vec<_> = top
@@ -1496,6 +1506,102 @@ fn get_poly_creds(state: &AppState) -> Option<polymarket_trader::auth::PolyCrede
         secret: pm.secret.clone().unwrap_or_default(),
         passphrase: pm.passphrase.clone().unwrap_or_default(),
     })
+}
+
+fn get_poly_wallet_address(state: &AppState) -> Option<String> {
+    let cfg = state.config.lock();
+    cfg.polymarket
+        .wallet_address
+        .clone()
+        .filter(|w| !w.trim().is_empty())
+}
+
+async fn resolve_live_token_id(series_id: Option<&str>) -> anyhow::Result<String> {
+    let sid = series_id.ok_or_else(|| anyhow::anyhow!("Please select a Market Series before starting live mode."))?;
+    let series = crate::tools::series::builtin_series()
+        .into_iter()
+        .find(|s| s.id == sid)
+        .ok_or_else(|| anyhow::anyhow!("Selected Market Series is not recognized. Please refresh and choose again."))?;
+
+    let slug_prefix = series.slug_prefix;
+    let markets = polymarket_trader::markets::list_markets(polymarket_trader::markets::MarketFilter {
+        query: Some(slug_prefix.clone()),
+        active_only: true,
+        limit: Some(50),
+        ..Default::default()
+    }).await?;
+
+    let best = markets
+        .into_iter()
+        .filter(|m| m.slug.to_lowercase().contains(&slug_prefix.to_lowercase()))
+        .max_by(|a, b| {
+            let av = a.liquidity + a.volume;
+            let bv = b.liquidity + b.volume;
+            av.partial_cmp(&bv).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .ok_or_else(|| anyhow::anyhow!(
+            "No active Polymarket market found for this series right now. Try again in a moment or pick another series."
+        ))?;
+
+    if best.yes_token_id.trim().is_empty() {
+        anyhow::bail!("The selected market has no tradable token yet. Please pick another series.");
+    }
+
+    Ok(best.yes_token_id)
+}
+
+async fn ensure_live_wallet_has_min_balance(wallet_address: &str, min_usdc: f64) -> anyhow::Result<()> {
+    let url = format!("https://clob.polymarket.com/positions?user={wallet_address}");
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(12))
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let code = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("Unable to verify wallet balance from Polymarket ({}). {}", code, body);
+    }
+
+    let data: serde_json::Value = resp.json().await?;
+
+    fn as_num(v: Option<&serde_json::Value>) -> Option<f64> {
+        let x = v?;
+        if let Some(n) = x.as_f64() { return Some(n); }
+        x.as_str().and_then(|s| s.parse::<f64>().ok())
+    }
+
+    let candidates = [
+        as_num(data.get("availableBalance")),
+        as_num(data.get("available_balance")),
+        as_num(data.get("cash")),
+        as_num(data.get("balance")),
+        as_num(data.get("usdc_balance")),
+    ];
+
+    let available = candidates.into_iter().flatten().next().unwrap_or(0.0);
+    if available < min_usdc {
+        anyhow::bail!(
+            "Insufficient wallet balance for live mode. Required at least ${:.2} USDC, detected ${:.2}.",
+            min_usdc,
+            available
+        );
+    }
+
+    Ok(())
+}
+
+fn friendly_live_error(e: &str) -> String {
+    if e.contains("Market Series") || e.contains("No active Polymarket market") {
+        format!("{e} Open Live Strategies and select a supported built-in BTC/ETH series.")
+    } else if e.contains("wallet balance") || e.contains("Insufficient wallet balance") {
+        format!("{e} Please fund your Polymarket wallet and try again.")
+    } else if e.contains("wallet address") {
+        "Live mode requires a Polymarket wallet address. Go to Settings → Config and set polymarket.wallet_address.".to_string()
+    } else {
+        e.to_string()
+    }
 }
 
 /// GET /api/polymarket/positions — open positions
@@ -2622,6 +2728,18 @@ pub async fn handle_api_backtest_scripts(
     Json(serde_json::json!({ "scripts": scripts })).into_response()
 }
 
+/// GET /api/backtest/series u2014 list all built-in (and future user-defined) recurring market series
+pub async fn handle_api_backtest_series(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let series = crate::tools::series::builtin_series();
+    Json(serde_json::json!({ "series": series })).into_response()
+}
+
 #[derive(serde::Deserialize)]
 pub struct BacktestRunBody {
     pub script: String,
@@ -2634,6 +2752,16 @@ pub struct BacktestRunBody {
     pub to_date: String,
     pub initial_balance: f64,
     pub fee_pct: f64,
+    /// Optional series identifier u2014 if provided, overrides symbol/interval/resolution_logic
+    pub series_id: Option<String>,
+    /// Resolution logic override: "price_up" | "threshold_above" | "threshold_below"
+    pub resolution_logic: Option<String>,
+    /// Threshold for threshold_above/below resolution (e.g. 25.0 for u00b0C)
+    pub threshold: Option<f64>,
+    /// Maximum stake per trade in USD — enforces Polymarket per-market liquidity limits.
+    /// Polymarket recurring 5-min binary windows have ~$500-$3,000 liquidity each.
+    /// Default (None) = no cap (use for crypto backtests).
+    pub max_position_usd: Option<f64>,
 }
 
 fn default_market_type() -> String {
@@ -2674,15 +2802,39 @@ pub async fn handle_api_backtest_run(
             .into_response();
     }
 
+    // If a series_id was provided, resolve it to symbol/interval/resolution_logic/threshold
+    let (symbol, interval, resolution_logic, threshold) = if let Some(ref sid) = body.series_id {
+        let series = crate::tools::series::builtin_series();
+        if let Some(s) = series.iter().find(|s| s.id == *sid) {
+            let rl = match s.resolution_logic {
+                crate::tools::series::ResolutionLogic::PriceUp        => "price_up",
+                crate::tools::series::ResolutionLogic::ThresholdAbove => "threshold_above",
+                crate::tools::series::ResolutionLogic::ThresholdBelow => "threshold_below",
+            };
+            (s.symbol.clone(), s.cadence.clone(), rl.to_string(), s.threshold)
+        } else {
+            (body.symbol.clone(), body.interval.clone(),
+             body.resolution_logic.clone().unwrap_or_else(|| "price_up".into()),
+             body.threshold)
+        }
+    } else {
+        (body.symbol.clone(), body.interval.clone(),
+         body.resolution_logic.clone().unwrap_or_else(|| "price_up".into()),
+         body.threshold)
+    };
+
     let metrics = crate::tools::backtest::run_backtest_engine(
         &script_path,
         &body.market_type,
-        &body.symbol,
-        &body.interval,
+        &symbol,
+        &interval,
         &body.from_date,
         &body.to_date,
         body.initial_balance,
         body.fee_pct,
+        &resolution_logic,
+        threshold,
+        body.max_position_usd,
         &workspace_dir,
     )
     .await;
@@ -2720,6 +2872,9 @@ pub async fn handle_api_backtest_run(
         "to_date": body.to_date,
         "initial_balance": body.initial_balance,
         "fee_pct": body.fee_pct,
+        "series_id": body.series_id,
+        "resolution_logic": resolution_logic,
+        "threshold": threshold,
         "total_return_pct": metrics.total_return_pct,
         "sharpe_ratio": metrics.sharpe_ratio,
         "max_drawdown_pct": metrics.max_drawdown_pct,
@@ -2728,6 +2883,11 @@ pub async fn handle_api_backtest_run(
         "worst_trades": worst_trades,
         "all_trades": all_trades,
         "analysis": metrics.analysis,
+        "avg_token_price": metrics.avg_token_price,
+        "correct_direction_pct": metrics.correct_direction_pct,
+        "break_even_win_rate": metrics.break_even_win_rate,
+        "markets_tested": metrics.markets_tested,
+        "final_balance": body.initial_balance * (1.0 + metrics.total_return_pct / 100.0),
     }))
     .into_response()
 }
@@ -3018,8 +3178,120 @@ pub struct CreateRunnerBody {
     pub initial_balance: f64,
     pub fee_pct: Option<f64>,
     pub warmup_days: Option<u32>,
+    pub auto_restart: Option<bool>,
+    pub series_id: Option<String>,
+    pub resolution_logic: Option<String>,
+    pub threshold: Option<f64>,
 }
 
+#[derive(serde::Deserialize)]
+pub struct PatchRunnerBody {
+    pub auto_restart: Option<bool>,
+}
+
+async fn hydrate_live_runtime_config(state: &AppState, config: &mut crate::strategy_runner::RunnerConfig) -> anyhow::Result<()> {
+    if config.mode != "live" || config.market_type != "polymarket_binary" {
+        return Ok(());
+    }
+
+    let poly = state.config.lock().polymarket.clone();
+    let api_key = poly.api_key.unwrap_or_default();
+    let secret = poly.secret.unwrap_or_default();
+    let passphrase = poly.passphrase.unwrap_or_default();
+    if api_key.is_empty() || secret.is_empty() || passphrase.is_empty() {
+        anyhow::bail!("Live mode requires polymarket.api_key, polymarket.secret, and polymarket.passphrase in config.");
+    }
+
+    let wallet_address = get_poly_wallet_address(state)
+        .ok_or_else(|| anyhow::anyhow!("Live mode requires polymarket.wallet_address. Go to Settings → Config and set your Polymarket wallet address."))?;
+
+    let token_id = resolve_live_token_id(config.series_id.as_deref()).await?;
+    let min_live_usdc = 10.0;
+    ensure_live_wallet_has_min_balance(&wallet_address, min_live_usdc).await?;
+
+    config.poly_creds = Some(polymarket_trader::auth::PolyCredentials { api_key, secret, passphrase });
+    config.poly_token_id = Some(token_id);
+    Ok(())
+}
+
+async fn rehydrate_live_runner_config(state: &AppState, config: &mut crate::strategy_runner::RunnerConfig) -> anyhow::Result<()> {
+    if config.mode != "live" {
+        return Ok(());
+    }
+    hydrate_live_runtime_config(state, config).await
+}
+
+pub async fn restart_stored_runners(state: &AppState) {
+    let configs = state.strategy_runner.list_restartable_configs();
+    if configs.is_empty() {
+        return;
+    }
+
+    let mut restarted = 0usize;
+    for mut config in configs {
+        if let Err(e) = rehydrate_live_runner_config(state, &mut config).await {
+            let msg = friendly_live_error(&e.to_string());
+            let id = config.id.clone();
+            let _ = state.strategy_runner.set_starting(&id);
+            if let Some(mut r) = state.strategy_runner.get(&id) {
+                r.status.status = "error".to_string();
+                r.status.error = Some(msg);
+                state.strategy_runner.upsert(r);
+            }
+            continue;
+        }
+
+        let id = config.id.clone();
+        let Some(creds) = config.poly_creds.clone() else {
+            continue;
+        };
+        if !state.strategy_runner.hydrate_live_creds_for_runner(&id, creds) {
+            continue;
+        }
+        if let Some(token_id) = config.poly_token_id.clone() {
+            let _ = state.strategy_runner.set_poly_token_id(&id, token_id);
+        }
+        let _ = state.strategy_runner.set_starting(&id);
+
+        let workspace_dir = state.config.lock().workspace_dir.clone();
+        let _ = crate::strategy_runner::start_runner(
+            state.strategy_runner.clone(),
+            config,
+            workspace_dir,
+        );
+        restarted += 1;
+    }
+
+    if restarted > 0 {
+        tracing::info!("Auto-restarted {restarted} strategy runner(s) after startup");
+    }
+}
+
+pub async fn handle_api_live_patch(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<PatchRunnerBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+
+    let auto_restart = match body.auto_restart {
+        Some(v) => v,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "Missing auto_restart field" })),
+            ).into_response();
+        }
+    };
+
+    match state.strategy_runner.set_auto_restart(&id, auto_restart) {
+        Some(runner) => Json(serde_json::json!({ "runner": runner })).into_response(),
+        None => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "runner not found" }))).into_response(),
+    }
+}
+
+/// GET /api/live/strategies — list all strategy runners
 /// GET /api/live/strategies — list all strategy runners
 pub async fn handle_api_live_list(
     State(state): State<AppState>,
@@ -3039,18 +3311,60 @@ pub async fn handle_api_live_create(
     if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
 
     let id = uuid::Uuid::new_v4().to_string();
-    let config = crate::strategy_runner::RunnerConfig {
+
+    let mut symbol = body.symbol;
+    let mut interval = body.interval;
+    let mut resolution_logic = body.resolution_logic;
+    let mut threshold = body.threshold;
+
+    if let Some(ref sid) = body.series_id {
+        if let Some(s) = crate::tools::series::builtin_series().into_iter().find(|s| s.id == *sid) {
+            symbol = s.symbol;
+            interval = s.cadence;
+            resolution_logic = Some(match s.resolution_logic {
+                crate::tools::series::ResolutionLogic::PriceUp => "price_up".to_string(),
+                crate::tools::series::ResolutionLogic::ThresholdAbove => "threshold_above".to_string(),
+                crate::tools::series::ResolutionLogic::ThresholdBelow => "threshold_below".to_string(),
+            });
+            threshold = s.threshold;
+        }
+    }
+
+    let is_live = body.mode == "live";
+    if is_live && body.market_type != "polymarket_binary" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Live mode is only supported for market_type=polymarket_binary"
+            })),
+        ).into_response();
+    }
+
+    let mut config = crate::strategy_runner::RunnerConfig {
         id: id.clone(),
-        name: body.name.unwrap_or_else(|| format!("{} on {}", body.script, body.symbol)),
+        name: body.name.unwrap_or_else(|| format!("{} on {}", body.script, symbol)),
         script: body.script,
         market_type: body.market_type,
-        symbol: body.symbol,
-        interval: body.interval,
+        symbol,
+        interval,
         mode: body.mode,
         initial_balance: body.initial_balance,
         fee_pct: body.fee_pct.unwrap_or(0.1),
         warmup_days: body.warmup_days.unwrap_or(90),
+        auto_restart: body.auto_restart.unwrap_or(true),
+        series_id: body.series_id,
+        resolution_logic: Some(resolution_logic.unwrap_or_else(|| "price_up".to_string())),
+        threshold,
+        poly_creds: None,
+        poly_token_id: None,
     };
+
+    if let Err(e) = hydrate_live_runtime_config(&state, &mut config).await {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": friendly_live_error(&e.to_string()) })),
+        ).into_response();
+    }
 
     let workspace_dir = state.config.lock().workspace_dir.clone();
     let runner = crate::strategy_runner::start_runner(
@@ -3108,10 +3422,18 @@ pub async fn handle_api_live_restart(
 ) -> impl IntoResponse {
     if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
 
-    let config = match state.strategy_runner.get(&id) {
+    let mut config = match state.strategy_runner.get(&id) {
         Some(r) => r.config.clone(),
         None => return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "runner not found" }))).into_response(),
     };
+
+    if let Err(e) = rehydrate_live_runner_config(&state, &mut config).await {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": friendly_live_error(&e.to_string()) })),
+        ).into_response();
+    }
+
     let workspace_dir = state.config.lock().workspace_dir.clone();
     let runner = crate::strategy_runner::start_runner(
         state.strategy_runner.clone(),
@@ -3119,6 +3441,191 @@ pub async fn handle_api_live_restart(
         workspace_dir,
     );
     Json(serde_json::json!({ "runner": runner })).into_response()
+}
+
+// ── Export / Import ──────────────────────────────────────────────────────────
+
+/// GET /api/export — download a ZIP with config, wallets, and scripts
+pub async fn handle_api_export(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let config = state.config.lock().clone();
+
+    let zip_bytes = match build_export_zip(&config).await {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Export failed: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/zip"),
+            (
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=\"traderclaw-export.zip\"",
+            ),
+        ],
+        zip_bytes,
+    )
+        .into_response()
+}
+
+async fn build_export_zip(config: &crate::config::Config) -> anyhow::Result<Vec<u8>> {
+    // Collect all file content first (async), then build zip (sync/blocking)
+    let masked = mask_sensitive_fields(config);
+    let toml_str = toml::to_string_pretty(&masked).unwrap_or_default();
+
+    let wallets_path = super::wallets_file_path(&config.config_path);
+    let wallets_bytes = if wallets_path.exists() {
+        tokio::fs::read(&wallets_path).await.unwrap_or_default()
+    } else {
+        vec![]
+    };
+
+    let mut script_files: Vec<(String, Vec<u8>)> = vec![];
+    let scripts_dir = config.workspace_dir.join("scripts");
+    if scripts_dir.is_dir() {
+        if let Ok(mut entries) = tokio::fs::read_dir(&scripts_dir).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("rhai") {
+                    if let Ok(content) = tokio::fs::read(&path).await {
+                        let name = path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("script.rhai")
+                            .to_owned();
+                        script_files.push((name, content));
+                    }
+                }
+            }
+        }
+    }
+
+    // Build zip synchronously
+    tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+        let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        let cursor = std::io::Cursor::new(Vec::new());
+        let mut zip = zip::ZipWriter::new(cursor);
+
+        zip.start_file("config.toml", opts)?;
+        zip.write_all(toml_str.as_bytes())?;
+
+        if !wallets_bytes.is_empty() {
+            zip.start_file("wallets.json", opts)?;
+            zip.write_all(&wallets_bytes)?;
+        }
+
+        for (name, content) in script_files {
+            zip.start_file(format!("scripts/{name}"), opts)?;
+            zip.write_all(&content)?;
+        }
+
+        let cursor = zip.finish()?;
+        Ok::<Vec<u8>, anyhow::Error>(cursor.into_inner())
+    })
+    .await?
+}
+
+/// POST /api/import — upload a ZIP to restore config, wallets, and scripts
+pub async fn handle_api_import(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let config = state.config.lock().clone();
+
+    let b64 = match body.get("data").and_then(|v| v.as_str()) {
+        Some(s) => s.to_owned(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Missing 'data' field (base64 zip)"})),
+            )
+                .into_response();
+        }
+    };
+
+    use base64::Engine as _;
+    let zip_bytes = match base64::engine::general_purpose::STANDARD.decode(&b64) {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid base64: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    match apply_import_zip(&config, zip_bytes).await {
+        Ok(imported) => Json(serde_json::json!({ "status": "ok", "imported": imported })).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("Import failed: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
+async fn apply_import_zip(config: &crate::config::Config, bytes: Vec<u8>) -> anyhow::Result<Vec<String>> {
+    // Parse zip synchronously, collect files to write
+    let wallets_path = super::wallets_file_path(&config.config_path);
+    let scripts_dir = config.workspace_dir.join("scripts");
+
+    let extracted: Vec<(String, Vec<u8>)> = tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let cursor = std::io::Cursor::new(bytes);
+        let mut archive = zip::ZipArchive::new(cursor)?;
+        let mut files = Vec::new();
+        for i in 0..archive.len() {
+            let mut file = archive.by_index(i)?;
+            let name = file.name().to_owned();
+            let mut content = Vec::new();
+            file.read_to_end(&mut content)?;
+            files.push((name, content));
+        }
+        Ok::<_, anyhow::Error>(files)
+    })
+    .await??;
+
+    let mut imported = Vec::new();
+    for (name, content) in extracted {
+        if name == "wallets.json" {
+            if let Some(parent) = wallets_path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            tokio::fs::write(&wallets_path, &content).await?;
+            imported.push("wallets.json".to_string());
+        } else if name.starts_with("scripts/") && name.ends_with(".rhai") {
+            tokio::fs::create_dir_all(&scripts_dir).await?;
+            let filename = std::path::Path::new(&name)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("script.rhai");
+            tokio::fs::write(scripts_dir.join(filename), &content).await?;
+            imported.push(name.clone());
+        }
+    }
+
+    Ok(imported)
 }
 
 #[cfg(test)]

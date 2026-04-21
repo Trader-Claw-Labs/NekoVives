@@ -8,6 +8,10 @@ pub struct MarketFilter {
     pub min_volume_usdc: Option<f64>,
     pub min_liquidity_usdc: Option<f64>,
     pub active_only: bool,
+    /// Free-text search (passed as `question_mid_partial` to Gamma API)
+    pub query: Option<String>,
+    /// Max number of results to return (default 50)
+    pub limit: Option<usize>,
 }
 
 /// Polymarket prediction market
@@ -121,9 +125,16 @@ fn apply_filter(markets: Vec<GammaMarket>, filter: &MarketFilter) -> Vec<Market>
 /// Handles both flat `[...]` and paginated `{"data":[...]}` response shapes.
 pub async fn list_markets(filter: MarketFilter) -> Result<Vec<Market>> {
     let client = reqwest::Client::new();
-    let mut url = "https://gamma-api.polymarket.com/markets?limit=100&order=volume&ascending=false".to_string();
+    let limit = filter.limit.unwrap_or(50);
+    let mut url = format!("https://gamma-api.polymarket.com/markets?limit={limit}&order=volume&ascending=false");
     if filter.active_only {
         url.push_str("&active=true&closed=false");
+    }
+    if let Some(ref q) = filter.query {
+        if !q.is_empty() {
+            let encoded = q.replace(' ', "+");
+            url.push_str(&format!("&question_mid_partial={encoded}"));
+        }
     }
 
     let bytes = client

@@ -2671,6 +2671,13 @@ pub struct ChannelsConfig {
     /// Default: 300s for on-device LLMs (Ollama) which are slower than cloud APIs.
     #[serde(default = "default_channel_message_timeout_secs")]
     pub message_timeout_secs: u64,
+
+    /// Hard timeout in seconds for a single agent turn in the WebSocket chat UI.
+    /// Long-running tasks (backtesting analysis, extensive research with many tool calls)
+    /// may need more than the default. Set to 0 to disable the timeout entirely.
+    /// Default: 1800s (30 minutes).
+    #[serde(default = "default_agent_turn_timeout_secs")]
+    pub agent_turn_timeout_secs: u64,
 }
 
 impl ChannelsConfig {
@@ -2763,6 +2770,10 @@ fn default_channel_message_timeout_secs() -> u64 {
     300
 }
 
+fn default_agent_turn_timeout_secs() -> u64 {
+    1800 // 30 minutes
+}
+
 impl Default for ChannelsConfig {
     fn default() -> Self {
         Self {
@@ -2786,6 +2797,7 @@ impl Default for ChannelsConfig {
             qq: None,
             nostr: None,
             message_timeout_secs: default_channel_message_timeout_secs(),
+            agent_turn_timeout_secs: default_agent_turn_timeout_secs(),
         }
     }
 }
@@ -3784,11 +3796,10 @@ pub(crate) async fn persist_active_workspace_config_dir(config_dir: &Path) -> Re
     let default_config_dir = default_config_dir()?;
     let state_path = active_workspace_state_path(&default_config_dir);
 
-    // Guard: never persist a temp-directory path as the active workspace.
+    // Guard: never persist a temp-directory path into a real (non-temp) user config dir.
     // This prevents transient test runs or one-off invocations from hijacking
     // the daemon's config resolution.
-    #[cfg(not(test))]
-    if is_temp_directory(config_dir) {
+    if is_temp_directory(config_dir) && !is_temp_directory(&default_config_dir) {
         tracing::warn!(
             path = %config_dir.display(),
             "Refusing to persist temp directory as active workspace marker"

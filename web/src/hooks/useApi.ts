@@ -2,9 +2,20 @@ const BASE = ''
 
 let authToken: string | null = localStorage.getItem('auth_token')
 
+// Called by App when a 401 is received — shows the pairing modal
+let onAuthError: (() => void) | null = null
+export function setAuthErrorCallback(cb: () => void) {
+  onAuthError = cb
+}
+
 export function setAuthToken(token: string) {
   authToken = token
   localStorage.setItem('auth_token', token)
+}
+
+export function clearAuthToken() {
+  authToken = null
+  localStorage.removeItem('auth_token')
 }
 
 export function getAuthToken(): string | null {
@@ -26,6 +37,11 @@ export async function apiFetch<T = unknown>(path: string, init?: RequestInit): P
     headers: buildHeaders(init?.headers),
   })
   if (!res.ok) {
+    // Token rejected by server — clear it and trigger re-pairing
+    if (res.status === 401) {
+      clearAuthToken()
+      onAuthError?.()
+    }
     const text = await res.text().catch(() => res.statusText)
     throw new Error(`${res.status}: ${text}`)
   }

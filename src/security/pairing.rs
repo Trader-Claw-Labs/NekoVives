@@ -71,7 +71,7 @@ impl PairingGuard {
                 }
             })
             .collect();
-        let code = if require_pairing && tokens.is_empty() {
+        let code = if require_pairing {
             Some(generate_code())
         } else {
             None
@@ -327,9 +327,9 @@ mod tests {
     }
 
     #[test]
-    async fn new_guard_no_code_when_tokens_exist() {
+    async fn new_guard_has_code_even_when_tokens_exist() {
         let guard = PairingGuard::new(true, &["zc_existing".into()]);
-        assert!(guard.pairing_code().is_none());
+        assert!(guard.pairing_code().is_some());
         assert!(guard.is_paired());
     }
 

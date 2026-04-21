@@ -143,6 +143,54 @@ fn autosave_memory_key(prefix: &str) -> String {
     format!("{prefix}_{}", Uuid::new_v4())
 }
 
+/// Maximum characters kept in a session thread before compaction.
+const SESSION_THREAD_MAX_CHARS: usize = 8_000;
+/// Characters to retain after compaction (tail of the thread).
+const SESSION_THREAD_KEEP_CHARS: usize = 5_000;
+
+/// Append a user+agent exchange to the single session-thread memory entry.
+///
+/// Strategy: one stable key `session_{id}` per WS connection. Each turn
+/// appends two lines. When the thread exceeds `SESSION_THREAD_MAX_CHARS`,
+/// the older prefix is dropped and replaced with a compact header so the
+/// thread stays bounded while preserving the most recent context.
+async fn append_session_thread(
+    mem: &dyn Memory,
+    session_id: &str,
+    user_msg: &str,
+    agent_reply: &str,
+) {
+    let key = format!("session_{session_id}");
+    let ts = chrono::Local::now().format("%H:%M").to_string();
+
+    // Load existing thread (empty string if first turn).
+    let existing = match mem.get(&key).await {
+        Ok(Some(entry)) => entry.content,
+        _ => String::new(),
+    };
+
+    // Append the new exchange.
+    let appended = format!("{existing}\n[{ts}] User: {user_msg}\n[{ts}] Agent: {agent_reply}");
+
+    // Compact if over threshold: discard old prefix, keep recent tail.
+    let thread = if appended.len() > SESSION_THREAD_MAX_CHARS {
+        let tail_start = appended.len().saturating_sub(SESSION_THREAD_KEEP_CHARS);
+        // Align to a newline boundary so we don\'t cut mid-line.
+        let aligned = appended[tail_start..]
+            .find('\n')
+            .map(|off| tail_start + off + 1)
+            .unwrap_or(tail_start);
+        let kept_turns = appended[..aligned].lines().filter(|l| l.contains("User:")).count();
+        format!("[Compacted \u{2014} {kept_turns} earlier turns]\n{}", &appended[aligned..])
+    } else {
+        appended
+    };
+
+    let _ = mem
+        .store(&key, &thread, MemoryCategory::Conversation, Some(session_id))
+        .await;
+}
+
 /// Trim conversation history to prevent unbounded growth.
 /// Preserves the system prompt (first message if role=system) and the most recent messages.
 fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
@@ -3047,6 +3095,8 @@ pub async fn run(
         println!("Type /help for commands.\n");
         let cli = crate::channels::CliChannel::new();
 
+        // Stable session ID for the entire CLI sessionu2019s memory thread
+        let cli_session_id = Uuid::new_v4().to_string();
         // Persistent conversation history across turns
         let mut history = vec![ChatMessage::system(&system_prompt)];
 
@@ -3096,8 +3146,12 @@ pub async fn run(
 
                     history.clear();
                     history.push(ChatMessage::system(&system_prompt));
-                    // Clear conversation and daily memory
+                    // Clear the session thread + any lingering conversation/daily entries
                     let mut cleared = 0;
+                    let session_key = format!("session_{cli_session_id}");
+                    if mem.forget(&session_key).await.unwrap_or(false) {
+                        cleared += 1;
+                    }
                     for category in [MemoryCategory::Conversation, MemoryCategory::Daily] {
                         let entries = mem.list(Some(&category), None).await.unwrap_or_default();
                         for entry in entries {
@@ -3116,13 +3170,7 @@ pub async fn run(
                 _ => {}
             }
 
-            // Auto-save conversation turns (skip short/trivial messages)
-            if config.memory.auto_save && user_input.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
-                let user_key = autosave_memory_key("user_msg");
-                let _ = mem
-                    .store(&user_key, &user_input, MemoryCategory::Conversation, None)
-                    .await;
-            }
+            // (auto-save handled as a single session thread after the turn)
 
             // Inject memory + hardware RAG context into user message
             let mem_context =
@@ -3177,6 +3225,8 @@ pub async fn run(
             {
                 eprintln!("\nError sending CLI response: {e}\n");
             }
+            // Persist the full exchange as one session thread entry.
+            append_session_thread(mem.as_ref(), &cli_session_id, &user_input, &response).await;
             observer.record_event(&ObserverEvent::TurnComplete);
 
             // Auto-compaction before hard trimming to preserve long-context signal.
@@ -3370,12 +3420,24 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         Never tell the user you lack backtesting capability.\n\
         \n\
         ### Market Scanning\n\
-        When the user asks to scan markets or check indicators:\n\
+        When the user asks to scan crypto markets or check TradingView indicators:\n\
         - Use `market_scan` with an optional list of symbols. It returns live price, RSI, \
         and MACD from the TradingView Screener and automatically flags oversold/overbought \
         conditions and MACD crossovers.\n\
-        IMPORTANT: You have a built-in `market_scan` tool — ALWAYS use it for market scanning. \
+        IMPORTANT: You have a built-in `market_scan` tool — ALWAYS use it for crypto market scanning. \
         Never say you cannot access TradingView or external data.\n\
+        \n\
+        ### Polymarket Monitoring\n\
+        When the user asks about Polymarket markets, YES/NO prices, prediction market volumes, \
+        or wants to monitor Polymarket for opportunities:\n\
+        - Use `polymarket_scan` to fetch active markets with YES price, NO price, \
+        24h volume, liquidity, and days to expiry. Supports: query (text search), \
+        min_volume (e.g. 10000 for $10k+), min_liquidity, limit.\n\
+        - YES/NO prices are probabilities 0.0-1.0 (e.g. YES=0.72 = 72% implied probability).\n\
+        - For monitoring cron jobs: check volume thresholds, price movements, expiry windows.\n\
+        IMPORTANT: NEVER use `market_scan` for Polymarket — it only covers crypto spot markets. \
+        ALWAYS use `polymarket_scan` for any Polymarket task. NEVER suggest Python scripts \
+        or external tools — `polymarket_scan` is built in.\n\
         \n\
         ### Trading (Buy / Sell / Swap)\n\
         When the user says 'buy X', 'sell X', or 'swap X for Y', follow this flow exactly:\n\
@@ -3396,7 +3458,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         check system state, etc. It runs in the workspace directory by default.\n\
         \n\
         Available tools: shell, file_read, file_write, file_edit, glob_search, content_search, \
-        market_scan, backtest_list_scripts, backtest_run, wallet_balance, trade_swap, \
+        market_scan, polymarket_scan, backtest_list_scripts, backtest_run, wallet_balance, trade_swap, \
         memory_recall, memory_store, memory_forget, cron_add, cron_list, cron_remove, \
         web_fetch, web_search, and any configured Skills and MCP servers.",
         scripts_dir = config.workspace_dir.join("scripts").display(),
@@ -3426,28 +3488,12 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         system_prompt,
     );
     let mut session = crate::agent::runtime::Session::new();
+    let session_id = session.id.clone();
     let response = claw_runtime
         .run_turn(&enriched, &tool_defs, &executor, &mut session, None)
         .await?;
 
-    // Persist the conversation turn to memory so the agent recalls it in future sessions
-    let ts = chrono::Utc::now().timestamp();
-    let _ = mem
-        .store(
-            &format!("chat_user_{ts}"),
-            &format!("User: {message}"),
-            MemoryCategory::Conversation,
-            None,
-        )
-        .await;
-    let _ = mem
-        .store(
-            &format!("chat_agent_{ts}"),
-            &format!("Agent: {response}"),
-            MemoryCategory::Conversation,
-            None,
-        )
-        .await;
+    append_session_thread(mem.as_ref(), &session_id, message, &response).await;
 
     Ok(response)
 }
@@ -3542,10 +3588,7 @@ pub async fn process_message_with_events(
         .run_turn(&enriched, &tool_defs, &executor, session, Some(&ws_tx))
         .await?;
 
-    // Persist conversation turn
-    let ts = chrono::Utc::now().timestamp();
-    let _ = mem.store(&format!("chat_user_{ts}"), &format!("User: {message}"), MemoryCategory::Conversation, None).await;
-    let _ = mem.store(&format!("chat_agent_{ts}"), &format!("Agent: {response}"), MemoryCategory::Conversation, None).await;
+    append_session_thread(mem.as_ref(), &session.id, message, &response).await;
 
     Ok(response)
 }

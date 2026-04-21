@@ -1,22 +1,22 @@
 import { useState } from 'react'
-import { NavLink } from 'react-router-dom'
+import { NavLink, useLocation } from 'react-router-dom'
 import {
   LayoutDashboard,
   Wallet,
   BarChart2,
   Send,
-  Zap,
-  MessageSquare,
   Brain,
   Settings,
   ChevronLeft,
   ChevronRight,
+  ChevronDown,
   Activity,
-  TrendingUp,
   FlaskConical,
   Bot,
   Heart,
   Database,
+  Blocks,
+  HelpCircle,
 } from 'lucide-react'
 import { useQuery } from '@tanstack/react-query'
 import { apiFetch } from '../hooks/useApi'
@@ -28,17 +28,19 @@ interface NavItem {
   label: string
 }
 
-const navItems: NavItem[] = [
+const mainNavItems: NavItem[] = [
   { to: '/', icon: <LayoutDashboard size={18} />, label: 'Dashboard' },
   { to: '/wallets', icon: <Wallet size={18} />, label: 'Web3 Wallets' },
   { to: '/polymarket', icon: <BarChart2 size={18} />, label: 'Polymarket' },
   { to: '/telegram', icon: <Send size={18} />, label: 'Telegram' },
-  { to: '/skills', icon: <Zap size={18} />, label: 'Skills' },
-  { to: '/scheduled-jobs', icon: <Activity size={18} />, label: 'Scheduled Jobs' },
-  { to: '/chat', icon: <MessageSquare size={18} />, label: 'Terminal' },
-  { to: '/tradingview', icon: <TrendingUp size={18} />, label: 'TradingView' },
+  { to: '/strategy-builder', icon: <Blocks size={18} />, label: 'Strategy Builder' },
   { to: '/backtesting', icon: <FlaskConical size={18} />, label: 'Backtesting' },
   { to: '/live', icon: <Bot size={18} />, label: 'Live Strategies' },
+  { to: '/scheduled-jobs', icon: <Activity size={18} />, label: 'Scheduled Jobs' },
+  { to: '/help', icon: <HelpCircle size={18} />, label: 'Help' },
+]
+
+const settingsNavItems: NavItem[] = [
   { to: '/health', icon: <Heart size={18} />, label: 'System Health' },
   { to: '/memory', icon: <Database size={18} />, label: 'Memory' },
   { to: '/settings/llm', icon: <Brain size={18} />, label: 'LLM Settings' },
@@ -47,6 +49,11 @@ const navItems: NavItem[] = [
 
 export default function Sidebar() {
   const [collapsed, setCollapsed] = useState(false)
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  const location = useLocation()
+
+  // Auto-open settings group if current route is a settings route
+  const isInSettings = settingsNavItems.some(item => location.pathname.startsWith(item.to))
 
   const { data: status } = useQuery({
     queryKey: ['status'],
@@ -54,7 +61,10 @@ export default function Sidebar() {
     refetchInterval: 10_000,
   })
 
-  const telegramConfigured = !!(status?.channels && typeof status.channels === 'object' && (status.channels as Record<string, boolean>)['telegram'])
+  const channelsMap = status?.channels && typeof status.channels === 'object'
+    ? Object.fromEntries(Object.entries(status.channels as Record<string, boolean>).map(([k, v]) => [k.toLowerCase(), v]))
+    : {}
+  const telegramConfigured = !!channelsMap['telegram']
   const telegramHealth = (status as any)?.health?.components?.['channel:telegram']
   const telegramStatus: 'online' | 'offline' | 'warning' = !telegramConfigured
     ? 'offline'
@@ -116,7 +126,7 @@ export default function Sidebar() {
 
       {/* Navigation */}
       <nav className="flex-1 py-2 overflow-y-auto">
-        {navItems.map((item) => (
+        {mainNavItems.map((item) => (
           <NavLink
             key={item.to}
             to={item.to}
@@ -141,6 +151,75 @@ export default function Sidebar() {
             {!collapsed && <span>{item.label}</span>}
           </NavLink>
         ))}
+
+        {/* Settings group */}
+        {!collapsed && (
+          <div className="mx-1 mt-2">
+            <button
+              onClick={() => setSettingsOpen(v => !v)}
+              className="w-full flex items-center gap-3 px-3 py-2 rounded text-xs font-semibold uppercase tracking-widest hover:bg-white/5 transition-colors"
+              style={{ color: 'var(--color-text-muted)' }}
+            >
+              <Settings size={14} />
+              <span className="flex-1 text-left">Settings</span>
+              <ChevronDown
+                size={12}
+                className="transition-transform"
+                style={{ transform: (settingsOpen || isInSettings) ? 'rotate(180deg)' : 'rotate(0deg)' }}
+              />
+            </button>
+            {(settingsOpen || isInSettings) && (
+              <div className="ml-2 border-l pl-2 mt-0.5" style={{ borderColor: 'var(--color-border)' }}>
+                {settingsNavItems.map((item) => (
+                  <NavLink
+                    key={item.to}
+                    to={item.to}
+                    className={({ isActive }) =>
+                      clsx(
+                        'flex items-center gap-3 px-3 py-2 my-0.5 rounded text-sm transition-colors',
+                        isActive ? 'text-black font-medium' : 'hover:bg-white/5'
+                      )
+                    }
+                    style={({ isActive }) =>
+                      isActive
+                        ? { backgroundColor: 'var(--color-accent)', color: '#000' }
+                        : { color: 'var(--color-text-muted)' }
+                    }
+                  >
+                    <span className="flex-shrink-0">{item.icon}</span>
+                    <span>{item.label}</span>
+                  </NavLink>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Collapsed settings icons */}
+        {collapsed && (
+          <>
+            {settingsNavItems.map((item) => (
+              <NavLink
+                key={item.to}
+                to={item.to}
+                className={({ isActive }) =>
+                  clsx(
+                    'flex items-center justify-center px-3 py-2.5 mx-1 my-0.5 rounded text-sm transition-colors',
+                    isActive ? 'text-black font-medium' : 'hover:bg-white/5'
+                  )
+                }
+                style={({ isActive }) =>
+                  isActive
+                    ? { backgroundColor: 'var(--color-accent)', color: '#000' }
+                    : { color: 'var(--color-text-muted)' }
+                }
+                title={item.label}
+              >
+                <span className="flex-shrink-0">{item.icon}</span>
+              </NavLink>
+            ))}
+          </>
+        )}
       </nav>
 
       {/* Collapse toggle */}

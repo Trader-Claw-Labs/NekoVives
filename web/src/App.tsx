@@ -3,23 +3,24 @@ import type { ReactNode } from 'react'
 import { Routes, Route } from 'react-router-dom'
 import Sidebar from './components/Sidebar'
 import PairingModal from './components/PairingModal'
+import StrategyWithChatLayout from './components/StrategyWithChatLayout'
 import OnboardingModal from './components/OnboardingModal'
 import Dashboard from './pages/Dashboard'
 import Wallets from './pages/Wallets'
 import Polymarket from './pages/Polymarket'
 import Telegram from './pages/Telegram'
-import Skills from './pages/Skills'
+import StrategyBuilder from './pages/StrategyBuilder'
 import ScheduledJobs from './pages/ScheduledJobs'
 import Chat from './pages/Chat'
 import { ChatProvider } from './context/ChatContext'
 import LLMSettings from './pages/LLMSettings'
 import Config from './pages/Config'
-import TradingViewPage from './pages/TradingView'
 import Backtesting from './pages/Backtesting'
 import LiveStrategies from './pages/LiveStrategies'
 import SystemHealth from './pages/SystemHealth'
 import Memory from './pages/Memory'
-import { apiFetch, getAuthToken } from './hooks/useApi'
+import Help from './pages/Help'
+import { apiFetch, getAuthToken, setAuthErrorCallback } from './hooks/useApi'
 
 // ── Error boundary ────────────────────────────────────────────────
 class ErrorBoundary extends Component<
@@ -84,8 +85,10 @@ export default function App() {
   const [showPairing, setShowPairing] = useState(false)
   const [showOnboarding, setShowOnboarding] = useState(false)
 
-  // On mount: check pairing, then check onboarding
+  // On mount: register 401 handler, then check pairing + onboarding
   useEffect(() => {
+    setAuthErrorCallback(() => setShowPairing(true))
+
     fetch('/health')
       .then((r) => r.json())
       .then((data: { require_pairing?: boolean }) => {
@@ -138,14 +141,14 @@ export default function App() {
             <Route path="/wallets" element={<Wallets />} />
             <Route path="/polymarket" element={<Polymarket />} />
             <Route path="/telegram" element={<Telegram />} />
-            <Route path="/skills" element={<Skills />} />
-            <Route path="/scheduled-jobs" element={<ScheduledJobs />} />
+            <Route path="/strategy-builder" element={<StrategyWithChatLayout><StrategyBuilder /></StrategyWithChatLayout>} />
+            <Route path="/scheduled-jobs" element={<StrategyWithChatLayout><ScheduledJobs /></StrategyWithChatLayout>} />
             <Route path="/chat" element={<Chat />} />
-            <Route path="/tradingview" element={<TradingViewPage />} />
-            <Route path="/backtesting" element={<Backtesting />} />
-            <Route path="/live" element={<LiveStrategies />} />
+            <Route path="/backtesting" element={<StrategyWithChatLayout><Backtesting /></StrategyWithChatLayout>} />
+            <Route path="/live" element={<StrategyWithChatLayout><LiveStrategies /></StrategyWithChatLayout>} />
             <Route path="/health" element={<SystemHealth />} />
             <Route path="/memory" element={<Memory />} />
+            <Route path="/help" element={<Help />} />
             <Route path="/settings/llm" element={<LLMSettings />} />
             <Route path="/settings/config" element={<Config />} />
           </Routes>

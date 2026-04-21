@@ -25,9 +25,20 @@ pub trait ToolExecutor: Send + Sync {
 
 /// Per-WebSocket-connection conversation history.
 /// Each WS connection owns one Session; messages accumulate across turns.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct Session {
+    /// Stable UUID for this connection — used as the memory thread key.
+    pub id: String,
     pub history: Vec<InputMessage>,
+}
+
+impl Default for Session {
+    fn default() -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            history: Vec::new(),
+        }
+    }
 }
 
 impl Session {

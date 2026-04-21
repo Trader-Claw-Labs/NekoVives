@@ -379,7 +379,7 @@ function PlaceOrderTab() {
 }
 
 export default function Polymarket() {
-  const [activeTab, setActiveTab] = useState<'markets' | 'orders' | 'positions' | 'place'>('markets')
+  const [activeTab, setActiveTab] = useState<'markets' | 'orders' | 'positions'>('markets')
   const [walletAddress, setWalletAddress] = useState('')
   const [apiKeys, setApiKeys] = useState<ApiKeyEntry[]>([
     { id: genId(), label: 'API Key 1', key: '', secret: '', passphrase: '', show: false, expanded: true },
@@ -399,6 +399,13 @@ export default function Polymarket() {
   const { data: savedConfig } = useQuery<PolyConfigData>({
     queryKey: ['polymarket-config'],
     queryFn: () => apiFetch('/api/polymarket/configure'),
+  })
+
+  const { data: balanceData, isLoading: balanceLoading, refetch: refetchBalance } = useQuery<{ balances?: { symbol: string; balance: string; chain: string }[] }>({
+    queryKey: ['poly-balance', walletAddress],
+    queryFn: () => walletAddress ? apiFetch(`/api/wallets/${encodeURIComponent(walletAddress)}/balance`) : Promise.resolve({}),
+    enabled: !!walletAddress,
+    refetchInterval: 30_000,
   })
 
   useEffect(() => {
@@ -493,15 +500,47 @@ export default function Polymarket() {
         <h1 className="text-lg font-bold">Polymarket</h1>
       </div>
 
+      {/* Wallet Balance */}
+      {walletAddress && (
+        <div className="rounded-lg border p-4 mb-5 flex items-center justify-between"
+          style={{ backgroundColor: 'var(--color-surface)', borderColor: 'var(--color-border)' }}>
+          <div>
+            <p className="text-xs mb-1" style={{ color: 'var(--color-text-muted)' }}>Polygon Wallet Balance</p>
+            <p className="text-xs font-mono truncate max-w-48" style={{ color: 'var(--color-text-muted)' }}>{walletAddress}</p>
+          </div>
+          <div className="flex items-center gap-3">
+            {balanceLoading ? (
+              <span className="text-xs" style={{ color: 'var(--color-text-muted)' }}>Loading...</span>
+            ) : (
+              <div className="flex gap-4">
+                {(balanceData?.balances ?? []).filter(b => ['USDC', 'MATIC', 'POL'].includes(b.symbol)).map(b => (
+                  <div key={b.symbol} className="text-right">
+                    <p className="text-sm font-bold" style={{ color: 'var(--color-accent)' }}>{parseFloat(b.balance).toFixed(2)}</p>
+                    <p className="text-xs" style={{ color: 'var(--color-text-muted)' }}>{b.symbol}</p>
+                  </div>
+                ))}
+                {(!balanceData?.balances || balanceData.balances.length === 0) && (
+                  <span className="text-xs" style={{ color: 'var(--color-text-muted)' }}>—</span>
+                )}
+              </div>
+            )}
+            <button onClick={() => refetchBalance()} className="p-1.5 rounded hover:bg-white/5"
+              style={{ color: 'var(--color-text-muted)' }}>
+              <RefreshCw size={12} className={balanceLoading ? 'animate-spin' : ''} />
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Tabs */}
       <div className="flex gap-1 mb-5 p-1 rounded" style={{ backgroundColor: 'var(--color-surface)' }}>
-        {(['markets', 'orders', 'positions', 'place'] as const).map(tab => (
+        {(['markets', 'orders', 'positions'] as const).map(tab => (
           <button key={tab} onClick={() => setActiveTab(tab)}
             className="flex-1 py-1.5 rounded text-sm font-medium transition-colors capitalize"
             style={activeTab === tab
               ? { backgroundColor: 'var(--color-accent)', color: '#000' }
               : { color: 'var(--color-text-muted)' }}>
-            {tab === 'place' ? 'Place Order' : tab.charAt(0).toUpperCase() + tab.slice(1)}
+            {tab.charAt(0).toUpperCase() + tab.slice(1)}
           </button>
         ))}
       </div>
@@ -512,7 +551,6 @@ export default function Polymarket() {
           style={{ backgroundColor: 'var(--color-surface)', borderColor: 'var(--color-border)' }}>
           {activeTab === 'orders' && <OrdersTab />}
           {activeTab === 'positions' && <PositionsTab />}
-          {activeTab === 'place' && <PlaceOrderTab />}
         </div>
       )}
 

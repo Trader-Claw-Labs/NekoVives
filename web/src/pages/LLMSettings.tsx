@@ -26,6 +26,7 @@ const PROVIDERS = [
   'gemini',
   'ollama',
   'custom',
+  'anthropic-custom',
 ]
 
 const MODELS_BY_PROVIDER: Record<string, string[]> = {
@@ -90,56 +91,86 @@ export default function LLMSettings() {
     if (!configData?.content) return
     const content = configData.content
 
-    const providerMatch = content.match(/default_provider\s*=\s*"([^"]+)"/)
-    const modelMatch = content.match(/default_model\s*=\s*"([^"]+)"/)
-    const tempMatch = content.match(/default_temperature\s*=\s*([\d.]+)/)
-    const apiKeyMatch = content.match(/^api_key\s*=\s*"([^"]*)"/m)
-    const apiUrlMatch = content.match(/^api_url\s*=\s*"([^"]*)"/m)
+    // Only parse from the top-level section (before first [header]) to avoid
+    // picking up keys with the same name inside subsections (e.g. [transcription].api_url)
+    const firstSection = content.search(/^\[/m)
+    const topLevel = firstSection === -1 ? content : content.slice(0, firstSection)
 
-    if (providerMatch) setProvider(providerMatch[1])
+    const providerMatch = topLevel.match(/default_provider\s*=\s*"([^"]+)"/)
+    const modelMatch = topLevel.match(/default_model\s*=\s*"([^"]+)"/)
+    const tempMatch = topLevel.match(/default_temperature\s*=\s*([\d.]+)/)
+    const apiKeyMatch = topLevel.match(/^api_key\s*=\s*"([^"]*)"/m)
+    const apiUrlMatch = topLevel.match(/^api_url\s*=\s*"([^"]*)"/m)
+
+    if (providerMatch) {
+      const raw = providerMatch[1]
+      // "custom:https://..." → split into provider=custom + apiUrl
+      if (raw.startsWith('custom:')) {
+        setProvider('custom')
+        setApiUrl(raw.slice('custom:'.length))
+      } else if (raw.startsWith('anthropic-custom:')) {
+        setProvider('anthropic-custom')
+        setApiUrl(raw.slice('anthropic-custom:'.length))
+      } else {
+        setProvider(raw)
+        // Recover URL from separate api_url field (legacy configs saved before url-embedding)
+        if (apiUrlMatch && apiUrlMatch[1]) setApiUrl(apiUrlMatch[1])
+      }
+    }
     if (modelMatch) setModel(modelMatch[1])
     if (tempMatch) setTemperature(parseFloat(tempMatch[1]))
     if (apiKeyMatch && apiKeyMatch[1] && !apiKeyMatch[1].startsWith('•')) setApiKey(apiKeyMatch[1])
-    if (apiUrlMatch) setApiUrl(apiUrlMatch[1])
   }, [configData])
 
   const saveMutation = useMutation({
     mutationFn: async () => {
       if (!configData?.content) throw new Error('No config loaded')
-      let toml = configData.content
+      const toml = configData.content
 
-      const effectiveModel = model
+      // Split TOML into top-level section (before first [header]) and the rest.
+      // All LLM keys live at the top level — never touch keys inside [sections].
+      const firstSection = toml.search(/^\[/m)
+      let top = firstSection === -1 ? toml : toml.slice(0, firstSection)
+      const rest = firstSection === -1 ? '' : toml.slice(firstSection)
 
-      // Update fields in TOML
-      toml = toml.replace(/default_provider\s*=\s*"[^"]*"/, `default_provider = "${provider}"`)
-      toml = toml.replace(/default_model\s*=\s*"[^"]*"/, `default_model = "${effectiveModel}"`)
-      toml = toml.replace(/default_temperature\s*=\s*[\d.]+/, `default_temperature = ${temperature}`)
+      // For custom/anthropic-custom, embed the URL in the provider name itself.
+      const needsUrlInName = provider === 'custom' || provider === 'anthropic-custom'
+      const effectiveProvider = needsUrlInName && apiUrl.trim()
+        ? `${provider}:${apiUrl.trim()}`
+        : provider
 
-      // Update or append api_key (only if user typed something)
-      if (apiKey) {
-        if (/^api_key\s*=/m.test(toml)) {
-          toml = toml.replace(/^api_key\s*=\s*"[^"]*"/m, `api_key = "${apiKey}"`)
-        } else {
-          toml = `api_key = "${apiKey}"\n` + toml
-        }
+      // Helper: set or append a key=value line in the top section only
+      function setTopKey(src: string, key: string, value: string): string {
+        const re = new RegExp(`^${key}\\s*=\\s*"[^"]*"`, 'm')
+        if (re.test(src)) return src.replace(re, `${key} = "${value}"`)
+        return src + `${key} = "${value}"\n`
+      }
+      function removeTopKey(src: string, key: string): string {
+        return src.replace(new RegExp(`^${key}\\s*=\\s*"[^"]*"\\n?`, 'm'), '')
       }
 
-      // Update or append api_url (only if set)
-      if (apiUrl) {
-        if (/^api_url\s*=/m.test(toml)) {
-          toml = toml.replace(/^api_url\s*=\s*"[^"]*"/m, `api_url = "${apiUrl}"`)
-        } else {
-          toml = `api_url = "${apiUrl}"\n` + toml
-        }
-      } else if (/^api_url\s*=/m.test(toml)) {
-        // Remove api_url line if cleared
-        toml = toml.replace(/^api_url\s*=\s*"[^"]*"\n?/m, '')
+      top = setTopKey(top, 'default_provider', effectiveProvider)
+      top = setTopKey(top, 'default_model', model)
+      // Temperature is a number, not a string
+      top = /^default_temperature\s*=/m.test(top)
+        ? top.replace(/^default_temperature\s*=\s*[\d.]+/m, `default_temperature = ${temperature}`)
+        : top + `default_temperature = ${temperature}\n`
+
+      if (apiKey) top = setTopKey(top, 'api_key', apiKey)
+
+      // api_url: write at top level for ollama/openai/etc, and as fallback for custom types
+      if (apiUrl.trim()) {
+        top = setTopKey(top, 'api_url', apiUrl.trim())
+      } else {
+        top = removeTopKey(top, 'api_url')
       }
+
+      const updatedToml = top + rest
 
       const res = await fetch('/api/config', {
         method: 'PUT',
         headers: { 'Content-Type': 'text/plain', Authorization: `Bearer ${localStorage.getItem('auth_token') ?? ''}` },
-        body: toml,
+        body: updatedToml,
       })
       if (!res.ok) throw new Error(await res.text())
       return res.json()
@@ -232,19 +263,31 @@ export default function LLMSettings() {
           </div>
         </div>
 
-        {/* Base URL (custom or ollama) */}
-        {(provider === 'custom' || provider === 'ollama') && (
+        {/* Base URL (custom, anthropic-custom or ollama) */}
+        {(provider === 'custom' || provider === 'anthropic-custom' || provider === 'ollama') && (
           <div>
             <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>
-              Base URL {provider === 'ollama' ? '(e.g. http://localhost:11434)' : '(custom endpoint)'}
+              Base URL
+              {provider === 'ollama' && ' (e.g. http://localhost:11434)'}
+              {provider === 'custom' && ' u2014 OpenAI-compatible endpoint'}
+              {provider === 'anthropic-custom' && ' u2014 Anthropic-compatible endpoint'}
             </label>
             <input
               type="text"
               value={apiUrl}
               onChange={(e) => setApiUrl(e.target.value)}
               className="w-full rounded px-3 py-2 text-sm font-mono"
-              placeholder={provider === 'ollama' ? 'http://localhost:11434' : 'https://api.example.com/v1'}
+              placeholder={
+                provider === 'ollama' ? 'http://localhost:11434' :
+                provider === 'anthropic-custom' ? 'http://localhost:20128' :
+                'http://localhost:20128/v1'
+              }
             />
+            {(provider === 'custom' || provider === 'anthropic-custom') && apiUrl && (
+              <p className="text-xs mt-1" style={{ color: 'var(--color-text-muted)' }}>
+                Will save as: <span className="font-mono" style={{ color: 'var(--color-accent)' }}>{provider}:{apiUrl}</span>
+              </p>
+            )}
           </div>
         )}
 

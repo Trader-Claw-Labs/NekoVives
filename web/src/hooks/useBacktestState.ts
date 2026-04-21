@@ -1,16 +1,32 @@
 import { useQueryClient, useQuery, useMutation } from '@tanstack/react-query'
-import { apiPost } from './useApi'
+import { apiPost, apiFetch } from './useApi'
 
-// ── Types ─────────────────────────────────────────────────────────
+// ── Types ─────────────────────────────────────────────────────
 
 export type MarketType = 'crypto' | 'polymarket' | 'polymarket_binary'
 
-// Presets for binary markets (no condition token ID needed)
+// A recurring Polymarket binary market series (loaded from /api/backtest/series)
+export interface MarketSeries {
+  id: string
+  label: string
+  slug_prefix: string
+  data_source: 'binance' | 'open_meteo'
+  symbol: string
+  cadence: string
+  resolution_logic: 'price_up' | 'threshold_above' | 'threshold_below'
+  threshold: number | null
+  unit: string | null
+  description: string
+  default_script: string | null
+  builtin: boolean
+}
+
+// Legacy hardcoded presets — used as fallback if API not yet loaded
 export interface PolyBinaryPreset {
   id: string
   label: string
-  symbol: string          // Binance pair for underlying data
-  defaultInterval: string // default window size
+  symbol: string
+  defaultInterval: string
   description: string
 }
 
@@ -32,8 +48,16 @@ export interface BacktestConfig {
   to_date: string
   initial_balance: number
   fee_pct: number
-  // Binary-only: which preset is selected (drives symbol + default interval)
+  // Binary series identifier (replaces poly_binary_preset, drives symbol/interval/resolution)
+  series_id?: string
+  // Kept for backward compat with stored state
   poly_binary_preset?: string
+  // Resolution override (set automatically from series)
+  resolution_logic?: string
+  threshold?: number
+  // Polymarket position limit: max stake per trade in USD.
+  // Reflects real market liquidity caps (~$500-$3,000 per 5-min window).
+  max_position_usd?: number
 }
 
 export interface TradeLog {
@@ -57,10 +81,12 @@ export interface BacktestResult {
   all_trades?: TradeLog[]
   analysis?: string
   initial_balance?: number
+  final_balance?: number
   // Binary-specific metrics (present only for polymarket_binary runs)
   avg_token_price?: number
   correct_direction_pct?: number
   break_even_win_rate?: number
+  markets_tested?: number
 }
 
 export interface ProgressState {
@@ -95,7 +121,11 @@ const DEFAULT_CONFIG: BacktestConfig = {
   to_date: TODAY,
   initial_balance: 10000,
   fee_pct: 0.1,
+  series_id: 'btc_5m',
   poly_binary_preset: 'btc_5m',
+  resolution_logic: 'price_up',
+  // Default $500 per trade reflects real Polymarket 5-min binary window liquidity
+  max_position_usd: 500,
 }
 
 const DEFAULT_STATE: BacktestState = {
@@ -119,7 +149,9 @@ function loadFromStorage(): Partial<BacktestState> {
     const parsed = JSON.parse(raw)
     // Only restore non-running state — don't restore stale isRunning/progress
     return {
-      config: parsed.config ?? DEFAULT_CONFIG,
+      // Spread DEFAULT_CONFIG first so any new fields get their defaults
+      // even when the stored config predates them (e.g. max_position_usd added later)
+      config: { ...DEFAULT_CONFIG, ...(parsed.config ?? {}) },
       result: parsed.result ?? null,
       scriptResults: parsed.scriptResults ?? {},
     }
@@ -217,32 +249,51 @@ export function useBacktestState() {
         progress: { step: 'preparing', message: 'Validating configuration...', startTime: Date.now() },
       })
 
-      await new Promise(r => setTimeout(r, 300))
+      await new Promise(r => setTimeout(r, 200))
 
+      const fetchStart = Date.now()
       updateState({
         progress: {
           step: 'fetching',
           message: cfg.market_type === 'polymarket_binary'
-            ? `Fetching ${cfg.symbol} 1m candles from Binance for ${cfg.interval} binary windows (${cfg.from_date} → ${cfg.to_date})...`
-            : `Fetching ${cfg.symbol} ${cfg.interval} candles (${cfg.from_date} to ${cfg.to_date})...`,
-          startTime: Date.now(),
+            ? `Fetching ${cfg.symbol} 1m candles from Binance (${cfg.from_date} → ${cfg.to_date})…`
+            : `Fetching ${cfg.symbol} ${cfg.interval} candles (${cfg.from_date} → ${cfg.to_date})…`,
+          startTime: fetchStart,
         },
       })
 
-      const response = await apiPost<BacktestResult>('/api/backtest/run', cfg)
+      // After 8s advance to 'running', after 15s advance to 'analyzing'
+      // These timers reflect what the backend is actually doing during the single API call.
+      const phaseTimer = setTimeout(() => {
+        updateState({
+          progress: {
+            step: 'running',
+            message: 'Executing Rhai strategy engine against historical data…',
+            startTime: Date.now(),
+          },
+        })
+      }, 8_000)
+      const analyzeTimer = setTimeout(() => {
+        updateState({
+          progress: {
+            step: 'analyzing',
+            message: 'Computing metrics: Sharpe ratio, drawdown, win rate…',
+            startTime: Date.now(),
+          },
+        })
+      }, 15_000)
 
-      updateState({
-        progress: { step: 'running', message: 'Executing Rhai strategy engine...', startTime: Date.now() },
-      })
-      await new Promise(r => setTimeout(r, 200))
-
-      updateState({
-        progress: { step: 'analyzing', message: 'Computing metrics and analysis...', startTime: Date.now() },
-      })
-      await new Promise(r => setTimeout(r, 200))
-
-      console.log('[Backtest] Complete:', response)
-      return response
+      try {
+        const response = await apiPost<BacktestResult>('/api/backtest/run', cfg)
+        clearTimeout(phaseTimer)
+        clearTimeout(analyzeTimer)
+        console.log('[Backtest] Complete:', response)
+        return response
+      } catch (err) {
+        clearTimeout(phaseTimer)
+        clearTimeout(analyzeTimer)
+        throw err
+      }
     },
     onSuccess: (data) => {
       queryClient.setQueryData<BacktestState>(BACKTEST_STATE_KEY, (old) => {
@@ -287,6 +338,7 @@ export function useBacktestState() {
     setResult,
     clearResult,
     runBacktest: (cfg?: BacktestConfig) => runBacktest.mutate(cfg ?? currentState.config),
+    runBacktestAsync: (cfg: BacktestConfig) => runBacktest.mutateAsync(cfg),
 
     // Mutation state
     mutation: runBacktest,

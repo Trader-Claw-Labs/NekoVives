@@ -275,6 +275,17 @@ export function ChatProvider({ children }: { children: ReactNode }) {
           }
         }
 
+        if (msg.type === 'cancelled') {
+          return {
+            ...s,
+            messages: msgs.map((m) =>
+              m.streaming
+                ? { ...m, content: m.content || 'Task cancelled.', streaming: false }
+                : m
+            ),
+          }
+        }
+
         return s
       })
     })

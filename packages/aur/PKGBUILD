@@ -1,0 +1,17 @@
+# Maintainer: Trader Claw Labs <contact@trader-claw-labs.com>
+pkgname=trader-claw-bin
+pkgver=__VERSION__
+pkgrel=1
+pkgdesc="Rust crypto trading agent for EVM, Solana, TON, and Polymarket prediction markets"
+arch=('x86_64')
+url="https://github.com/Trader-Claw-Labs/Trader-Claw"
+license=('MIT OR Apache-2.0')
+provides=('trader-claw')
+conflicts=('trader-claw')
+options=('!strip')
+source_x86_64=("trader-claw-linux-x86_64.tar.gz::https://github.com/Trader-Claw-Labs/Trader-Claw/releases/download/v${pkgver}/trader-claw-linux-x86_64.tar.gz")
+sha256sums_x86_64=('__SHA256_LINUX_X86_64__')
+
+package() {
+    install -Dm755 "${srcdir}/trader-claw" "${pkgdir}/usr/bin/trader-claw"
+}

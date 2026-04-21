@@ -1,7 +1,8 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { useQuery, useMutation } from '@tanstack/react-query'
 import { apiFetch } from '../hooks/useApi'
-import { Settings, Save, RefreshCw, Copy, Check } from 'lucide-react'
+import { Settings, Save, RefreshCw, Copy, Check, Download, Upload } from 'lucide-react'
+import { getAuthToken } from '../hooks/useApi'
 
 interface ConfigResponse {
   format?: string
@@ -316,6 +317,93 @@ export default function Config() {
       >
         Warning: Editing config directly. Sensitive values (API keys, tokens) are masked with ***MASKED*** — saving will preserve existing secrets.
       </div>
+
+      {/* Export / Import */}
+      <ExportImportPanel />
+    </div>
+  )
+}
+
+function ExportImportPanel() {
+  const [importMsg, setImportMsg] = useState('')
+  const [importErr, setImportErr] = useState('')
+  const [importing, setImporting] = useState(false)
+  const fileRef = useRef<HTMLInputElement>(null)
+
+  function handleExport() {
+    const token = getAuthToken()
+    const a = document.createElement('a')
+    a.href = '/api/export'
+    // Pass auth token via URL is not ideal; use fetch instead
+    fetch('/api/export', { headers: token ? { Authorization: `Bearer ${token}` } : {} })
+      .then(r => r.blob())
+      .then(blob => {
+        const url = URL.createObjectURL(blob)
+        a.href = url
+        a.download = 'traderclaw-export.zip'
+        a.click()
+        URL.revokeObjectURL(url)
+      })
+  }
+
+  async function handleImport(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0]
+    if (!file) return
+    setImporting(true)
+    setImportMsg('')
+    setImportErr('')
+    try {
+      const token = getAuthToken()
+      const arrayBuf = await file.arrayBuffer()
+      const b64 = btoa(String.fromCharCode(...new Uint8Array(arrayBuf)))
+      const res = await fetch('/api/import', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify({ data: b64 }),
+      })
+      const json = await res.json()
+      if (res.ok) {
+        const imported: string[] = json.imported ?? []
+        setImportMsg(`Imported: ${imported.length ? imported.join(', ') : 'nothing'}`)
+      } else {
+        setImportErr(json.error ?? 'Import failed')
+      }
+    } catch (err: unknown) {
+      setImportErr(err instanceof Error ? err.message : 'Import failed')
+    } finally {
+      setImporting(false)
+      if (fileRef.current) fileRef.current.value = ''
+    }
+  }
+
+  return (
+    <div className="mt-4 rounded-lg border p-4" style={{ backgroundColor: 'var(--color-surface)', borderColor: 'var(--color-border)' }}>
+      <h2 className="text-sm font-semibold mb-3">Export / Import</h2>
+      <p className="text-xs mb-4" style={{ color: 'var(--color-text-muted)' }}>
+        Export wallets and strategies as a ZIP archive. Import to restore them on another instance.
+        Sensitive config values (API keys) are masked in exports.
+      </p>
+      <div className="flex gap-3 flex-wrap">
+        <button
+          onClick={handleExport}
+          className="flex items-center gap-2 px-4 py-1.5 rounded text-sm font-medium border"
+          style={{ borderColor: 'var(--color-accent)', color: 'var(--color-accent)' }}
+        >
+          <Download size={13} />
+          Export ZIP
+        </button>
+        <label className="flex items-center gap-2 px-4 py-1.5 rounded text-sm font-medium border cursor-pointer"
+          style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-muted)' }}>
+          <Upload size={13} />
+          {importing ? 'Importing...' : 'Import ZIP'}
+          <input ref={fileRef} type="file" accept=".zip" className="hidden" onChange={handleImport} disabled={importing} />
+        </label>
+      </div>
+      {importMsg && <p className="mt-2 text-xs" style={{ color: 'var(--color-accent)' }}>{importMsg}</p>}
+      {importErr && <p className="mt-2 text-xs" style={{ color: 'var(--color-danger)' }}>{importErr}</p>}
     </div>
   )
 }

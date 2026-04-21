@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from 'react'
 import {
-  Plus, X, Wifi, WifiOff, Pencil, Send,
+  Plus, X, Wifi, WifiOff, Pencil, Send, Square,
   Zap, BarChart2, Search, Wallet, BookOpen, Settings2, Terminal,
   ChevronDown, ChevronRight, AlertCircle, Paperclip, FlaskConical,
 } from 'lucide-react'
@@ -217,7 +217,7 @@ function ThinkingRow({ round, replanning, active }: { round: number; replanning?
 }
 
 function ToolRow({ item }: { item: TimelineItem }) {
-  const [open, setOpen] = useState(false)
+  const [open, setOpen] = useState(true)
   const meta    = toolMeta(item.toolName ?? '')
   const label   = argsLabel(item.toolName ?? '', item.args)
   const failed  = item.success === false
@@ -359,7 +359,7 @@ function Timeline({ toolEvents, streaming }: { toolEvents: ToolEvent[]; streamin
 
 // Keep backward-compat alias used in MessageBubble for completed messages
 function ActionLog({ toolEvents }: { toolEvents: ToolEvent[] }) {
-  const [open, setOpen] = useState(false)
+  const [open, setOpen] = useState(true)
   const calls = toolEvents.filter(e => e.type === 'tool_call')
   if (calls.length === 0) return null
 
@@ -499,7 +499,12 @@ function ChatWindow({ session, onUpdate, connected, send }: ChatWindowProps) {
   const [attachedResult, setAttachedResult] = useState<BacktestResult | null>(null)
   const bottomRef  = useRef<HTMLDivElement>(null)
   const inputRef   = useRef<HTMLTextAreaElement>(null)
+  const isInitialRender = useRef(true)
   const { scriptResults, result: latestResult } = useBacktestState()
+
+  useEffect(() => {
+    isInitialRender.current = true
+  }, [session.id])
 
   // Derive sending from whether the last assistant message is still streaming
   const sending = session.messages.some((m) => m.streaming)
@@ -515,7 +520,12 @@ function ChatWindow({ session, onUpdate, connected, send }: ChatWindowProps) {
   useEffect(() => { setCmdIndex(0) }, [slashQuery])
 
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+    if (isInitialRender.current) {
+      bottomRef.current?.scrollIntoView({ behavior: 'auto' })
+      isInitialRender.current = false
+    } else {
+      bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+    }
   }, [session.messages])
 
   useEffect(() => {
@@ -761,25 +771,40 @@ function ChatWindow({ session, onUpdate, connected, send }: ChatWindowProps) {
             disabled={sending}
             autoFocus
           />
-          <button
-            onClick={handleSend}
-            disabled={!input.trim() || sending}
-            className="flex-shrink-0 flex items-center justify-center rounded-xl transition-all"
-            style={{
-              width: 32, height: 32,
-              background: input.trim() && !sending ? 'var(--color-accent)' : 'rgba(255,255,255,0.08)',
-              color: input.trim() && !sending ? '#000' : 'rgba(255,255,255,0.25)',
-              cursor: input.trim() && !sending ? 'pointer' : 'not-allowed',
-              transition: 'background 0.15s, color 0.15s',
-            }}
-            title="Send (Enter)"
-          >
-            {sending ? (
-              <span className="agent-spinner" style={{ width: 12, height: 12 }} />
-            ) : (
+          {sending ? (
+            <button
+              onClick={() => send({ type: 'cancel' })}
+              className="flex-shrink-0 flex items-center justify-center rounded-xl transition-all"
+              style={{
+                width: 32, height: 32,
+                background: 'rgba(239,68,68,0.15)',
+                color: '#ef4444',
+                cursor: 'pointer',
+                border: '1px solid rgba(239,68,68,0.3)',
+                transition: 'background 0.15s',
+              }}
+              title="Stop agent (cancel)"
+              type="button"
+            >
+              <Square size={12} fill="currentColor" />
+            </button>
+          ) : (
+            <button
+              onClick={handleSend}
+              disabled={!input.trim()}
+              className="flex-shrink-0 flex items-center justify-center rounded-xl transition-all"
+              style={{
+                width: 32, height: 32,
+                background: input.trim() ? 'var(--color-accent)' : 'rgba(255,255,255,0.08)',
+                color: input.trim() ? '#000' : 'rgba(255,255,255,0.25)',
+                cursor: input.trim() ? 'pointer' : 'not-allowed',
+                transition: 'background 0.15s, color 0.15s',
+              }}
+              title="Send (Enter)"
+            >
               <Send size={14} />
-            )}
-          </button>
+            </button>
+          )}
         </div>
         <p className="text-center text-xs mt-1.5" style={{ color: 'var(--color-text-muted)', opacity: 0.3 }}>
           Enter to send · Shift+Enter for newline

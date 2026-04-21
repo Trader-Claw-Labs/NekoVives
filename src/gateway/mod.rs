@@ -398,8 +398,25 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     let actual_port = listener.local_addr()?.port();
     let display_addr = format!("{host}:{actual_port}");
 
+    // Resolve provider name: if bare "custom" or "anthropic-custom" appears without embedded URL,
+    // try to combine with top-level api_url. Avoids crashing on legacy or partially-saved configs.
+    let resolved_provider_name: String;
+    let raw_provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
+    let effective_provider_name = if (raw_provider_name == "custom" || raw_provider_name == "anthropic-custom")
+        && config.api_url.as_deref().map(|u| !u.trim().is_empty()).unwrap_or(false)
+    {
+        resolved_provider_name = format!("{}:{}", raw_provider_name, config.api_url.as_deref().unwrap().trim());
+        tracing::warn!(
+            "Provider '{}' has no embedded URL — combined with api_url: '{}'. Re-save in LLM Settings.",
+            raw_provider_name, resolved_provider_name
+        );
+        resolved_provider_name.as_str()
+    } else {
+        raw_provider_name
+    };
+
     let provider: Arc<dyn Provider> = Arc::from(providers::create_resilient_provider_with_options(
-        config.default_provider.as_deref().unwrap_or("openrouter"),
+        effective_provider_name,
         config.api_key.as_deref(),
         config.api_url.as_deref(),
         &config.reliability,
@@ -513,6 +530,24 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         }
     }
 
+    // Log provider config for debugging
+    {
+        let raw_provider = effective_provider_name;
+        let (provider_label, base_url_hint) = if let Some(url) = raw_provider.strip_prefix("custom:") {
+            ("custom", url.to_string())
+        } else if let Some(url) = raw_provider.strip_prefix("anthropic-custom:") {
+            ("anthropic-custom", url.to_string())
+        } else if let Some(ref url) = config.api_url {
+            (raw_provider, url.clone())
+        } else {
+            (raw_provider, String::new())
+        };
+        if base_url_hint.is_empty() {
+            println!("  🤖 LLM: provider={provider_label}  model={}", config.default_model.as_deref().unwrap_or("(default)"));
+        } else {
+            println!("  🤖 LLM: provider={provider_label}  base_url={base_url_hint}  model={}", config.default_model.as_deref().unwrap_or("(default)"));
+        }
+    }
     println!("🦀 TraderClaw Gateway listening on http://{display_addr}");
     if let Some(ref url) = tunnel_url {
         println!("  🌐 Public URL: {url}");
@@ -525,14 +560,17 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     println!("  GET  /health    — health check");
     println!("  GET  /metrics   — Prometheus metrics");
     if let Some(code) = pairing.pairing_code() {
+        let label = if pairing.is_paired() {
+            "🔐 PAIRING CODE — add a new client:"
+        } else {
+            "🔐 PAIRING REQUIRED — use this one-time code:"
+        };
         println!();
-        println!("  🔐 PAIRING REQUIRED — use this one-time code:");
+        println!("  {label}");
         println!("     ┌──────────────┐");
         println!("     │  {code}  │");
         println!("     └──────────────┘");
         println!("     Send: POST /pair with header X-Pairing-Code: {code}");
-    } else if pairing.require_pairing() {
-        println!("  🔒 Pairing: ACTIVE (bearer token required)");
     } else {
         println!("  ⚠️  Pairing: DISABLED (all requests accepted)");
     }
@@ -677,6 +715,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         // ── TradingView ──
         .route("/api/tradingview/scan", get(api::handle_api_tradingview_scan))
         // ── Backtesting ──
+        .route("/api/backtest/series", get(api::handle_api_backtest_series))
         .route("/api/backtest/scripts", get(api::handle_api_backtest_scripts).delete(api::handle_api_backtest_scripts_delete))
         .route("/api/backtest/scripts/rename", post(api::handle_api_backtest_scripts_rename))
         .route("/api/backtest/scripts/description", post(api::handle_api_backtest_scripts_description))
@@ -697,10 +736,12 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/chat", post(api::handle_api_chat))
         // ── Live Strategy Runner ──
         .route("/api/live/strategies", get(api::handle_api_live_list).post(api::handle_api_live_create))
-        .route("/api/live/strategies/{id}", get(api::handle_api_live_get).delete(api::handle_api_live_delete))
+        .route("/api/live/strategies/{id}", get(api::handle_api_live_get).patch(api::handle_api_live_patch).delete(api::handle_api_live_delete))
         .route("/api/live/strategies/{id}/stop", post(api::handle_api_live_stop))
         .route("/api/live/strategies/{id}/restart", post(api::handle_api_live_restart))
         // ── SSE event stream (no timeout — long-lived) ──
+        .route("/api/export", get(api::handle_api_export))
+        .route("/api/import", post(api::handle_api_import))
         .route("/api/events", get(sse::handle_sse_events))
         // ── Static assets (web dashboard) ──
         .route("/_app/{*path}", get(static_files::handle_static))
@@ -724,6 +765,16 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
 
     // Merge all routers: WS (no timeout) + backtest/run (5min timeout) + main (30s timeout)
     let app = ws_router.merge(backtest_run_router).merge(app);
+
+    // Spawn cron scheduler alongside the HTTP server.
+    if config.cron.enabled {
+        let scheduler_cfg = config.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::cron::scheduler::run(scheduler_cfg).await {
+                tracing::error!("Cron scheduler exited with error: {e}");
+            }
+        });
+    }
 
     // Spawn Telegram (and any other configured channels) alongside the HTTP server.
     // start_channels() runs the long-poll loop; if no channels are configured it exits

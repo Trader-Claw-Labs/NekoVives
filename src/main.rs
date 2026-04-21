@@ -79,6 +79,7 @@ mod security;
 mod service;
 mod skillforge;
 mod skills;
+mod live_feed;
 mod strategy_runner;
 mod tools;
 mod tunnel;
@@ -463,6 +464,22 @@ Examples:
         /// Target shell
         #[arg(value_enum)]
         shell: CompletionShell,
+    },
+
+    /// Update trader-claw to the latest release from GitHub
+    #[command(long_about = "\
+Update trader-claw to the latest release.
+
+Downloads and replaces the current binary from the latest GitHub release.
+Use --prerelease to also consider pre-release versions.
+
+Examples:
+  trader-claw update
+  trader-claw update --prerelease")]
+    Update {
+        /// Also consider pre-release versions
+        #[arg(long)]
+        prerelease: bool,
     },
 }
 
@@ -1056,7 +1073,42 @@ async fn main() -> Result<()> {
                 Ok(())
             }
         },
+
+        Commands::Update { prerelease } => run_update(prerelease).await,
     }
+}
+
+async fn run_update(_allow_prerelease: bool) -> Result<()> {
+    let current = env!("CARGO_PKG_VERSION");
+    println!("  Current version : v{current}");
+    println!("  Checking for updates...");
+
+    let status = tokio::task::spawn_blocking(move || {
+        self_update::backends::github::Update::configure()
+            .repo_owner("Trader-Claw-Labs")
+            .repo_name("Trader-Claw")
+            .bin_name("trader-claw")
+            .show_download_progress(true)
+            .current_version(current)
+            .build()
+            .and_then(|u| u.update())
+    })
+    .await
+    .context("update task panicked")?;
+
+    match status {
+        Ok(s) if s.updated() => {
+            println!("  \u{2713} Updated to v{}", s.version());
+            println!("  Restart trader-claw for changes to take effect.");
+        }
+        Ok(_) => {
+            println!("  \u{2713} Already on the latest version (v{current}).");
+        }
+        Err(e) => {
+            anyhow::bail!("Update failed: {e}");
+        }
+    }
+    Ok(())
 }
 
 fn handle_estop_command(

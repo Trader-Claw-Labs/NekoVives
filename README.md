@@ -131,6 +131,69 @@ cargo build --release
 
 ---
 
+## Installation (pre-built binaries)
+
+No Rust required — grab a pre-built binary from [GitHub Releases](https://github.com/Trader-Claw-Labs/Trader-Claw/releases).
+
+### One-liner (Linux / macOS)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Trader-Claw-Labs/Trader-Claw/main/install.sh | sh
+```
+
+Installs to `/usr/local/bin/trader-claw`. Detects OS and architecture automatically.
+
+### One-liner (Windows PowerShell)
+
+```powershell
+irm https://raw.githubusercontent.com/Trader-Claw-Labs/Trader-Claw/main/install.ps1 | iex
+```
+
+Installs to `%LOCALAPPDATA%\trader-claw\` and adds it to your PATH.
+
+### Homebrew (macOS / Linux)
+
+```bash
+brew tap Trader-Claw-Labs/trader-claw
+brew install trader-claw
+```
+
+### Scoop (Windows)
+
+```powershell
+scoop bucket add trader-claw https://github.com/Trader-Claw-Labs/scoop-trader-claw
+scoop install trader-claw
+```
+
+### AUR (Arch Linux)
+
+```bash
+yay -S trader-claw-bin
+# or: paru -S trader-claw-bin
+```
+
+### MSI installer (Windows)
+
+Download `trader-claw-windows-x86_64.msi` from the latest [release](https://github.com/Trader-Claw-Labs/Trader-Claw/releases) — installs to `Program Files\Trader Claw\` and adds to system PATH.
+
+### DMG (macOS)
+
+Download `trader-claw-macos-arm64.dmg` (Apple Silicon) or `trader-claw-macos-x86_64.dmg` (Intel) from the latest [release](https://github.com/Trader-Claw-Labs/Trader-Claw/releases). Copy `trader-claw` to `/usr/local/bin/`.
+
+> **Gatekeeper note:** macOS may block unsigned binaries. Right-click → Open → Open to allow.
+
+### Self-update
+
+Once installed, keep `trader-claw` up to date with:
+
+```bash
+trader-claw update
+```
+
+This checks GitHub Releases, downloads the latest binary for your platform, and replaces the running binary in-place.
+
+---
+
 ## Telegram commands
 
 | Command | Description |

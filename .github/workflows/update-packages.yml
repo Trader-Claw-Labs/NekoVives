@@ -1,0 +1,127 @@
+name: Update Package Manifests
+
+on:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag to update (e.g. v1.2.3)'
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  update:
+    name: Update Homebrew & Scoop
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine version
+        id: version
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            # Get the tag that triggered the release workflow
+            VERSION=$(curl -fsSL \
+              "https://api.github.com/repos/Trader-Claw-Labs/Trader-Claw/releases/latest" \
+              | jq -r '.tag_name')
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "version_bare=${VERSION#v}" >> "$GITHUB_OUTPUT"
+          echo "Updating packages to $VERSION"
+
+      - name: Download release artifacts and compute SHA256
+        id: sha256
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          BASE="https://github.com/Trader-Claw-Labs/Trader-Claw/releases/download/${VERSION}"
+
+          declare -A FILES=(
+            [macos_arm64]="trader-claw-macos-arm64.tar.gz"
+            [macos_x86_64]="trader-claw-macos-x86_64.tar.gz"
+            [linux_arm64]="trader-claw-linux-arm64.tar.gz"
+            [linux_x86_64]="trader-claw-linux-x86_64.tar.gz"
+            [windows_x86_64]="trader-claw-windows-x86_64.zip"
+          )
+
+          for KEY in "${!FILES[@]}"; do
+            FILE="${FILES[$KEY]}"
+            curl -fsSL "${BASE}/${FILE}" -o "/tmp/${FILE}"
+            HASH=$(sha256sum "/tmp/${FILE}" | awk '{print $1}')
+            echo "${KEY}=${HASH}" >> "$GITHUB_OUTPUT"
+            echo "  $KEY: $HASH"
+          done
+
+      - name: Update Homebrew formula
+        env:
+          VERSION_BARE: ${{ steps.version.outputs.version_bare }}
+          SHA_MACOS_ARM64: ${{ steps.sha256.outputs.macos_arm64 }}
+          SHA_MACOS_X86_64: ${{ steps.sha256.outputs.macos_x86_64 }}
+          SHA_LINUX_ARM64: ${{ steps.sha256.outputs.linux_arm64 }}
+          SHA_LINUX_X86_64: ${{ steps.sha256.outputs.linux_x86_64 }}
+        run: |
+          sed -i \
+            -e "s/__VERSION__/${VERSION_BARE}/g" \
+            -e "s/__SHA256_MACOS_ARM64__/${SHA_MACOS_ARM64}/g" \
+            -e "s/__SHA256_MACOS_X86_64__/${SHA_MACOS_X86_64}/g" \
+            -e "s/__SHA256_LINUX_ARM64__/${SHA_LINUX_ARM64}/g" \
+            -e "s/__SHA256_LINUX_X86_64__/${SHA_LINUX_X86_64}/g" \
+            packages/homebrew/trader-claw.rb
+          echo "--- Updated formula ---"
+          cat packages/homebrew/trader-claw.rb
+
+      - name: Update Scoop manifest
+        env:
+          VERSION_BARE: ${{ steps.version.outputs.version_bare }}
+          SHA_WINDOWS_X86_64: ${{ steps.sha256.outputs.windows_x86_64 }}
+        run: |
+          sed -i \
+            -e "s/__VERSION__/${VERSION_BARE}/g" \
+            -e "s/__SHA256_WINDOWS_X86_64__/${SHA_WINDOWS_X86_64}/g" \
+            packages/scoop/trader-claw.json
+          echo "--- Updated manifest ---"
+          cat packages/scoop/trader-claw.json
+
+      - name: Update AUR PKGBUILD
+        env:
+          VERSION_BARE: ${{ steps.version.outputs.version_bare }}
+          SHA_LINUX_X86_64: ${{ steps.sha256.outputs.linux_x86_64 }}
+        run: |
+          sed -i \
+            -e "s/__VERSION__/${VERSION_BARE}/g" \
+            -e "s/__SHA256_LINUX_X86_64__/${SHA_LINUX_X86_64}/g" \
+            packages/aur/PKGBUILD
+
+      # Push updated formula to homebrew tap repo
+      - name: Push to Homebrew tap
+        uses: dmnemec/copy_file_to_another_repo_action@v1.1.1
+        env:
+          API_TOKEN_GITHUB: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        with:
+          source_file: packages/homebrew/trader-claw.rb
+          destination_repo: Trader-Claw-Labs/homebrew-trader-claw
+          destination_branch: main
+          destination_folder: Formula
+          user_email: github-actions[bot]@users.noreply.github.com
+          user_name: github-actions[bot]
+          commit_message: "chore: update trader-claw formula to ${{ steps.version.outputs.version }}"
+
+      # Push updated manifest to Scoop bucket repo
+      - name: Push to Scoop bucket
+        uses: dmnemec/copy_file_to_another_repo_action@v1.1.1
+        env:
+          API_TOKEN_GITHUB: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        with:
+          source_file: packages/scoop/trader-claw.json
+          destination_repo: Trader-Claw-Labs/scoop-trader-claw
+          destination_branch: main
+          destination_folder: bucket
+          user_email: github-actions[bot]@users.noreply.github.com
+          user_name: github-actions[bot]
+          commit_message: "chore: update trader-claw manifest to ${{ steps.version.outputs.version }}"
