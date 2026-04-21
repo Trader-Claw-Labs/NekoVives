@@ -1331,10 +1331,12 @@ export default function Backtesting() {
           Configuration
         </h2>
 
-        <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-10 gap-3 items-end">
-          {/* Market Type Select */}
-          <div>
-            <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>Market</label>
+        <div className="space-y-3">
+          {/* Row 1: Market, Script, Symbol/Series, Window */}
+          <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-12 gap-3 items-end">
+            {/* Market Type Select */}
+            <div className="lg:col-span-2">
+              <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>Market</label>
             <select
               value={config.market_type}
               onChange={(e) => {
@@ -1374,7 +1376,7 @@ export default function Backtesting() {
           </div>
 
           {/* Script select */}
-          <div className="col-span-2">
+          <div className="col-span-2 lg:col-span-4">
             <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>
               Strategy Script
             </label>
@@ -1426,7 +1428,7 @@ export default function Backtesting() {
 
           {/* Symbol / Market selector — adapts to market type */}
           {config.market_type === 'crypto' ? (
-            <div>
+            <div className="lg:col-span-3">
               <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>Symbol</label>
               <input
                 value={config.symbol}
@@ -1441,7 +1443,7 @@ export default function Backtesting() {
               />
             </div>
           ) : config.market_type === 'polymarket_binary' ? (
-            <div className="col-span-2">
+            <div className="col-span-2 lg:col-span-4">
               <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>Market Series</label>
               <select
                 value={config.series_id ?? config.poly_binary_preset ?? 'btc_5m'}
@@ -1501,7 +1503,7 @@ export default function Backtesting() {
           ) : null}
 
           {/* Interval / Window */}
-          <div>
+          <div className={config.market_type === 'crypto' ? 'lg:col-span-3' : 'lg:col-span-2'}>
             <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>
               {config.market_type === 'polymarket_binary' ? 'Window' : 'Interval'}
             </label>
@@ -1526,8 +1528,12 @@ export default function Backtesting() {
             </select>
           </div>
 
+          {/* Row 2: Dates, Balance, Fee, MaxPos, Run */}
+          </div>
+          <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-12 gap-3 items-end">
+
           {/* From date */}
-          <div>
+          <div className="lg:col-span-2">
             <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>From</label>
             <input
               type="date"
@@ -1543,7 +1549,7 @@ export default function Backtesting() {
           </div>
 
           {/* To date */}
-          <div>
+          <div className="lg:col-span-2">
             <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>To</label>
             <input
               type="date"
@@ -1559,7 +1565,7 @@ export default function Backtesting() {
           </div>
 
           {/* Balance */}
-          <div>
+          <div className="lg:col-span-2">
             <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>Balance ($)</label>
             <input
               type="number"
@@ -1576,7 +1582,7 @@ export default function Backtesting() {
           </div>
 
           {/* Fee % */}
-          <div>
+          <div className="lg:col-span-2">
             <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>
               Fee %
               <span
@@ -1604,7 +1610,7 @@ export default function Backtesting() {
 
           {/* Max Position USD — only for Polymarket binary */}
           {config.market_type === 'polymarket_binary' && (
-            <div>
+            <div className="lg:col-span-2">
               <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>
                 Max Pos ($)
                 <span
@@ -1632,7 +1638,7 @@ export default function Backtesting() {
           )}
 
           {/* Run + Live Trading buttons */}
-          <div className="col-span-2 flex gap-2">
+          <div className={clsx('col-span-2 flex gap-2', config.market_type !== 'polymarket_binary' && 'lg:col-span-4')}>
             <button
               onClick={() => {
                 if (isBatchMode) {
@@ -1675,6 +1681,7 @@ export default function Backtesting() {
                 Live
               </button>
             )}
+          </div>
           </div>
         </div>
       </div>
