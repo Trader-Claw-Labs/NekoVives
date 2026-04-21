@@ -44,6 +44,19 @@ interface LiveTrade {
   balance: number
 }
 
+interface BacktestScript {
+  name: string
+  path: string
+  description?: string
+  last_run_stats?: {
+    total_return_pct: number
+    sharpe_ratio: number | null
+    win_rate_pct: number
+    total_trades: number
+    run_date: string
+  }
+}
+
 interface RunnerResult {
   total_return_pct: number
   balance: number
@@ -271,7 +284,7 @@ function LiveEquityChart({ trades, initialBalance }: LiveEquityChartProps) {
 // ── Create Runner Modal ───────────────────────────────────────────────
 
 export interface CreateModalProps {
-  scripts: string[]
+  scripts: BacktestScript[]
   onClose: () => void
   onCreated: () => void
   defaultScript?: string
@@ -288,7 +301,7 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript }: Crea
 
   const [form, setForm] = useState({
     name: '',
-    script: defaultScript ?? scripts[0] ?? '',
+    script: defaultScript ?? scripts[0]?.path ?? '',
     market_type: 'crypto',
     symbol: 'BTCUSDT',
     interval: '5m',
@@ -405,9 +418,13 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript }: Crea
 
           <div>
             <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>Strategy Script</label>
-            <select className="w-full rounded px-3 py-2 text-sm" value={form.script}
+            <select className="w-full rounded px-3 py-2 text-sm font-mono" value={form.script}
               onChange={e => set('script', e.target.value)}>
-              {scripts.map(s => <option key={s} value={s}>{s}</option>)}
+              {scripts.map(s => (
+                <option key={s.path} value={s.path}>
+                  {s.name} {s.last_run_stats ? `(${s.last_run_stats.win_rate_pct.toFixed(1)}% WR)` : ''}
+                </option>
+              ))}
             </select>
           </div>
 
@@ -765,9 +782,9 @@ export default function LiveStrategies() {
     refetchInterval: 5_000,
   })
 
-  const { data: scriptsData } = useQuery<{ scripts: Array<{ name: string } | string> }>({
+  const { data: scriptsData } = useQuery<{ scripts: BacktestScript[] }>({
     queryKey: ['backtest-scripts'],
-    queryFn: () => apiFetch<{ scripts: Array<{ name: string } | string> }>('/api/backtest/scripts').catch(() => ({ scripts: [] })),
+    queryFn: () => apiFetch<{ scripts: BacktestScript[] }>('/api/backtest/scripts').catch(() => ({ scripts: [] })),
   })
 
   const stopMutation = useMutation({
@@ -786,7 +803,7 @@ export default function LiveStrategies() {
   })
 
   const runners = data?.runners ?? []
-  const scripts = (scriptsData?.scripts ?? []).map(s => typeof s === 'string' ? s : s.name)
+  const scripts = scriptsData?.scripts ?? []
   const running = runners.filter(r => r.status.status === 'running').length
   const totalReturn = runners.reduce((s, r) => s + (r.result?.total_return_pct ?? 0), 0)
 

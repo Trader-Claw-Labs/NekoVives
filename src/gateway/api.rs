@@ -1524,30 +1524,58 @@ async fn resolve_live_token_id(series_id: Option<&str>) -> anyhow::Result<String
         .ok_or_else(|| anyhow::anyhow!("Selected Market Series is not recognized. Please refresh and choose again."))?;
 
     let slug_prefix = series.slug_prefix;
-    let markets = polymarket_trader::markets::list_markets(polymarket_trader::markets::MarketFilter {
-        query: Some(slug_prefix.clone()),
-        active_only: true,
-        limit: Some(50),
-        ..Default::default()
-    }).await?;
+    let cadence = series.cadence.as_str();
+    let seconds = match cadence {
+        "1m" => 60,
+        "4m" => 240,
+        "5m" => 300,
+        "15m" => 900,
+        "1h" => 3600,
+        _ => 300, // fallback to 5m
+    };
 
-    let best = markets
-        .into_iter()
-        .filter(|m| m.slug.to_lowercase().contains(&slug_prefix.to_lowercase()))
-        .max_by(|a, b| {
-            let av = a.liquidity + a.volume;
-            let bv = b.liquidity + b.volume;
-            av.partial_cmp(&bv).unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .ok_or_else(|| anyhow::anyhow!(
-            "No active Polymarket market found for this series right now. Try again in a moment or pick another series."
-        ))?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
 
-    if best.yes_token_id.trim().is_empty() {
+    let window_ts = now - (now % seconds);
+
+    // Construct the deterministic slug for the current active window
+    // e.g. btc-updown-5m-1714200000
+    let target_slug = format!("{}-{}", slug_prefix, window_ts);
+
+    tracing::info!(
+        "[resolve_live_token_id] series_id={}, target_slug={}",
+        sid, target_slug
+    );
+
+    // Fetch the specific market by slug
+    let market = match polymarket_trader::markets::get_market(&target_slug).await {
+        Ok(m) => m,
+        Err(e) => {
+            // Try fetching the NEXT window if the current one just closed but the new one isn't fully active
+            let next_window_ts = window_ts + seconds;
+            let next_target_slug = format!("{}-{}", slug_prefix, next_window_ts);
+            tracing::warn!(
+                "[resolve_live_token_id] Failed to fetch current window slug '{}': {}. Trying next window '{}'...",
+                target_slug, e, next_target_slug
+            );
+
+            polymarket_trader::markets::get_market(&next_target_slug)
+                .await
+                .map_err(|e2| anyhow::anyhow!(
+                    "No active Polymarket market found for this series right now. (Tried {} and {}). Error: {}",
+                    target_slug, next_target_slug, e2
+                ))?
+        }
+    };
+
+    if market.yes_token_id.trim().is_empty() {
         anyhow::bail!("The selected market has no tradable token yet. Please pick another series.");
     }
 
-    Ok(best.yes_token_id)
+    Ok(market.yes_token_id)
 }
 
 async fn ensure_live_wallet_has_min_balance(wallet_address: &str, min_usdc: f64) -> anyhow::Result<()> {

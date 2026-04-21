@@ -162,6 +162,10 @@ pub async fn list_markets(filter: MarketFilter) -> Result<Vec<Market>> {
 
 /// Get a single market by slug.
 /// GET https://gamma-api.polymarket.com/markets?slug=<slug>
+///
+/// For recurring binary markets Gamma may return multiple entries (expired,
+/// current, future). We scan all results, keep only active ones with valid
+/// Yes/No tokens, and pick the best by liquidity + volume.
 pub async fn get_market(slug: &str) -> Result<Market> {
     let client = reqwest::Client::new();
     let url = format!("https://gamma-api.polymarket.com/markets?slug={}", slug);
@@ -174,12 +178,19 @@ pub async fn get_market(slug: &str) -> Result<Market> {
         .json()
         .await?;
 
-    let gamma = raw
+    let best = raw
         .into_iter()
-        .next()
-        .ok_or_else(|| anyhow!("No market found with slug: {}", slug))?;
+        .filter(|g| g.active && !g.closed)
+        .filter_map(gamma_to_market)
+        .filter(|m| !m.yes_token_id.trim().is_empty())
+        .max_by(|a, b| {
+            let av = a.liquidity + a.volume;
+            let bv = b.liquidity + b.volume;
+            av.partial_cmp(&bv).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .ok_or_else(|| anyhow!("No active market with valid tokens found for slug: {}", slug))?;
 
-    gamma_to_market(gamma).ok_or_else(|| anyhow!("Market is missing Yes/No tokens"))
+    Ok(best)
 }
 
 /// Get YES token price (0.0 to 1.0).

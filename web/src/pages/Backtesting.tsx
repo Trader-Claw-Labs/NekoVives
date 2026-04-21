@@ -1910,7 +1910,7 @@ export default function Backtesting() {
       {/* Live Trading Modal */}
       {showLiveModal && (
         <CreateModal
-          scripts={scripts.map(s => s.path)}
+          scripts={scripts}
           defaultScript={config.script}
           onClose={() => setShowLiveModal(false)}
           onCreated={() => setShowLiveModal(false)}

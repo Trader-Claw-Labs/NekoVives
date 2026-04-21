@@ -525,6 +525,35 @@ async fn polymarket_runner_loop(
                     .unwrap_or_default()
             );
 
+            // ─ Live mode: resolve the token_id for the current window
+            if is_live {
+                if let Some(ref series_id) = config.series_id {
+                    match resolve_token_for_window(series_id, current_window as u64).await {
+                        Ok(new_token_id) => {
+                            tracing::info!(
+                                "[RUNNER {id}] Resolved token_id for window {}: {}",
+                                current_window, new_token_id
+                            );
+                            // Update the config with the new token
+                            let mut map = store.runners.lock().unwrap();
+                            if let Some(r) = map.get_mut(&id) {
+                                r.config.poly_token_id = Some(new_token_id);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "[RUNNER {id}] Failed to resolve token_id for window {}: {}",
+                                current_window, e
+                            );
+                            append_runner_log(
+                                &store, &id,
+                                &format!("Token resolution failed for window {}: {}", current_window, e),
+                            );
+                        }
+                    }
+                }
+            }
+
             let metrics = eval_polymarket(&script_content, &buffer, window_minutes, &config);
 
             // ─ Live mode: act on signal change
@@ -570,6 +599,29 @@ async fn polymarket_runner_loop(
 /// - "buy"  → place a BUY (YES) market order for the configured position size.
 /// - "sell" → place a SELL (NO) market order.
 /// - "flat" / other → no action.
+async fn resolve_token_for_window(series_id: &str, window_ts: u64) -> anyhow::Result<String> {
+    let series = crate::tools::series::builtin_series()
+        .into_iter()
+        .find(|s| s.id == series_id)
+        .ok_or_else(|| anyhow::anyhow!("Selected Market Series is not recognized: {}", series_id))?;
+
+    let target_slug = format!("{}-{}", series.slug_prefix, window_ts);
+
+    let market = polymarket_trader::markets::get_market(&target_slug)
+        .await
+        .map_err(|e| anyhow::anyhow!(
+            "No active Polymarket market found for slug {}. Error: {}",
+            target_slug,
+            e
+        ))?;
+
+    if market.yes_token_id.trim().is_empty() {
+        anyhow::bail!("The selected market has no tradable token yet for slug {}.", target_slug);
+    }
+
+    Ok(market.yes_token_id)
+}
+
 async fn execute_live_polymarket_signal(
     id: &str,
     client: &polymarket_trader::orders::ClobClient,
