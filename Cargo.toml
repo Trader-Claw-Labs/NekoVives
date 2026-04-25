@@ -121,7 +121,7 @@ gray_matter = "0.2"   # YAML/TOML frontmatter parsing for Obsidian-style session
 
 # Interactive CLI prompts
 dialoguer = { version = "0.12", features = ["fuzzy-select"] }
-self_update = { version = "0.42", default-features = false, features = ["rustls"] }
+self_update = { version = "0.44", default-features = false, features = ["rustls"] }
 console = "0.16"
 
 # Hardware discovery (device path globbing)
