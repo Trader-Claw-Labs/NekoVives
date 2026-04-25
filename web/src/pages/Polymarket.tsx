@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch, apiPost, apiDelete } from '../hooks/useApi'
-import { BarChart2, Eye, EyeOff, Save, RefreshCw, TrendingUp, Plus, X, CheckCircle, AlertCircle, ChevronDown, ChevronUp, ExternalLink, Trash2 } from 'lucide-react'
+import { BarChart2, Eye, EyeOff, Save, RefreshCw, TrendingUp, Plus, X, CheckCircle, AlertCircle, ChevronDown, ChevronUp, ExternalLink, Trash2, KeyRound } from 'lucide-react'
 
 interface Market {
   id?: string
@@ -23,6 +23,7 @@ interface PolyConfigData {
   wallet_address?: string
   has_secret?: boolean
   has_passphrase?: boolean
+  has_private_key?: boolean
 }
 
 interface ApiKeyEntry {
@@ -31,6 +32,7 @@ interface ApiKeyEntry {
   key: string
   secret: string
   passphrase: string
+  private_key: string
   show: boolean
   expanded: boolean
 }
@@ -382,12 +384,23 @@ export default function Polymarket() {
   const [activeTab, setActiveTab] = useState<'markets' | 'orders' | 'positions'>('markets')
   const [walletAddress, setWalletAddress] = useState('')
   const [apiKeys, setApiKeys] = useState<ApiKeyEntry[]>([
-    { id: genId(), label: 'API Key 1', key: '', secret: '', passphrase: '', show: false, expanded: true },
+    { id: genId(), label: 'API Key 1', key: '', secret: '', passphrase: '', private_key: '', show: false, expanded: true },
   ])
   const [saveMsg, setSaveMsg] = useState('')
   const [saveErr, setSaveErr] = useState('')
   const [testStatus, setTestStatus] = useState<'idle' | 'ok' | 'error'>('idle')
   const [testMsg, setTestMsg] = useState('')
+  const [testDetails, setTestDetails] = useState<{
+    http_status?: number
+    strategy?: string
+    last_strategy?: string
+    api_key_preview?: string
+    api_key_length?: number
+    secret_length?: number
+    passphrase_length?: number
+    wallet_address?: string
+    response_preview?: string
+  } | null>(null)
   const [showGuide, setShowGuide] = useState(false)
 
   const { data: marketsData, isLoading: marketsLoading, refetch, error: marketsError } = useQuery<MarketsResponse>({
@@ -412,12 +425,17 @@ export default function Polymarket() {
     if (!savedConfig?.configured) return
     if (savedConfig.wallet_address) setWalletAddress(savedConfig.wallet_address)
     if (savedConfig.api_key_masked) {
+      // Leave secret / passphrase / private_key blank. Backend preserves the
+      // stored values when these fields come empty, so the user doesn't have
+      // to re-type them. Previously we prefilled with "••••••••", which users
+      // could accidentally save as the literal secret → 401 at request time.
       setApiKeys([{
         id: genId(),
         label: 'API Key 1',
         key: savedConfig.api_key_masked,
-        secret: savedConfig.has_secret ? '••••••••' : '',
-        passphrase: savedConfig.has_passphrase ? '••••••••' : '',
+        secret: '',
+        passphrase: '',
+        private_key: '',
         show: false,
         expanded: false,
       }])
@@ -431,6 +449,7 @@ export default function Polymarket() {
         api_key: apiKeys[0]?.key ?? '',
         secret: apiKeys[0]?.secret ?? '',
         passphrase: apiKeys[0]?.passphrase ?? '',
+        private_key: apiKeys[0]?.private_key ?? '',
       }),
     onSuccess: () => {
       setSaveMsg('Saved!')
@@ -445,11 +464,25 @@ export default function Polymarket() {
 
   const testMutation = useMutation({
     mutationFn: () =>
-      apiPost<{ status: string; message?: string; error?: string }>('/api/polymarket/test', {
+      apiPost<{
+        status: string
+        message?: string
+        error?: string
+        http_status?: number
+        strategy?: string
+        last_strategy?: string
+        api_key_preview?: string
+        api_key_length?: number
+        secret_length?: number
+        passphrase_length?: number
+        wallet_address?: string
+        response_preview?: string
+      }>('/api/polymarket/test', {
         wallet_address: walletAddress,
         api_key: apiKeys[0]?.key ?? '',
         secret: apiKeys[0]?.secret ?? '',
         passphrase: apiKeys[0]?.passphrase ?? '',
+        private_key: apiKeys[0]?.private_key ?? '',
       }),
     onSuccess: (data) => {
       if (data.status === 'ok') {
@@ -459,19 +492,105 @@ export default function Polymarket() {
         setTestStatus('error')
         setTestMsg(data.error ?? 'Unknown error')
       }
-      setTimeout(() => setTestStatus('idle'), 4000)
+      setTestDetails({
+        http_status: data.http_status,
+        strategy: data.strategy,
+        last_strategy: data.last_strategy,
+        api_key_preview: data.api_key_preview,
+        api_key_length: data.api_key_length,
+        secret_length: data.secret_length,
+        passphrase_length: data.passphrase_length,
+        wallet_address: data.wallet_address,
+        response_preview: data.response_preview,
+      })
+      // Keep result visible — successful results clear after 8s, errors stay until the
+      // user clicks Test again so they can read the diagnostics.
+      if (data.status === 'ok') {
+        setTimeout(() => {
+          setTestStatus('idle')
+          setTestDetails(null)
+        }, 8000)
+      }
     },
     onError: (e: Error) => {
+      // Best-effort parse of the error body: apiPost throws Error(JSON.stringify(errBody))
+      // or Error(plain text). Try to recover structured fields either way.
+      let parsed: Record<string, unknown> | null = null
+      try {
+        const m = e.message.match(/\{.*\}/s)
+        if (m) parsed = JSON.parse(m[0])
+      } catch {
+        /* ignore */
+      }
       setTestStatus('error')
-      setTestMsg(e.message)
-      setTimeout(() => setTestStatus('idle'), 4000)
+      setTestMsg(
+        (parsed?.error as string | undefined) ??
+          (parsed?.message as string | undefined) ??
+          e.message,
+      )
+      setTestDetails(
+        parsed
+          ? {
+              http_status: parsed.http_status as number | undefined,
+              strategy: parsed.strategy as string | undefined,
+              last_strategy: parsed.last_strategy as string | undefined,
+              api_key_preview: parsed.api_key_preview as string | undefined,
+              api_key_length: parsed.api_key_length as number | undefined,
+              secret_length: parsed.secret_length as number | undefined,
+              passphrase_length: parsed.passphrase_length as number | undefined,
+              wallet_address: parsed.wallet_address as string | undefined,
+              response_preview: parsed.response_preview as string | undefined,
+            }
+          : null,
+      )
+    },
+  })
+
+  // Regenerate API credentials via L1 EIP-712 auth using the saved private_key.
+  // Autofills api_key/secret/passphrase in the first entry; user still has to click Save.
+  const regenerateMutation = useMutation({
+    mutationFn: () =>
+      apiPost<{
+        success?: boolean
+        api_key?: string
+        secret?: string
+        passphrase?: string
+        wallet_address?: string
+        error?: string
+      }>('/api/polymarket/refresh-credentials', {}),
+    onSuccess: (data) => {
+      if (!data.success || !data.api_key) {
+        setSaveErr(data.error ?? 'Failed to regenerate credentials')
+        return
+      }
+      setSaveErr('')
+      setApiKeys((k) => {
+        const first = k[0]
+        const updated: ApiKeyEntry = {
+          id: first?.id ?? genId(),
+          label: first?.label ?? 'API Key 1',
+          key: data.api_key ?? '',
+          secret: data.secret ?? '',
+          passphrase: data.passphrase ?? '',
+          private_key: first?.private_key ?? '',
+          show: true,
+          expanded: true,
+        }
+        return [updated, ...k.slice(1)]
+      })
+      if (data.wallet_address) setWalletAddress(data.wallet_address)
+      setSaveMsg('New credentials generated — click Save to store them.')
+      setTimeout(() => setSaveMsg(''), 6000)
+    },
+    onError: (e: Error) => {
+      setSaveErr(e.message)
     },
   })
 
   function addApiKey() {
     setApiKeys((k) => [
       ...k.map((e) => ({ ...e, expanded: false })),
-      { id: genId(), label: `API Key ${k.length + 1}`, key: '', secret: '', passphrase: '', show: false, expanded: true },
+      { id: genId(), label: `API Key ${k.length + 1}`, key: '', secret: '', passphrase: '', private_key: '', show: false, expanded: true },
     ])
   }
 
@@ -766,7 +885,7 @@ export default function Polymarket() {
                   )}
                 </div>
 
-                {/* Secret + Passphrase (expandable) */}
+                {/* Secret + Passphrase + Private Key (expandable) */}
                 {entry.expanded && (
                   <div
                     className="px-3 py-3 grid grid-cols-1 md:grid-cols-2 gap-3 border-t"
@@ -782,6 +901,14 @@ export default function Polymarket() {
                       value={entry.passphrase}
                       onChange={(v) => updateApiKey(entry.id, 'passphrase', v)}
                     />
+                    <div className="md:col-span-2">
+                      <MaskedInput
+                        label="Private Key (required for live trading — never shared)"
+                        value={entry.private_key}
+                        onChange={(v) => updateApiKey(entry.id, 'private_key', v)}
+                        placeholder="0x..."
+                      />
+                    </div>
                   </div>
                 )}
               </div>
@@ -796,24 +923,122 @@ export default function Polymarket() {
           <p className="text-xs mb-3" style={{ color: 'var(--color-accent)' }}>{saveMsg}</p>
         )}
 
-        {/* Test connection status */}
+        {/* Test connection status + diagnostics */}
         {testStatus !== 'idle' && (
           <div
-            className="flex items-center gap-2 text-xs mb-3 px-3 py-2 rounded"
+            className="text-xs mb-3 px-3 py-2 rounded"
             style={{
               backgroundColor: testStatus === 'ok' ? 'rgba(0,255,136,0.08)' : 'rgba(255,68,68,0.08)',
               color: testStatus === 'ok' ? 'var(--color-accent)' : 'var(--color-danger)',
               border: `1px solid ${testStatus === 'ok' ? 'rgba(0,255,136,0.3)' : 'rgba(255,68,68,0.3)'}`,
             }}
           >
-            {testStatus === 'ok' ? <CheckCircle size={13} /> : <AlertCircle size={13} />}
-            {testMsg}
+            <div className="flex items-start gap-2">
+              {testStatus === 'ok' ? (
+                <CheckCircle size={13} className="mt-0.5 flex-shrink-0" />
+              ) : (
+                <AlertCircle size={13} className="mt-0.5 flex-shrink-0" />
+              )}
+              <div className="flex-1">{testMsg}</div>
+              {testStatus === 'error' && (
+                <button
+                  onClick={() => {
+                    setTestStatus('idle')
+                    setTestDetails(null)
+                  }}
+                  className="p-0.5 rounded hover:bg-white/10"
+                  title="Dismiss"
+                >
+                  <X size={12} />
+                </button>
+              )}
+            </div>
+            {testDetails &&
+              (testDetails.http_status !== undefined ||
+                testDetails.api_key_preview ||
+                testDetails.wallet_address) && (
+                <div
+                  className="mt-2 pt-2 grid grid-cols-2 gap-x-4 gap-y-1 font-mono"
+                  style={{
+                    borderTop: `1px solid ${
+                      testStatus === 'ok' ? 'rgba(0,255,136,0.2)' : 'rgba(255,68,68,0.2)'
+                    }`,
+                    color: 'var(--color-text-muted)',
+                  }}
+                >
+                  {testDetails.http_status !== undefined && (
+                    <div>
+                      <span>HTTP:</span>{' '}
+                      <span style={{ color: 'var(--color-text)' }}>
+                        {testDetails.http_status}
+                      </span>
+                    </div>
+                  )}
+                  {(testDetails.strategy || testDetails.last_strategy) && (
+                    <div>
+                      <span>Secret decode:</span>{' '}
+                      <span style={{ color: 'var(--color-text)' }}>
+                        {testDetails.strategy ?? testDetails.last_strategy}
+                      </span>
+                    </div>
+                  )}
+                  {testDetails.api_key_preview && (
+                    <div>
+                      <span>api_key:</span>{' '}
+                      <span style={{ color: 'var(--color-text)' }}>
+                        {testDetails.api_key_preview}
+                      </span>
+                      {testDetails.api_key_length !== undefined && (
+                        <span> (len {testDetails.api_key_length})</span>
+                      )}
+                    </div>
+                  )}
+                  {testDetails.secret_length !== undefined && (
+                    <div>
+                      <span>secret length:</span>{' '}
+                      <span style={{ color: 'var(--color-text)' }}>
+                        {testDetails.secret_length}
+                      </span>
+                    </div>
+                  )}
+                  {testDetails.passphrase_length !== undefined && (
+                    <div>
+                      <span>passphrase length:</span>{' '}
+                      <span style={{ color: 'var(--color-text)' }}>
+                        {testDetails.passphrase_length}
+                      </span>
+                    </div>
+                  )}
+                  {testDetails.wallet_address && (
+                    <div className="col-span-2 truncate" title={testDetails.wallet_address}>
+                      <span>wallet:</span>{' '}
+                      <span style={{ color: 'var(--color-text)' }}>
+                        {testDetails.wallet_address}
+                      </span>
+                    </div>
+                  )}
+                  {testDetails.response_preview && (
+                    <div className="col-span-2 truncate" title={testDetails.response_preview}>
+                      <span>response:</span>{' '}
+                      <span style={{ color: 'var(--color-text)' }}>
+                        {testDetails.response_preview}
+                      </span>
+                    </div>
+                  )}
+                </div>
+              )}
           </div>
         )}
 
         <div className="flex gap-2">
           <button
-            onClick={() => saveMutation.mutate()}
+            onClick={() => {
+              // Clear any stale Test Connection banner so the user doesn't
+              // conflate a previous test failure with this Save action.
+              setTestStatus('idle')
+              setTestDetails(null)
+              saveMutation.mutate()
+            }}
             disabled={saveMutation.isPending}
             className="flex items-center gap-2 px-4 py-2 rounded text-sm font-medium disabled:opacity-50"
             style={{ backgroundColor: 'var(--color-accent)', color: '#000' }}
@@ -822,13 +1047,36 @@ export default function Polymarket() {
             Save
           </button>
           <button
-            onClick={() => testMutation.mutate()}
+            onClick={() => {
+              setTestStatus('idle')
+              setTestDetails(null)
+              testMutation.mutate()
+            }}
             disabled={testMutation.isPending}
             className="flex items-center gap-2 px-4 py-2 rounded text-sm border disabled:opacity-50 hover:bg-white/5 transition-colors"
             style={{ borderColor: 'var(--color-border)', color: 'var(--color-text)' }}
           >
             <RefreshCw size={14} className={testMutation.isPending ? 'animate-spin' : ''} />
             Test Connection
+          </button>
+          <button
+            onClick={() => {
+              if (!confirm('Regenerate API credentials?\n\nThis will use your saved private_key to request a fresh api_key / secret / passphrase from Polymarket, bound to the corresponding wallet. The current credentials will be overwritten after you click Save.')) return
+              // Clear stale Test Connection banner — its text references
+              // "click Regenerate" which confuses people when it sticks around.
+              setTestStatus('idle')
+              setTestDetails(null)
+              setSaveErr('')
+              setSaveMsg('')
+              regenerateMutation.mutate()
+            }}
+            disabled={regenerateMutation.isPending}
+            className="flex items-center gap-2 px-4 py-2 rounded text-sm border disabled:opacity-50 hover:bg-white/5 transition-colors"
+            style={{ borderColor: 'var(--color-warning)', color: 'var(--color-warning)' }}
+            title="Derive a new api_key/secret/passphrase from your private_key (L1 EIP-712 auth)"
+          >
+            <KeyRound size={14} className={regenerateMutation.isPending ? 'animate-pulse' : ''} />
+            {regenerateMutation.isPending ? 'Regenerating…' : 'Regenerate API Credentials'}
           </button>
         </div>
       </div>

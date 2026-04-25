@@ -56,7 +56,6 @@ const BINARY_WINDOW_INTERVALS = [
   { value: '1m',  label: '1 min' },
   { value: '2m',  label: '2 min' },
   { value: '3m',  label: '3 min' },
-  { value: '4m',  label: '4 min' },
   { value: '5m',  label: '5 min' },
   { value: '10m', label: '10 min' },
   { value: '15m', label: '15 min' },

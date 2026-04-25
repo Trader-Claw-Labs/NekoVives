@@ -32,7 +32,7 @@ fn on_candle(ctx) {
     //    "Is BTC up or down vs the window open price?"
     let win_pct = if window_open > 0.0 { (close - window_open) / window_open * 100.0 } else { 0.0 };
 
-    let score = 0.0;
+    let mut score = 0.0;
     if win_pct >  0.10 { score +=  7.0; }
     else if win_pct >  0.02 { score +=  5.0; }
     else if win_pct >  0.005 { score +=  3.0; }

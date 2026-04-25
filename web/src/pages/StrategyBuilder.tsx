@@ -131,7 +131,7 @@ fn on_candle(ctx) {
   {
     id: 'polymarket_binary',
     name: 'Polymarket BTC UP/DOWN',
-    description: 'Strategy for Polymarket binary markets. Compatible with all BTC/ETH recurring series (btc_5m, btc_4m, btc_15m, btc_1h, eth_5m, eth_15m). 3-of-4 confirmations with momentum, RSI and volume. The engine resolves each window automatically — no manual stop/take.',
+    description: 'Strategy for Polymarket binary markets. Compatible with all BTC/ETH recurring series (btc_5m, btc_15m, btc_1h, eth_5m, eth_15m). 3-of-4 confirmations with momentum, RSI and volume. The engine resolves each window automatically — no manual stop/take.',
     market: 'polymarket_binary',
     difficulty: 'Intermediate',
     icon: <BarChart2 size={24} />,
@@ -139,7 +139,6 @@ fn on_candle(ctx) {
     params: [
       { key: 'series', label: 'Target series', description: 'Select the series from the registry — only affects the generated comment. Use the same value in Backtesting -> series.', type: 'select', default: 'btc_5m', options: [
         { value: 'btc_5m',  label: 'BTC — 5-min binary' },
-        { value: 'btc_4m',  label: 'BTC — 4-min binary' },
         { value: 'btc_15m', label: 'BTC — 15-min binary' },
         { value: 'btc_1h',  label: 'BTC — 1-hour binary' },
         { value: 'eth_5m',  label: 'ETH — 5-min binary' },
@@ -511,9 +510,15 @@ function TemplateCard({
   onSelect: () => void
 }) {
   const marketLabel = {
-    crypto: 'Crypto (Binance)',
+    crypto: 'Crypto',
     polymarket_binary: 'Polymarket Binary',
     both: 'Crypto + Polymarket',
+  }[template.market]
+
+  const marketColor = {
+    crypto: '#3b82f6',
+    polymarket_binary: '#8b5cf6',
+    both: '#10b981',
   }[template.market]
 
   const diffColor = {
@@ -542,7 +547,7 @@ function TemplateCard({
           <div className="flex items-center gap-2 flex-wrap">
             <span
               className="text-[10px] px-2 py-0.5 rounded font-semibold uppercase tracking-wider"
-              style={{ backgroundColor: 'var(--color-surface-2)', color: 'var(--color-text-muted)' }}
+              style={{ backgroundColor: `${marketColor}20`, color: marketColor }}
             >
               {marketLabel}
             </span>

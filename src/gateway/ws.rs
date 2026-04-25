@@ -120,7 +120,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         let turn_start = std::time::Instant::now();
 
         let agent_future = crate::agent::process_message_with_events(
-            config, &content, event_tx, &mut session,
+            config, &content, event_tx, &mut session, state.cost_tracker.clone(),
         );
         tokio::pin!(agent_future);
 

@@ -178,6 +178,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         transcription: crate::config::TranscriptionConfig::default(),
         chains_rpc: crate::config::schema::ChainsRpcConfig::default(),
         polymarket: crate::config::schema::PolymarketConfig::default(),
+        chainlink: crate::config::schema::ChainlinkConfig::default(),
     };
 
     println!(
@@ -531,6 +532,7 @@ async fn run_quick_setup_with_home(
         transcription: crate::config::TranscriptionConfig::default(),
         chains_rpc: crate::config::schema::ChainsRpcConfig::default(),
         polymarket: crate::config::schema::PolymarketConfig::default(),
+        chainlink: crate::config::schema::ChainlinkConfig::default(),
     };
 
     config.save().await?;

@@ -3,13 +3,16 @@
 //! types so tool-use blocks stream correctly and feed back reliably.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use anyhow::Result;
 use claw_api::{
     ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, OutputContentBlock,
-    ProviderClient, StreamEvent, ToolDefinition, ToolResultContentBlock,
+    ProviderClient, StreamEvent, ToolDefinition, ToolResultContentBlock, Usage,
 };
 use serde_json::Value;
+
+use crate::cost::CostTracker;
 
 const MAX_TOOL_ITERATIONS: usize = 20;
 
@@ -65,6 +68,7 @@ pub struct ConversationRuntime {
     max_tokens: u32,
     temperature: Option<f64>,
     system_prompt: String,
+    cost_tracker: Option<Arc<CostTracker>>,
 }
 
 impl ConversationRuntime {
@@ -82,7 +86,14 @@ impl ConversationRuntime {
             max_tokens,
             temperature,
             system_prompt: system_prompt.into(),
+            cost_tracker: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_cost_tracker(mut self, cost_tracker: Option<Arc<CostTracker>>) -> Self {
+        self.cost_tracker = cost_tracker;
+        self
     }
 
     /// Execute one agent turn: stream from the model, dispatch any tool calls,
@@ -348,6 +359,8 @@ impl ConversationRuntime {
     /// Stream a single model response, returning:
     /// - `assistant_blocks`: the accumulated `InputContentBlock`s for history
     /// - `tool_calls`: `(id, name, input)` tuples for each tool the model requested
+    /// Stream and accumulate one assistant turn.
+    /// Returns accumulated content blocks and tool calls.
     async fn stream_turn(
         &self,
         request: &MessageRequest,
@@ -360,9 +373,13 @@ impl ConversationRuntime {
         let mut text_blocks: BTreeMap<u32, String> = BTreeMap::new();
         let mut tool_use_ids: BTreeMap<u32, (String, String)> = BTreeMap::new(); // index → (id, name)
         let mut input_json_bufs: BTreeMap<u32, String> = BTreeMap::new();
+        let mut final_usage: Option<Usage> = None;
 
         while let Some(event) = stream.next_event().await? {
             match event {
+                StreamEvent::MessageDelta(e) => {
+                    final_usage = Some(e.usage);
+                }
                 StreamEvent::ContentBlockStart(e) => match &e.content_block {
                     OutputContentBlock::Text { .. } => {
                         text_blocks.insert(e.index, String::new());
@@ -411,6 +428,19 @@ impl ConversationRuntime {
                 StreamEvent::MessageStop(_) => break,
                 _ => {}
             }
+        }
+
+        // Record token usage if tracker and usage are available
+        if let (Some(ref tracker), Some(usage)) = (self.cost_tracker.as_ref(), final_usage) {
+            // Use default pricing: $3/M input, $15/M output (Claude Sonnet 4 pricing)
+            let cost_usage = crate::cost::TokenUsage::new(
+                &self.model,
+                usage.input_tokens as u64,
+                usage.output_tokens as u64,
+                3.0,
+                15.0,
+            );
+            let _ = tracker.record_usage(cost_usage);
         }
 
         // Build assistant content blocks (text first, then tool uses)

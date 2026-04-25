@@ -3480,13 +3480,17 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
 
     let tool_defs = tools_to_claw_definitions(&tools_registry);
     let executor = TraderToolExecutor { tools: tools_registry };
+    let cost_tracker = crate::cost::CostTracker::new(config.cost.clone(), &config.workspace_dir)
+        .map(std::sync::Arc::new)
+        .ok();
     let claw_runtime = crate::agent::runtime::ConversationRuntime::new(
         claw_client,
         claw_model,
         8192u32,
         Some(config.default_temperature),
         system_prompt,
-    );
+    )
+    .with_cost_tracker(cost_tracker);
     let mut session = crate::agent::runtime::Session::new();
     let session_id = session.id.clone();
     let response = claw_runtime
@@ -3510,6 +3514,7 @@ pub async fn process_message_with_events(
     message: &str,
     ws_tx: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
     session: &mut crate::agent::runtime::Session,
+    cost_tracker: Option<Arc<crate::cost::CostTracker>>,
 ) -> Result<String> {
     let _observer: Arc<dyn Observer> =
         Arc::from(observability::create_observer(&config.observability));
@@ -3583,7 +3588,8 @@ pub async fn process_message_with_events(
         8192u32,
         Some(config.default_temperature),
         system_prompt,
-    );
+    )
+    .with_cost_tracker(cost_tracker);
     let response = claw_runtime
         .run_turn(&enriched, &tool_defs, &executor, session, Some(&ws_tx))
         .await?;

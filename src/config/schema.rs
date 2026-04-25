@@ -166,6 +166,10 @@ pub struct Config {
     #[serde(default)]
     pub polymarket: PolymarketConfig,
 
+    /// Chainlink Data Streams configuration (`[chainlink]`).
+    #[serde(default)]
+    pub chainlink: ChainlinkConfig,
+
     /// Custom RPC endpoints per chain (`[chains_rpc]`).
     #[serde(default)]
     pub chains_rpc: ChainsRpcConfig,
@@ -569,8 +573,8 @@ impl Default for IdentityConfig {
 /// Cost tracking and budget enforcement configuration (`[cost]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CostConfig {
-    /// Enable cost tracking (default: false)
-    #[serde(default)]
+    /// Enable cost tracking (default: true)
+    #[serde(default = "default_true")]
     pub enabled: bool,
 
     /// Daily spending limit in USD (default: 10.00)
@@ -929,7 +933,45 @@ pub struct PolymarketConfig {
     /// Polygon wallet address used for Polymarket activity
     #[serde(default)]
     pub wallet_address: Option<String>,
+    /// Private key of the Polygon wallet (hex, with or without 0x prefix).
+    /// Required for EIP-712 order signing. NEVER share or commit this value.
+    #[serde(default)]
+    pub private_key: Option<String>,
+    /// Whether these credentials are Polymarket Builder Key credentials.
+    /// When true, uses POLY_BUILDER_* headers instead of POLY_API_KEY / POLY_SIGNATURE.
+    #[serde(default)]
+    pub is_builder: Option<bool>,
+    /// Optional proxy wallet address (e.g. Polymarket proxy / Safe).
+    /// When set, orders are signed with proxy signature_type=1 and maker/signer use this address.
+    #[serde(default)]
+    pub proxy_address: Option<String>,
 }
+
+// ── Chainlink Data Streams ──────────────────────────────────────
+
+/// Chainlink Data Streams configuration (`[chainlink]` section).
+///
+/// Used for live price feeds in Polymarket binary trading.
+/// Set `enabled = true` and provide your `endpoint_url` to use Chainlink
+/// instead of Binance for the displayed BTC price.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct ChainlinkConfig {
+    /// Enable Chainlink price feed for live trading display.
+    #[serde(default)]
+    pub enabled: bool,
+    /// REST endpoint URL. Example:
+    /// `https://api.chain.link/v1/streams/0x.../report`
+    #[serde(default)]
+    pub endpoint_url: Option<String>,
+    /// Optional API key for authenticated endpoints.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Polling interval in seconds. Default: 5.
+    #[serde(default = "default_chainlink_interval")]
+    pub interval_secs: u64,
+}
+
+fn default_chainlink_interval() -> u64 { 5 }
 
 // ── Composio (managed tool surface) ─────────────────────────────
 
@@ -3708,6 +3750,7 @@ impl Default for Config {
             transcription: TranscriptionConfig::default(),
             chains_rpc: ChainsRpcConfig::default(),
             polymarket: PolymarketConfig::default(),
+            chainlink: ChainlinkConfig::default(),
         }
     }
 }
@@ -5216,6 +5259,7 @@ default_temperature = 0.7
                 qq: None,
                 nostr: None,
                 message_timeout_secs: 300,
+                agent_turn_timeout_secs: 1800,
             },
             memory: MemoryConfig::default(),
             storage: StorageConfig::default(),
@@ -5780,6 +5824,7 @@ allowed_users = ["@ops:matrix.org"]
             qq: None,
             nostr: None,
             message_timeout_secs: 300,
+            agent_turn_timeout_secs: 1800,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -5992,6 +6037,7 @@ channel_id = "C123"
             qq: None,
             nostr: None,
             message_timeout_secs: 300,
+            agent_turn_timeout_secs: 1800,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();

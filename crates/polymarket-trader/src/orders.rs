@@ -1,6 +1,17 @@
-use crate::auth::{create_l2_headers, PolyCredentials};
+use crate::auth::PolyCredentials;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::str::FromStr as _;
+
+use polymarket_client_sdk::POLYGON;
+use polymarket_client_sdk::auth::{Credentials as SdkCredentials, LocalSigner, Signer, Uuid};
+use polymarket_client_sdk::clob::types::request::OrdersRequest;
+use polymarket_client_sdk::clob::types::{Amount, AssetType, OrderType, Side as SdkSide, SignatureType};
+use polymarket_client_sdk::clob::{Client as SdkClient, Config as SdkConfig};
+use polymarket_client_sdk::clob::types::request::BalanceAllowanceRequest;
+use polymarket_client_sdk::derive_proxy_wallet;
+use polymarket_client_sdk::derive_safe_wallet;
+use polymarket_client_sdk::types::{Decimal, U256};
 
 const CLOB_BASE_URL: &str = "https://clob.polymarket.com";
 
@@ -12,10 +23,10 @@ pub enum Side {
 }
 
 impl Side {
-    fn as_str(self) -> &'static str {
+    fn to_sdk_side(self) -> SdkSide {
         match self {
-            Side::Buy => "BUY",
-            Side::Sell => "SELL",
+            Side::Buy => SdkSide::Buy,
+            Side::Sell => SdkSide::Sell,
         }
     }
 }
@@ -25,14 +36,6 @@ impl Side {
 pub struct OrderResponse {
     pub order_id: String,
     pub status: String,
-}
-
-/// Raw API response shape: field is `orderID`
-#[derive(Deserialize)]
-struct RawOrderResponse {
-    #[serde(rename = "orderID")]
-    order_id: String,
-    status: String,
 }
 
 /// Open order from GET /orders
@@ -49,15 +52,108 @@ pub struct Order {
 /// A CLOB client that holds credentials
 pub struct ClobClient {
     creds: PolyCredentials,
-    http: reqwest::Client,
 }
 
 impl ClobClient {
     pub fn new(creds: PolyCredentials) -> Self {
-        Self {
-            creds,
-            http: reqwest::Client::new(),
-        }
+        Self { creds }
+    }
+
+    /// Parse the stored private key into a LocalSigner.
+    fn make_signer(&self) -> Result<polymarket_client_sdk::auth::LocalSigner<k256::ecdsa::SigningKey>> {
+        let pk_hex = self
+            .creds
+            .private_key
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Private key is required for order signing. Set polymarket.private_key in config."))?;
+        let signer = LocalSigner::from_str(pk_hex)?
+            .with_chain_id(Some(POLYGON));
+        Ok(signer)
+    }
+
+    /// Create SDK credentials from our stored credentials.
+    fn sdk_credentials(&self) -> Result<SdkCredentials> {
+        let key = Uuid::parse_str(&self.creds.api_key)
+            .map_err(|e| anyhow::anyhow!("Invalid API key UUID: {e}"))?;
+        Ok(SdkCredentials::new(
+            key,
+            self.creds.secret.clone(),
+            self.creds.passphrase.clone(),
+        ))
+    }
+
+    /// Build an authenticated SDK CLOB client.
+    /// Automatically detects whether the user has a Gnosis Safe or an EIP-1167 proxy
+    /// (MetaMask users typically get a Safe; Magic/email users get a Proxy).
+    async fn sdk_client(&self) -> Result<SdkClient<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>> {
+        let signer = self.make_signer()?;
+        let sdk_creds = self.sdk_credentials()?;
+
+        let client = SdkClient::new(CLOB_BASE_URL, SdkConfig::default())?;
+        let auth = client.authentication_builder(&signer).credentials(sdk_creds);
+        let signer_addr = signer.address();
+        tracing::info!("CLOB signer address derived from private_key: {}", signer_addr);
+
+        let auth = match self.creds.proxy_address.as_deref() {
+            Some(proxy) if !proxy.is_empty() => {
+                let proxy_addr = proxy.parse::<polymarket_client_sdk::types::Address>()
+                    .map_err(|e| anyhow::anyhow!("Invalid proxy address: {e}"))?;
+
+                // Determine whether the explicit address matches a derived Safe or Proxy
+                let derived_safe  = derive_safe_wallet(signer_addr, POLYGON);
+                let derived_proxy = derive_proxy_wallet(signer_addr, POLYGON);
+
+                let is_safe  = derived_safe.map_or(false, |d| d == proxy_addr);
+                let is_proxy = !is_safe && derived_proxy.map_or(false, |d| d == proxy_addr);
+
+                if is_safe {
+                    tracing::info!("CLOB auth using explicit Gnosis Safe: {}", proxy_addr);
+                    auth.funder(proxy_addr)
+                        .signature_type(SignatureType::GnosisSafe)
+                } else if is_proxy {
+                    tracing::info!("CLOB auth using explicit EIP-1167 proxy: {}", proxy_addr);
+                    auth.funder(proxy_addr)
+                        .signature_type(SignatureType::Proxy)
+                } else {
+                    // Address doesn't match either derived wallet — assume a custom Safe
+                    // (most modern Polymarket wallets are Gnosis Safe variants).
+                    tracing::info!(
+                        "CLOB auth using explicit funder {} (no derived match for signer {})",
+                        proxy_addr, signer_addr
+                    );
+                    auth.funder(proxy_addr)
+                        .signature_type(SignatureType::GnosisSafe)
+                }
+            }
+            _ => {
+                // No explicit proxy — auto-derive.  Try Safe first (MetaMask/browser wallets),
+                // then fall back to Proxy (Magic/email wallets), then EOA.
+                if let Some(safe) = derive_safe_wallet(signer_addr, POLYGON) {
+                    tracing::info!(
+                        "CLOB auth auto-derived Gnosis Safe {} from signer {}",
+                        safe, signer_addr
+                    );
+                    auth.funder(safe)
+                        .signature_type(SignatureType::GnosisSafe)
+                } else if let Some(proxy) = derive_proxy_wallet(signer_addr, POLYGON) {
+                    tracing::info!(
+                        "CLOB auth auto-derived EIP-1167 proxy {} from signer {}",
+                        proxy, signer_addr
+                    );
+                    auth.funder(proxy)
+                        .signature_type(SignatureType::Proxy)
+                } else {
+                    tracing::info!(
+                        "CLOB auth using EOA (no wallet derivation available for signer {})",
+                        signer_addr
+                    );
+                    auth
+                }
+            }
+        };
+
+        let authenticated = auth.authenticate().await?;
+        Ok(authenticated)
     }
 
     /// POST /order — GTC limit order
@@ -68,41 +164,32 @@ impl ClobClient {
         price: f64,
         size: f64,
     ) -> Result<OrderResponse> {
-        let body = serde_json::json!({
-            "order": {
-                "tokenID": token_id,
-                "price": format!("{:.2}", price),
-                "size": format!("{:.2}", size),
-                "side": side.as_str(),
-                "type": "GTC"
-            },
-            "owner": self.creds.api_key
-        });
-        let body_str = serde_json::to_string(&body)?;
-        let headers = create_l2_headers(&self.creds, "POST", "/order", Some(&body_str));
+        let signer = self.make_signer()?;
+        let client = self.sdk_client().await?;
 
-        let mut req = self
-            .http
-            .post(format!("{CLOB_BASE_URL}/order"))
-            .header("Content-Type", "application/json")
-            .body(body_str);
+        let token_id_u256 = U256::from_str(token_id)
+            .map_err(|e| anyhow::anyhow!("Invalid token_id: {e}"))?;
+        let price_dec = Decimal::from_f64_retain(price)
+            .ok_or_else(|| anyhow::anyhow!("Invalid price: {price}"))?;
+        let size_dec = Decimal::from_f64_retain(size)
+            .ok_or_else(|| anyhow::anyhow!("Invalid size: {size}"))?;
 
-        for (k, v) in &headers {
-            req = req.header(k.as_str(), v.as_str());
-        }
+        let order = client
+            .limit_order()
+            .token_id(token_id_u256)
+            .price(price_dec)
+            .size(size_dec)
+            .side(side.to_sdk_side())
+            .order_type(OrderType::GTC)
+            .build()
+            .await?;
 
-        let resp = req.send().await?;
+        let signed = client.sign(&signer, order).await?;
+        let resp = client.post_order(signed).await?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("create_limit_order failed ({}): {}", status, text);
-        }
-
-        let raw: RawOrderResponse = resp.json().await?;
         Ok(OrderResponse {
-            order_id: raw.order_id,
-            status: raw.status,
+            order_id: resp.order_id,
+            status: resp.status.to_string(),
         })
     }
 
@@ -111,114 +198,111 @@ impl ClobClient {
         &self,
         token_id: &str,
         side: Side,
-        amount_usdc: f64,
+        amount: f64,
         worst_price: f64,
     ) -> Result<OrderResponse> {
-        let body = serde_json::json!({
-            "order": {
-                "tokenID": token_id,
-                "amount": format!("{:.2}", amount_usdc),
-                "side": side.as_str(),
-                "type": "FOK",
-                "worstPrice": format!("{:.2}", worst_price)
-            },
-            "owner": self.creds.api_key
-        });
-        let body_str = serde_json::to_string(&body)?;
-        let headers = create_l2_headers(&self.creds, "POST", "/order", Some(&body_str));
+        let signer = self.make_signer()?;
+        let client = self.sdk_client().await?;
 
-        let mut req = self
-            .http
-            .post(format!("{CLOB_BASE_URL}/order"))
-            .header("Content-Type", "application/json")
-            .body(body_str);
+        let token_id_u256 = U256::from_str(token_id)
+            .map_err(|e| anyhow::anyhow!("Invalid token_id: {e}"))?;
+        let amount_dec = Decimal::from_f64_retain(amount)
+            .ok_or_else(|| anyhow::anyhow!("Invalid amount: {amount}"))?;
+        let price_dec = Decimal::from_f64_retain(worst_price)
+            .ok_or_else(|| anyhow::anyhow!("Invalid worst_price: {worst_price}"))?;
 
-        for (k, v) in &headers {
-            req = req.header(k.as_str(), v.as_str());
+        let sdk_amount = match side {
+            Side::Buy => Amount::usdc(amount_dec)?,
+            Side::Sell => Amount::shares(amount_dec)?,
+        };
+
+        let mut builder = client
+            .market_order()
+            .token_id(token_id_u256)
+            .amount(sdk_amount)
+            .side(side.to_sdk_side());
+
+        // Only set an explicit worst-price when it is inside the valid Polymarket
+        // share-price range [tick_size, 1 - tick_size].  Callers that pass 0.0 or
+        // 1.0 (or a raw crypto price like 78031) are asking for a true market
+        // order, so we let the SDK calculate the price from the orderbook.
+        if worst_price >= 0.01 && worst_price <= 0.99 {
+            builder = builder.price(price_dec);
         }
 
-        let resp = req.send().await?;
+        let order = builder.build().await?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("create_market_order failed ({}): {}", status, text);
-        }
+        let signed = client.sign(&signer, order).await?;
+        let resp = client.post_order(signed).await?;
 
-        let raw: RawOrderResponse = resp.json().await?;
         Ok(OrderResponse {
-            order_id: raw.order_id,
-            status: raw.status,
+            order_id: resp.order_id,
+            status: resp.status.to_string(),
         })
     }
 
     /// DELETE /orders/<order_id>
     pub async fn cancel_order(&self, order_id: &str) -> Result<()> {
-        let path = format!("/orders/{}", order_id);
-        let headers = create_l2_headers(&self.creds, "DELETE", &path, None);
-
-        let mut req = self.http.delete(format!("{CLOB_BASE_URL}{}", path));
-
-        for (k, v) in &headers {
-            req = req.header(k.as_str(), v.as_str());
-        }
-
-        let resp = req.send().await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("cancel_order failed ({}): {}", status, text);
-        }
-
+        let client = self.sdk_client().await?;
+        client.cancel_order(order_id).await?;
         Ok(())
     }
 
-    /// GET /orders?owner=<api_key>&status=LIVE
+    /// GET /orders?owner=<wallet_address>&status=LIVE
     pub async fn get_open_orders(&self) -> Result<Vec<Order>> {
-        let path = "/orders";
-        let headers = create_l2_headers(&self.creds, "GET", path, None);
+        let client = self.sdk_client().await?;
+        let request = OrdersRequest::default();
+        let page = client.orders(&request, None).await?;
 
-        let mut req = self
-            .http
-            .get(format!("{CLOB_BASE_URL}{}", path))
-            .query(&[("owner", &self.creds.api_key), ("status", &"LIVE".to_string())]);
+        let orders: Vec<Order> = page.data
+            .into_iter()
+            .filter(|o| matches!(o.status, polymarket_client_sdk::clob::types::OrderStatusType::Live))
+            .map(|o| Order {
+                id: o.id,
+                token_id: o.asset_id.to_string(),
+                side: o.side.to_string(),
+                price: o.price.to_string(),
+                size: o.original_size.to_string(),
+                status: o.status.to_string(),
+            })
+            .collect();
 
-        for (k, v) in &headers {
-            req = req.header(k.as_str(), v.as_str());
-        }
-
-        let resp = req.send().await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("get_open_orders failed ({}): {}", status, text);
-        }
-
-        let orders: Vec<Order> = resp.json().await?;
         Ok(orders)
+    }
+
+    /// GET /balance — reads USDC.e balance directly from Polygon RPC.
+    /// When a proxy address is configured, reads the proxy balance (the funder).
+    pub async fn get_balance(&self) -> Result<f64> {
+        let target = self.creds.proxy_address.as_deref()
+            .unwrap_or(&self.creds.wallet_address);
+        let rpc_bal = fetch_polygon_usdc_balance(target).await;
+        match &rpc_bal {
+            Ok(b) => tracing::info!(
+                "Polygon RPC USDC.e balance for {}: ${:.2}",
+                target, b
+            ),
+            Err(e) => tracing::warn!("Polygon RPC balance fetch failed: {}", e),
+        }
+        rpc_bal
+    }
+
+    /// GET /balance-allowance — queries the CLOB API for the balance it sees
+    /// for the authenticated user (takes signature_type into account).
+    pub async fn get_api_balance(&self) -> Result<f64> {
+        let client = self.sdk_client().await?;
+        let request = BalanceAllowanceRequest::builder()
+            .asset_type(AssetType::Collateral)
+            .build();
+        let resp = client.balance_allowance(request).await?;
+        tracing::info!("CLOB API balance: {} | allowances: {:?}", resp.balance, resp.allowances);
+        let bal: f64 = resp.balance.try_into().unwrap_or(0.0) / 1_000_000.0;
+        Ok(bal)
     }
 
     /// POST /heartbeat — keep session alive (call every 5s while orders open)
     pub async fn heartbeat(&self) -> Result<()> {
-        let path = "/heartbeat";
-        let headers = create_l2_headers(&self.creds, "POST", path, None);
-
-        let mut req = self.http.post(format!("{CLOB_BASE_URL}{}", path));
-
-        for (k, v) in &headers {
-            req = req.header(k.as_str(), v.as_str());
-        }
-
-        let resp = req.send().await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("heartbeat failed ({}): {}", status, text);
-        }
-
+        let client = self.sdk_client().await?;
+        client.post_heartbeat(None).await?;
         Ok(())
     }
 
@@ -247,6 +331,51 @@ impl ClobClient {
     }
 }
 
+// ── Polygon RPC balance fetcher ─────────────────────────────────────────────
+
+/// USDC.e contract on Polygon (Bridged USDC)
+const USDC_E_CONTRACT: &str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
+
+async fn fetch_polygon_usdc_balance(wallet_address: &str) -> Result<f64> {
+    let client = reqwest::Client::new();
+
+    let addr_clean = wallet_address.strip_prefix("0x").unwrap_or(wallet_address);
+    let data = format!("0x70a08231{:0>64}", addr_clean.to_lowercase());
+
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "eth_call",
+        "params": [
+            {
+                "to": USDC_E_CONTRACT,
+                "data": data
+            },
+            "latest"
+        ],
+        "id": 1
+    });
+
+    let resp = client
+        .post("https://polygon-rpc.com")
+        .json(&body)
+        .send()
+        .await?;
+
+    let resp_json: serde_json::Value = resp.json().await?;
+    tracing::debug!("Polygon RPC raw response: {}", resp_json);
+
+    let hex_result = resp_json
+        .get("result")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("Polygon RPC returned no result"))?;
+
+    let raw = u128::from_str_radix(hex_result.strip_prefix("0x").unwrap_or(hex_result), 16)
+        .map_err(|e| anyhow::anyhow!("Failed to parse Polygon balance hex: {}", e))?;
+
+    let balance = raw as f64 / 1_000_000.0;
+    Ok(balance)
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -256,9 +385,13 @@ mod tests {
 
     fn mock_creds() -> PolyCredentials {
         PolyCredentials {
-            api_key: "test-key".to_string(),
+            api_key: "d5f666f5-ac31-81cc-95ee-c1b0bb7945ca".to_string(),
             secret: "test-secret".to_string(),
             passphrase: "test-pass".to_string(),
+            wallet_address: "0x1234567890123456789012345678901234567890".to_string(),
+            private_key: Some("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80".to_string()),
+            is_builder: false,
+            proxy_address: None,
         }
     }
 
@@ -278,13 +411,21 @@ mod tests {
         assert_eq!(sell, "\"Sell\"");
     }
 
+    #[test]
+    fn test_sdk_credentials_parse() {
+        let creds = mock_creds();
+        let client = ClobClient::new(creds);
+        let sdk_creds = client.sdk_credentials().expect("parse creds");
+        assert_eq!(sdk_creds.key().to_string(), "d5f666f5-ac31-81cc-95ee-c1b0bb7945ca");
+    }
+
     #[tokio::test]
     #[ignore]
     async fn test_network_create_limit_order() {
         let creds = mock_creds();
         let client = ClobClient::new(creds);
         let resp = client
-            .create_limit_order("some-token-id", Side::Buy, 0.65, 10.0)
+            .create_limit_order("15871154585880608648532107628464183779895785213830018178010423617714102767076", Side::Buy, 0.5, 10.0)
             .await
             .expect("create_limit_order failed");
         assert!(!resp.order_id.is_empty());
@@ -307,7 +448,6 @@ mod tests {
         let creds = mock_creds();
         let client = ClobClient::new(creds);
         let orders = client.get_open_orders().await.expect("get_open_orders failed");
-        // Just verify it returns a vec (may be empty)
         let _ = orders;
     }
 
@@ -316,10 +456,7 @@ mod tests {
         let creds = mock_creds();
         let client = std::sync::Arc::new(ClobClient::new(creds));
         let token = client.start_heartbeat();
-        // Cancel immediately; the spawned task should stop without panic
         token.cancel();
-        // Give the task a moment to receive cancellation
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        // If we reach here without panic, the test passes
     }
 }

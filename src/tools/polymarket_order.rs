@@ -60,6 +60,10 @@ impl Tool for PolymarketOrderTool {
                         api_key: key.clone(),
                         secret: secret.clone(),
                         passphrase: pass.clone(),
+                        wallet_address: pm.wallet_address.clone().unwrap_or_default().to_lowercase(),
+                        private_key: pm.private_key.clone().filter(|k| !k.is_empty()),
+                        is_builder: pm.is_builder.unwrap_or(false),
+                        proxy_address: pm.proxy_address.clone().filter(|k| !k.is_empty()).map(|s| s.to_lowercase()),
                     })
                 }
                 _ => None,
@@ -135,8 +139,10 @@ impl Tool for PolymarketOrderTool {
                     let size = amount / price;
                     client.create_limit_order(token_id, side, price, size).await
                 } else {
-                    // Market order: use amount as USDC, worst price 0 for buy, 1 for sell
-                    let worst_price = if action == "buy" { 1.0_f64 } else { 0.0_f64 };
+                    // Market order: amount is the notional to trade.  worst_price
+                    // values outside [0.01, 0.99] tell the SDK to calculate the
+                    // real price from the orderbook instead of using a fixed slippage cap.
+                    let worst_price = 0.0_f64;
                     client.create_market_order(token_id, side, amount, worst_price).await
                 };
 

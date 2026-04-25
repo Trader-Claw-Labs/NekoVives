@@ -32,7 +32,6 @@ export interface PolyBinaryPreset {
 
 export const POLY_BINARY_PRESETS: PolyBinaryPreset[] = [
   { id: 'btc_5m',  label: 'BTC — 5-min binary',  symbol: 'BTCUSDT', defaultInterval: '5m',  description: 'Will BTC go up in the next 5 minutes?' },
-  { id: 'btc_4m',  label: 'BTC — 4-min binary',  symbol: 'BTCUSDT', defaultInterval: '4m',  description: 'Will BTC go up in the next 4 minutes?' },
   { id: 'btc_15m', label: 'BTC — 15-min binary', symbol: 'BTCUSDT', defaultInterval: '15m', description: 'Will BTC go up in the next 15 minutes?' },
   { id: 'btc_1h',  label: 'BTC — 1-hour binary', symbol: 'BTCUSDT', defaultInterval: '1h',  description: 'Will BTC go up in the next hour?' },
   { id: 'eth_5m',  label: 'ETH — 5-min binary',  symbol: 'ETHUSDT', defaultInterval: '5m',  description: 'Will ETH go up in the next 5 minutes?' },
@@ -114,13 +113,13 @@ const THREE_MONTHS_AGO = new Date(Date.now() - 90 * 86400 * 1000).toISOString().
 
 const DEFAULT_CONFIG: BacktestConfig = {
   script: '',
-  market_type: 'crypto',
+  market_type: 'polymarket_binary',
   symbol: 'BTCUSDT',
-  interval: '1m',
+  interval: '5m',
   from_date: THREE_MONTHS_AGO,
   to_date: TODAY,
   initial_balance: 10000,
-  fee_pct: 0.1,
+  fee_pct: 1.5,
   series_id: 'btc_5m',
   poly_binary_preset: 'btc_5m',
   resolution_logic: 'price_up',

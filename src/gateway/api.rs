@@ -721,6 +721,7 @@ pub struct PolymarketConfigBody {
     pub api_key: Option<String>,
     pub secret: Option<String>,
     pub passphrase: Option<String>,
+    pub private_key: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1366,6 +1367,7 @@ pub async fn handle_api_polymarket_configure_get(
         "wallet_address": pm.wallet_address,
         "has_secret": pm.secret.as_deref().map(|s| !s.is_empty()).unwrap_or(false),
         "has_passphrase": pm.passphrase.as_deref().map(|p| !p.is_empty()).unwrap_or(false),
+        "has_private_key": pm.private_key.as_deref().map(|k| !k.is_empty()).unwrap_or(false),
     }))
     .into_response()
 }
@@ -1380,18 +1382,57 @@ pub async fn handle_api_polymarket_configure(
         return e.into_response();
     }
 
-    let api_key = body.api_key.as_deref().unwrap_or("").to_string();
-    let secret = body.secret.clone().unwrap_or_default();
-    let passphrase = body.passphrase.clone().unwrap_or_default();
-    let wallet_address = body.wallet_address.clone();
+    // Trim whitespace — copy/paste from browser often carries trailing spaces or newlines,
+    // which break the HMAC signature with a silent 401 at request time.
+    fn clean(s: Option<String>) -> Option<String> {
+        s.map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+    }
+    /// A masked placeholder (e.g. "••••••••") was shown in the UI for a field
+    /// that already had a value stored. If the user didn't re-type it, we must
+    /// NOT overwrite the real secret with the literal bullet characters.
+    /// Also detects the api_key "abcd…wxyz" mask returned by GET /configure.
+    fn is_placeholder(s: &str) -> bool {
+        if s.is_empty() { return false; }
+        if s.chars().all(|c| matches!(c, '•' | '*' | '·' | '●')) { return true; }
+        if s.contains('…') { return true; }
+        false
+    }
 
-    // Save to config (validation is handled separately via POST /api/polymarket/test)
+    let api_key_input = clean(body.api_key.clone());
+    let secret_input = clean(body.secret.clone());
+    let passphrase_input = clean(body.passphrase.clone());
+    let private_key_input = clean(body.private_key.clone());
+    let wallet_address = clean(body.wallet_address.clone());
+
     let mut config = state.config.lock().clone();
+    let existing = config.polymarket.clone();
+
+    // Skip overwriting with masked placeholders — keep the previously stored value.
+    let api_key = match api_key_input {
+        Some(v) if is_placeholder(&v) => existing.api_key.clone(),
+        other => other.or(existing.api_key.clone()),
+    };
+    let secret = match secret_input {
+        Some(v) if is_placeholder(&v) => existing.secret.clone(),
+        other => other.or(existing.secret.clone()),
+    };
+    let passphrase = match passphrase_input {
+        Some(v) if is_placeholder(&v) => existing.passphrase.clone(),
+        other => other.or(existing.passphrase.clone()),
+    };
+    let private_key = match private_key_input {
+        Some(v) if is_placeholder(&v) => existing.private_key.clone(),
+        other => other.or(existing.private_key.clone()),
+    };
+
     config.polymarket = crate::config::schema::PolymarketConfig {
-        api_key: if api_key.is_empty() { None } else { Some(api_key) },
-        secret: if secret.is_empty() { None } else { Some(secret) },
-        passphrase: if passphrase.is_empty() { None } else { Some(passphrase) },
-        wallet_address,
+        api_key,
+        secret,
+        passphrase,
+        wallet_address: wallet_address.or(existing.wallet_address),
+        private_key,
+        is_builder: existing.is_builder,
+        proxy_address: existing.proxy_address,
     };
     if let Err(e) = config.save().await {
         return (
@@ -1407,6 +1448,18 @@ pub async fn handle_api_polymarket_configure(
 }
 
 /// POST /api/polymarket/test — validate API key against Polymarket CLOB API
+///
+/// Real validation flow:
+///   1. Ping the CLOB public endpoint for connectivity.
+///   2. Make an L2-authenticated request to `GET /auth/api-keys` trying each
+///      secret-decoding strategy (Base64 default, then Raw, then Hex). The one
+///      that returns 2xx is the real encoding Polymarket expects for this key.
+///   3. On failure, report which part is likely wrong (api_key length/preview,
+///      secret length, passphrase length, and hint on encoding).
+///
+/// Empty or masked (bullet / "abcd…wxyz") fields in the request body fall back
+/// to the stored config values — so the user can hit "Test Connection" without
+/// re-typing the secret every time.
 pub async fn handle_api_polymarket_test(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1416,82 +1469,506 @@ pub async fn handle_api_polymarket_test(
         return e.into_response();
     }
 
-    let api_key = match body.api_key.as_deref().filter(|k| !k.is_empty()) {
-        Some(k) => k.to_string(),
-        None => {
+    fn clean(s: Option<String>) -> Option<String> {
+        s.map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+    }
+    fn is_placeholder(s: &str) -> bool {
+        if s.is_empty() { return false; }
+        if s.chars().all(|c| matches!(c, '•' | '*' | '·' | '●')) { return true; }
+        if s.contains('…') { return true; }
+        false
+    }
+    fn resolve(input: Option<String>, stored: Option<String>) -> Option<String> {
+        match clean(input) {
+            Some(v) if is_placeholder(&v) => stored,
+            other => other.or(stored),
+        }
+    }
+
+    // Resolve credentials: prefer the form input, fall back to stored config
+    // when the user left the field empty or the UI rendered a placeholder mask.
+    let stored = { state.config.lock().polymarket.clone() };
+    let api_key = resolve(body.api_key.clone(), stored.api_key.clone()).unwrap_or_default();
+    let secret = resolve(body.secret.clone(), stored.secret.clone()).unwrap_or_default();
+    let passphrase = resolve(body.passphrase.clone(), stored.passphrase.clone()).unwrap_or_default();
+    let wallet_address = resolve(body.wallet_address.clone(), stored.wallet_address.clone())
+        .unwrap_or_default();
+
+    if api_key.is_empty() || secret.is_empty() || passphrase.is_empty() {
+        let mut missing = Vec::new();
+        if api_key.is_empty() { missing.push("api_key"); }
+        if secret.is_empty() { missing.push("secret"); }
+        if passphrase.is_empty() { missing.push("passphrase"); }
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "status": "error",
+                "error": format!("Missing credentials: {}", missing.join(", ")),
+            })),
+        )
+            .into_response();
+    }
+
+    // Build a client with a real User-Agent — some CDNs block the default reqwest UA.
+    let client = match reqwest::Client::builder()
+        .user_agent("trader-claw/0.1 (+https://github.com/Trader-Claw-Labs/trader-claw)")
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
             return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "API key is required to test connection"})),
-            )
-                .into_response();
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "status": "error",
+                    "error": format!("Failed to build HTTP client: {e}"),
+                })),
+            ).into_response();
         }
     };
-    let secret = body.secret.clone().unwrap_or_default();
-    let passphrase = body.passphrase.clone().unwrap_or_default();
 
-    // Verify the CLOB API is reachable via a public endpoint, then validate credentials
-    // with a lightweight L2-authenticated request to GET /sampling/simplifiedmarkets
-    let client = reqwest::Client::new();
+    // Step 1 — connectivity (with one retry on transient network errors).
+    async fn send_with_retry(
+        req_builder: impl Fn() -> reqwest::RequestBuilder,
+        attempts: u32,
+    ) -> std::result::Result<reqwest::Response, String> {
+        let mut last_err = String::from("unknown network error");
+        for i in 0..attempts {
+            match req_builder().send().await {
+                Ok(r) => return Ok(r),
+                Err(e) => {
+                    last_err = format!("{e}");
+                    if i + 1 < attempts {
+                        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                    }
+                }
+            }
+        }
+        Err(last_err)
+    }
 
-    // Step 1: ping CLOB
-    let ping = client
-        .get("https://clob.polymarket.com/markets?limit=1")
-        .timeout(std::time::Duration::from_secs(8))
-        .send()
-        .await;
-
+    let ping = send_with_retry(
+        || {
+            client
+                .get("https://clob.polymarket.com/markets?limit=1")
+                .timeout(std::time::Duration::from_secs(10))
+        },
+        2,
+    )
+    .await;
     match ping {
-        Err(e) => return (
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({"error": format!("Cannot reach Polymarket CLOB: {e}")})),
-        ).into_response(),
-        Ok(r) if !r.status().is_success() => return (
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({"error": format!("Polymarket CLOB returned {}", r.status())})),
-        ).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "status": "error",
+                    "error": format!(
+                        "Cannot reach Polymarket CLOB public endpoint: {e}. \
+                         Check your internet connection or firewall."
+                    ),
+                })),
+            ).into_response();
+        }
+        Ok(r) if !r.status().is_success() => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "status": "error",
+                    "error": format!("Polymarket CLOB returned {} on public ping", r.status()),
+                })),
+            ).into_response();
+        }
         _ => {}
     }
 
-    // Step 2: authenticated request — GET /auth/api-key with L2 headers
-    let creds = polymarket_trader::auth::PolyCredentials {
+    // Step 2 — L2 auth probe on /auth/api-keys with all three secret strategies.
+    //         If /auth/api-keys is unreachable, fall back to POST /order with a dummy
+    //         body (401 on bad auth, 400/422 on valid auth with bad order — both tell us
+    //         whether auth succeeded).
+    use polymarket_trader::auth::{create_l2_headers_with_strategy, PolyCredentials, SecretDecodeStrategy};
+    let creds = PolyCredentials {
         api_key: api_key.clone(),
-        secret,
-        passphrase,
+        secret: secret.clone(),
+        passphrase: passphrase.clone(),
+        wallet_address: wallet_address.clone().to_lowercase(),
+        private_key: None,
+        is_builder: stored.is_builder.unwrap_or(false),
+        proxy_address: stored.proxy_address.clone().filter(|k| !k.is_empty()).map(|s| s.to_lowercase()),
     };
-    let l2 = polymarket_trader::auth::create_l2_headers(&creds, "GET", "/auth/api-key", None);
-    let mut req = client
-        .get("https://clob.polymarket.com/auth/api-key")
-        .timeout(std::time::Duration::from_secs(8));
-    for (k, v) in &l2 {
-        req = req.header(k.as_str(), v.as_str());
+
+    /// Probe result: http status (0 = network error), response body, error detail.
+    async fn probe_get(
+        client: &reqwest::Client,
+        creds: &PolyCredentials,
+        path: &str,
+        strategy: SecretDecodeStrategy,
+    ) -> (u16, String) {
+        let headers = create_l2_headers_with_strategy(creds, "GET", path, None, strategy);
+        for attempt in 0..2u32 {
+            let mut req = client
+                .get(format!("https://clob.polymarket.com{}", path))
+                .timeout(std::time::Duration::from_secs(12));
+            for (k, v) in &headers {
+                req = req.header(k.as_str(), v.as_str());
+            }
+            match req.send().await {
+                Ok(r) => {
+                    let s = r.status().as_u16();
+                    let b = r.text().await.unwrap_or_default();
+                    return (s, b);
+                }
+                Err(e) => {
+                    if attempt == 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                        continue;
+                    }
+                    return (0, format!("network error: {e}"));
+                }
+            }
+        }
+        (0, String::from("network error (unreachable)"))
     }
 
-    match req.send().await {
-        Ok(resp) if resp.status().is_success() => Json(serde_json::json!({
-            "status": "ok",
-            "message": "Connected — Polymarket CLOB authenticated successfully",
-        })).into_response(),
-        Ok(resp) if resp.status().as_u16() == 401 || resp.status().as_u16() == 403 => (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "Invalid API key, secret, or passphrase"})),
-        ).into_response(),
-        Ok(resp) if resp.status().as_u16() == 405 => {
-            // Some CLOB versions don't support GET /auth/api-key — fall back to connectivity-only check
-            Json(serde_json::json!({
+    /// Fallback probe: POST /order with a dummy token id.
+    /// - 401: auth failed.
+    /// - Any other status: auth succeeded (the server looked past the headers
+    ///   and started validating the order payload), so we treat it as "OK".
+    async fn probe_post_order(
+        client: &reqwest::Client,
+        creds: &PolyCredentials,
+        strategy: SecretDecodeStrategy,
+    ) -> (u16, String) {
+        let body = r#"{"order":{"tokenID":"0","price":"0.5","size":"1","side":"BUY","type":"GTC"},"owner":""}"#;
+        let headers = create_l2_headers_with_strategy(creds, "POST", "/order", Some(body), strategy);
+        for attempt in 0..2u32 {
+            let mut req = client
+                .post("https://clob.polymarket.com/order")
+                .header("Content-Type", "application/json")
+                .body(body)
+                .timeout(std::time::Duration::from_secs(12));
+            for (k, v) in &headers {
+                req = req.header(k.as_str(), v.as_str());
+            }
+            match req.send().await {
+                Ok(r) => {
+                    let s = r.status().as_u16();
+                    let b = r.text().await.unwrap_or_default();
+                    return (s, b);
+                }
+                Err(e) => {
+                    if attempt == 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                        continue;
+                    }
+                    return (0, format!("network error: {e}"));
+                }
+            }
+        }
+        (0, String::from("network error (unreachable)"))
+    }
+
+    let strategies = [
+        ("Base64", SecretDecodeStrategy::Base64),
+        ("Raw", SecretDecodeStrategy::Raw),
+        ("Hex", SecretDecodeStrategy::Hex),
+    ];
+
+    let mut last_status: u16 = 0;
+    let mut last_body = String::new();
+    let mut last_strategy_name: &str = "Base64";
+    let mut last_endpoint: &str = "/auth/api-keys";
+    let mut all_network_errors = true;
+    for (name, strat) in strategies {
+        // First try the dedicated L2 list endpoint.
+        let (mut status, mut body_text) = probe_get(&client, &creds, "/auth/api-keys", strat).await;
+        last_endpoint = "/auth/api-keys";
+        // If /auth/api-keys is unreachable (0) OR returns 401/403, fall back to
+        // POST /order. The GET endpoint may reject valid Builder Key credentials
+        // while POST /order accurately reflects whether L2 auth headers are correct.
+        if status == 0 || status == 401 || status == 403 {
+            let (s2, b2) = probe_post_order(&client, &creds, strat).await;
+            if s2 != 0 {
+                status = s2;
+                body_text = b2;
+                last_endpoint = "POST /order";
+                // POST /order returns non-401 on auth-ok + order-invalid.
+                if status != 401 && status != 403 {
+                    let preview: String = body_text.chars().take(240).collect();
+                    let api_key_head: String = api_key.chars().take(4).collect();
+                    let api_key_tail: String = api_key.chars().rev().take(4).collect::<Vec<_>>()
+                        .into_iter().rev().collect();
+                    return Json(serde_json::json!({
+                        "status": "ok",
+                        "message": format!(
+                            "Polymarket CLOB authenticated OK (fallback POST /order → HTTP {status}, \
+                             auth passed; secret decoded as {name})."
+                        ),
+                        "strategy": name,
+                        "http_status": status,
+                        "endpoint": "POST /order",
+                        "api_key_preview": format!("{api_key_head}…{api_key_tail}"),
+                        "api_key_length": api_key.len(),
+                        "secret_length": secret.len(),
+                        "passphrase_length": passphrase.len(),
+                        "wallet_address": wallet_address,
+                        "response_preview": preview,
+                    })).into_response();
+                }
+            }
+        }
+        last_status = status;
+        last_body = body_text;
+        last_strategy_name = name;
+        if status != 0 {
+            all_network_errors = false;
+        }
+        if (200..300).contains(&status) {
+            let preview: String = last_body.chars().take(240).collect();
+            let api_key_head: String = api_key.chars().take(4).collect();
+            let api_key_tail: String = api_key.chars().rev().take(4).collect::<Vec<_>>()
+                .into_iter().rev().collect();
+            return Json(serde_json::json!({
                 "status": "ok",
-                "message": "Polymarket CLOB is reachable. Credentials will be validated on first order.",
+                "message": format!(
+                    "Polymarket CLOB authenticated OK (HTTP {status}, secret decoded as {name})."
+                ),
+                "strategy": name,
+                "http_status": status,
+                "endpoint": last_endpoint,
+                "api_key_preview": format!("{api_key_head}…{api_key_tail}"),
+                "api_key_length": api_key.len(),
+                "secret_length": secret.len(),
+                "passphrase_length": passphrase.len(),
+                "wallet_address": wallet_address,
+                "response_preview": preview,
+            })).into_response();
+        }
+        // Keep probing on 401/403 to see if another encoding works.
+        if status != 401 && status != 403 && status != 0 {
+            break;
+        }
+    }
+
+    // If every strategy only produced network errors, report that explicitly
+    // instead of leaking an empty "credentials rejected (HTTP 0)" message.
+    if all_network_errors {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "status": "error",
+                "error": format!(
+                    "Cannot reach Polymarket CLOB authenticated endpoints. Last error: {last_body}. \
+                     The public /markets endpoint responded but /auth/api-keys and POST /order \
+                     both failed — this is almost always a transient network issue, try again."
+                ),
+                "http_status": 0,
+                "endpoint": last_endpoint,
+                "response_preview": last_body.chars().take(180).collect::<String>(),
+            })),
+        ).into_response();
+    }
+
+    // All strategies failed — build actionable diagnostics.
+    let detail: String = last_body.chars().take(180).collect();
+    let api_key_head: String = api_key.chars().take(4).collect();
+    let api_key_tail: String = api_key.chars().rev().take(4).collect::<Vec<_>>()
+        .into_iter().rev().collect();
+    let hint = if last_status == 401 || last_status == 403 {
+        "Credentials were rejected with every secret encoding (Base64/Raw/Hex). \
+         Most likely the api_key/secret/passphrase trío doesn't belong to the configured wallet. \
+         Open the Polymarket page and click 'Regenerate API Credentials' to derive a fresh trío from your private_key."
+    } else {
+        "Polymarket CLOB returned an unexpected status."
+    };
+    // IMPORTANT: never return 401/403 to the frontend for Polymarket-side auth
+    // failures — the SPA treats any 401 as "gateway Bearer expired", wipes the
+    // token and shows the pairing modal. Use 422 instead so the caller can
+    // distinguish this from a gateway-auth error.
+    let http_code = if last_status == 401 || last_status == 403 {
+        StatusCode::UNPROCESSABLE_ENTITY
+    } else {
+        StatusCode::BAD_GATEWAY
+    };
+    (
+        http_code,
+        Json(serde_json::json!({
+            "status": "error",
+            "error": format!(
+                "Polymarket credentials rejected (HTTP {last_status}). {hint}"
+            ),
+            "http_status": last_status,
+            "endpoint": last_endpoint,
+            "last_strategy": last_strategy_name,
+            "response_preview": detail,
+            "api_key_preview": format!("{api_key_head}…{api_key_tail}"),
+            "api_key_length": api_key.len(),
+            "secret_length": secret.len(),
+            "passphrase_length": passphrase.len(),
+            "wallet_address": wallet_address,
+        })),
+    ).into_response()
+}
+
+/// POST /api/polymarket/diagnose-auth — test which secret decoding strategy works.
+///
+/// Tries Raw, Base64, and Hex secret decoding against real CLOB endpoints.
+/// The key test is POST /order with a dummy body: if auth passes we get 400/404,
+/// if auth fails we get 401.
+#[derive(serde::Deserialize)]
+pub struct DiagnoseAuthBody {
+    pub api_key: String,
+    pub secret: String,
+    pub passphrase: String,
+    pub wallet_address: String,
+    #[serde(default)]
+    pub is_builder: Option<bool>,
+    #[serde(default)]
+    pub proxy_address: Option<String>,
+}
+
+pub async fn handle_api_polymarket_diagnose_auth(
+    State(_state): State<AppState>,
+    Json(body): Json<DiagnoseAuthBody>,
+) -> impl IntoResponse {
+    use polymarket_trader::auth::{PolyCredentials, SecretDecodeStrategy, create_l2_headers_with_strategy};
+
+    let client = reqwest::Client::new();
+    let mut results = Vec::new();
+
+    for strategy in [
+        SecretDecodeStrategy::Raw,
+        SecretDecodeStrategy::Base64,
+        SecretDecodeStrategy::Hex,
+    ] {
+        let creds = PolyCredentials {
+            api_key: body.api_key.clone(),
+            secret: body.secret.clone(),
+            passphrase: body.passphrase.clone(),
+            wallet_address: body.wallet_address.clone(),
+            private_key: None,
+            is_builder: body.is_builder.unwrap_or(false),
+            proxy_address: body.proxy_address.clone().filter(|k| !k.is_empty()),
+        };
+
+        // ── Test 1: POST /order with dummy body ──
+        // If auth is correct but body is malformed → 400 Bad Request
+        // If auth is wrong → 401 Unauthorized
+        let order_body = r#"{"order":{"tokenID":"dummy","price":"0.50","size":"1","side":"BUY","type":"GTC"},"owner":""}"#;
+        let order_headers = create_l2_headers_with_strategy(
+            &creds, "POST", "/order", Some(order_body), strategy);
+
+        let mut order_req = client
+            .post("https://clob.polymarket.com/order")
+            .header("Content-Type", "application/json")
+            .body(order_body)
+            .timeout(std::time::Duration::from_secs(10));
+        for (k, v) in &order_headers {
+            order_req = order_req.header(k.as_str(), v.as_str());
+        }
+
+        let order_result = match order_req.send().await {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                let body_text = resp.text().await.unwrap_or_default();
+                serde_json::json!({
+                    "endpoint": "POST /order",
+                    "status": status,
+                    "auth_ok": status != 401,
+                    "response_preview": body_text.chars().take(200).collect::<String>()
+                })
+            }
+            Err(e) => serde_json::json!({
+                "endpoint": "POST /order",
+                "status": 0,
+                "auth_ok": false,
+                "error": format!("Network error: {}", e)
+            }),
+        };
+
+        // ── Test 2: GET /sampling/simplifiedmarkets ──
+        // Mentioned in original code as a lightweight authenticated endpoint
+        let samp_headers = create_l2_headers_with_strategy(
+            &creds, "GET", "/sampling/simplifiedmarkets", None, strategy);
+
+        let mut samp_req = client
+            .get("https://clob.polymarket.com/sampling/simplifiedmarkets")
+            .timeout(std::time::Duration::from_secs(10));
+        for (k, v) in &samp_headers {
+            samp_req = samp_req.header(k.as_str(), v.as_str());
+        }
+
+        let samp_result = match samp_req.send().await {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                let body_text = resp.text().await.unwrap_or_default();
+                serde_json::json!({
+                    "endpoint": "GET /sampling/simplifiedmarkets",
+                    "status": status,
+                    "auth_ok": status != 401,
+                    "response_preview": body_text.chars().take(200).collect::<String>()
+                })
+            }
+            Err(e) => serde_json::json!({
+                "endpoint": "GET /sampling/simplifiedmarkets",
+                "status": 0,
+                "auth_ok": false,
+                "error": format!("Network error: {}", e)
+            }),
+        };
+
+        results.push(serde_json::json!({
+            "strategy": format!("{:?}", strategy),
+            "tests": [order_result, samp_result],
+        }));
+    }
+
+    Json(serde_json::json!({
+        "wallet_address": body.wallet_address,
+        "api_key_prefix": body.api_key.chars().take(8).collect::<String>(),
+        "secret_length": body.secret.len(),
+        "secret_preview": format!("{}...", &body.secret[..body.secret.len().min(4)]),
+        "results": results,
+    })).into_response()
+}
+
+/// POST /api/polymarket/refresh-credentials — derive fresh API credentials via L1 EIP-712 auth.
+///
+/// Uses the private key from config to sign a ClobAuth message and call
+/// POST /auth/api-key on the CLOB. Returns new api_key, secret, passphrase.
+/// The old credentials are NOT automatically saved — caller must confirm.
+pub async fn handle_api_polymarket_refresh_credentials(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let private_key = {
+        let cfg = state.config.lock();
+        match cfg.polymarket.private_key.clone().filter(|k| !k.is_empty()) {
+            Some(pk) => pk,
+            None => {
+                return (axum::http::StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                    "error": "No private_key configured in [polymarket] section. L1 auth requires the wallet private key."
+                }))).into_response();
+            }
+        }
+    };
+
+    match polymarket_trader::auth::setup_credentials(&private_key).await {
+        Ok(creds) => {
+            Json(serde_json::json!({
+                "success": true,
+                "api_key": creds.api_key,
+                "secret": creds.secret,
+                "passphrase": creds.passphrase,
+                "wallet_address": creds.wallet_address,
+                "note": "These credentials are NOT saved. Copy them into Settings → Config → [polymarket] section."
             })).into_response()
         }
-        Ok(resp) => {
-            let status = resp.status();
-            let body_text = resp.text().await.unwrap_or_default();
-            (StatusCode::BAD_GATEWAY, Json(serde_json::json!({
-                "error": format!("CLOB API returned {status}: {body_text}")
+        Err(e) => {
+            let err_str = format!("{e:#}");
+            (axum::http::StatusCode::BAD_GATEWAY, Json(serde_json::json!({
+                "success": false,
+                "error": err_str
             }))).into_response()
         }
-        Err(e) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({
-            "error": format!("Cannot reach Polymarket CLOB: {e}")
-        }))).into_response(),
     }
 }
 
@@ -1505,6 +1982,10 @@ fn get_poly_creds(state: &AppState) -> Option<polymarket_trader::auth::PolyCrede
         api_key,
         secret: pm.secret.clone().unwrap_or_default(),
         passphrase: pm.passphrase.clone().unwrap_or_default(),
+        wallet_address: pm.wallet_address.clone().unwrap_or_default().to_lowercase(),
+        private_key: pm.private_key.clone().filter(|k| !k.is_empty()),
+        is_builder: pm.is_builder.unwrap_or(false),
+        proxy_address: pm.proxy_address.clone().filter(|k| !k.is_empty()).map(|s| s.to_lowercase()),
     })
 }
 
@@ -1516,7 +1997,7 @@ fn get_poly_wallet_address(state: &AppState) -> Option<String> {
         .filter(|w| !w.trim().is_empty())
 }
 
-async fn resolve_live_token_id(series_id: Option<&str>) -> anyhow::Result<String> {
+async fn resolve_live_token_ids(series_id: Option<&str>) -> anyhow::Result<(String, String)> {
     let sid = series_id.ok_or_else(|| anyhow::anyhow!("Please select a Market Series before starting live mode."))?;
     let series = crate::tools::series::builtin_series()
         .into_iter()
@@ -1527,55 +2008,56 @@ async fn resolve_live_token_id(series_id: Option<&str>) -> anyhow::Result<String
     let cadence = series.cadence.as_str();
     let seconds = match cadence {
         "1m" => 60,
-        "4m" => 240,
         "5m" => 300,
         "15m" => 900,
         "1h" => 3600,
         _ => 300, // fallback to 5m
     };
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-
-    let window_ts = now - (now % seconds);
-
-    // Construct the deterministic slug for the current active window
-    // e.g. btc-updown-5m-1714200000
-    let target_slug = format!("{}-{}", slug_prefix, window_ts);
+    let now_utc = chrono::Utc::now();
+    let now_secs = now_utc.timestamp() as u64;
+    let windows = calculate_resolution_windows(now_secs, seconds);
 
     tracing::info!(
-        "[resolve_live_token_id] series_id={}, target_slug={}",
-        sid, target_slug
+        "[resolve_live_token_ids] UTC now: {}, window_ts: {}, series_id={}, slug_prefix={}",
+        now_utc.to_rfc3339(), windows[0], sid, slug_prefix
     );
 
-    // Fetch the specific market by slug
-    let market = match polymarket_trader::markets::get_market(&target_slug).await {
-        Ok(m) => m,
-        Err(e) => {
-            // Try fetching the NEXT window if the current one just closed but the new one isn't fully active
-            let next_window_ts = window_ts + seconds;
-            let next_target_slug = format!("{}-{}", slug_prefix, next_window_ts);
-            tracing::warn!(
-                "[resolve_live_token_id] Failed to fetch current window slug '{}': {}. Trying next window '{}'...",
-                target_slug, e, next_target_slug
-            );
+    let mut last_err = anyhow::anyhow!("No active market found");
 
-            polymarket_trader::markets::get_market(&next_target_slug)
-                .await
-                .map_err(|e2| anyhow::anyhow!(
-                    "No active Polymarket market found for this series right now. (Tried {} and {}). Error: {}",
-                    target_slug, next_target_slug, e2
-                ))?
+    for ts in &windows {
+        let target_slug = format!("{}-{}", slug_prefix, ts);
+        match polymarket_trader::markets::get_market(&target_slug).await {
+            Ok(m) => {
+                if !m.yes_token_id.trim().is_empty() && !m.no_token_id.trim().is_empty() {
+                    tracing::info!("[resolve_live_token_ids] Resolved YES={} NO={} from slug {}", m.yes_token_id, m.no_token_id, target_slug);
+                    return Ok((m.yes_token_id, m.no_token_id));
+                }
+            }
+            Err(e) => {
+                last_err = e;
+                tracing::debug!("[resolve_live_token_ids] Slug {} not available: {}", target_slug, last_err);
+            }
         }
-    };
-
-    if market.yes_token_id.trim().is_empty() {
-        anyhow::bail!("The selected market has no tradable token yet. Please pick another series.");
     }
 
-    Ok(market.yes_token_id)
+    anyhow::bail!(
+        "No active market with both YES and NO tokens found for the selected series right now. (Tried windows around {}). Error: {}",
+        windows[0], last_err
+    );
+}
+
+/// Pure helper for resolution window selection.
+/// Returns [current, next, previous, next+1, previous-1] windows.
+fn calculate_resolution_windows(now_secs: u64, seconds: u64) -> Vec<u64> {
+    let window_ts = now_secs - (now_secs % seconds);
+    vec![
+        window_ts,
+        window_ts + seconds,
+        window_ts - seconds,
+        window_ts + (2 * seconds),
+        window_ts - (2 * seconds),
+    ]
 }
 
 async fn ensure_live_wallet_has_min_balance(wallet_address: &str, min_usdc: f64) -> anyhow::Result<()> {
@@ -1589,7 +2071,12 @@ async fn ensure_live_wallet_has_min_balance(wallet_address: &str, min_usdc: f64)
     if !resp.status().is_success() {
         let code = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("Unable to verify wallet balance from Polymarket ({}). {}", code, body);
+        tracing::warn!(
+            "Skipping Polymarket wallet balance pre-check (endpoint unavailable: {}): {}",
+            code,
+            body
+        );
+        return Ok(());
     }
 
     let data: serde_json::Value = resp.json().await?;
@@ -1627,9 +2114,133 @@ fn friendly_live_error(e: &str) -> String {
         format!("{e} Please fund your Polymarket wallet and try again.")
     } else if e.contains("wallet address") {
         "Live mode requires a Polymarket wallet address. Go to Settings → Config and set polymarket.wallet_address.".to_string()
+    } else if e.contains("Invalid api key") || e.contains("Polymarket credentials rejected") {
+        format!("{e} Go to the Polymarket page and click \"Regenerate API credentials\" so they match your wallet.")
     } else {
         e.to_string()
     }
+}
+
+/// Pre-flight validation of Polymarket L2 credentials.
+///
+/// Calls an authenticated CLOB endpoint (`GET /auth/api-keys`) with the supplied
+/// credentials. On 401 tries all 3 secret-decoding strategies (Base64 / Raw / Hex)
+/// to distinguish "wrong key" from "wrong encoding", and reports which part is
+/// likely bad so the user can act.
+async fn validate_live_poly_credentials(
+    creds: &polymarket_trader::auth::PolyCredentials,
+) -> anyhow::Result<()> {
+    use polymarket_trader::auth::{create_l2_headers_with_strategy, SecretDecodeStrategy};
+
+    let path = "/auth/api-keys";
+    let client = reqwest::Client::new();
+
+    async fn try_get(
+        client: &reqwest::Client,
+        creds: &polymarket_trader::auth::PolyCredentials,
+        path: &str,
+        strategy: SecretDecodeStrategy,
+    ) -> (u16, String) {
+        let headers = create_l2_headers_with_strategy(creds, "GET", path, None, strategy);
+        let mut req = client
+            .get(format!("https://clob.polymarket.com{}", path))
+            .timeout(std::time::Duration::from_secs(10));
+        for (k, v) in &headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
+        match req.send().await {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                let body = resp.text().await.unwrap_or_default();
+                (status, body)
+            }
+            Err(e) => (0, format!("network error: {e}")),
+        }
+    }
+
+    async fn try_post_order(
+        client: &reqwest::Client,
+        creds: &polymarket_trader::auth::PolyCredentials,
+        strategy: SecretDecodeStrategy,
+    ) -> (u16, String) {
+        let body = r#"{"order":{"tokenID":"0","price":"0.5","size":"1","side":"BUY","type":"GTC"},"owner":""}"#;
+        let headers = create_l2_headers_with_strategy(creds, "POST", "/order", Some(body), strategy);
+        let mut req = client
+            .post("https://clob.polymarket.com/order")
+            .header("Content-Type", "application/json")
+            .body(body)
+            .timeout(std::time::Duration::from_secs(10));
+        for (k, v) in &headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
+        match req.send().await {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                let body = resp.text().await.unwrap_or_default();
+                (status, body)
+            }
+            Err(e) => (0, format!("network error: {e}")),
+        }
+    }
+
+    // Start with the library default (Base64). This is what real order calls will use.
+    let (status, body) = try_get(&client, creds, path, SecretDecodeStrategy::Base64).await;
+    if status >= 200 && status < 300 {
+        return Ok(());
+    }
+    if status == 0 {
+        anyhow::bail!("Cannot reach Polymarket CLOB to validate credentials: {body}");
+    }
+    if status != 401 && status != 403 {
+        tracing::warn!(
+            "Polymarket credential pre-flight returned {status} (non-auth) — continuing: {body}"
+        );
+        return Ok(());
+    }
+
+    // GET /auth/api-keys returned 401/403. For Builder Keys this endpoint may
+    // reject valid credentials while POST /order correctly reflects auth status.
+    // Try the fallback before giving up.
+    let (post_status, _post_body) = try_post_order(&client, creds, SecretDecodeStrategy::Base64).await;
+    if post_status != 0 && post_status != 401 && post_status != 403 {
+        tracing::info!(
+            "Polymarket credential pre-flight: GET /auth/api-keys → 401, \
+             but POST /order → {post_status} (auth OK, order rejected). Continuing."
+        );
+        return Ok(());
+    }
+
+    // 401 / 403 on both endpoints — probe the other two strategies for diagnostics.
+    let (raw_status, _) = try_get(&client, creds, path, SecretDecodeStrategy::Raw).await;
+    let (hex_status, _) = try_get(&client, creds, path, SecretDecodeStrategy::Hex).await;
+
+    let detail = body.chars().take(120).collect::<String>();
+    let api_key_preview = creds.api_key.chars().take(4).collect::<String>();
+    let api_key_tail: String = creds
+        .api_key
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let secret_len = creds.secret.len();
+    let passphrase_len = creds.passphrase.len();
+
+    let hint = if raw_status == 200 || raw_status == 204 {
+        " Hint: the secret works when treated as raw bytes — you may have pasted it already-decoded."
+    } else if hex_status == 200 || hex_status == 204 {
+        " Hint: the secret works as hex — you may have pasted a hex-encoded value by mistake."
+    } else {
+        " Tip: open the Polymarket page and click 'Regenerate API Credentials'; it derives a fresh L2 trío for the wallet of your saved private_key."
+    };
+
+    anyhow::bail!(
+        "Polymarket credentials rejected ({status}): {detail}. api_key='{api_key_preview}…{api_key_tail}' (len={}), secret_len={secret_len}, passphrase_len={passphrase_len}, wallet={}.{hint}",
+        creds.api_key.len(),
+        creds.wallet_address,
+    );
 }
 
 /// GET /api/polymarket/positions — open positions
@@ -3233,12 +3844,44 @@ async fn hydrate_live_runtime_config(state: &AppState, config: &mut crate::strat
     let wallet_address = get_poly_wallet_address(state)
         .ok_or_else(|| anyhow::anyhow!("Live mode requires polymarket.wallet_address. Go to Settings → Config and set your Polymarket wallet address."))?;
 
-    let token_id = resolve_live_token_id(config.series_id.as_deref()).await?;
-    let min_live_usdc = 10.0;
-    ensure_live_wallet_has_min_balance(&wallet_address, min_live_usdc).await?;
+    let private_key = poly.private_key.filter(|k| !k.is_empty());
+    if private_key.is_none() {
+        anyhow::bail!("Live mode requires polymarket.private_key for EIP-712 order signing. Go to Settings → Polymarket and set your wallet private key.");
+    }
 
-    config.poly_creds = Some(polymarket_trader::auth::PolyCredentials { api_key, secret, passphrase });
-    config.poly_token_id = Some(token_id);
+    let (yes_token_id, no_token_id) = resolve_live_token_ids(config.series_id.as_deref()).await?;
+    let min_live_usdc = 10.0;
+    if config.mode == "live" {
+        ensure_live_wallet_has_min_balance(&wallet_address, min_live_usdc).await?;
+    }
+
+    let creds = polymarket_trader::auth::PolyCredentials {
+        api_key,
+        secret,
+        passphrase,
+        wallet_address: wallet_address.clone().to_lowercase(),
+        private_key,
+        is_builder: poly.is_builder.unwrap_or(false),
+        proxy_address: poly.proxy_address.clone().filter(|k| !k.is_empty()).map(|s| s.to_lowercase()),
+    };
+
+    // Pre-flight: verify L2 auth actually works before starting the runner.
+    // Catches mismatched api_key/secret/passphrase so we don't discover the
+    // problem only when the first order is submitted.
+    validate_live_poly_credentials(&creds).await?;
+
+    config.poly_creds = Some(creds);
+    config.poly_token_id = Some(yes_token_id);
+    config.poly_no_token_id = Some(no_token_id);
+    config.wallet_address = Some(wallet_address);
+
+    // Populate Chainlink price feed config from global settings
+    let cl = state.config.lock().chainlink.clone();
+    if cl.enabled {
+        config.chainlink_endpoint_url = cl.endpoint_url;
+        config.chainlink_api_key = cl.api_key;
+        config.chainlink_interval_secs = cl.interval_secs;
+    }
     Ok(())
 }
 
@@ -3276,8 +3919,11 @@ pub async fn restart_stored_runners(state: &AppState) {
         if !state.strategy_runner.hydrate_live_creds_for_runner(&id, creds) {
             continue;
         }
-        if let Some(token_id) = config.poly_token_id.clone() {
-            let _ = state.strategy_runner.set_poly_token_id(&id, token_id);
+        if let (Some(yes), Some(no)) = (config.poly_token_id.clone(), config.poly_no_token_id.clone()) {
+            let _ = state.strategy_runner.set_poly_token_ids(&id, yes, no);
+        }
+        if let Some(addr) = config.wallet_address.clone() {
+            let _ = state.strategy_runner.set_wallet_address(&id, addr);
         }
         let _ = state.strategy_runner.set_starting(&id);
 
@@ -3385,6 +4031,11 @@ pub async fn handle_api_live_create(
         threshold,
         poly_creds: None,
         poly_token_id: None,
+        poly_no_token_id: None,
+        wallet_address: None,
+        chainlink_endpoint_url: None,
+        chainlink_api_key: None,
+        chainlink_interval_secs: 5,
     };
 
     if let Err(e) = hydrate_live_runtime_config(&state, &mut config).await {
@@ -4018,5 +4669,28 @@ mod tests {
             .embedding_routes
             .iter()
             .all(|route| route.api_key.as_deref() != Some(MASKED_SECRET)));
+    }
+
+    #[test]
+    fn test_calculate_resolution_windows() {
+        // Test 5m cadence (300 seconds)
+        let now = 1776871250; // Some random timestamp
+        let window_ts = now - (now % 300); // 1776871200
+
+        let windows = calculate_resolution_windows(now, 300);
+
+        assert_eq!(windows.len(), 5);
+        assert_eq!(windows[0], window_ts); // current
+        assert_eq!(windows[1], window_ts + 300); // next
+        assert_eq!(windows[2], window_ts - 300); // prev
+        assert_eq!(windows[3], window_ts + 600); // next+1
+        assert_eq!(windows[4], window_ts - 600); // prev-1
+
+        // Ensure rounding behaves properly exactly on the boundary
+        let exact = 1776871200;
+        let windows_exact = calculate_resolution_windows(exact, 300);
+        assert_eq!(windows_exact[0], exact);
+        assert_eq!(windows_exact[1], exact + 300);
+        assert_eq!(windows_exact[2], exact - 300);
     }
 }

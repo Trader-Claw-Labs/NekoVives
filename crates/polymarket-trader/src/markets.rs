@@ -62,6 +62,23 @@ struct ClobPriceResponse {
     price: String,
 }
 
+#[derive(Deserialize)]
+struct ClobMarketResponse {
+    condition_id: String,
+    tokens: Vec<ClobToken>,
+}
+
+#[derive(Deserialize)]
+struct ClobToken {
+    token_id: String,
+    outcome: String,
+}
+
+#[derive(Deserialize)]
+struct GammaEvent {
+    markets: Vec<GammaMarket>,
+}
+
 fn value_to_f64(v: &serde_json::Value) -> f64 {
     if let Some(n) = v.as_f64() {
         return n;
@@ -73,8 +90,12 @@ fn value_to_f64(v: &serde_json::Value) -> f64 {
 }
 
 fn gamma_to_market(g: GammaMarket) -> Option<Market> {
-    let yes_token = g.tokens.iter().find(|t| t.outcome.eq_ignore_ascii_case("Yes"))?;
-    let no_token = g.tokens.iter().find(|t| t.outcome.eq_ignore_ascii_case("No"))?;
+    let yes_token = g.tokens.iter().find(|t|
+        t.outcome.eq_ignore_ascii_case("Yes") || t.outcome.eq_ignore_ascii_case("Up")
+    )?;
+    let no_token = g.tokens.iter().find(|t|
+        t.outcome.eq_ignore_ascii_case("No") || t.outcome.eq_ignore_ascii_case("Down")
+    )?;
 
     Some(Market {
         condition_id: g.condition_id,
@@ -178,7 +199,7 @@ pub async fn get_market(slug: &str) -> Result<Market> {
         .json()
         .await?;
 
-    let best = raw
+    let mut best = raw
         .into_iter()
         .filter(|g| g.active && !g.closed)
         .filter_map(gamma_to_market)
@@ -187,10 +208,40 @@ pub async fn get_market(slug: &str) -> Result<Market> {
             let av = a.liquidity + a.volume;
             let bv = b.liquidity + b.volume;
             av.partial_cmp(&bv).unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .ok_or_else(|| anyhow!("No active market with valid tokens found for slug: {}", slug))?;
+        });
 
-    Ok(best)
+    if best.is_none() {
+        // Fallback: try the events endpoint. For 5m binary markets, Gamma hides the
+        // tokens in the /markets endpoint, but the /events endpoint includes the
+        // conditionId which we can use to fetch tokens from CLOB.
+        let event_url = format!("https://gamma-api.polymarket.com/events?slug={}", slug);
+        let events: Vec<GammaEvent> = client.get(&event_url).send().await?.json().await.unwrap_or_default();
+
+        if let Some(event) = events.into_iter().next() {
+            if let Some(mut m) = event.markets.into_iter().find(|m| m.slug == slug) {
+                // If it has no tokens, fetch them from CLOB using conditionId
+                if m.tokens.is_empty() && !m.condition_id.is_empty() {
+                    let clob_url = format!("https://clob.polymarket.com/markets/{}", m.condition_id);
+                    if let Ok(resp) = client.get(&clob_url).send().await {
+                        if let Ok(clob_market) = resp.json::<ClobMarketResponse>().await {
+                            m.tokens = clob_market.tokens.into_iter().map(|t| GammaToken {
+                                token_id: t.token_id,
+                                outcome: t.outcome,
+                            }).collect();
+                        }
+                    }
+                }
+
+                if let Some(market) = gamma_to_market(m) {
+                    if !market.yes_token_id.trim().is_empty() {
+                        best = Some(market);
+                    }
+                }
+            }
+        }
+    }
+
+    best.ok_or_else(|| anyhow!("No active market with valid tokens found for slug: {}", slug))
 }
 
 /// Get YES token price (0.0 to 1.0).

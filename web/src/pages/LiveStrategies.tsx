@@ -1,10 +1,11 @@
-import { useState } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch, apiPost, apiDelete } from '../hooks/useApi'
 import { type MarketSeries, POLY_BINARY_PRESETS } from '../hooks/useBacktestState'
+import { useProfitCelebration } from '../hooks/useProfitCelebration'
 import {
   Bot, Plus, Trash2, RefreshCw, X, StopCircle, RotateCcw,
-  TrendingUp, TrendingDown, Activity, ChevronDown, ChevronUp, AlertCircle,
+  TrendingUp, TrendingDown, Activity, ChevronDown, ChevronUp, AlertCircle, ExternalLink, Copy,
 } from 'lucide-react'
 import clsx from 'clsx'
 
@@ -57,6 +58,27 @@ interface BacktestScript {
   }
 }
 
+interface LiveFeedData {
+  current_btc_price: number
+  market_slug: string
+  window_timestamp: number
+  window_seconds_left: number
+  price_to_beat: number
+  yes_token_price: number
+  no_token_price: number
+  price_history: [number, number][]
+}
+
+interface LiveOrder {
+  timestamp: string
+  window_ts: number
+  side: string
+  token_id: string
+  amount_usdc: number
+  order_id: string
+  status: string
+}
+
 interface RunnerResult {
   total_return_pct: number
   balance: number
@@ -68,6 +90,12 @@ interface RunnerResult {
   all_trades: LiveTrade[]
   last_signal: string
   analysis: string
+  live_feed?: LiveFeedData
+  wallet_address?: string
+  wallet_balance_usdc?: number
+  live_orders?: LiveOrder[]
+  live_wins?: number
+  live_total_trades?: number
 }
 
 interface StoredRunner {
@@ -87,9 +115,16 @@ function fmt(iso?: string) {
   try { return new Date(iso).toLocaleString() } catch { return iso }
 }
 
-function fmtPct(v: number) {
-  const color = v >= 0 ? 'var(--color-accent)' : 'var(--color-danger)'
-  return <span style={{ color }}>{v >= 0 ? '+' : ''}{v.toFixed(2)}%</span>
+function fmtPct(v: number | null | undefined) {
+  const safe = v ?? 0
+  const color = safe >= 0 ? 'var(--color-accent)' : 'var(--color-danger)'
+  return <span style={{ color }}>{safe >= 0 ? '+' : ''}{safe.toFixed(2)}%</span>
+}
+
+/** Format a number as USD with commas and 2 decimals. */
+function fmtUSD(v: number | null | undefined): string {
+  const safe = v ?? 0
+  return safe.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 }
 
 // ── Live Equity Chart ────────────────────────────────────────────────
@@ -270,13 +305,101 @@ function LiveEquityChart({ trades, initialBalance }: LiveEquityChartProps) {
           </div>
           <div className="flex justify-between gap-3">
             <span style={{ color: 'var(--color-text-muted)' }}>Balance</span>
-            <span>${hoveredTrade.balance.toFixed(2)}</span>
+            <span>${fmtUSD(hoveredTrade.balance)}</span>
           </div>
           <div style={{ color: 'var(--color-text-muted)', marginTop: 2 }}>
             {(() => { try { return new Date(hoveredTrade.timestamp).toLocaleString() } catch { return hoveredTrade.timestamp } })()}
           </div>
         </div>
       )}
+    </div>
+  )
+}
+
+// ── Missing API Key Modal ─────────────────────────────────────────────
+
+function MissingApiKeyModal({ onClose }: { onClose: () => void }) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" onClick={(e) => { if (e.target === e.currentTarget) onClose() }}>
+      <div
+        className="rounded-lg border w-full max-w-md"
+        style={{ backgroundColor: 'var(--color-surface)', borderColor: 'var(--color-border)' }}
+      >
+        <div className="p-4 border-b flex items-center justify-between" style={{ borderColor: 'var(--color-border)' }}>
+          <div className="flex items-center gap-2">
+            <AlertCircle size={16} style={{ color: 'var(--color-danger)' }} />
+            <h2 className="font-semibold">Polymarket API Credentials Required</h2>
+          </div>
+          <button onClick={onClose} className="p-1 rounded hover:bg-white/10" style={{ color: 'var(--color-text-muted)' }}>
+            <X size={16} />
+          </button>
+        </div>
+        <div className="p-4 space-y-3 text-sm">
+          <p style={{ color: 'var(--color-text-muted)' }}>
+            Live trading on Polymarket requires API credentials to be configured.
+          </p>
+          <p style={{ color: 'var(--color-text-muted)' }}>
+            Please go to <strong>Settings → Config</strong> and set:
+          </p>
+          <ul className="list-disc list-inside space-y-1 text-xs font-mono" style={{ color: 'var(--color-text-muted)' }}>
+            <li>polymarket.api_key</li>
+            <li>polymarket.secret</li>
+            <li>polymarket.passphrase</li>
+          </ul>
+        </div>
+        <div className="p-4 border-t flex gap-2" style={{ borderColor: 'var(--color-border)' }}>
+          <button
+            onClick={onClose}
+            className="flex-1 py-2 rounded text-sm font-medium"
+            style={{ backgroundColor: 'var(--color-accent)', color: '#000' }}
+          >
+            Got it
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ── Missing Private Key Modal ─────────────────────────────────────────
+
+function MissingPrivateKeyModal({ onClose }: { onClose: () => void }) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" onClick={(e) => { if (e.target === e.currentTarget) onClose() }}>
+      <div
+        className="rounded-lg border w-full max-w-md"
+        style={{ backgroundColor: 'var(--color-surface)', borderColor: 'var(--color-border)' }}
+      >
+        <div className="p-4 border-b flex items-center justify-between" style={{ borderColor: 'var(--color-border)' }}>
+          <div className="flex items-center gap-2">
+            <AlertCircle size={16} style={{ color: 'var(--color-danger)' }} />
+            <h2 className="font-semibold">Private Key Required for Live Trading</h2>
+          </div>
+          <button onClick={onClose} className="p-1 rounded hover:bg-white/10" style={{ color: 'var(--color-text-muted)' }}>
+            <X size={16} />
+          </button>
+        </div>
+        <div className="p-4 space-y-3 text-sm">
+          <p style={{ color: 'var(--color-text-muted)' }}>
+            Live trading on Polymarket requires your wallet's <strong>private key</strong> to cryptographically sign each order (EIP-712).
+          </p>
+          <p style={{ color: 'var(--color-text-muted)' }}>
+            Please go to <strong>Polymarket → Builder API Credentials</strong> and paste your private key in the <em>Private Key</em> field, then click Save.
+          </p>
+          <div className="rounded p-2.5 text-xs" style={{ backgroundColor: 'rgba(255,170,0,0.08)', borderLeft: '2px solid var(--color-warning)', color: 'var(--color-warning)' }}>
+            Your private key is stored locally in your config file and is never sent to our servers. It is only used to sign orders on your machine.
+          </div>
+        </div>
+        <div className="p-4 border-t flex gap-2" style={{ borderColor: 'var(--color-border)' }}>
+          <button
+            onClick={onClose}
+            className="flex-1 py-2 rounded text-sm font-medium"
+            style={{ backgroundColor: 'var(--color-accent)', color: '#000' }}
+          >
+            Got it
+          </button>
+        </div>
+      </div>
     </div>
   )
 }
@@ -302,18 +425,20 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript }: Crea
   const [form, setForm] = useState({
     name: '',
     script: defaultScript ?? scripts[0]?.path ?? '',
-    market_type: 'crypto',
+    market_type: 'polymarket_binary',
     symbol: 'BTCUSDT',
     interval: '5m',
     mode: 'paper',
     initial_balance: 1000,
-    fee_pct: 0.1,
+    fee_pct: 1.5,
     warmup_days: 7,
-    series_id: '' as string,
-    resolution_logic: 'price_up' as string,
+    series_id: 'btc_5m',
+    resolution_logic: 'price_up',
     threshold: null as number | null,
   })
   const [error, setError] = useState('')
+  const [showMissingApiKeyModal, setShowMissingApiKeyModal] = useState(false)
+  const [showMissingPrivateKeyModal, setShowMissingPrivateKeyModal] = useState(false)
 
   function friendlyCreateError(message: string) {
     const m = message.toLowerCase()
@@ -326,8 +451,20 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript }: Crea
     if (m.includes('insufficient wallet balance') || m.includes('required at least')) {
       return `Insufficient Polymarket wallet balance for live mode. ${message}`
     }
-    if (m.includes('api_key') || m.includes('passphrase') || m.includes('secret')) {
-      return 'Polymarket API credentials are incomplete. Please configure api_key, secret, and passphrase in Settings → Config.'
+    // Credentials rejected by CLOB (401): keys are present but do not match the wallet.
+    // Must be checked BEFORE the "missing credentials" rule so the user sees a
+    // regenerate-keys hint instead of the generic "credentials required" modal.
+    if (m.includes('credentials rejected') || m.includes('invalid api key') || m.includes('401')) {
+      return `Polymarket rejected your API credentials. They do not match the configured wallet. Open the Polymarket page and click "Regenerate API Credentials" with your current private key, then try again. (${message})`
+    }
+    if (m.includes('private_key') || m.includes('private key')) {
+      setShowMissingPrivateKeyModal(true)
+      return ''
+    }
+    // Only surface the "missing credentials" modal for the actual missing-config case.
+    if (m.includes('requires polymarket.api_key') || m.includes('credentials incomplete')) {
+      setShowMissingApiKeyModal(true)
+      return ''
     }
     return message
   }
@@ -399,7 +536,7 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript }: Crea
     : POLY_BINARY_PRESETS.find(p => p.symbol === form.symbol && p.defaultInterval === form.interval)
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" onClick={(e) => { if (e.target === e.currentTarget) onClose() }}>
       <div
         className="rounded-lg border w-full max-w-lg max-h-[90vh] overflow-y-auto"
         style={{ backgroundColor: 'var(--color-surface)', borderColor: 'var(--color-border)' }}
@@ -422,7 +559,7 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript }: Crea
               onChange={e => set('script', e.target.value)}>
               {scripts.map(s => (
                 <option key={s.path} value={s.path}>
-                  {s.name} {s.last_run_stats ? `(${s.last_run_stats.win_rate_pct.toFixed(1)}% WR)` : ''}
+                  {s.name} {s.last_run_stats ? `(${(s.last_run_stats.win_rate_pct ?? 0).toFixed(1)}% WR)` : ''}
                 </option>
               ))}
             </select>
@@ -439,12 +576,26 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript }: Crea
             </div>
             <div>
               <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>Mode</label>
-              <select className="w-full rounded px-3 py-2 text-sm" value={form.mode}
-                onChange={e => set('mode', e.target.value)}
-                disabled={form.market_type !== 'polymarket_binary'}>
-                <option value="paper">Paper Trading</option>
-                <option value="live" disabled={form.market_type !== 'polymarket_binary'}>Live Trading</option>
-              </select>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 ${
+                    form.mode === 'live' ? 'bg-blue-500' : 'bg-gray-300 dark:bg-gray-600'
+                  }`}
+                  onClick={() => set('mode', form.mode === 'live' ? 'paper' : 'live')}
+                  disabled={form.market_type !== 'polymarket_binary'}
+                  aria-pressed={form.mode === 'live'}
+                >
+                  <span
+                    className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                      form.mode === 'live' ? 'translate-x-6' : 'translate-x-1'
+                    }`}
+                  />
+                </button>
+                <span className="text-sm font-medium">
+                  {form.mode === 'live' ? 'Live Trading' : 'Paper Trading'}
+                </span>
+              </div>
             </div>
           </div>
 
@@ -545,6 +696,87 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript }: Crea
             style={{ borderColor: 'var(--color-border)' }}>Cancel</button>
         </div>
       </div>
+      {showMissingApiKeyModal && <MissingApiKeyModal onClose={() => setShowMissingApiKeyModal(false)} />}
+      {showMissingPrivateKeyModal && <MissingPrivateKeyModal onClose={() => setShowMissingPrivateKeyModal(false)} />}
+    </div>
+  )
+}
+
+// ── Low Balance Modal ─────────────────────────────────────────────────
+
+function LowBalanceModal({
+  balance,
+  walletAddress,
+  onClose
+}: {
+  balance: number
+  walletAddress: string
+  onClose: () => void
+}) {
+  const handleCopy = () => {
+    navigator.clipboard.writeText(walletAddress)
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" onClick={(e) => { if (e.target === e.currentTarget) onClose() }}>
+      <div
+        className="rounded-lg border w-full max-w-md"
+        style={{ backgroundColor: 'var(--color-surface)', borderColor: 'var(--color-warning)' }}
+      >
+        <div className="p-4 border-b flex items-center justify-between" style={{ borderColor: 'var(--color-border)' }}>
+          <div className="flex items-center gap-2">
+            <AlertCircle size={18} style={{ color: 'var(--color-warning)' }} />
+            <h2 className="font-semibold" style={{ color: 'var(--color-warning)' }}>Insufficient Wallet Balance</h2>
+          </div>
+          <button onClick={onClose} className="p-1 rounded hover:bg-white/10" style={{ color: 'var(--color-text-muted)' }}>
+            <X size={16} />
+          </button>
+        </div>
+
+        <div className="p-4 space-y-4 text-sm">
+          <p style={{ color: 'var(--color-text-muted)' }}>
+            Your Polymarket wallet does not have enough balance to run live trades effectively.
+          </p>
+
+          <div className="grid grid-cols-2 gap-4">
+            <div className="rounded p-3 border" style={{ backgroundColor: 'var(--color-base)', borderColor: 'var(--color-border)' }}>
+              <div className="text-xs mb-1" style={{ color: 'var(--color-text-muted)' }}>Current Balance</div>
+              <div className="font-semibold text-lg" style={{ color: 'var(--color-danger)' }}>${fmtUSD(balance)}</div>
+            </div>
+            <div className="rounded p-3 border" style={{ backgroundColor: 'var(--color-base)', borderColor: 'var(--color-border)' }}>
+              <div className="text-xs mb-1" style={{ color: 'var(--color-text-muted)' }}>Minimum Required</div>
+              <div className="font-semibold text-lg">$10.00</div>
+            </div>
+          </div>
+
+          <div className="rounded p-3 border space-y-2" style={{ backgroundColor: 'var(--color-base)', borderColor: 'var(--color-border)' }}>
+            <div className="text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>
+              Send USDC.e (Polygon) to your wallet:
+            </div>
+            <div className="flex items-center gap-2">
+              <code className="flex-1 px-2 py-1.5 rounded text-xs break-all" style={{ backgroundColor: 'rgba(0,0,0,0.2)' }}>
+                {walletAddress}
+              </code>
+              <button
+                onClick={handleCopy}
+                className="p-1.5 rounded hover:bg-white/10"
+                title="Copy Address"
+              >
+                <Copy size={14} />
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div className="p-4 border-t flex justify-end" style={{ borderColor: 'var(--color-border)' }}>
+          <button
+            onClick={onClose}
+            className="px-4 py-2 rounded text-sm font-medium hover:bg-white/5"
+          >
+            I understand
+          </button>
+        </div>
+      </div>
     </div>
   )
 }
@@ -564,6 +796,178 @@ function statusDot(s: string): 'online' | 'warning' | 'offline' {
   return 'offline'
 }
 
+function maskAddress(addr?: string): string {
+  if (!addr) return '—'
+  if (addr.length <= 12) return addr
+  return `${addr.slice(0, 6)}...${addr.slice(-4)}`
+}
+
+function MiniPriceChart({ history }: { history: [number, number][] }) {
+  if (history.length < 2) return null
+  const W = 320
+  const H = 60
+  const PAD = 4
+  const times = history.map(([t]) => t)
+  const prices = history.map(([, p]) => p)
+  const minP = Math.min(...prices)
+  const maxP = Math.max(...prices)
+  const range = maxP - minP || 1
+  const minT = times[0]
+  const maxT = times[times.length - 1]
+  const timeRange = maxT - minT || 1
+  // Use real timestamps for X so gaps in data are reflected accurately.
+  const toX = (t: number) => PAD + ((t - minT) / timeRange) * (W - PAD * 2)
+  const toY = (p: number) => H - PAD - ((p - minP) / range) * (H - PAD * 2)
+  const points = history.map(([t, p]) => `${toX(t)},${toY(p)}`).join(' ')
+  const isUp = prices[prices.length - 1] >= prices[0]
+  const color = isUp ? 'var(--color-accent)' : 'var(--color-danger)'
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ height: H }}>
+      <polyline points={points} fill="none" stroke={color} strokeWidth={1.5} strokeLinejoin="round" strokeLinecap="round" />
+      <circle cx={toX(times[times.length - 1])} cy={toY(prices[prices.length - 1])} r={2.5} fill={color} />
+    </svg>
+  )
+}
+
+function LiveFeedPanel({ feed, walletBalance, liveOrders }: { feed: LiveFeedData; walletBalance?: number; liveOrders?: LiveOrder[] }) {
+  // Deterministic countdown: window is always 5 min (300s) from window_timestamp.
+  // Recalculates every second from wall-clock time so it stays accurate even
+  // if the WebSocket feed has gaps or latency.
+  const WINDOW_DURATION = 300
+  const [secondsLeft, setSecondsLeft] = useState(() =>
+    Math.max(0, feed.window_timestamp + WINDOW_DURATION - Math.floor(Date.now() / 1000))
+  )
+  const [isNewWindow, setIsNewWindow] = useState(false)
+  const prevWindowTsRef = useRef(feed.window_timestamp)
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setSecondsLeft(
+        Math.max(0, feed.window_timestamp + WINDOW_DURATION - Math.floor(Date.now() / 1000))
+      )
+    }, 1000)
+    return () => clearInterval(interval)
+  }, [feed.window_timestamp])
+
+  // Detect window change and flash animation
+  useEffect(() => {
+    if (feed.window_timestamp !== prevWindowTsRef.current) {
+      prevWindowTsRef.current = feed.window_timestamp
+      setIsNewWindow(true)
+      const t = setTimeout(() => setIsNewWindow(false), 2500)
+      return () => clearTimeout(t)
+    }
+  }, [feed.window_timestamp])
+
+  const currentAboveBeat = (feed.current_btc_price ?? 0) >= (feed.price_to_beat ?? 0)
+  const currentWindowOrder = liveOrders?.find(o => o.window_ts === feed.window_timestamp)
+  const mins = Math.floor(Math.max(0, secondsLeft) / 60)
+  const secs = Math.max(0, secondsLeft) % 60
+  const justStarted = secondsLeft >= 295
+
+  return (
+    <div className="mx-4 mb-3 px-4 py-4 rounded border space-y-4" style={{ backgroundColor: 'var(--color-base)', borderColor: 'var(--color-border)' }}>
+      {/* Window change flash banner */}
+      {isNewWindow && (
+        <div className="-mx-4 -mt-4 mb-2 px-4 py-1.5 text-[10px] font-bold uppercase tracking-wider text-center animate-pulse"
+          style={{ backgroundColor: 'var(--color-accent)', color: '#000' }}>
+          New Window Started — Evaluating Strategy…
+        </div>
+      )}
+      {/* Evaluating indicator during first ~5s of window */}
+      {justStarted && !isNewWindow && (
+        <div className="-mx-4 -mt-4 mb-2 px-4 py-1.5 text-[10px] font-bold uppercase tracking-wider text-center"
+          style={{ backgroundColor: 'rgba(245,158,11,0.15)', color: 'var(--color-warning)' }}>
+          <Activity size={10} className="inline mr-1" />
+          Evaluating Strategy…
+        </div>
+      )}
+      {/* Order placed indicator for current window */}
+      {currentWindowOrder && (
+        <div className="-mx-4 -mt-4 mb-2 px-4 py-1.5 text-[10px] font-bold uppercase tracking-wider text-center"
+          style={{ backgroundColor: 'rgba(74,222,128,0.15)', color: 'var(--color-accent)' }}>
+          <TrendingUp size={10} className="inline mr-1" />
+          Order Placed — {currentWindowOrder.side.toUpperCase()} ${currentWindowOrder.amount_usdc.toFixed(0)}
+        </div>
+      )}
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <TrendingUp size={16} style={{ color: 'var(--color-accent)' }} />
+          <span className="text-sm font-bold">Bitcoin Up or Down - 5 Minutes</span>
+        </div>
+        <div className="flex items-center gap-4">
+          {typeof walletBalance === 'number' && (
+            <div className="text-right mr-2">
+              <div className="text-[10px] uppercase font-bold" style={{ color: 'var(--color-text-muted)' }}>Wallet</div>
+              <div className="text-sm font-bold" style={{ color: walletBalance < 10 ? 'var(--color-warning)' : 'var(--color-accent)' }}>
+                ${fmtUSD(walletBalance)}
+              </div>
+            </div>
+          )}
+          <div className="text-right">
+            <div className="text-[10px] uppercase font-bold" style={{ color: 'var(--color-text-muted)' }}>Mins</div>
+            <div className="text-xl font-bold leading-none" style={{ color: 'var(--color-danger)' }}>{String(mins).padStart(2, '0')}</div>
+          </div>
+          <div className="text-right">
+            <div className="text-[10px] uppercase font-bold" style={{ color: 'var(--color-text-muted)' }}>Secs</div>
+            <div className="text-xl font-bold leading-none" style={{ color: 'var(--color-danger)' }}>{String(secs).padStart(2, '0')}</div>
+          </div>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-2 gap-6">
+        <div>
+          <div className="text-xs font-medium mb-1" style={{ color: 'var(--color-text-muted)' }}>Price To Beat</div>
+          <div className="text-xl font-bold">${(feed.price_to_beat ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
+        </div>
+        <div>
+          <div className="text-xs font-medium mb-1" style={{ color: 'var(--color-text-muted)' }}>
+            Current Price
+            <span className="ml-2 text-[10px]" style={{ color: 'var(--color-danger)' }}>
+              ▼ ${Math.abs((feed.current_btc_price ?? 0) - (feed.price_to_beat ?? 0)).toFixed(0)}
+            </span>
+          </div>
+          <div className="text-xl font-bold" style={{ color: currentAboveBeat ? 'var(--color-accent)' : '#f59e0b' }}>
+            ${(feed.current_btc_price ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+          </div>
+        </div>
+      </div>
+
+      {feed.price_history && feed.price_history.length > 1 && (
+        <div className="pt-1">
+          <MiniPriceChart history={feed.price_history} />
+        </div>
+      )}
+
+      <div className="flex items-center gap-3 pt-2">
+        <div className="flex-1 flex items-center justify-between p-2 rounded bg-green-500/10 border border-green-500/20">
+          <span className="text-xs font-bold text-green-500">Up</span>
+          <span className="text-sm font-bold text-green-500">{(feed.yes_token_price ?? 0) > 0 ? `${((feed.yes_token_price ?? 0) * 100).toFixed(0)}¢` : '—'}</span>
+        </div>
+        <div className="flex-1 flex items-center justify-between p-2 rounded bg-white/5 border border-white/10">
+          <span className="text-xs font-bold text-white/40">Down</span>
+          <span className="text-sm font-bold text-white/40">{(feed.no_token_price ?? 0) > 0 ? `${((feed.no_token_price ?? 0) * 100).toFixed(0)}¢` : '—'}</span>
+        </div>
+      </div>
+
+      <div className="flex items-center justify-between pt-1 border-t border-white/5">
+        <div className="text-[10px] font-mono opacity-40 truncate flex-1">
+          {feed.market_slug}
+        </div>
+        <a
+          href={`https://polymarket.com/event/${feed.market_slug}`}
+          target="_blank"
+          rel="noreferrer"
+          className="text-[10px] font-bold uppercase tracking-wider flex items-center gap-1 ml-2"
+          style={{ color: 'var(--color-accent)' }}
+        >
+          View on Poly <ExternalLink size={10} />
+        </a>
+      </div>
+    </div>
+  )
+}
+
 interface RunnerCardProps {
   runner: StoredRunner
   onStop: () => void
@@ -572,9 +976,48 @@ interface RunnerCardProps {
 }
 
 function RunnerCard({ runner, onStop, onRestart, onDelete }: RunnerCardProps) {
-  const [expanded, setExpanded] = useState(false)
+  const [expanded, setExpanded] = useState(true)
+  const [showLowBalanceModal, setShowLowBalanceModal] = useState(false)
+  const [lowBalanceShownOnce, setLowBalanceShownOnce] = useState(() => {
+    try {
+      return sessionStorage.getItem(`low-balance-shown-${runner.config.id}`) === 'true'
+    } catch {
+      return false
+    }
+  })
+  const { celebrate } = useProfitCelebration()
+  const prevTradesRef = useRef<number>(0)
   const { config, status, result } = runner
   const isRunning = status.status === 'running' || status.status === 'starting'
+
+  useEffect(() => {
+    if (
+      config.mode === 'live' &&
+      typeof result?.wallet_balance_usdc === 'number' &&
+      result.wallet_balance_usdc < 10 &&
+      !lowBalanceShownOnce
+    ) {
+      setShowLowBalanceModal(true)
+      setLowBalanceShownOnce(true)
+      try {
+        sessionStorage.setItem(`low-balance-shown-${config.id}`, 'true')
+      } catch {
+        // ignore
+      }
+    }
+  }, [config.mode, config.id, result?.wallet_balance_usdc, lowBalanceShownOnce])
+
+  // Trigger celebration on profitable trades (paper mode only — live trades are real orders)
+  useEffect(() => {
+    if (config.mode === 'live') return
+    if (!result?.all_trades) return
+    const newTrades = result.all_trades.slice(prevTradesRef.current)
+    const profitTrades = newTrades.filter(t => t.pnl && t.pnl > 0)
+    if (profitTrades.length > 0) {
+      celebrate()
+    }
+    prevTradesRef.current = result.all_trades.length
+  }, [result?.all_trades, celebrate, config.mode])
 
   return (
     <div
@@ -586,7 +1029,7 @@ function RunnerCard({ runner, onStop, onRestart, onDelete }: RunnerCardProps) {
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 mb-0.5">
             <span className={clsx('status-dot', statusDot(status.status))} />
-            <h3 className="text-sm font-semibold truncate">{config.name || config.script}</h3>
+            <h3 className="text-sm font-semibold truncate">{config.name || config.script.split('/').pop()}</h3>
             <span
               className="text-xs px-1.5 py-0.5 rounded flex-shrink-0"
               style={{ backgroundColor: 'var(--color-base)', color: statusColor(status.status) }}
@@ -603,7 +1046,7 @@ function RunnerCard({ runner, onStop, onRestart, onDelete }: RunnerCardProps) {
             )}
           </div>
           <p className="text-xs font-mono truncate" style={{ color: 'var(--color-text-muted)' }}>
-            {config.script} · {config.symbol} · {config.interval} · {config.mode}
+            {config.script.split('/').pop()} · {config.symbol} · {config.interval} · {config.mode}
             {config.market_type === 'polymarket_binary' ? ` · ${config.resolution_logic ?? 'price_up'}${config.threshold !== undefined && config.threshold !== null ? `(${config.threshold})` : ''}` : ''}
           </p>
         </div>
@@ -639,7 +1082,7 @@ function RunnerCard({ runner, onStop, onRestart, onDelete }: RunnerCardProps) {
           </div>
           <div>
             <div style={{ color: 'var(--color-text-muted)' }}>Win Rate</div>
-            <div className="font-semibold">{result.win_rate_pct.toFixed(1)}%</div>
+            <div className="font-semibold">{(result.win_rate_pct ?? 0).toFixed(1)}%</div>
           </div>
           <div>
             <div style={{ color: 'var(--color-text-muted)' }}>Trades</div>
@@ -655,14 +1098,28 @@ function RunnerCard({ runner, onStop, onRestart, onDelete }: RunnerCardProps) {
         </div>
       )}
 
-      {/* Live mode summary — signal only, no paper P&L */}
+      {/* Live mode summary — live trades + signal */}
       {config.mode === 'live' && (
-        <div className="grid grid-cols-2 gap-2 px-4 pb-3 text-xs">
+        <div className="grid grid-cols-4 gap-2 px-4 pb-3 text-xs">
           <div>
             <div style={{ color: 'var(--color-text-muted)' }}>Last Signal</div>
             <div className="font-semibold"
               style={{ color: result?.last_signal === 'buy' ? 'var(--color-accent)' : result?.last_signal === 'sell' ? 'var(--color-danger)' : 'var(--color-text-muted)' }}>
               {result?.last_signal || 'waiting...'}
+            </div>
+          </div>
+          <div>
+            <div style={{ color: 'var(--color-text-muted)' }}>Total Trades</div>
+            <div className="font-semibold">{result?.live_total_trades ?? 0}</div>
+          </div>
+          <div>
+            <div style={{ color: 'var(--color-text-muted)' }}>Win Rate</div>
+            <div className="font-semibold">
+              {(() => {
+                const total = result?.live_total_trades ?? 0
+                const wins = result?.live_wins ?? 0
+                return total > 0 ? `${((wins / total) * 100).toFixed(1)}%` : '—'
+              })()}
             </div>
           </div>
           <div>
@@ -682,7 +1139,7 @@ function RunnerCard({ runner, onStop, onRestart, onDelete }: RunnerCardProps) {
               Equity Curve
             </span>
             <span className="text-xs" style={{ color: 'var(--color-text-muted)' }}>
-              {result.all_trades.length} trades · ${result.balance.toFixed(2)}
+              {result.all_trades.length} trades · ${fmtUSD(result.balance)}
             </span>
           </div>
           <LiveEquityChart trades={result.all_trades} initialBalance={config.initial_balance} />
@@ -697,7 +1154,70 @@ function RunnerCard({ runner, onStop, onRestart, onDelete }: RunnerCardProps) {
         </div>
       )}
 
-      {config.mode === 'live' && !status.error && status.status === 'running' && (
+      {/* Live Feed Panel for binary recurring markets */}
+      {config.mode === 'live' && config.market_type === 'polymarket_binary' && result?.live_feed && (
+        <LiveFeedPanel feed={result.live_feed} walletBalance={result.wallet_balance_usdc} liveOrders={result.live_orders} />
+      )}
+
+      {/* Live order history */}
+      {config.mode === 'live' && result?.live_orders && result.live_orders.length > 0 && (
+        <div className="mx-4 mb-3 rounded border overflow-hidden" style={{ borderColor: 'var(--color-border)' }}>
+          <div className="px-3 py-2 text-xs font-semibold border-b flex items-center gap-2" style={{ borderColor: 'var(--color-border)', backgroundColor: 'var(--color-base)' }}>
+            <TrendingUp size={12} style={{ color: 'var(--color-accent)' }} />
+            Order History
+          </div>
+          <table className="w-full text-xs">
+            <thead>
+              <tr style={{ backgroundColor: 'var(--color-base)' }}>
+                <th className="px-3 py-1.5 text-left font-medium" style={{ color: 'var(--color-text-muted)' }}>Time</th>
+                <th className="px-3 py-1.5 text-left font-medium" style={{ color: 'var(--color-text-muted)' }}>Side</th>
+                <th className="px-3 py-1.5 text-right font-medium" style={{ color: 'var(--color-text-muted)' }}>Amount</th>
+                <th className="px-3 py-1.5 text-left font-medium" style={{ color: 'var(--color-text-muted)' }}>Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              {[...result.live_orders].reverse().slice(0, 10).map((order, i) => (
+                <tr key={i} className="border-t" style={{ borderColor: 'var(--color-border)' }}>
+                  <td className="px-3 py-1.5 font-mono" style={{ color: 'var(--color-text-muted)' }}>
+                    {fmt(order.timestamp)}
+                  </td>
+                  <td className="px-3 py-1.5 font-semibold" style={{
+                    color: order.side.startsWith('yes') || order.side === 'buy'
+                      ? 'var(--color-accent)'
+                      : order.side.startsWith('no') || order.side === 'sell'
+                        ? 'var(--color-danger)'
+                        : 'var(--color-text-muted)'
+                  }}>
+                    {order.side.toUpperCase()}
+                  </td>
+                  <td className="px-3 py-1.5 text-right font-mono">
+                    ${order.amount_usdc.toFixed(2)}
+                  </td>
+                  <td className="px-3 py-1.5">
+                    <span className="text-[10px] px-1.5 py-0.5 rounded" style={{
+                      backgroundColor: order.status === 'matched' || order.status === 'filled'
+                        ? 'rgba(74,222,128,0.15)'
+                        : 'rgba(245,158,11,0.15)',
+                      color: order.status === 'matched' || order.status === 'filled'
+                        ? 'var(--color-accent)'
+                        : 'var(--color-warning)',
+                    }}>
+                      {order.status}
+                    </span>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {result.live_orders.length > 10 && (
+            <div className="px-3 py-1 text-[10px] text-center" style={{ color: 'var(--color-text-muted)', backgroundColor: 'var(--color-base)' }}>
+              +{result.live_orders.length - 10} older orders
+            </div>
+          )}
+        </div>
+      )}
+
+      {config.mode === 'live' && !status.error && status.status === 'running' && !result?.live_feed && (
         <div className="mx-4 mb-3 px-3 py-3 rounded text-xs text-center"
           style={{ backgroundColor: 'var(--color-base)', color: 'var(--color-text-muted)' }}>
           <Activity size={12} className="inline mr-1 animate-pulse" />
@@ -742,19 +1262,42 @@ function RunnerCard({ runner, onStop, onRestart, onDelete }: RunnerCardProps) {
               <span style={{ color: 'var(--color-text-muted)' }}>Next tick</span>
               <span>{fmt(status.next_tick_at)}</span>
             </div>
-            <div className="flex justify-between">
-              <span style={{ color: 'var(--color-text-muted)' }}>{config.mode === 'live' ? 'Wallet Balance' : 'Balance'}</span>
-              <span>${result?.balance.toFixed(2) ?? (config.mode === 'live' ? '—' : config.initial_balance)}</span>
-            </div>
+            {config.mode === 'paper' && (
+              <div className="flex justify-between">
+                <span style={{ color: 'var(--color-text-muted)' }}>Balance</span>
+                <span>${fmtUSD(result?.balance)}</span>
+              </div>
+            )}
+            {config.mode === 'live' && (
+              typeof result?.wallet_balance_usdc === 'number' ? (
+                <div className="flex justify-between">
+                  <span style={{ color: 'var(--color-text-muted)' }}>Wallet Balance</span>
+                  <span style={{ color: result.wallet_balance_usdc < 10 ? 'var(--color-warning)' : 'inherit' }}>
+                    ${fmtUSD(result.wallet_balance_usdc)}
+                  </span>
+                </div>
+              ) : (
+                <div className="flex justify-between text-[10px]" style={{ color: 'var(--color-warning)' }}>
+                  <span>Balance Unknown</span>
+                  <span className="text-right">Fund your Polymarket wallet</span>
+                </div>
+              )
+            )}
+            {config.mode === 'live' && result?.wallet_address && (
+              <div className="flex justify-between">
+                <span style={{ color: 'var(--color-text-muted)' }}>Wallet</span>
+                <span className="font-mono text-xs">{maskAddress(result.wallet_address)}</span>
+              </div>
+            )}
             {result && (
               <>
                 <div className="flex justify-between">
                   <span style={{ color: 'var(--color-text-muted)' }}>Sharpe</span>
-                  <span>{result.sharpe_ratio.toFixed(2)}</span>
+                  <span>{(result.sharpe_ratio ?? 0).toFixed(2)}</span>
                 </div>
                 <div className="flex justify-between">
                   <span style={{ color: 'var(--color-text-muted)' }}>Max DD</span>
-                  <span style={{ color: 'var(--color-danger)' }}>{result.max_drawdown_pct.toFixed(2)}%</span>
+                  <span style={{ color: 'var(--color-danger)' }}>{(result.max_drawdown_pct ?? 0).toFixed(2)}%</span>
                 </div>
               </>
             )}
@@ -766,6 +1309,13 @@ function RunnerCard({ runner, onStop, onRestart, onDelete }: RunnerCardProps) {
           )}
         </div>
       )}
+      {showLowBalanceModal && result?.wallet_address && typeof result?.wallet_balance_usdc === 'number' && (
+        <LowBalanceModal
+          balance={result.wallet_balance_usdc}
+          walletAddress={result.wallet_address}
+          onClose={() => setShowLowBalanceModal(false)}
+        />
+      )}
     </div>
   )
 }
@@ -774,6 +1324,8 @@ function RunnerCard({ runner, onStop, onRestart, onDelete }: RunnerCardProps) {
 
 export default function LiveStrategies() {
   const [showCreate, setShowCreate] = useState(false)
+  const [showCelebrationSettings, setShowCelebrationSettings] = useState(false)
+  const { settings, setSettings } = useProfitCelebration()
   const qc = useQueryClient()
 
   const { data, isLoading, refetch } = useQuery<LiveListResponse>({
@@ -828,13 +1380,49 @@ export default function LiveStrategies() {
           )}
         </div>
         <div className="flex gap-2">
+          <div className="relative">
+            <button
+              onClick={() => setShowCelebrationSettings(!showCelebrationSettings)}
+              className="p-2 rounded border hover:bg-white/5 h-[34px] flex items-center justify-center"
+              style={{ borderColor: 'var(--color-border)', color: settings.enabled ? 'var(--color-accent)' : 'var(--color-text-muted)' }}
+              title="Celebration Settings"
+            >
+              🎉
+            </button>
+            {showCelebrationSettings && (
+              <div
+                className="absolute right-0 top-full mt-2 w-48 rounded border p-3 shadow-lg z-50 text-sm space-y-3"
+                style={{ backgroundColor: 'var(--color-surface)', borderColor: 'var(--color-border)' }}
+              >
+                <div className="font-semibold mb-2">Trade Celebrations</div>
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={settings.enabled}
+                    onChange={e => setSettings(s => ({ ...s, enabled: e.target.checked }))}
+                  />
+                  <span>Enable Confetti</span>
+                </label>
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={settings.sound}
+                    disabled={!settings.enabled}
+                    onChange={e => setSettings(s => ({ ...s, sound: e.target.checked }))}
+                    className="disabled:opacity-50"
+                  />
+                  <span className={!settings.enabled ? 'opacity-50' : ''}>Play Sound</span>
+                </label>
+              </div>
+            )}
+          </div>
           <button onClick={() => refetch()}
-            className="p-2 rounded border hover:bg-white/5"
+            className="p-2 rounded border hover:bg-white/5 h-[34px] flex items-center justify-center"
             style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-muted)' }}>
             <RefreshCw size={13} className={isLoading ? 'animate-spin' : ''} />
           </button>
           <button onClick={() => setShowCreate(true)}
-            className="flex items-center gap-2 px-3 py-1.5 rounded text-sm font-medium"
+            className="flex items-center gap-2 px-3 h-[34px] rounded text-sm font-medium"
             style={{ backgroundColor: 'var(--color-accent)', color: '#000' }}>
             <Plus size={14} />
             New Strategy
@@ -848,8 +1436,22 @@ export default function LiveStrategies() {
           {[
             { label: 'Runners', value: runners.length, icon: <Activity size={14} /> },
             { label: 'Running', value: running, icon: <Bot size={14} /> },
-            { label: 'Total Trades', value: runners.reduce((s, r) => s + (r.result?.total_trades ?? 0), 0), icon: <TrendingUp size={14} /> },
-            { label: 'Avg Win Rate', value: runners.length ? `${(runners.reduce((s, r) => s + (r.result?.win_rate_pct ?? 0), 0) / runners.length).toFixed(1)}%` : '—', icon: <TrendingDown size={14} /> },
+            { label: 'Total Trades', value: runners.reduce((s, r) => s + (r.config.mode === 'live' ? (r.result?.live_total_trades ?? 0) : (r.result?.total_trades ?? 0)), 0), icon: <TrendingUp size={14} /> },
+            { label: 'Avg Win Rate', value: (() => {
+              const liveRunners = runners.filter(r => r.config.mode === 'live' && (r.result?.live_total_trades ?? 0) > 0)
+              const paperRunners = runners.filter(r => r.config.mode !== 'live')
+              let totalWins = 0
+              let totalTrades = 0
+              liveRunners.forEach(r => {
+                totalWins += r.result?.live_wins ?? 0
+                totalTrades += r.result?.live_total_trades ?? 0
+              })
+              paperRunners.forEach(r => {
+                totalWins += Math.round((r.result?.win_rate_pct ?? 0) / 100 * (r.result?.total_trades ?? 0))
+                totalTrades += r.result?.total_trades ?? 0
+              })
+              return totalTrades > 0 ? `${((totalWins / totalTrades) * 100).toFixed(1)}%` : '—'
+            })(), icon: <TrendingDown size={14} /> },
           ].map(stat => (
             <div key={stat.label} className="rounded-lg border p-3"
               style={{ backgroundColor: 'var(--color-surface)', borderColor: 'var(--color-border)' }}>
@@ -881,7 +1483,7 @@ export default function LiveStrategies() {
           </button>
         </div>
       ) : (
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <div className="grid grid-cols-1 gap-4">
           {runners.map(runner => (
             <RunnerCard
               key={runner.config.id}

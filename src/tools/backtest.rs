@@ -26,33 +26,54 @@ const LIQUIDATION_HUNT_SCRIPT: &str = include_str!("scripts/liquidation_hunt.rha
 
 /// Write bundled default scripts to `<workspace>/scripts/` if they don't exist yet.
 /// Called by both backtest tools so the scripts are always available on first run.
+/// All bundled default scripts as (filename, content) pairs.
+const DEFAULT_SCRIPTS: [(&str, &str); 15] = [
+    ("polymarket_4min.rhai",        POLYMARKET_4MIN_SCRIPT),
+    ("polymarket_5min.rhai",        POLYMARKET_5MIN_SCRIPT),
+    ("polymarket_btc_binary.rhai",  POLYMARKET_BTC_BINARY_SCRIPT),
+    ("weather_binary.rhai",         WEATHER_BINARY_SCRIPT),
+    ("crypto_4min.rhai",            CRYPTO_4MIN_SCRIPT),
+    ("strategy_reference.rhai",     STRATEGY_REFERENCE_SCRIPT),
+    ("strategy.rhai",               STRATEGY_SCRIPT),
+    ("mean_reversion.rhai",         MEAN_REVERSION_SCRIPT),
+    ("dca_bot.rhai",                DCA_BOT_SCRIPT),
+    ("pump_detection.rhai",         PUMP_DETECTION_SCRIPT),
+    ("grid_trading.rhai",           GRID_TRADING_SCRIPT),
+    ("spread_arb.rhai",             SPREAD_ARB_SCRIPT),
+    ("event_driven.rhai",           EVENT_DRIVEN_SCRIPT),
+    ("correlation_arb.rhai",        CORRELATION_ARB_SCRIPT),
+    ("liquidation_hunt.rhai",       LIQUIDATION_HUNT_SCRIPT),
+];
+
 pub fn ensure_default_scripts(workspace_dir: &std::path::Path) {
     let scripts_dir = workspace_dir.join("scripts");
     let _ = std::fs::create_dir_all(&scripts_dir);
-    let defaults = [
-        ("polymarket_4min.rhai",        POLYMARKET_4MIN_SCRIPT),
-        ("polymarket_5min.rhai",        POLYMARKET_5MIN_SCRIPT),
-        ("polymarket_btc_binary.rhai",  POLYMARKET_BTC_BINARY_SCRIPT),
-        ("weather_binary.rhai",     WEATHER_BINARY_SCRIPT),
-        ("crypto_4min.rhai",       CRYPTO_4MIN_SCRIPT),
-        ("strategy_reference.rhai",STRATEGY_REFERENCE_SCRIPT),
-        ("strategy.rhai",          STRATEGY_SCRIPT),
-        // Advanced strategies
-        ("mean_reversion.rhai",    MEAN_REVERSION_SCRIPT),
-        ("dca_bot.rhai",           DCA_BOT_SCRIPT),
-        ("pump_detection.rhai",    PUMP_DETECTION_SCRIPT),
-        ("grid_trading.rhai",      GRID_TRADING_SCRIPT),
-        ("spread_arb.rhai",        SPREAD_ARB_SCRIPT),
-        ("event_driven.rhai",      EVENT_DRIVEN_SCRIPT),
-        ("correlation_arb.rhai",   CORRELATION_ARB_SCRIPT),
-        ("liquidation_hunt.rhai",  LIQUIDATION_HUNT_SCRIPT),
-    ];
-    for (name, content) in &defaults {
+    for (name, content) in &DEFAULT_SCRIPTS {
         let path = scripts_dir.join(name);
         if !path.exists() {
             let _ = std::fs::write(&path, content);
         }
     }
+}
+
+/// Read a script from the workspace, or fall back to the bundled default.
+/// If the file does not exist but matches a bundled default name, writes it
+/// to disk first so the user can inspect/edit it later.
+pub fn read_script_or_default(workspace_dir: &std::path::Path, name: &str) -> Option<String> {
+    let scripts_dir = workspace_dir.join("scripts");
+    let path = scripts_dir.join(name);
+    if path.exists() {
+        return std::fs::read_to_string(&path).ok();
+    }
+    // Fallback: write bundled default to disk and return it
+    for (default_name, content) in &DEFAULT_SCRIPTS {
+        if *default_name == name {
+            let _ = std::fs::create_dir_all(&scripts_dir);
+            let _ = std::fs::write(&path, content);
+            return Some(content.to_string());
+        }
+    }
+    None
 }
 
 // ── backtest_list_scripts ────────────────────────────────────────────
@@ -2383,9 +2404,10 @@ on_candle(ctx);
             let stake       = s.bet_stake;
             let went_up     = last.close > s.bet_entry_close;
             let won         = (direction > 0 && went_up) || (direction < 0 && !went_up);
-            let tokens      = stake / token_price;
-            let net_payout  = if won { tokens * (1.0 - fee_pct / 100.0) } else { 0.0 };
-            let pnl         = net_payout - stake;
+            let tokens       = stake / token_price;
+            let gross_payout = if won { tokens } else { 0.0 };
+            let net_payout   = gross_payout * (1.0 - fee_pct / 100.0);
+            let pnl          = net_payout - stake;
             s.balance += net_payout;
             if won { s.total_correct += 1; }
             s.total_resolved += 1;
@@ -3127,6 +3149,215 @@ pub async fn fetch_recent_candles(
     Ok(candles)
 }
 
+
+/// Evaluate the live trading signal for the *current* (incomplete) window.
+/// Runs the Rhai script on the decision candle and returns "yes", "no", or "flat".
+/// This does NOT compute P&L — it only extracts the directional signal.
+pub fn run_polymarket_live_signal(
+    script_content: &str,
+    candles: Vec<Candle>,
+    window_minutes: usize,
+) -> anyhow::Result<String> {
+    use rhai::{Engine, Scope};
+    use std::sync::{Arc, Mutex};
+
+    if candles.is_empty() {
+        return Err(anyhow::anyhow!("No candles for live signal"));
+    }
+
+    let check = Engine::new();
+    let ast_check = check.compile(script_content)
+        .map_err(|e| anyhow::anyhow!("Script compile error: {e}"))?;
+    if !ast_check.iter_functions().any(|f| f.name == "on_candle") {
+        return Err(anyhow::anyhow!("Binary strategy requires an on_candle(ctx) function."));
+    }
+
+    let window_secs = (window_minutes as i64) * 60;
+    let last_candle = candles.last().unwrap();
+    let last_close_ts = (last_candle.open_time_ms / 1000) + 60;
+    let current_window = last_close_ts - (last_close_ts % window_secs);
+    let decision_ts = current_window + ((window_minutes as i64) - 1) * 60;
+
+    // Find decision candle in buffer
+    let dec_idx = candles.iter()
+        .position(|c| c.open_time_ms / 1000 == decision_ts)
+        .or_else(|| {
+            // Fallback: closest candle before or at decision time
+            candles.iter().enumerate()
+                .filter(|(_, c)| (c.open_time_ms / 1000) <= decision_ts)
+                .map(|(i, _)| i)
+                .last()
+        })
+        .ok_or_else(|| anyhow::anyhow!("Decision candle not found in buffer"))?;
+
+    let dec = &candles[dec_idx];
+    let window_open = candles.iter()
+        .find(|c| c.open_time_ms / 1000 == current_window)
+        .map(|c| c.open)
+        .unwrap_or(dec.open);
+
+    let closes: Vec<f64> = candles.iter().map(|c| c.close).collect();
+    let highs: Vec<f64> = candles.iter().map(|c| c.high).collect();
+    let lows: Vec<f64> = candles.iter().map(|c| c.low).collect();
+    let volumes: Vec<f64> = candles.iter().map(|c| c.volume).collect();
+    let closes_arc = Arc::new(closes);
+    let highs_arc = Arc::new(highs);
+    let lows_arc = Arc::new(lows);
+    let volumes_arc = Arc::new(volumes);
+
+    let patched_script = script_content
+        .replace("ctx.rsi(",             "rsi_impl(")
+        .replace("ctx.ema(",             "ema_impl(")
+        .replace("ctx.atr(",             "atr_impl(")
+        .replace("ctx.sma(",             "sma_impl(")
+        .replace("ctx.close_at(",        "close_at_impl(")
+        .replace("ctx.high_at(",         "high_at_impl(")
+        .replace("ctx.low_at(",          "low_at_impl(")
+        .replace("ctx.volume_at(",       "volume_at_impl(")
+        .replace("ctx.set_stop_loss(",   "set_stop_loss_impl(")
+        .replace("ctx.set_take_profit(", "set_take_profit_impl(")
+        .replace("ctx.buy(",             "buy_impl(")
+        .replace("ctx.sell(",            "sell_impl(")
+        .replace("ctx.short(",           "sell_impl(")
+        .replace("ctx.set(",             "set_impl(")
+        .replace("ctx.get(",             "get_impl(")
+        .replace("ctx.log(",             "log_impl(");
+
+    #[derive(Clone)]
+    struct LiveState {
+        pending_buy: bool,
+        pending_sell: bool,
+    }
+    let state = Arc::new(Mutex::new(LiveState { pending_buy: false, pending_sell: false }));
+
+    let mut engine = Engine::new();
+    engine.set_max_operations(500_000);
+    engine.set_max_call_levels(64);
+
+    let cl = closes_arc.clone();
+    engine.register_fn("close_at_impl",  move |idx: i64| -> f64 { cl.get(idx as usize).copied().unwrap_or(0.0) });
+    let vl = volumes_arc.clone();
+    engine.register_fn("volume_at_impl", move |idx: i64| -> f64 { vl.get(idx as usize).copied().unwrap_or(0.0) });
+    let hl = highs_arc.clone();
+    engine.register_fn("high_at_impl",   move |idx: i64| -> f64 { hl.get(idx as usize).copied().unwrap_or(0.0) });
+    let ll = lows_arc.clone();
+    engine.register_fn("low_at_impl",    move |idx: i64| -> f64 { ll.get(idx as usize).copied().unwrap_or(0.0) });
+
+    let ci = Arc::new(Mutex::new(dec_idx));
+    let cr = closes_arc.clone();
+    engine.register_fn("rsi_impl", move |period: i64| -> f64 {
+        let i = *ci.lock().unwrap();
+        let period = period as usize;
+        if i < period { return 50.0; }
+        let mut gain = 0.0_f64; let mut loss = 0.0_f64;
+        for j in (i - period + 1)..=i {
+            if j == 0 { continue; }
+            let d = cr[j] - cr[j - 1];
+            if d > 0.0 { gain += d; } else { loss += d.abs(); }
+        }
+        gain /= period as f64; loss /= period as f64;
+        if loss == 0.0 { 100.0 } else { 100.0 - 100.0 / (1.0 + gain / loss) }
+    });
+
+    let ci = Arc::new(Mutex::new(dec_idx));
+    let ce = closes_arc.clone();
+    engine.register_fn("ema_impl", move |period: i64| -> f64 {
+        let i = *ci.lock().unwrap();
+        let period = period as usize;
+        if period == 0 { return ce.get(i).copied().unwrap_or(0.0); }
+        let k = 2.0 / (period as f64 + 1.0);
+        let start = i.saturating_sub(period * 5);
+        let mut e = ce[start];
+        for j in (start + 1)..=i { e = ce[j] * k + e * (1.0 - k); }
+        e
+    });
+
+    let ci = Arc::new(Mutex::new(dec_idx));
+    let cs = closes_arc.clone();
+    engine.register_fn("sma_impl", move |period: i64| -> f64 {
+        let i = *ci.lock().unwrap();
+        let period = period as usize;
+        if period == 0 { return 0.0; }
+        let start = if i + 1 >= period { i + 1 - period } else { 0 };
+        cs[start..=i].iter().sum::<f64>() / (i - start + 1) as f64
+    });
+
+    let ci = Arc::new(Mutex::new(dec_idx));
+    let ha = highs_arc.clone(); let la = lows_arc.clone(); let ca = closes_arc.clone();
+    engine.register_fn("atr_impl", move |period: i64| -> f64 {
+        let i = *ci.lock().unwrap();
+        let period = (period.max(1)) as usize;
+        if i == 0 { return 0.0; }
+        let start = i.saturating_sub(period * 3);
+        let tr_vals: Vec<f64> = ((start + 1)..=i).map(|j| {
+            (ha[j] - la[j]).max((ha[j] - ca[j-1]).abs()).max((la[j] - ca[j-1]).abs())
+        }).collect();
+        if tr_vals.is_empty() { return 0.0; }
+        if tr_vals.len() < period { return tr_vals.iter().sum::<f64>() / tr_vals.len() as f64; }
+        let mut atr = tr_vals[..period].iter().sum::<f64>() / period as f64;
+        for j in period..tr_vals.len() { atr = (atr * (period - 1) as f64 + tr_vals[j]) / period as f64; }
+        atr
+    });
+
+    engine.register_fn("set_stop_loss_impl",   |_: f64| {});
+    engine.register_fn("set_take_profit_impl", |_: f64| {});
+    engine.register_fn("log_impl", |_msg: rhai::Dynamic| {});
+
+    let sb = state.clone();
+    engine.register_fn("buy_impl", move |_frac: f64| {
+        sb.lock().unwrap().pending_buy = true;
+    });
+    let ss = state.clone();
+    engine.register_fn("sell_impl", move |_frac: f64| {
+        ss.lock().unwrap().pending_sell = true;
+    });
+    let kv = Arc::new(Mutex::new(std::collections::HashMap::<String, f64>::new()));
+    let kv_set = kv.clone();
+    engine.register_fn("set_impl", move |key: String, val: f64| {
+        kv_set.lock().unwrap().insert(key, val);
+    });
+    let kv_get = kv.clone();
+    engine.register_fn("get_impl", move |key: String, def: f64| -> f64 {
+        kv_get.lock().unwrap().get(&key).copied().unwrap_or(def)
+    });
+
+    let ast = engine.compile(&patched_script)
+        .map_err(|e| anyhow::anyhow!("Script compile error (patched): {e}"))?;
+
+    let mut ctx_map = rhai::Map::new();
+    ctx_map.insert("close".into(),          rhai::Dynamic::from(dec.close));
+    ctx_map.insert("open".into(),            rhai::Dynamic::from(dec.open));
+    ctx_map.insert("high".into(),            rhai::Dynamic::from(dec.high));
+    ctx_map.insert("low".into(),             rhai::Dynamic::from(dec.low));
+    ctx_map.insert("volume".into(),          rhai::Dynamic::from(dec.volume));
+    ctx_map.insert("index".into(),           rhai::Dynamic::from(dec_idx as i64));
+    ctx_map.insert("position".into(),        rhai::Dynamic::from(0.0_f64));
+    ctx_map.insert("entry_price".into(),     rhai::Dynamic::from(0.0_f64));
+    ctx_map.insert("entry_index".into(),     rhai::Dynamic::from(0i64));
+    ctx_map.insert("balance".into(),         rhai::Dynamic::from(1000.0_f64));
+    ctx_map.insert("open_positions".into(),  rhai::Dynamic::from(0i64));
+    ctx_map.insert("window_open".into(),      rhai::Dynamic::from(window_open));
+    ctx_map.insert("window_minutes".into(),   rhai::Dynamic::from(window_minutes as i64));
+    ctx_map.insert("token_price".into(),      rhai::Dynamic::from(0.5_f64));
+    ctx_map.insert("threshold".into(),        rhai::Dynamic::from(0.0_f64));
+    ctx_map.insert("resolution_value".into(), rhai::Dynamic::from(dec.close));
+    ctx_map.insert("value".into(),            rhai::Dynamic::from(dec.close));
+
+    let mut scope = Scope::new();
+    engine.call_fn::<()>(&mut scope, &ast, "on_candle", (rhai::Dynamic::from_map(ctx_map),))
+        .map_err(|e| anyhow::anyhow!("Script runtime error: {e}"))?;
+
+    let s = state.lock().unwrap();
+    let signal = if s.pending_buy {
+        "yes".to_string()
+    } else if s.pending_sell {
+        "no".to_string()
+    } else {
+        "flat".to_string()
+    };
+
+    Ok(signal)
+}
 
 /// Run the Rhai polymarket binary strategy on a pre-built buffer of 1m candles.
 /// Called from the live strategy runner at each window boundary.

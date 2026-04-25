@@ -464,17 +464,17 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     let tools_registry: Arc<Vec<ToolSpec>> =
         Arc::new(tools_registry_raw.iter().map(|t| t.spec()).collect());
 
-    // Cost tracker (optional)
-    let cost_tracker = if config.cost.enabled {
-        match CostTracker::new(config.cost.clone(), &config.workspace_dir) {
-            Ok(ct) => Some(Arc::new(ct)),
-            Err(e) => {
-                tracing::warn!("Failed to initialize cost tracker: {e}");
-                None
-            }
+    // Cost tracker (always initialize for Dashboard metrics)
+    let cost_tracker = match CostTracker::new(config.cost.clone(), &config.workspace_dir) {
+        Ok(ct) => {
+            // If cost tracking was explicitly disabled, we still keep the tracker for metrics
+            // but we might want to bypass budget blocking in the provider layer.
+            Some(Arc::new(ct))
         }
-    } else {
-        None
+        Err(e) => {
+            tracing::warn!("Failed to initialize cost tracker: {e}");
+            None
+        }
     };
 
     // SSE broadcast channel for real-time events
@@ -695,6 +695,14 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route(
             "/api/polymarket/test",
             post(api::handle_api_polymarket_test),
+        )
+        .route(
+            "/api/polymarket/diagnose-auth",
+            post(api::handle_api_polymarket_diagnose_auth),
+        )
+        .route(
+            "/api/polymarket/refresh-credentials",
+            post(api::handle_api_polymarket_refresh_credentials),
         )
         .route(
             "/api/polymarket/positions",

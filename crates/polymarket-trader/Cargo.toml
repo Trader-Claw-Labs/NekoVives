@@ -20,6 +20,8 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 k256 = { version = "0.13", features = ["ecdsa"] }
 rand = "0.8"
 toml = "1.0"
+tracing = "0.1"
+polymarket-client-sdk = { version = "0.4", features = ["clob"] }
 
 [dev-dependencies]
 tempfile = "3"

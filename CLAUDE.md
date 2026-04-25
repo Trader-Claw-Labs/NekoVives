@@ -123,7 +123,7 @@ Key routes:
 - Exposed by: `GET /api/backtest/series`
 - Fields include: `id`, `label`, `slug_prefix`, `data_source`, `symbol`, `cadence`,
   `resolution_logic`, `threshold`, `unit`, `description`, `default_script`, `builtin`
-- Builtin crypto recurrent series: `btc_5m`, `btc_4m`, `btc_15m`, `btc_1h`, `eth_5m`, `eth_15m`
+- Builtin crypto recurrent series: `btc_5m`, `btc_15m`, `btc_1h`, `eth_5m`, `eth_15m`
 - Builtin weather series (Open-Meteo): `munich_temp_daily`, `london_temp_daily`, `nyc_temp_daily`
 
 ### Bundled default strategies (embedded in binary via `include_str!`)
@@ -186,6 +186,12 @@ Key routes:
 - `web/src/hooks/useBacktestState.ts`
 - `web/src/pages/StrategyBuilder.tsx`
 - `strategy/` (new workspace folder in progress)
+
+#### 
+Polymarket BTC UP DOWN 5 minutes strategy
+
+https://gist.github.com/Archetapp/7680adabc48f812a561ca79d73cbac69
+
 
 ### Notes
 - The gateway route map and UI continue evolving; prefer checking current source for the exact latest status.

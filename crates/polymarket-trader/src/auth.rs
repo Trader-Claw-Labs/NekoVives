@@ -17,6 +17,18 @@ pub struct PolyCredentials {
     pub api_key: String,
     pub secret: String,
     pub passphrase: String,
+    pub wallet_address: String,
+    /// Wallet private key (hex) for EIP-712 order signing.
+    /// NOT serialized when storing credentials to disk.
+    #[serde(skip)]
+    pub private_key: Option<String>,
+    /// Whether these are Builder Key credentials (use POLY_BUILDER_* headers).
+    #[serde(default)]
+    pub is_builder: bool,
+    /// Optional proxy wallet address (Polymarket proxy / Safe).
+    /// When set, orders use proxy signature_type=1 with this address as maker/signer.
+    #[serde(default)]
+    pub proxy_address: Option<String>,
 }
 
 // ── EIP-712 helpers ──────────────────────────────────────────────────────────
@@ -61,26 +73,52 @@ fn domain_separator() -> [u8; 32] {
     keccak256(&encoded)
 }
 
+/// Parse a checksummed Ethereum address into its 20 raw bytes.
+fn address_to_bytes20(addr: &str) -> Result<[u8; 20]> {
+    let clean = addr.strip_prefix("0x").unwrap_or(addr).to_lowercase();
+    let bytes = hex::decode(&clean).map_err(|e| PolyError::Auth(format!("invalid address hex: {e}")))?;
+    if bytes.len() != 20 {
+        return Err(PolyError::Auth(format!("address must be 20 bytes, got {}", bytes.len())).into());
+    }
+    let mut arr = [0u8; 20];
+    arr.copy_from_slice(&bytes);
+    Ok(arr)
+}
+
+/// Encode an address for EIP-712 (20 bytes left-padded to 32 bytes).
+fn encode_address(addr_bytes: &[u8; 20]) -> [u8; 32] {
+    let mut buf = [0u8; 32];
+    buf[12..].copy_from_slice(addr_bytes);
+    buf
+}
+
 /// Build the ClobAuth struct hash.
-/// Type: ClobAuth(string address,uint256 timestamp)
-fn clob_auth_struct_hash(address: &str, timestamp: u64) -> Result<[u8; 32]> {
-    let clob_type_hash = type_hash("ClobAuth(string address,uint256 timestamp)");
+///
+/// Type: ClobAuth(address address,string timestamp,uint256 nonce,string message)
+///
+/// Matches the official Polymarket SDK exactly.
+fn clob_auth_struct_hash(address: &str, timestamp: &str, nonce: u64) -> Result<[u8; 32]> {
+    let clob_type_hash = type_hash("ClobAuth(address address,string timestamp,uint256 nonce,string message)");
 
-    // EIP-712: dynamic types (string) are encoded as keccak256 of their content
-    let addr_bytes = address.as_bytes();
-    let addr_hash = keccak256(addr_bytes);
+    let addr_bytes = address_to_bytes20(address)?;
+    let addr_encoded = encode_address(&addr_bytes);
 
-    let mut encoded = Vec::with_capacity(32 * 3);
+    let timestamp_hash = keccak256(timestamp.as_bytes());
+    let message_hash = keccak256(b"This message attests that I control the given wallet");
+
+    let mut encoded = Vec::with_capacity(32 * 5);
     encoded.extend_from_slice(&abi_encode_bytes32(&clob_type_hash));
-    encoded.extend_from_slice(&abi_encode_bytes32(&addr_hash));
-    encoded.extend_from_slice(&abi_encode_uint256(timestamp));
+    encoded.extend_from_slice(&addr_encoded);
+    encoded.extend_from_slice(&abi_encode_bytes32(&timestamp_hash));
+    encoded.extend_from_slice(&abi_encode_uint256(nonce));
+    encoded.extend_from_slice(&abi_encode_bytes32(&message_hash));
     Ok(keccak256(&encoded))
 }
 
-/// Compute the final EIP-712 digest.
-pub fn eip712_digest(address: &str, timestamp: u64) -> Result<[u8; 32]> {
+/// Compute the final EIP-712 digest for L1 auth.
+pub fn eip712_digest(address: &str, timestamp: &str, nonce: u64) -> Result<[u8; 32]> {
     let ds = domain_separator();
-    let sh = clob_auth_struct_hash(address, timestamp)?;
+    let sh = clob_auth_struct_hash(address, timestamp, nonce)?;
 
     let mut msg = Vec::with_capacity(2 + 32 + 32);
     msg.push(0x19u8);
@@ -123,13 +161,6 @@ pub fn sign_eip712(signing_key: &SigningKey, digest: &[u8; 32]) -> Result<String
 
 // ── Network request helper ───────────────────────────────────────────────────
 
-#[derive(Serialize)]
-struct L1AuthBody<'a> {
-    address: &'a str,
-    signature: &'a str,
-    timestamp: &'a str,
-}
-
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ApiKeyResponse {
@@ -139,7 +170,9 @@ struct ApiKeyResponse {
 }
 
 /// Perform L1 EIP-712 auth to get API credentials from Polymarket CLOB API.
-/// POST https://clob.polymarket.com/auth/api-key
+///
+/// The CLOB expects L1 auth as **headers** (not JSON body):
+/// POLY_ADDRESS, POLY_SIGNATURE, POLY_TIMESTAMP, POLY_NONCE.
 pub async fn setup_credentials(private_key_hex: &str) -> Result<PolyCredentials> {
     // 1. Parse private key (never log it)
     let key_bytes = hex::decode(private_key_hex.strip_prefix("0x").unwrap_or(private_key_hex))
@@ -153,22 +186,20 @@ pub async fn setup_credentials(private_key_hex: &str) -> Result<PolyCredentials>
     // 3. Get current timestamp
     let timestamp = Utc::now().timestamp() as u64;
     let timestamp_str = timestamp.to_string();
+    let nonce: u64 = 0;
 
     // 4. Compute EIP-712 digest and sign
-    let digest = eip712_digest(&address, timestamp)?;
+    let digest = eip712_digest(&address, &timestamp_str, nonce)?;
     let signature = sign_eip712(&signing_key, &digest)?;
 
-    // 5. POST to CLOB API
+    // 5. POST to CLOB API with L1 auth headers
     let client = reqwest::Client::new();
-    let body = L1AuthBody {
-        address: &address,
-        signature: &signature,
-        timestamp: &timestamp_str,
-    };
-
     let resp = client
         .post("https://clob.polymarket.com/auth/api-key")
-        .json(&body)
+        .header("POLY_ADDRESS", &address)
+        .header("POLY_SIGNATURE", &signature)
+        .header("POLY_TIMESTAMP", &timestamp_str)
+        .header("POLY_NONCE", "0")
         .send()
         .await
         .map_err(PolyError::Http)?;
@@ -185,6 +216,10 @@ pub async fn setup_credentials(private_key_hex: &str) -> Result<PolyCredentials>
         api_key: api_resp.api_key,
         secret: api_resp.secret,
         passphrase: api_resp.passphrase,
+        wallet_address: address,
+        private_key: None,
+        is_builder: false,
+        proxy_address: None,
     })
 }
 
@@ -200,6 +235,7 @@ struct SecretsSection {
     api_key: String,
     secret: String,
     passphrase: String,
+    wallet_address: Option<String>,
 }
 
 /// Load credentials from a TOML config file with a `[secrets]` section.
@@ -211,6 +247,10 @@ pub fn load_credentials(config_path: &str) -> Result<PolyCredentials> {
         api_key: config.secrets.api_key,
         secret: config.secrets.secret,
         passphrase: config.secrets.passphrase,
+        wallet_address: config.secrets.wallet_address.unwrap_or_default(),
+        private_key: None,
+        is_builder: false,
+        proxy_address: None,
     })
 }
 
@@ -221,6 +261,7 @@ pub fn save_credentials(config_path: &str, creds: &PolyCredentials) -> Result<()
             api_key: creds.api_key.clone(),
             secret: creds.secret.clone(),
             passphrase: creds.passphrase.clone(),
+            wallet_address: Some(creds.wallet_address.clone()),
         },
     };
     let toml_str =
@@ -231,10 +272,119 @@ pub fn save_credentials(config_path: &str, creds: &PolyCredentials) -> Result<()
 
 // ── L2 HMAC-SHA256 headers ───────────────────────────────────────────────────
 
+/// Strategy for decoding the API secret before HMAC.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SecretDecodeStrategy {
+    /// Use the secret as raw UTF-8 bytes.
+    Raw,
+    /// Decode from base64 first.
+    Base64,
+    /// Decode from hex first.
+    Hex,
+}
+
+impl Default for SecretDecodeStrategy {
+    fn default() -> Self {
+        SecretDecodeStrategy::Base64
+    }
+}
+
+/// Decode secret according to the chosen strategy.
+///
+/// **Base64 secrets:** Polymarket Builder Keys may deliver secrets in base64url
+/// format (using `-` and `_` instead of `+` and `/`). We normalize those before decoding.
+fn decode_secret(secret: &str, strategy: SecretDecodeStrategy) -> Vec<u8> {
+    match strategy {
+        SecretDecodeStrategy::Raw => secret.as_bytes().to_vec(),
+        SecretDecodeStrategy::Base64 => {
+            // Normalize base64url → standard base64
+            let normalized = secret.replace('-', "+").replace('_', "/");
+            if let Ok(decoded) = BASE64.decode(&normalized) {
+                if decoded.len() >= 16 {
+                    return decoded;
+                }
+            }
+            secret.as_bytes().to_vec()
+        }
+        SecretDecodeStrategy::Hex => {
+            if let Ok(decoded) = hex::decode(secret.strip_prefix("0x").unwrap_or(secret)) {
+                if decoded.len() >= 16 {
+                    return decoded;
+                }
+            }
+            secret.as_bytes().to_vec()
+        }
+    }
+}
+
 /// Create L2 HMAC-SHA256 auth headers for a Polymarket CLOB API request.
 ///
-/// Returns a map with keys: POLY-API-KEY, POLY-SIGNATURE, POLY-TIMESTAMP, POLY-PASSPHRASE
+/// Returns a map with keys: POLY_API_KEY, POLY_SIGNATURE, POLY_TIMESTAMP,
+/// POLY_PASSPHRASE, POLY_ADDRESS.
+///
+/// **Important differences from the old buggy implementation:**
+/// - Header names use underscores (`POLY_API_KEY`) not hyphens (`POLY-API-KEY`)
+/// - The secret is **always** decoded from base64 (with base64url support)
+/// - The signature is base64 URL-safe (`+` → `-`, `/` → `_`)
+/// - `POLY_ADDRESS` is always included
 pub fn create_l2_headers(
+    creds: &PolyCredentials,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> HashMap<String, String> {
+    create_l2_headers_with_strategy(creds, method, path, body, SecretDecodeStrategy::default())
+}
+
+/// Same as `create_l2_headers` but lets you specify the secret decoding strategy.
+///
+/// **Default is Base64** because Polymarket Builder Key secrets are base64-encoded.
+pub fn create_l2_headers_with_strategy(
+    creds: &PolyCredentials,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+    strategy: SecretDecodeStrategy,
+) -> HashMap<String, String> {
+    let timestamp = Utc::now().timestamp().to_string();
+    let body_str = body.unwrap_or("");
+    let message = format!("{}{}{}{}", timestamp, method, path, body_str);
+
+    let secret_bytes = decode_secret(&creds.secret, strategy);
+    tracing::debug!(
+        "L2 HMAC message='{}' secret_strategy={:?} secret_len={}",
+        message,
+        strategy,
+        secret_bytes.len()
+    );
+
+    let mut mac =
+        HmacSha256::new_from_slice(&secret_bytes).expect("HMAC accepts any key length");
+    mac.update(message.as_bytes());
+    let result = mac.finalize().into_bytes();
+
+    // Polymarket uses URL-safe base64 for the signature: '+' → '-', '/' → '_'
+    let signature = BASE64.encode(result)
+        .replace('+', "-")
+        .replace('/', "_");
+
+    let mut headers = HashMap::new();
+    headers.insert("POLY_API_KEY".to_string(), creds.api_key.clone());
+    headers.insert("POLY_SIGNATURE".to_string(), signature);
+    headers.insert("POLY_TIMESTAMP".to_string(), timestamp);
+    headers.insert("POLY_PASSPHRASE".to_string(), creds.passphrase.clone());
+    headers.insert("POLY_ADDRESS".to_string(), creds.wallet_address.clone());
+    headers
+}
+
+/// Create Builder Key auth headers for a Polymarket CLOB API request.
+///
+/// Builder Keys use different header names than standard L2 credentials:
+/// POLY_BUILDER_API_KEY, POLY_BUILDER_SIGNATURE, POLY_BUILDER_TIMESTAMP,
+/// POLY_BUILDER_PASSPHRASE (no POLY_ADDRESS).
+///
+/// The secret is expected to be base64url-encoded.
+pub fn create_builder_headers(
     creds: &PolyCredentials,
     method: &str,
     path: &str,
@@ -244,17 +394,24 @@ pub fn create_l2_headers(
     let body_str = body.unwrap_or("");
     let message = format!("{}{}{}{}", timestamp, method, path, body_str);
 
-    let mut mac =
-        HmacSha256::new_from_slice(creds.secret.as_bytes()).expect("HMAC accepts any key length");
+    // Builder secrets are base64url — decode directly
+    let normalized = creds.secret.replace('-', "+").replace('_', "/");
+    let secret_bytes = BASE64.decode(&normalized).unwrap_or_else(|_| creds.secret.as_bytes().to_vec());
+
+    let mut mac = HmacSha256::new_from_slice(&secret_bytes).expect("HMAC accepts any key length");
     mac.update(message.as_bytes());
     let result = mac.finalize().into_bytes();
-    let signature = BASE64.encode(result);
+
+    // URL-safe base64
+    let signature = BASE64.encode(result)
+        .replace('+', "-")
+        .replace('/', "_");
 
     let mut headers = HashMap::new();
-    headers.insert("POLY-API-KEY".to_string(), creds.api_key.clone());
-    headers.insert("POLY-SIGNATURE".to_string(), signature);
-    headers.insert("POLY-TIMESTAMP".to_string(), timestamp);
-    headers.insert("POLY-PASSPHRASE".to_string(), creds.passphrase.clone());
+    headers.insert("POLY_BUILDER_API_KEY".to_string(), creds.api_key.clone());
+    headers.insert("POLY_BUILDER_SIGNATURE".to_string(), signature);
+    headers.insert("POLY_BUILDER_TIMESTAMP".to_string(), timestamp);
+    headers.insert("POLY_BUILDER_PASSPHRASE".to_string(), creds.passphrase.clone());
     headers
 }
 
@@ -270,6 +427,10 @@ mod tests {
             api_key: "test-api-key".to_string(),
             secret: "test-secret".to_string(),
             passphrase: "test-passphrase".to_string(),
+            wallet_address: "0x1234567890123456789012345678901234567890".to_string(),
+            private_key: None,
+            is_builder: false,
+            proxy_address: None,
         }
     }
 
@@ -278,15 +439,17 @@ mod tests {
         let creds = mock_creds();
         let headers = create_l2_headers(&creds, "GET", "/markets", None);
 
-        assert!(headers.contains_key("POLY-API-KEY"), "missing POLY-API-KEY");
-        assert!(headers.contains_key("POLY-SIGNATURE"), "missing POLY-SIGNATURE");
-        assert!(headers.contains_key("POLY-TIMESTAMP"), "missing POLY-TIMESTAMP");
-        assert!(headers.contains_key("POLY-PASSPHRASE"), "missing POLY-PASSPHRASE");
+        assert!(headers.contains_key("POLY_API_KEY"), "missing POLY_API_KEY");
+        assert!(headers.contains_key("POLY_SIGNATURE"), "missing POLY_SIGNATURE");
+        assert!(headers.contains_key("POLY_TIMESTAMP"), "missing POLY_TIMESTAMP");
+        assert!(headers.contains_key("POLY_PASSPHRASE"), "missing POLY_PASSPHRASE");
+        assert!(headers.contains_key("POLY_ADDRESS"), "missing POLY_ADDRESS");
 
-        assert_eq!(headers["POLY-API-KEY"], creds.api_key);
-        assert_eq!(headers["POLY-PASSPHRASE"], creds.passphrase);
+        assert_eq!(headers["POLY_API_KEY"], creds.api_key);
+        assert_eq!(headers["POLY_PASSPHRASE"], creds.passphrase);
+        assert_eq!(headers["POLY_ADDRESS"], creds.wallet_address);
         // Signature must be non-empty base64
-        assert!(!headers["POLY-SIGNATURE"].is_empty());
+        assert!(!headers["POLY_SIGNATURE"].is_empty());
     }
 
     #[test]
@@ -298,8 +461,8 @@ mod tests {
 
         // Signatures should differ because body is included in the HMAC message
         // (timestamps may differ by a second, so we just check structure)
-        assert!(headers_with.contains_key("POLY-SIGNATURE"));
-        assert!(headers_without.contains_key("POLY-SIGNATURE"));
+        assert!(headers_with.contains_key("POLY_SIGNATURE"));
+        assert!(headers_without.contains_key("POLY_SIGNATURE"));
     }
 
     #[test]
@@ -332,8 +495,8 @@ mod tests {
         assert!(address.starts_with("0x"), "address should start with 0x");
         assert_eq!(address.len(), 42, "address should be 42 chars");
 
-        let timestamp: u64 = 1_700_000_000;
-        let digest = eip712_digest(&address, timestamp).unwrap();
+        let timestamp = "1700000000";
+        let digest = eip712_digest(&address, timestamp, 0).unwrap();
         assert_eq!(digest.len(), 32);
 
         let sig = sign_eip712(&signing_key, &digest).unwrap();

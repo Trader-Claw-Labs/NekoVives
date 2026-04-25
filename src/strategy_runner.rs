@@ -39,6 +39,21 @@ pub struct RunnerConfig {
     /// Polymarket token_id for the active market slug (resolved at start).
     #[serde(skip)]
     pub poly_token_id: Option<String>,
+    /// Polymarket NO token_id for the active market slug (resolved at start).
+    #[serde(skip)]
+    pub poly_no_token_id: Option<String>,
+    /// Wallet address for live mode (read from config on creation).
+    #[serde(skip)]
+    pub wallet_address: Option<String>,
+    /// Chainlink Data Streams endpoint URL for live price feed (overrides Binance display price).
+    #[serde(default)]
+    pub chainlink_endpoint_url: Option<String>,
+    /// Chainlink API key for authenticated endpoints.
+    #[serde(skip)]
+    pub chainlink_api_key: Option<String>,
+    /// Chainlink polling interval in seconds.
+    #[serde(default = "default_chainlink_interval")]
+    pub chainlink_interval_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,6 +64,17 @@ pub struct RunnerStatus {
     pub last_tick_at: Option<String>,
     pub next_tick_at: Option<String>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiveOrder {
+    pub timestamp: String,
+    pub window_ts: i64,
+    pub side: String,
+    pub token_id: String,
+    pub amount_usdc: f64,
+    pub order_id: String,
+    pub status: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,6 +89,28 @@ pub struct RunnerResult {
     pub all_trades: Vec<crate::tools::backtest::AllTrade>,
     pub last_signal: String,
     pub analysis: String,
+    pub live_feed: Option<LiveFeedData>,
+    pub wallet_address: Option<String>,
+    pub wallet_balance_usdc: Option<f64>,
+    /// Live-mode orders placed via Polymarket CLOB (reset on runner start)
+    pub live_orders: Vec<LiveOrder>,
+    /// Live-mode win count (for calculating live win rate)
+    pub live_wins: u32,
+    /// Live-mode total trades count
+    pub live_total_trades: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiveFeedData {
+    pub current_btc_price: f64,
+    pub market_slug: String,
+    pub window_timestamp: i64,
+    pub window_seconds_left: i64,
+    pub price_to_beat: f64,
+    pub yes_token_price: f64,
+    pub no_token_price: f64,
+    /// Last 60 seconds of BTC price points for the mini chart
+    pub price_history: Vec<(i64, f64)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,6 +127,7 @@ pub struct StrategyRunnerStore {
 }
 
 fn default_auto_restart() -> bool { true }
+fn default_chainlink_interval() -> u64 { 5 }
 
 // ── Store impl ───────────────────────────────────────────────────────────────
 
@@ -169,10 +218,21 @@ impl StrategyRunnerStore {
         }
     }
 
-    pub fn set_poly_token_id(&self, id: &str, token_id: String) -> bool {
+    pub fn set_poly_token_ids(&self, id: &str, yes_token_id: String, no_token_id: String) -> bool {
         let mut map = self.runners.lock().unwrap();
         if let Some(r) = map.get_mut(id) {
-            r.config.poly_token_id = Some(token_id);
+            r.config.poly_token_id = Some(yes_token_id);
+            r.config.poly_no_token_id = Some(no_token_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn set_wallet_address(&self, id: &str, addr: String) -> bool {
+        let mut map = self.runners.lock().unwrap();
+        if let Some(r) = map.get_mut(id) {
+            r.config.wallet_address = Some(addr);
             true
         } else {
             false
@@ -297,19 +357,14 @@ async fn crypto_runner_loop(
 ) {
     let id = config.id.clone();
 
-    // ─ Resolve script ─────────────────────────────────────────────────────────
-    let script_path = {
-        let p = std::path::Path::new(&config.script);
-        if p.is_absolute() || p.exists() { p.to_path_buf() }
-        else { workspace_dir.join("scripts").join(&config.script) }
-    };
-    if !script_path.exists() {
-        set_runner_error(&store, &id, &format!("Script not found: {}", script_path.display()));
-        return;
-    }
-    let script_content = match std::fs::read_to_string(&script_path) {
-        Ok(s) => s,
-        Err(e) => { set_runner_error(&store, &id, &e.to_string()); return; }
+    // ─ Resolve script (read from disk or fall back to bundled default)
+    let script_content = match crate::tools::backtest::read_script_or_default(
+        &workspace_dir, &config.script) {
+        Some(s) => s,
+        None => {
+            set_runner_error(&store, &id, &format!("Script not found: {}", config.script));
+            return;
+        }
     };
 
     // ─ Warmup: fetch recent candles from Binance REST ──────────────────────────
@@ -342,7 +397,7 @@ async fn crypto_runner_loop(
         config.initial_balance,
         config.fee_pct,
     );
-    update_runner_result(&store, &id, &config, &initial_metrics);
+    update_runner_result(&store, &id, &config, &initial_metrics, None, None, None, None, None, None, None).await;
     set_runner_status(&store, &id, "running");
 
     // ─ Connect Binance WebSocket for real-time closed candles ──────────────────
@@ -384,7 +439,7 @@ async fn crypto_runner_loop(
                 r.status.next_tick_at = None; // event-driven; no fixed next tick
             }
         }
-        update_runner_result(&store, &id, &config, &metrics);
+        update_runner_result(&store, &id, &config, &metrics, None, None, None, None, None, None, None).await;
         store.persist();
     }
 
@@ -410,19 +465,13 @@ async fn polymarket_runner_loop(
     let window_secs = interval_to_secs(&config.interval).max(60);
     let window_minutes = (window_secs / 60).max(1) as usize;
 
-    // ─ Resolve script
-    let script_path = {
-        let p = std::path::Path::new(&config.script);
-        if p.is_absolute() || p.exists() { p.to_path_buf() }
-        else { workspace_dir.join("scripts").join(&config.script) }
-    };
-    if !script_path.exists() {
-        set_runner_error(&store, &id, &format!("Script not found: {}", script_path.display()));
-        return;
-    }
-    let script_content = match std::fs::read_to_string(&script_path) {
-        Ok(s) => s,
-        Err(e) => { set_runner_error(&store, &id, &e.to_string()); return; }
+    // ─ Resolve script (read from disk or fall back to bundled default)
+    let script_content = match crate::tools::backtest::read_script_or_default(&workspace_dir, &config.script) {
+        Some(s) => s,
+        None => {
+            set_runner_error(&store, &id, &format!("Script not found: {}", config.script));
+            return;
+        }
     };
 
     // ─ Live mode: validate credentials/token and build CLOB client
@@ -486,7 +535,7 @@ async fn polymarket_runner_loop(
 
     // Initial evaluation on warmup data
     let initial = eval_polymarket(&script_content, &buffer, window_minutes, &config);
-    update_runner_result(&store, &id, &config, &initial);
+    update_runner_result(&store, &id, &config, &initial, None, None, None, None, None, None, None).await;
     set_runner_status(&store, &id, "running");
 
     // ─ Connect 1m WebSocket (polymarket binary always uses 1m real-time feed)
@@ -496,8 +545,53 @@ async fn polymarket_runner_loop(
     );
     tracing::info!("[RUNNER {id}] Polymarket live feed started: {binance_sym}@1m (window={window_secs}s)");
 
-    let mut last_eval_window: i64 = -1;
-    let mut last_live_signal: String = "flat".to_string();
+    // ─ Optional Chainlink price feed (overrides displayed BTC price)
+    let chainlink_price: Option<crate::live_feed::ChainlinkPriceHandle> =
+        config.chainlink_endpoint_url.as_ref().map(|url| {
+            tracing::info!("[RUNNER {id}] Chainlink price feed enabled: {url}");
+            crate::live_feed::spawn_chainlink_price_feed(
+                url.clone(),
+                config.chainlink_api_key.clone(),
+                config.chainlink_interval_secs.max(1),
+            )
+        });
+
+    // ─ Binance 1s miniTicker — updates displayed price every second
+    let mut ticker_rx = crate::live_feed::spawn_binance_ticker_feed(binance_sym.clone());
+    let store_for_ticker = store.clone();
+    let id_for_ticker = id.clone();
+    tokio::spawn(async move {
+        while let Some(price) = ticker_rx.recv().await {
+            let mut map = store_for_ticker.runners.lock().unwrap();
+            if let Some(r) = map.get_mut(&id_for_ticker) {
+                if let Some(ref mut result) = r.result {
+                    if let Some(ref mut feed) = result.live_feed {
+                        feed.current_btc_price = price;
+                        // Also push to price_history for the mini chart (throttle to avoid overflow)
+                        let now_ms = chrono::Utc::now().timestamp_millis();
+                        if feed.price_history.len() >= 300 {
+                            feed.price_history.remove(0);
+                        }
+                        feed.price_history.push((now_ms, price));
+                    }
+                }
+            }
+        }
+    });
+
+    let mut last_window: i64 = -1;
+    let mut last_decision_window: i64 = -1;
+    let mut prev_live_position: Option<(i64, String)> = None; // (window_ts, signal)
+    let mut price_history: std::collections::VecDeque<(i64, f64)> = std::collections::VecDeque::with_capacity(60);
+    // Live-mode counters (reset on runner start)
+    let mut live_orders: Vec<LiveOrder> = Vec::new();
+    let mut live_wins: u32 = 0;
+    let mut live_total_trades: u32 = 0;
+
+    // Minute within the window to take the decision.
+    // For a 5m window: minute 0 starts at :00, decision at minute 4 (:04 candle close),
+    // resolution at minute 5 when the next window begins.
+    let decision_minute = (window_minutes as i64) - 1;
 
     while let Some(live) = candle_rx.recv().await {
         let candle = crate::tools::backtest::Candle {
@@ -509,35 +603,46 @@ async fn polymarket_runner_loop(
         buffer.push_back(candle.clone());
         if buffer.len() > MAX_BUFFER { buffer.pop_front(); }
 
-        // Window this candle belongs to
-        let candle_ts_secs = live.open_time_ms / 1000;
-        let current_window = candle_ts_secs - (candle_ts_secs % window_secs as i64);
+        // Track price history for live chart (keep last 60 points)
+        price_history.push_back((live.open_time_ms, live.close));
+        if price_history.len() > 60 { price_history.pop_front(); }
 
-        // Re-evaluate at each new window boundary (i.e., once per window period)
-        if current_window != last_eval_window {
-            last_eval_window = current_window;
-            let next_window = current_window + window_secs as i64;
+        // Window this candle belongs to.
+        // Use candle *close* time for window detection so the new window is
+        // recognised immediately when the last 1m candle of the previous window
+        // closes (eliminates the ~1min inherent delay).
+        let candle_close_ts_secs = (live.open_time_ms / 1000) + 60;
+        let current_window = candle_close_ts_secs - (candle_close_ts_secs % window_secs as i64);
+        let next_window = current_window + window_secs as i64;
+        let window_seconds_left = next_window - candle_close_ts_secs;
+        // Minute within the current window (0-based from close time).
+        // For a 5m window: minute 0..4 correspond to candles 0..4.
+        let minute_in_window = (candle_close_ts_secs % window_secs as i64) / 60;
+
+        // ── New window boundary: resolve previous window, prepare tokens ──
+        if current_window != last_window {
+            last_window = current_window;
             tracing::info!(
-                "[RUNNER {id}] New {}-min window @ {} UTC, evaluating strategy...",
+                "[RUNNER {id}] New {}-min window @ {} UTC",
                 window_minutes,
                 chrono::DateTime::from_timestamp(current_window, 0)
                     .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
                     .unwrap_or_default()
             );
 
-            // ─ Live mode: resolve the token_id for the current window
+            // Live mode: resolve tokens for the new window
             if is_live {
                 if let Some(ref series_id) = config.series_id {
                     match resolve_token_for_window(series_id, current_window as u64).await {
-                        Ok(new_token_id) => {
+                        Ok((yes_id, no_id)) => {
                             tracing::info!(
-                                "[RUNNER {id}] Resolved token_id for window {}: {}",
-                                current_window, new_token_id
+                                "[RUNNER {id}] Resolved tokens for window {}: YES={} NO={}",
+                                current_window, yes_id, no_id
                             );
-                            // Update the config with the new token
                             let mut map = store.runners.lock().unwrap();
                             if let Some(r) = map.get_mut(&id) {
-                                r.config.poly_token_id = Some(new_token_id);
+                                r.config.poly_token_id = Some(yes_id);
+                                r.config.poly_no_token_id = Some(no_id);
                             }
                         }
                         Err(e) => {
@@ -554,25 +659,29 @@ async fn polymarket_runner_loop(
                 }
             }
 
-            let metrics = eval_polymarket(&script_content, &buffer, window_minutes, &config);
-
-            // ─ Live mode: act on signal change
+            // Resolve previous window outcome
             if is_live {
-                let current_signal = metrics.all_trades.last()
-                    .map(|t| t.side.clone())
-                    .unwrap_or_else(|| "flat".to_string());
-
-                if current_signal != last_live_signal {
-                    if let Some(ref client) = clob_client {
-                        execute_live_polymarket_signal(
-                            &id,
-                            client,
-                            &current_signal,
-                            &config,
-                            &live,
-                            &store,
-                        ).await;
-                        last_live_signal = current_signal;
+                if let Some((prev_window, prev_signal)) = prev_live_position.take() {
+                    let res_logic = config.resolution_logic.as_deref().unwrap_or("price_up");
+                    if let Some(went_up) = resolve_window_outcome(
+                        &buffer, prev_window, window_secs as i64, res_logic, config.threshold,
+                    ) {
+                        let won = (prev_signal.starts_with("yes") && went_up)
+                            || (prev_signal.starts_with("no") && !went_up);
+                        live_total_trades += 1;
+                        if won { live_wins += 1; }
+                        let outcome = if went_up { "UP" } else { "DOWN" };
+                        let pos = if prev_signal.starts_with("yes") { "YES" } else { "NO" };
+                        let result = if won { "WIN" } else { "LOSS" };
+                        tracing::info!(
+                            "[RUNNER {id}] Window {} resolved {}. Position {} → {} (live win rate: {:.1}%)",
+                            prev_window, outcome, pos, result,
+                            if live_total_trades > 0 { live_wins as f64 / live_total_trades as f64 * 100.0 } else { 0.0 }
+                        );
+                        append_runner_log(
+                            &store, &id,
+                            &format!("Window {}: {} | Position {} → {}", prev_window, outcome, pos, result),
+                        );
                     }
                 }
             }
@@ -588,18 +697,140 @@ async fn polymarket_runner_loop(
                     r.status.next_tick_at = Some(next_ts);
                 }
             }
-            update_runner_result(&store, &id, &config, &metrics);
+            let wallet_balance = if is_live {
+                if let Some(ref client) = clob_client {
+                    fetch_usdc_balance_clob(client).await
+                } else { None }
+            } else { None };
+            let metrics = eval_polymarket(&script_content, &buffer, window_minutes, &config);
+            update_runner_result(
+                &store, &id, &config, &metrics, None,
+                config.wallet_address.clone(),
+                wallet_balance,
+                Some(live_orders.clone()),
+                Some(live_wins),
+                Some(live_total_trades),
+                None,
+            ).await;
             store.persist();
+        }
+
+        // ── Decision point: evaluate strategy and place order (once per window) ──
+        if is_live && minute_in_window == decision_minute && current_window != last_decision_window {
+            last_decision_window = current_window;
+            tracing::info!(
+                "[RUNNER {id}] Decision point for window {} (minute {}), evaluating strategy...",
+                current_window, decision_minute
+            );
+
+            // Live signal: run script on the CURRENT (incomplete) window's decision candle.
+            // This is NOT a backtest — it extracts buy/sell intent for the live market.
+            let current_signal = match crate::tools::backtest::run_polymarket_live_signal(
+                &script_content,
+                buffer.iter().cloned().collect(),
+                window_minutes,
+            ) {
+                Ok(sig) => {
+                    tracing::info!("[RUNNER {id}] Live signal for window {}: {}", current_window, sig);
+                    append_runner_log(&store, &id, &format!("Signal window {}: {}", current_window, sig));
+                    sig
+                }
+                Err(e) => {
+                    tracing::warn!("[RUNNER {id}] Live signal eval failed: {}", e);
+                    append_runner_log(&store, &id, &format!("Signal eval FAILED: {}", e));
+                    "flat".to_string()
+                }
+            };
+
+            if !current_signal.starts_with("flat") {
+                if let Some(ref client) = clob_client {
+                    if let Some(order) = execute_live_polymarket_signal(
+                        &id, client, &current_signal, &config, &live, &store, current_window,
+                    ).await {
+                        prev_live_position = Some((current_window, current_signal.clone()));
+                        live_orders.push(order);
+                    }
+                }
+            } else {
+                append_runner_log(&store, &id, "Signal: flat (no trade)");
+            }
+
+            // Metrics from backtest (historical) are still useful for display
+            let metrics = eval_polymarket(&script_content, &buffer, window_minutes, &config);
+            let wallet_balance = if let Some(ref client) = clob_client {
+                fetch_usdc_balance_clob(client).await
+            } else { None };
+            update_runner_result(
+                &store, &id, &config, &metrics, None,
+                config.wallet_address.clone(),
+                wallet_balance,
+                Some(live_orders.clone()),
+                Some(live_wins),
+                Some(live_total_trades),
+                Some(current_signal),
+            ).await;
+            store.persist();
+        }
+
+        // Update live feed on every 1m candle (not just window boundaries)
+        if is_live {
+            let mut live_feed = None;
+            if let Some(series_id) = &config.series_id {
+                if let Some(series) = crate::tools::series::builtin_series().into_iter().find(|s| s.id == *series_id) {
+                    let market_slug = format!("{}-{}", series.slug_prefix, current_window);
+
+                    let price_to_beat = buffer.iter()
+                        .filter(|c| c.open_time_ms >= current_window as i64 * 1000)
+                        .min_by_key(|c| c.open_time_ms)
+                        .map(|c| c.open)
+                        .unwrap_or(live.open);
+
+                    let (yes_token_price, no_token_price) =
+                        match (&config.poly_token_id, &config.poly_no_token_id) {
+                            (Some(yes), Some(no)) => fetch_token_prices(yes, no).await,
+                            _ => (0.0, 0.0),
+                        };
+
+                    // Use Chainlink price if available, otherwise Binance candle close
+                    let current_btc_price = if let Some(ref cl) = chainlink_price {
+                        let cl_price = *cl.read().await;
+                        if let Some(p) = cl_price {
+                            tracing::debug!("[RUNNER {id}] Using Chainlink price: {p}");
+                            p
+                        } else {
+                            live.close
+                        }
+                    } else {
+                        live.close
+                    };
+
+                    live_feed = Some(LiveFeedData {
+                        current_btc_price,
+                        market_slug,
+                        window_timestamp: current_window,
+                        window_seconds_left,
+                        price_to_beat,
+                        yes_token_price,
+                        no_token_price,
+                        price_history: price_history.iter().cloned().collect(),
+                    });
+                }
+            }
+
+            // Update live_feed in result without re-running metrics
+            let mut map = store.runners.lock().unwrap();
+            if let Some(r) = map.get_mut(&id) {
+                if let Some(ref mut result) = r.result {
+                    result.live_feed = live_feed;
+                }
+            }
         }
     }
     tracing::info!("[RUNNER {id}] Polymarket feed closed, exiting");
 }
 
-/// Execute a real Polymarket CLOB order based on the strategy signal.
-/// - "buy"  → place a BUY (YES) market order for the configured position size.
-/// - "sell" → place a SELL (NO) market order.
-/// - "flat" / other → no action.
-async fn resolve_token_for_window(series_id: &str, window_ts: u64) -> anyhow::Result<String> {
+/// Resolve both YES and NO token IDs for the current window slug.
+async fn resolve_token_for_window(series_id: &str, window_ts: u64) -> anyhow::Result<(String, String)> {
     let series = crate::tools::series::builtin_series()
         .into_iter()
         .find(|s| s.id == series_id)
@@ -616,49 +847,58 @@ async fn resolve_token_for_window(series_id: &str, window_ts: u64) -> anyhow::Re
         ))?;
 
     if market.yes_token_id.trim().is_empty() {
-        anyhow::bail!("The selected market has no tradable token yet for slug {}.", target_slug);
+        anyhow::bail!("The selected market has no YES token yet for slug {}.", target_slug);
+    }
+    if market.no_token_id.trim().is_empty() {
+        anyhow::bail!("The selected market has no NO token yet for slug {}.", target_slug);
     }
 
-    Ok(market.yes_token_id)
+    Ok((market.yes_token_id, market.no_token_id))
 }
 
+/// Returns the LiveOrder if successfully placed.
 async fn execute_live_polymarket_signal(
     id: &str,
     client: &polymarket_trader::orders::ClobClient,
     signal: &str,
     config: &RunnerConfig,
-    live: &crate::live_feed::LiveCandle,
+    _live: &crate::live_feed::LiveCandle,
     store: &Arc<StrategyRunnerStore>,
-) {
+    window_ts: i64,
+) -> Option<LiveOrder> {
     use polymarket_trader::orders::Side;
 
-    let side = match signal {
-        "buy"  => Side::Buy,
-        "sell" => Side::Sell,
-        _ => {
-            tracing::debug!("[RUNNER {id}] Signal '{signal}' — no order placed");
-            return;
+    // In binary markets YES/NO are complementary tokens.
+    // "yes" → buy YES token  |  "no" → buy NO token
+    let (token_id, side) = if signal.starts_with("yes") {
+        match &config.poly_token_id {
+            Some(tid) if !tid.is_empty() => (tid.clone(), Side::Buy),
+            _ => {
+                tracing::warn!("[RUNNER {id}] Live mode: no YES token_id configured, skipping order");
+                append_runner_log(store, id, "No Polymarket YES token_id configured.");
+                return None;
+            }
         }
-    };
-
-    // Resolve token_id from config or a sensible default
-    let token_id = match &config.poly_token_id {
-        Some(tid) if !tid.is_empty() => tid.clone(),
-        _ => {
-            // Cannot place order without token_id; log and skip
-            tracing::warn!("[RUNNER {id}] Live mode: no token_id configured, skipping order");
-            append_runner_log(
-                store, id,
-                "No Polymarket token_id configured. Set the market token ID to enable live orders.",
-            );
-            return;
+    } else if signal.starts_with("no") {
+        match &config.poly_no_token_id {
+            Some(tid) if !tid.is_empty() => (tid.clone(), Side::Buy),
+            _ => {
+                tracing::warn!("[RUNNER {id}] Live mode: no NO token_id configured, skipping order");
+                append_runner_log(store, id, "No Polymarket NO token_id configured.");
+                return None;
+            }
         }
+    } else {
+        tracing::debug!("[RUNNER {id}] Signal '{signal}' — no order placed");
+        return None;
     };
 
     // Use a fixed position size: $10 USDC per trade (safe default)
-    // In future this could come from a config field (e.g. max_position_usd)
     let amount_usdc = 10.0_f64;
-    let worst_price = live.close; // use current close as price reference
+    // Market order: let the SDK calculate the real share price from the
+    // orderbook.  Polymarket share prices are 0–1 (probabilities), not raw
+    // crypto prices like $78k BTC, so live.close is not a valid worst_price.
+    let worst_price = 0.0_f64;
 
     tracing::info!(
         "[RUNNER {id}] Live order: {:?} {} USDC on token {} @ ~{:.4}",
@@ -673,16 +913,83 @@ async fn execute_live_polymarket_signal(
             );
             append_runner_log(
                 store, id,
-                &format!("Live order placed: {:?} ${amount_usdc} — order_id={}", side, resp.order_id),
+                &format!("Order placed: {} {} USDC (id={})", signal, amount_usdc, resp.order_id),
             );
+            Some(LiveOrder {
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                window_ts,
+                side: signal.to_string(),
+                token_id,
+                amount_usdc,
+                order_id: resp.order_id,
+                status: resp.status,
+            })
         }
         Err(e) => {
-            let msg = format!("Live order failed: {e}");
-            tracing::error!("[RUNNER {id}] {msg}");
+            let msg = e.to_string();
+            tracing::error!("[RUNNER {id}] Order failed: {msg}");
             append_runner_log(store, id, &format!("Order error: {msg}"));
             // Don't abort the runner on a single failed order; just log it
+            None
         }
     }
+}
+
+/// Fetch Yes/No token prices from Polymarket CLOB API.
+/// Returns (yes_price, no_price) or (0.0, 0.0) on error.
+async fn fetch_token_prices(yes_token_id: &str, no_token_id: &str) -> (f64, f64) {
+    let client = reqwest::Client::new();
+
+    let yes_url = format!("https://clob.polymarket.com/price?token_id={}&side=buy", yes_token_id);
+    let yes_price = match client.get(&yes_url).timeout(std::time::Duration::from_secs(5)).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            resp.json::<serde_json::Value>().await
+                .ok()
+                .and_then(|v| v.get("price").and_then(|p| p.as_str()).map(|s| s.to_string()))
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(0.0)
+        }
+        _ => 0.0,
+    };
+
+    let no_url = format!("https://clob.polymarket.com/price?token_id={}&side=buy", no_token_id);
+    let no_price = match client.get(&no_url).timeout(std::time::Duration::from_secs(5)).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            resp.json::<serde_json::Value>().await
+                .ok()
+                .and_then(|v| v.get("price").and_then(|p| p.as_str()).map(|s| s.to_string()))
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(0.0)
+        }
+        _ => 0.0,
+    };
+
+    (yes_price, no_price)
+}
+
+/// Determine the outcome of a completed window from the candle buffer.
+/// Returns Some(true) for YES/UP, Some(false) for NO/DOWN, or None if
+/// insufficient data.
+fn resolve_window_outcome(
+    buffer: &std::collections::VecDeque<crate::tools::backtest::Candle>,
+    window_start: i64,
+    window_secs: i64,
+    resolution_logic: &str,
+    threshold: Option<f64>,
+) -> Option<bool> {
+    let window_start_ms = window_start * 1000;
+    let window_end_ms = (window_start + window_secs) * 1000;
+
+    let first = buffer.iter().find(|c| c.open_time_ms >= window_start_ms)?;
+    let last = buffer.iter().rev().find(|c| c.open_time_ms < window_end_ms)?;
+
+    let went_up = match resolution_logic {
+        "threshold_above" => last.close > threshold.unwrap_or(f64::MAX),
+        "threshold_below" => last.close < threshold.unwrap_or(f64::MIN),
+        _ => last.close > first.open,
+    };
+
+    Some(went_up)
 }
 
 fn append_runner_log(store: &Arc<StrategyRunnerStore>, id: &str, msg: &str) {
@@ -747,15 +1054,63 @@ fn set_runner_status(store: &Arc<StrategyRunnerStore>, id: &str, status: &str) {
     store.persist();
 }
 
-fn update_runner_result(
+/// Fetch USDC trading balance from Polymarket CLOB API.
+async fn fetch_usdc_balance_clob(client: &polymarket_trader::orders::ClobClient) -> Option<f64> {
+    // Prefer CLOB API balance (always works as long as L2 auth is valid).
+    // Fall back to Polygon RPC only if the API call fails.
+    match client.get_api_balance().await {
+        Ok(api_bal) => {
+            tracing::info!("Polymarket CLOB API balance: ${:.2}", api_bal);
+            return Some(api_bal);
+        }
+        Err(e) => {
+            tracing::warn!("Failed to fetch Polymarket CLOB API balance: {e}");
+        }
+    }
+
+    match client.get_balance().await {
+        Ok(bal) => {
+            tracing::info!("Polymarket CLOB RPC balance: ${:.2}", bal);
+            Some(bal)
+        }
+        Err(e) => {
+            tracing::warn!("Failed to fetch Polymarket CLOB RPC balance: {e}");
+            None
+        }
+    }
+}
+
+async fn update_runner_result(
     store: &Arc<StrategyRunnerStore>,
     id: &str,
     config: &RunnerConfig,
     metrics: &crate::tools::backtest::BacktestMetrics,
+    live_feed: Option<LiveFeedData>,
+    wallet_address: Option<String>,
+    wallet_balance: Option<f64>,
+    live_orders: Option<Vec<LiveOrder>>,
+    live_wins: Option<u32>,
+    live_total_trades: Option<u32>,
+    override_last_signal: Option<String>,
 ) {
-    let last_signal = metrics.all_trades.last()
-        .map(|t| t.side.clone())
+    let last_signal = override_last_signal
+        .or_else(|| metrics.all_trades.last().map(|t| t.side.clone()))
         .unwrap_or_else(|| "flat".to_string());
+
+    // Preserve existing live counters/orders if not explicitly provided
+    let (orders, wins, total) = {
+        let map = store.runners.lock().unwrap();
+        if let Some(ref existing) = map.get(id).and_then(|r| r.result.as_ref()) {
+            (
+                live_orders.unwrap_or_else(|| existing.live_orders.clone()),
+                live_wins.unwrap_or(existing.live_wins),
+                live_total_trades.unwrap_or(existing.live_total_trades),
+            )
+        } else {
+            (live_orders.unwrap_or_default(), live_wins.unwrap_or(0), live_total_trades.unwrap_or(0))
+        }
+    };
+
     let result = RunnerResult {
         total_return_pct: metrics.total_return_pct,
         balance: config.initial_balance * (1.0 + metrics.total_return_pct / 100.0),
@@ -767,6 +1122,12 @@ fn update_runner_result(
         all_trades: metrics.all_trades.clone(),
         last_signal,
         analysis: metrics.analysis.clone(),
+        live_feed,
+        wallet_address,
+        wallet_balance_usdc: wallet_balance,
+        live_orders: orders,
+        live_wins: wins,
+        live_total_trades: total,
     };
     let mut map = store.runners.lock().unwrap();
     if let Some(r) = map.get_mut(id) {
