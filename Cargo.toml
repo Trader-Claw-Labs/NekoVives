@@ -89,7 +89,7 @@ hex = "0.4"
 rand = "0.10"
 
 # ZIP archive support (export/import)
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "8", default-features = false, features = ["deflate"] }
 
 # Fast mutexes that don't poison on panic
 parking_lot = "0.12"
