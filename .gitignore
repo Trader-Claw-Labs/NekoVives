@@ -19,11 +19,7 @@ target/
 **/*.log
 
 .DS_Store
-.claude/settings.local.json
-/.claude
-.remember/tmp/save-session.pid
+.claude/
 /web/dist
-.remember/tmp/save-session.pid
-.claude/settings.local.json
-
-.claude
+.remember
+.firecrawl 
