@@ -16,9 +16,11 @@
 //! [`all_tools_with_runtime`]. See `AGENTS.md` §7.3 for the full change playbook.
 
 pub mod backtest;
+pub mod script_migrator;
 pub mod series;
 pub mod browser;
 pub mod market_scan;
+pub mod polymarket_balance;
 pub mod polymarket_scan;
 pub mod shell_exec;
 pub mod trade_swap;
@@ -60,6 +62,7 @@ pub mod web_search_tool;
 pub use backtest::{BacktestListScriptsTool, BacktestRunTool};
 pub use browser::{BrowserTool, ComputerUseConfig};
 pub use market_scan::MarketScanTool;
+pub use polymarket_balance::PolymarketBalanceTool;
 pub use polymarket_scan::PolymarketScanTool;
 pub use shell_exec::ShellExecTool;
 pub use trade_swap::TradeSwapTool;
@@ -240,6 +243,7 @@ pub fn all_tools_with_runtime(
         Arc::new(BacktestRunTool::new(workspace_dir.to_path_buf())),
         Arc::new(MarketScanTool),
         Arc::new(PolymarketScanTool),
+        Arc::new(PolymarketBalanceTool { config: config.clone() }),
         Arc::new(ShellExecTool::new(security.clone(), workspace_dir.to_path_buf())),
         Arc::new(WalletBalanceTool::with_chains_rpc(
             root_config.config_path.clone(),

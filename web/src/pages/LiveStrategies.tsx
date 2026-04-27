@@ -25,6 +25,10 @@ interface RunnerConfig {
   series_id?: string
   resolution_logic?: string
   threshold?: number | null
+  live_sizing_mode?: 'fixed' | 'percent'
+  live_sizing_value?: number
+  stop_loss_pct?: number | null
+  early_fire_secs?: number | null
 }
 
 interface RunnerStatus {
@@ -77,6 +81,10 @@ interface LiveOrder {
   amount_usdc: number
   order_id: string
   status: string
+  entry_price?: number
+  result?: string
+  pnl?: number
+  stop_loss_triggered?: boolean
 }
 
 interface RunnerResult {
@@ -125,6 +133,41 @@ function fmtPct(v: number | null | undefined) {
 function fmtUSD(v: number | null | undefined): string {
   const safe = v ?? 0
   return safe.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+}
+
+/** Compute absolute P&L in USD for a runner. */
+function runnerPnlUSD(r: StoredRunner): number {
+  if (r.config.mode === 'live' && r.result?.live_orders) {
+    return r.result.live_orders.reduce((s, o) => s + (o.pnl ?? 0), 0)
+  }
+  if (r.result?.total_return_pct != null && r.config.initial_balance != null) {
+    return (r.result.total_return_pct / 100) * r.config.initial_balance
+  }
+  return 0
+}
+
+/** Persistent total P&L that survives strategy deletion. */
+function usePersistentTotalPnL(runners: StoredRunner[]) {
+  const [persisted, setPersisted] = useState(() => {
+    try {
+      return Number(localStorage.getItem('live-strategies-total-pnl') || '0')
+    } catch {
+      return 0
+    }
+  })
+
+  useEffect(() => {
+    const current = runners.reduce((s, r) => s + runnerPnlUSD(r), 0)
+    setPersisted(prev => {
+      const next = Math.max(prev, current)
+      try {
+        localStorage.setItem('live-strategies-total-pnl', String(next))
+      } catch {}
+      return next
+    })
+  }, [runners])
+
+  return persisted
 }
 
 // ── Live Equity Chart ────────────────────────────────────────────────
@@ -435,6 +478,10 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript }: Crea
     series_id: 'btc_5m',
     resolution_logic: 'price_up',
     threshold: null as number | null,
+    live_sizing_mode: 'percent' as 'fixed' | 'percent',
+    live_sizing_value: 5,
+    stop_loss_pct: null as number | null,
+    early_fire_secs: null as number | null,
   })
   const [error, setError] = useState('')
   const [showMissingApiKeyModal, setShowMissingApiKeyModal] = useState(false)
@@ -653,6 +700,107 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript }: Crea
                 <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>Warmup Days</label>
                 <input type="number" className="w-full rounded px-3 py-2 text-sm" value={form.warmup_days}
                   onChange={e => set('warmup_days', Number(e.target.value))} />
+              </div>
+            </div>
+          )}
+
+          {/* Live sizing config */}
+          {form.mode === 'live' && (
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>Sizing Mode</label>
+                <select
+                  className="w-full rounded px-3 py-2 text-sm"
+                  value={form.live_sizing_mode}
+                  onChange={e => set('live_sizing_mode', e.target.value as 'fixed' | 'percent')}
+                >
+                  <option value="percent">% of Balance</option>
+                  <option value="fixed">Fixed USD</option>
+                </select>
+              </div>
+              <div>
+                <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>
+                  {form.live_sizing_mode === 'fixed' ? 'Amount (USD)' : 'Max % of Balance'}
+                </label>
+                <input
+                  type="number"
+                  step={form.live_sizing_mode === 'fixed' ? 1 : 0.1}
+                  min={form.live_sizing_mode === 'fixed' ? 5 : 0.1}
+                  max={form.live_sizing_mode === 'fixed' ? undefined : 100}
+                  className="w-full rounded px-3 py-2 text-sm"
+                  value={form.live_sizing_value}
+                  onChange={e => set('live_sizing_value', Number(e.target.value))}
+                />
+                <p className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
+                  {form.live_sizing_mode === 'fixed'
+                    ? 'Fixed USDC amount per order (min $5)'
+                    : 'Script fraction is capped at this %'}
+                </p>
+              </div>
+
+              {/* Stop-loss */}
+              <div>
+                <label className="block text-xs font-medium mb-1" style={{ color: 'var(--color-text-muted)' }}>
+                  Stop-Loss (% drop from entry)
+                </label>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="number"
+                    className="flex-1 px-2 py-1.5 rounded text-xs"
+                    style={{ background: 'var(--color-surface-2)', border: '1px solid var(--color-border)', color: 'var(--color-text)' }}
+                    placeholder="e.g. 40 → exit if price drops 40%"
+                    step={5}
+                    min={5}
+                    max={90}
+                    value={form.stop_loss_pct != null ? form.stop_loss_pct * 100 : ''}
+                    onChange={e => set('stop_loss_pct', e.target.value === '' ? null : Number(e.target.value) / 100)}
+                  />
+                  <button
+                    type="button"
+                    className="text-[10px] px-2 py-1 rounded"
+                    style={{ background: form.stop_loss_pct == null ? 'var(--color-surface-3)' : 'rgba(239,68,68,0.15)', color: form.stop_loss_pct == null ? 'var(--color-text-muted)' : 'var(--color-danger)' }}
+                    onClick={() => set('stop_loss_pct', form.stop_loss_pct == null ? 0.40 : null)}
+                  >
+                    {form.stop_loss_pct == null ? 'Enable' : 'Disable'}
+                  </button>
+                </div>
+                <p className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
+                  {form.stop_loss_pct != null
+                    ? `Exit early if token drops ${(form.stop_loss_pct * 100).toFixed(0)}% from entry — limits max loss per trade`
+                    : 'Disabled — position held until market resolves'}
+                </p>
+              </div>
+
+              {/* Early fire */}
+              <div>
+                <label className="block text-[11px] font-medium mb-1" style={{ color: 'var(--color-text-muted)' }}>
+                  Early Fire (seconds before candle close)
+                </label>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="number"
+                    className="w-20 rounded border px-2 py-1 text-xs"
+                    style={{ background: 'var(--color-surface-2)', borderColor: 'var(--color-border)', color: 'var(--color-text)' }}
+                    placeholder="0"
+                    min={0}
+                    max={55}
+                    value={form.early_fire_secs != null ? form.early_fire_secs : ''}
+                    onChange={e => set('early_fire_secs', e.target.value === '' ? null : Number(e.target.value))}
+                  />
+                  <button
+                    type="button"
+                    className="text-[10px] px-2 py-1 rounded"
+                    style={{ background: form.early_fire_secs == null ? 'var(--color-surface-3)' : 'rgba(99,102,241,0.15)', color: form.early_fire_secs == null ? 'var(--color-text-muted)' : '#818cf8' }}
+                    onClick={() => set('early_fire_secs', form.early_fire_secs == null ? 10 : null)}
+                  >
+                    {form.early_fire_secs == null ? 'Enable' : 'Disable'}
+                  </button>
+                </div>
+                <p className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
+                  {form.early_fire_secs != null && form.early_fire_secs > 0
+                    ? `Order placed ${form.early_fire_secs}s before candle close — avoids bot-crowding at minute boundary`
+                    : 'Disabled — order placed at candle close'}
+                </p>
               </div>
             </div>
           )}
@@ -977,6 +1125,7 @@ interface RunnerCardProps {
 
 function RunnerCard({ runner, onStop, onRestart, onDelete }: RunnerCardProps) {
   const [expanded, setExpanded] = useState(true)
+  const [showLog, setShowLog] = useState(false)
   const [showLowBalanceModal, setShowLowBalanceModal] = useState(false)
   const [lowBalanceShownOnce, setLowBalanceShownOnce] = useState(() => {
     try {
@@ -1072,6 +1221,8 @@ function RunnerCard({ runner, onStop, onRestart, onDelete }: RunnerCardProps) {
           </button>
         </div>
       </div>
+      {expanded && (
+        <>
 
       {/* P&L summary — paper mode only */}
       {result && config.mode === 'paper' && (
@@ -1100,7 +1251,7 @@ function RunnerCard({ runner, onStop, onRestart, onDelete }: RunnerCardProps) {
 
       {/* Live mode summary — live trades + signal */}
       {config.mode === 'live' && (
-        <div className="grid grid-cols-4 gap-2 px-4 pb-3 text-xs">
+        <div className="grid grid-cols-5 gap-2 px-4 pb-3 text-xs">
           <div>
             <div style={{ color: 'var(--color-text-muted)' }}>Last Signal</div>
             <div className="font-semibold"
@@ -1119,6 +1270,18 @@ function RunnerCard({ runner, onStop, onRestart, onDelete }: RunnerCardProps) {
                 const total = result?.live_total_trades ?? 0
                 const wins = result?.live_wins ?? 0
                 return total > 0 ? `${((wins / total) * 100).toFixed(1)}%` : '—'
+              })()}
+            </div>
+          </div>
+          <div>
+            <div style={{ color: 'var(--color-text-muted)' }}>P&L</div>
+            <div className="font-semibold" style={{
+              color: (result?.live_orders?.reduce((s, o) => s + (o.pnl ?? 0), 0) ?? 0) >= 0
+                ? 'var(--color-accent)' : 'var(--color-danger)'
+            }}>
+              {(() => {
+                const pnl = result?.live_orders?.reduce((s, o) => s + (o.pnl ?? 0), 0) ?? 0
+                return `${pnl >= 0 ? '+' : ''}$${fmtUSD(pnl)}`
               })()}
             </div>
           </div>
@@ -1148,9 +1311,23 @@ function RunnerCard({ runner, onStop, onRestart, onDelete }: RunnerCardProps) {
 
       {/* Live order/activity log */}
       {config.mode === 'live' && status.error && (
-        <div className="mx-4 mb-3 px-3 py-2 rounded text-xs whitespace-pre-line"
-          style={{ backgroundColor: 'var(--color-base)', color: 'var(--color-text-muted)', border: '1px solid var(--color-border)' }}>
-          {status.error}
+        <div className="mx-4 mb-3 rounded border overflow-hidden" style={{ borderColor: 'var(--color-border)' }}>
+          <div className="px-3 py-1.5 text-xs font-semibold flex items-center justify-between"
+            style={{ backgroundColor: 'var(--color-base)', borderBottom: showLog ? '1px solid var(--color-border)' : 'none' }}>
+            <span className="flex items-center gap-1.5">
+              <Activity size={12} style={{ color: 'var(--color-text-muted)' }} />
+              Activity Log
+            </span>
+            <button onClick={() => setShowLog(l => !l)} className="text-[10px] hover:underline" style={{ color: 'var(--color-text-muted)' }}>
+              {showLog ? 'Hide' : 'Show'}
+            </button>
+          </div>
+          {showLog && (
+            <div className="px-3 py-2 text-xs whitespace-pre-wrap"
+              style={{ backgroundColor: 'var(--color-base)', color: 'var(--color-text-muted)', maxHeight: 200, overflowY: 'auto' }}>
+              {status.error}
+            </div>
+          )}
         </div>
       )}
 
@@ -1172,11 +1349,14 @@ function RunnerCard({ runner, onStop, onRestart, onDelete }: RunnerCardProps) {
                 <th className="px-3 py-1.5 text-left font-medium" style={{ color: 'var(--color-text-muted)' }}>Time</th>
                 <th className="px-3 py-1.5 text-left font-medium" style={{ color: 'var(--color-text-muted)' }}>Side</th>
                 <th className="px-3 py-1.5 text-right font-medium" style={{ color: 'var(--color-text-muted)' }}>Amount</th>
+                <th className="px-3 py-1.5 text-right font-medium" style={{ color: 'var(--color-text-muted)' }}>Entry Price</th>
                 <th className="px-3 py-1.5 text-left font-medium" style={{ color: 'var(--color-text-muted)' }}>Status</th>
+                <th className="px-3 py-1.5 text-left font-medium" style={{ color: 'var(--color-text-muted)' }}>Result</th>
+                <th className="px-3 py-1.5 text-right font-medium" style={{ color: 'var(--color-text-muted)' }}>P&amp;L</th>
               </tr>
             </thead>
             <tbody>
-              {[...result.live_orders].reverse().slice(0, 10).map((order, i) => (
+              {[...result.live_orders].reverse().map((order, i) => (
                 <tr key={i} className="border-t" style={{ borderColor: 'var(--color-border)' }}>
                   <td className="px-3 py-1.5 font-mono" style={{ color: 'var(--color-text-muted)' }}>
                     {fmt(order.timestamp)}
@@ -1193,6 +1373,9 @@ function RunnerCard({ runner, onStop, onRestart, onDelete }: RunnerCardProps) {
                   <td className="px-3 py-1.5 text-right font-mono">
                     ${order.amount_usdc.toFixed(2)}
                   </td>
+                  <td className="px-3 py-1.5 text-right font-mono">
+                    {order.entry_price != null ? `$${order.entry_price.toFixed(4)}` : '—'}
+                  </td>
                   <td className="px-3 py-1.5">
                     <span className="text-[10px] px-1.5 py-0.5 rounded" style={{
                       backgroundColor: order.status === 'matched' || order.status === 'filled'
@@ -1205,15 +1388,37 @@ function RunnerCard({ runner, onStop, onRestart, onDelete }: RunnerCardProps) {
                       {order.status}
                     </span>
                   </td>
+                  <td className="px-3 py-1.5">
+                    {order.result ? (
+                      <span className="text-[10px] px-1.5 py-0.5 rounded font-semibold" style={{
+                        backgroundColor:
+                          order.result === 'WIN'  ? 'rgba(74,222,128,0.15)' :
+                          order.result === 'STOP' ? 'rgba(251,191,36,0.15)' :
+                                                    'rgba(239,68,68,0.15)',
+                        color:
+                          order.result === 'WIN'  ? 'var(--color-accent)' :
+                          order.result === 'STOP' ? '#fbbf24' :
+                                                    'var(--color-danger)',
+                      }}>
+                        {order.result === 'STOP' ? '⏹ STOP' : order.result}
+                      </span>
+                    ) : (
+                      <span style={{ color: 'var(--color-text-muted)' }}>—</span>
+                    )}
+                  </td>
+                  <td className="px-3 py-1.5 text-right font-mono">
+                    {order.pnl != null ? (
+                      <span style={{ color: order.pnl >= 0 ? 'var(--color-accent)' : 'var(--color-danger)' }}>
+                        {order.pnl >= 0 ? '+' : ''}{order.pnl.toFixed(2)}
+                      </span>
+                    ) : (
+                      <span style={{ color: 'var(--color-text-muted)' }}>—</span>
+                    )}
+                  </td>
                 </tr>
               ))}
             </tbody>
           </table>
-          {result.live_orders.length > 10 && (
-            <div className="px-3 py-1 text-[10px] text-center" style={{ color: 'var(--color-text-muted)', backgroundColor: 'var(--color-base)' }}>
-              +{result.live_orders.length - 10} older orders
-            </div>
-          )}
         </div>
       )}
 
@@ -1244,7 +1449,6 @@ function RunnerCard({ runner, onStop, onRestart, onDelete }: RunnerCardProps) {
       )}
 
       {/* Expanded details */}
-      {expanded && (
         <div
           className="border-t px-4 py-3 space-y-3 text-xs"
           style={{ borderColor: 'var(--color-border)' }}
@@ -1308,7 +1512,7 @@ function RunnerCard({ runner, onStop, onRestart, onDelete }: RunnerCardProps) {
             </p>
           )}
         </div>
-      )}
+      </>)}
       {showLowBalanceModal && result?.wallet_address && typeof result?.wallet_balance_usdc === 'number' && (
         <LowBalanceModal
           balance={result.wallet_balance_usdc}
@@ -1357,7 +1561,7 @@ export default function LiveStrategies() {
   const runners = data?.runners ?? []
   const scripts = scriptsData?.scripts ?? []
   const running = runners.filter(r => r.status.status === 'running').length
-  const totalReturn = runners.reduce((s, r) => s + (r.result?.total_return_pct ?? 0), 0)
+  const totalPnl = usePersistentTotalPnL(runners)
 
   return (
     <div className="p-6 max-w-5xl mx-auto">
@@ -1372,12 +1576,13 @@ export default function LiveStrategies() {
               {running} running
             </span>
           )}
-          {runners.length > 0 && (
-            <span className="text-xs px-2 py-0.5 rounded"
-              style={{ backgroundColor: 'var(--color-base)', color: 'var(--color-text-muted)' }}>
-              Total P&L: {totalReturn >= 0 ? '+' : ''}{totalReturn.toFixed(2)}%
-            </span>
-          )}
+          <span className="text-xs px-2 py-0.5 rounded font-semibold"
+            style={{
+              backgroundColor: totalPnl >= 0 ? 'rgba(74,222,128,0.15)' : 'rgba(239,68,68,0.15)',
+              color: totalPnl >= 0 ? 'var(--color-accent)' : 'var(--color-danger)',
+            }}>
+            Total P&L: {totalPnl >= 0 ? '+' : ''}${fmtUSD(totalPnl)}
+          </span>
         </div>
         <div className="flex gap-2">
           <div className="relative">

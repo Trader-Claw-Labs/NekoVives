@@ -10,7 +10,18 @@ interface StrategyWithChatLayoutProps {
 }
 
 export default function StrategyWithChatLayout({ children }: StrategyWithChatLayoutProps) {
-  const [size, setSize] = useState<ChatPanelSize>('30')
+  const [size, setSize] = useState<ChatPanelSize>(() => {
+    try {
+      const stored = localStorage.getItem('chat-panel-size') as ChatPanelSize | null
+      if (stored === '30' || stored === '40' || stored === 'hidden') return stored
+    } catch { /* ignore */ }
+    return '30'
+  })
+
+  function handleSetSize(next: ChatPanelSize) {
+    setSize(next)
+    try { localStorage.setItem('chat-panel-size', next) } catch { /* ignore */ }
+  }
   const isHidden = size === 'hidden'
 
   const widthStyle =
@@ -35,7 +46,7 @@ export default function StrategyWithChatLayout({ children }: StrategyWithChatLay
           <div className="h-10 border-b flex items-center justify-end gap-1 px-2" style={{ borderColor: 'var(--color-border)' }}>
             <button
               type="button"
-              onClick={() => setSize('30')}
+              onClick={() => handleSetSize('30')}
               className="px-2 py-1 rounded text-xs"
               style={{
                 backgroundColor: size === '30' ? 'var(--color-accent)' : 'transparent',
@@ -47,7 +58,7 @@ export default function StrategyWithChatLayout({ children }: StrategyWithChatLay
             </button>
             <button
               type="button"
-              onClick={() => setSize('40')}
+              onClick={() => handleSetSize('40')}
               className="px-2 py-1 rounded text-xs"
               style={{
                 backgroundColor: size === '40' ? 'var(--color-accent)' : 'transparent',
@@ -59,7 +70,7 @@ export default function StrategyWithChatLayout({ children }: StrategyWithChatLay
             </button>
             <button
               type="button"
-              onClick={() => setSize(isHidden ? '30' : 'hidden')}
+              onClick={() => handleSetSize(isHidden ? '30' : 'hidden')}
               className="p-1.5 rounded hover:bg-white/5"
               style={{ color: 'var(--color-text-muted)' }}
               title={isHidden ? 'Show chat panel' : 'Hide chat panel'}

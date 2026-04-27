@@ -717,7 +717,12 @@ async fn main() -> Result<()> {
     );
 
     // Initialize logging - respects RUST_LOG env var, defaults to INFO (or DEBUG with --debug)
-    let default_filter = if debug_mode { "debug" } else { "info" };
+    // Suppress noisy DEBUG from HTTP/connection crates and live_feed ticker spam.
+    let default_filter = if debug_mode {
+        "debug".to_string()
+    } else {
+        "info,trader_claw::live_feed=warn,h2=warn,hyper_util=warn,hyper=warn".to_string()
+    };
     let subscriber = fmt::Subscriber::builder()
         .with_env_filter(
             EnvFilter::try_from_default_env()

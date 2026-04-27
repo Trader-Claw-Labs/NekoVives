@@ -360,7 +360,7 @@ impl Tool for BacktestRunTool {
 
 // ── Internal engine ──────────────────────────────────────────────────
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct BacktestMetrics {
     pub total_return_pct: f64,
     pub sharpe_ratio: f64,
@@ -380,9 +380,12 @@ pub struct BacktestMetrics {
     // Number of Polymarket market windows tested (slug-aligned binary mode only)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub markets_tested: Option<u32>,
+    /// Debug values captured for flat (no-trade) windows, keyed by timestamp.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub flat_debugs: Vec<(String, std::collections::HashMap<String, f64>)>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct WorstTrade {
     pub timestamp: String,
     pub side: String,
@@ -390,7 +393,7 @@ pub struct WorstTrade {
     pub pnl: f64,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct AllTrade {
     pub timestamp: String,
     pub side: String,
@@ -398,6 +401,8 @@ pub struct AllTrade {
     pub size: f64,
     pub pnl: f64,
     pub balance: f64,  // portfolio balance after this trade
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub debug: Option<std::collections::HashMap<String, f64>>,
 }
 
 // ── Candle from Binance ──────────────────────────────────────────────
@@ -937,6 +942,21 @@ fn compute_macd_series(closes: &[f64]) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
     (macd, signal, histogram)
 }
 
+/// Compute MACD histogram value at a specific index using configurable periods.
+fn macd_hist_value(closes: &[f64], i: usize, fast: usize, slow: usize, signal: usize) -> f64 {
+    if i == 0 || fast == 0 || slow == 0 || signal == 0 || fast >= slow || closes.len() <= i {
+        return 0.0;
+    }
+    let fast_ema = compute_ema(&closes[..=i], fast);
+    let slow_ema = compute_ema(&closes[..=i], slow);
+    let mut macd_line = vec![0.0; i + 1];
+    for j in 0..=i {
+        macd_line[j] = fast_ema[j] - slow_ema[j];
+    }
+    let signal_line = compute_ema(&macd_line, signal);
+    macd_line[i] - signal_line[i]
+}
+
 fn compute_atr_series(highs: &[f64], lows: &[f64], closes: &[f64], period: usize) -> Vec<f64> {
     let n = closes.len();
     if n == 0 { return Vec::new(); }
@@ -960,13 +980,14 @@ fn compute_atr_series(highs: &[f64], lows: &[f64], closes: &[f64], period: usize
 
 // ── Rhai execution ───────────────────────────────────────────────────
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct Trade {
     timestamp: String,
     side: String,
     price: f64,
     size: f64, // base token amount
     pnl: f64,
+    debug: Option<std::collections::HashMap<String, f64>>,
 }
 
 /// Run the Rhai script against all candles, simulate trades, return metrics.
@@ -1089,6 +1110,7 @@ fn run_rhai_backtest(
                         price,
                         size: pos,
                         pnl,
+                        debug: None,
                     });
                     s.balance     = proceeds;
                     s.position    = 0.0;
@@ -1110,6 +1132,7 @@ fn run_rhai_backtest(
                         price,
                         size: pos_abs,
                         pnl,
+                        debug: None,
                     });
                     s.balance    += pnl;
                     s.position    = 0.0;
@@ -1353,6 +1376,13 @@ let ctx = #{
                 closes_sma[start..=idx].iter().sum::<f64>() / period as f64
             });
 
+            // macd_hist(fast, slow, signal) - MACD histogram
+            let closes_macd = closes_arc.clone();
+            eng2.register_fn("macd_hist_impl", move |fast: i64, slow: i64, signal: i64| -> f64 {
+                let idx = cur_i;
+                macd_hist_value(&closes_macd, idx, fast as usize, slow as usize, signal as usize)
+            });
+
             // bb_middle(period) - Bollinger Band middle line (SMA)
             let closes_bbm = closes_arc.clone();
             eng2.register_fn("bb_middle_impl", move |period: i64| -> f64 {
@@ -1476,6 +1506,7 @@ let ctx = #{
                         price: buy_price,
                         size: pos_abs,
                         pnl,
+                        debug: None,
                     });
                     s.balance    += pnl;
                     s.position    = 0.0;
@@ -1524,6 +1555,7 @@ let ctx = #{
                         price: sell_price,
                         size: pos,
                         pnl,
+                        debug: None,
                     });
                     s.balance     = proceeds;
                     s.position    = 0.0;
@@ -1541,6 +1573,7 @@ let ctx = #{
                         price: sell_price,
                         size: pos_abs,
                         pnl,
+                        debug: None,
                     });
                     s.balance    += pnl;
                     s.position    = 0.0;
@@ -1578,6 +1611,7 @@ let ctx = #{
                         price: short_price,
                         size: pos,
                         pnl,
+                        debug: None,
                     });
                     s.balance     = proceeds;
                     s.position    = 0.0;
@@ -1661,6 +1695,7 @@ on_candle_shim();
                 .replace("ctx.ema(",            "ema_impl(")
                 .replace("ctx.atr(",            "atr_impl(")
                 .replace("ctx.sma(",            "sma_impl(")
+                .replace("ctx.macd_hist(",      "macd_hist_impl(")
                 .replace("ctx.close_at(",       "close_at_impl(")
                 .replace("ctx.high_at(",        "high_at_impl(")
                 .replace("ctx.low_at(",         "low_at_impl(")
@@ -1789,6 +1824,7 @@ on_candle(ctx);
                         price: c.close,
                         size:  pos,
                         pnl,
+                        debug: None,
                     });
                     s.balance     = proceeds;
                     s.position    = 0.0;
@@ -1828,6 +1864,7 @@ on_candle(ctx);
             price: last.close,
             size: pos,
             pnl,
+            debug: None,
         });
         s.balance = proceeds;
     }
@@ -1885,6 +1922,7 @@ on_candle(ctx);
             size: t.size,
             pnl: t.pnl,
             balance: running_balance,
+            debug: None,
         }
     }).collect();
 
@@ -1902,7 +1940,7 @@ on_candle(ctx);
         avg_token_price: None,
         correct_direction_pct: None,
         break_even_win_rate: None,
-        markets_tested: None,
+        markets_tested: None, flat_debugs: vec![],
     })
 }
 
@@ -2144,6 +2182,7 @@ fn run_polymarket_binary_backtest(
         .replace("ctx.ema(",             "ema_impl(")
         .replace("ctx.atr(",             "atr_impl(")
         .replace("ctx.sma(",             "sma_impl(")
+        .replace("ctx.macd_hist(",       "macd_hist_impl(")
         .replace("ctx.close_at(",        "close_at_impl(")
         .replace("ctx.high_at(",         "high_at_impl(")
         .replace("ctx.low_at(",          "low_at_impl(")
@@ -2194,6 +2233,7 @@ fn run_polymarket_binary_backtest(
                     price: token_price,
                     size:  tokens,
                     pnl,
+                    debug: None,
                 });
 
                 s.bet_active    = false;
@@ -2264,6 +2304,11 @@ fn run_polymarket_binary_backtest(
             let start = if i + 1 >= period { i + 1 - period } else { 0 };
             let slice = &cs[start..=i];
             slice.iter().sum::<f64>() / slice.len() as f64
+        });
+
+        let cs_macd = closes_arc.clone();
+        eng.register_fn("macd_hist_impl", move |fast: i64, slow: i64, signal: i64| -> f64 {
+            macd_hist_value(&cs_macd, i, fast as usize, slow as usize, signal as usize)
         });
 
         let ha = highs_arc.clone(); let la = lows_arc.clone(); let ca = closes_arc.clone();
@@ -2421,6 +2466,7 @@ on_candle(ctx);
                 timestamp: ts_last,
                 side: side_str.into(),
                 price: token_price, size: tokens, pnl,
+                debug: None,
             });
             s.bet_active = false;
         }
@@ -2448,6 +2494,7 @@ on_candle(ctx);
         AllTrade {
             timestamp: t.timestamp.clone(), side: t.side.clone(),
             price: t.price, size: t.size, pnl: t.pnl, balance: running_bal,
+            debug: None,
         }
     }).collect();
 
@@ -2484,7 +2531,7 @@ on_candle(ctx);
         avg_token_price,
         correct_direction_pct,
         break_even_win_rate,
-        markets_tested: None,
+        markets_tested: None, flat_debugs: vec![],
     })
 }
 
@@ -2555,6 +2602,7 @@ fn run_polymarket_slug_backtest(
         .replace("ctx.ema(",             "ema_impl(")
         .replace("ctx.atr(",             "atr_impl(")
         .replace("ctx.sma(",             "sma_impl(")
+        .replace("ctx.macd_hist(",       "macd_hist_impl(")
         .replace("ctx.close_at(",        "close_at_impl(")
         .replace("ctx.high_at(",         "high_at_impl(")
         .replace("ctx.low_at(",          "low_at_impl(")
@@ -2591,6 +2639,7 @@ fn run_polymarket_slug_backtest(
     let mut peak   = initial_balance;
     let mut max_dd = 0.0_f64;
     let mut markets_tested: u32 = 0;
+    let mut flat_debugs: Vec<(String, std::collections::HashMap<String, f64>)> = Vec::new();
 
     // ── Build engine ONCE — compile AST once, reuse across all windows ────────
     let cur_idx = Arc::new(Mutex::new(0usize));
@@ -2642,6 +2691,12 @@ fn run_polymarket_slug_backtest(
         if period == 0 { return 0.0; }
         let start = if i + 1 >= period { i + 1 - period } else { 0 };
         cs[start..=i].iter().sum::<f64>() / (i - start + 1) as f64
+    });
+
+    let ci_macd = cur_idx.clone(); let ce_macd = closes_arc.clone();
+    engine.register_fn("macd_hist_impl", move |fast: i64, slow: i64, signal: i64| -> f64 {
+        let i = *ci_macd.lock().unwrap();
+        macd_hist_value(&ce_macd, i, fast as usize, slow as usize, signal as usize)
     });
 
     let ci = cur_idx.clone();
@@ -2728,6 +2783,9 @@ fn run_polymarket_slug_backtest(
         {
             let mut s = state.lock().unwrap();
             s.pending_buy = false; s.pending_sell = false;
+            // Strip stale debug_* from kv so an early-return doesn’t leak
+            // previous-window indicators into the current trade/flat_debug.
+            s.kv.retain(|k, _| !k.starts_with("debug_"));
         }
 
         let (cur_balance, _cur_position) = { let s = state.lock().unwrap(); (s.balance, 0.0f64) };
@@ -2800,7 +2858,15 @@ fn run_polymarket_slug_backtest(
             if won { s.total_correct += 1; }
             s.total_resolved += 1;
             s.sum_token_price += token_p;
-            s.trades.push(Trade { timestamp: ts_str, side: side_str.into(), price: token_p, size: tokens, pnl });
+            let debug = s.kv.clone();
+            s.trades.push(Trade { timestamp: ts_str, side: side_str.into(), price: token_p, size: tokens, pnl, debug: Some(debug) });
+        } else {
+            let s = state.lock().unwrap();
+            let kv = s.kv.clone();
+            drop(s);
+            if !kv.is_empty() {
+                flat_debugs.push((ts_str, kv));
+            }
         }
 
         let snap = state.lock().unwrap().balance;
@@ -2826,7 +2892,7 @@ fn run_polymarket_slug_backtest(
     let mut running_bal = initial_balance;
     let all_trades: Vec<AllTrade> = s.trades.iter().map(|t| {
         running_bal += t.pnl;
-        AllTrade { timestamp: t.timestamp.clone(), side: t.side.clone(), price: t.price, size: t.size, pnl: t.pnl, balance: running_bal }
+        AllTrade { timestamp: t.timestamp.clone(), side: t.side.clone(), price: t.price, size: t.size, pnl: t.pnl, balance: running_bal, debug: t.debug.clone() }
     }).collect();
 
     let returns: Vec<f64> = portfolio_values.windows(2)
@@ -2862,6 +2928,7 @@ fn run_polymarket_slug_backtest(
         correct_direction_pct,
         break_even_win_rate,
         markets_tested: Some(markets_tested),
+        flat_debugs,
     })
 }
 
@@ -2900,7 +2967,7 @@ pub async fn run_backtest_engine(
                 total_return_pct: 0.0, sharpe_ratio: 0.0, max_drawdown_pct: 0.0,
                 win_rate_pct: 0.0, total_trades: 0, worst_trades: vec![], all_trades: vec![],
                 avg_token_price: None, correct_direction_pct: None, break_even_win_rate: None,
-                markets_tested: None,
+                markets_tested: None, flat_debugs: vec![],
                 analysis: format!("Error reading script: {e}"),
             };
         }
@@ -2922,13 +2989,13 @@ pub async fn run_backtest_engine(
                 Ok(_) => return BacktestMetrics {
                     total_return_pct: 0.0, sharpe_ratio: 0.0, max_drawdown_pct: 0.0,
                     win_rate_pct: 0.0, total_trades: 0, worst_trades: vec![], all_trades: vec![],
-                    avg_token_price: None, correct_direction_pct: None, break_even_win_rate: None, markets_tested: None,
+                    avg_token_price: None, correct_direction_pct: None, break_even_win_rate: None, markets_tested: None, flat_debugs: vec![],
                     analysis: format!("No weather data from Open-Meteo for '{symbol}' ({from_date}->{to_date}). Check city name."),
                 },
                 Err(e) => return BacktestMetrics {
                     total_return_pct: 0.0, sharpe_ratio: 0.0, max_drawdown_pct: 0.0,
                     win_rate_pct: 0.0, total_trades: 0, worst_trades: vec![], all_trades: vec![],
-                    avg_token_price: None, correct_direction_pct: None, break_even_win_rate: None, markets_tested: None,
+                    avg_token_price: None, correct_direction_pct: None, break_even_win_rate: None, markets_tested: None, flat_debugs: vec![],
                     analysis: format!("Failed to fetch Open-Meteo data: {e}"),
                 },
             }
@@ -2939,13 +3006,13 @@ pub async fn run_backtest_engine(
                 Ok(_) => return BacktestMetrics {
                     total_return_pct: 0.0, sharpe_ratio: 0.0, max_drawdown_pct: 0.0,
                     win_rate_pct: 0.0, total_trades: 0, worst_trades: vec![], all_trades: vec![],
-                    avg_token_price: None, correct_direction_pct: None, break_even_win_rate: None, markets_tested: None,
+                    avg_token_price: None, correct_direction_pct: None, break_even_win_rate: None, markets_tested: None, flat_debugs: vec![],
                     analysis: format!("No 1m candle data from Binance for {symbol} ({from_date}->{to_date}). Check symbol."),
                 },
                 Err(e) => return BacktestMetrics {
                     total_return_pct: 0.0, sharpe_ratio: 0.0, max_drawdown_pct: 0.0,
                     win_rate_pct: 0.0, total_trades: 0, worst_trades: vec![], all_trades: vec![],
-                    avg_token_price: None, correct_direction_pct: None, break_even_win_rate: None, markets_tested: None,
+                    avg_token_price: None, correct_direction_pct: None, break_even_win_rate: None, markets_tested: None, flat_debugs: vec![],
                     analysis: format!("Failed to fetch Binance data: {e}"),
                 },
             }
@@ -2973,7 +3040,7 @@ pub async fn run_backtest_engine(
                     total_return_pct: 0.0, sharpe_ratio: 0.0, max_drawdown_pct: 0.0,
                     win_rate_pct: 0.0, total_trades: 0, worst_trades: vec![], all_trades: vec![],
                     avg_token_price: None, correct_direction_pct: None, break_even_win_rate: None,
-                    markets_tested: None,
+                    markets_tested: None, flat_debugs: vec![],
                     analysis: format!("Binary slug engine error: {e}"),
                 }
             }
@@ -2981,7 +3048,7 @@ pub async fn run_backtest_engine(
                 total_return_pct: 0.0, sharpe_ratio: 0.0, max_drawdown_pct: 0.0,
                 win_rate_pct: 0.0, total_trades: 0, worst_trades: vec![], all_trades: vec![],
                 avg_token_price: None, correct_direction_pct: None, break_even_win_rate: None,
-                markets_tested: None,
+                markets_tested: None, flat_debugs: vec![],
                 analysis: format!("Binary slug task panicked: {e}"),
             },
         };
@@ -3000,7 +3067,7 @@ pub async fn run_backtest_engine(
                     total_return_pct: 0.0, sharpe_ratio: 0.0, max_drawdown_pct: 0.0,
                     win_rate_pct: 0.0, total_trades: 0, worst_trades: vec![], all_trades: vec![],
                     avg_token_price: None, correct_direction_pct: None, break_even_win_rate: None,
-                    markets_tested: None,
+                    markets_tested: None, flat_debugs: vec![],
                     analysis: format!(
                         "Could not fetch historical data from Polymarket: {e}. \
                         Ensure the condition ID is valid."
@@ -3028,7 +3095,7 @@ pub async fn run_backtest_engine(
                         "No candle data returned from Binance for {symbol} ({from_date}→{to_date}). \
                         Check the symbol name and date range."
                     ),
-                    markets_tested: None,
+                    markets_tested: None, flat_debugs: vec![],
                 };
             }
             Err(e) => {
@@ -3037,7 +3104,7 @@ pub async fn run_backtest_engine(
                     total_return_pct: 0.0, sharpe_ratio: 0.0, max_drawdown_pct: 0.0,
                     win_rate_pct: 0.0, total_trades: 0, worst_trades: vec![], all_trades: vec![],
                     avg_token_price: None, correct_direction_pct: None, break_even_win_rate: None,
-                    markets_tested: None,
+                    markets_tested: None, flat_debugs: vec![],
                     analysis: format!(
                         "Could not fetch historical data from Binance: {e}. \
                         Ensure the gateway has internet access."
@@ -3078,7 +3145,7 @@ pub async fn run_backtest_engine(
                 total_return_pct: 0.0, sharpe_ratio: 0.0, max_drawdown_pct: 0.0,
                 win_rate_pct: 0.0, total_trades: 0, worst_trades: vec![], all_trades: vec![],
                 avg_token_price: None, correct_direction_pct: None, break_even_win_rate: None,
-                markets_tested: None,
+                markets_tested: None, flat_debugs: vec![],
                 analysis: format!("Rhai execution error: {e}"),
             }
         }
@@ -3088,7 +3155,7 @@ pub async fn run_backtest_engine(
                 total_return_pct: 0.0, sharpe_ratio: 0.0, max_drawdown_pct: 0.0,
                 win_rate_pct: 0.0, total_trades: 0, worst_trades: vec![], all_trades: vec![],
                 avg_token_price: None, correct_direction_pct: None, break_even_win_rate: None,
-                markets_tested: None,
+                markets_tested: None, flat_debugs: vec![],
                 analysis: format!("Backtest task panicked: {e}"),
             }
         }
@@ -3112,7 +3179,7 @@ pub fn run_rhai_on_candle_buffer(
             total_return_pct: 0.0, sharpe_ratio: 0.0, max_drawdown_pct: 0.0,
             win_rate_pct: 0.0, total_trades: 0, worst_trades: vec![], all_trades: vec![],
             avg_token_price: None, correct_direction_pct: None, break_even_win_rate: None,
-            markets_tested: None,
+            markets_tested: None, flat_debugs: vec![],
             analysis: format!("Strategy error: {e}"),
         })
 }
@@ -3150,6 +3217,15 @@ pub async fn fetch_recent_candles(
 }
 
 
+/// Result of evaluating a live trading signal.
+pub struct LiveSignalResult {
+    pub signal: String,
+    pub size: f64,
+    pub debug: std::collections::HashMap<String, f64>,
+    /// Updated kv state after the call — persist across windows to carry avg_vol etc.
+    pub kv_state: std::collections::HashMap<String, f64>,
+}
+
 /// Evaluate the live trading signal for the *current* (incomplete) window.
 /// Runs the Rhai script on the decision candle and returns "yes", "no", or "flat".
 /// This does NOT compute P&L — it only extracts the directional signal.
@@ -3157,7 +3233,10 @@ pub fn run_polymarket_live_signal(
     script_content: &str,
     candles: Vec<Candle>,
     window_minutes: usize,
-) -> anyhow::Result<String> {
+    decision_minute: Option<i64>,
+    _yes_token_price: f64, // real CLOB price kept for API compatibility; strategy uses momentum model
+    kv_seed: &std::collections::HashMap<String, f64>,
+) -> anyhow::Result<LiveSignalResult> {
     use rhai::{Engine, Scope};
     use std::sync::{Arc, Mutex};
 
@@ -3176,7 +3255,8 @@ pub fn run_polymarket_live_signal(
     let last_candle = candles.last().unwrap();
     let last_close_ts = (last_candle.open_time_ms / 1000) + 60;
     let current_window = last_close_ts - (last_close_ts % window_secs);
-    let decision_ts = current_window + ((window_minutes as i64) - 1) * 60;
+    let decision_min = decision_minute.unwrap_or((window_minutes as i64) - 1);
+    let decision_ts = current_window + decision_min * 60;
 
     // Find decision candle in buffer
     let dec_idx = candles.iter()
@@ -3210,6 +3290,7 @@ pub fn run_polymarket_live_signal(
         .replace("ctx.ema(",             "ema_impl(")
         .replace("ctx.atr(",             "atr_impl(")
         .replace("ctx.sma(",             "sma_impl(")
+        .replace("ctx.macd_hist(",       "macd_hist_impl(")
         .replace("ctx.close_at(",        "close_at_impl(")
         .replace("ctx.high_at(",         "high_at_impl(")
         .replace("ctx.low_at(",          "low_at_impl(")
@@ -3282,6 +3363,13 @@ pub fn run_polymarket_live_signal(
         cs[start..=i].iter().sum::<f64>() / (i - start + 1) as f64
     });
 
+    let ci_macd = Arc::new(Mutex::new(dec_idx));
+    let ce_macd = closes_arc.clone();
+    engine.register_fn("macd_hist_impl", move |fast: i64, slow: i64, signal: i64| -> f64 {
+        let i = *ci_macd.lock().unwrap();
+        macd_hist_value(&ce_macd, i, fast as usize, slow as usize, signal as usize)
+    });
+
     let ci = Arc::new(Mutex::new(dec_idx));
     let ha = highs_arc.clone(); let la = lows_arc.clone(); let ca = closes_arc.clone();
     engine.register_fn("atr_impl", move |period: i64| -> f64 {
@@ -3311,7 +3399,15 @@ pub fn run_polymarket_live_signal(
     engine.register_fn("sell_impl", move |_frac: f64| {
         ss.lock().unwrap().pending_sell = true;
     });
-    let kv = Arc::new(Mutex::new(std::collections::HashMap::<String, f64>::new()));
+    // Seed the kv with only non-debug state from the previous window.
+    // If the script early-returns, stale debug_* values must not leak
+    // into the current window’s indicator output.
+    let kv_seed_clean: std::collections::HashMap<String, f64> = kv_seed
+        .iter()
+        .filter(|(k, _)| !k.starts_with("debug_"))
+        .map(|(k, v)| (k.clone(), *v))
+        .collect();
+    let kv = Arc::new(Mutex::new(kv_seed_clean));
     let kv_set = kv.clone();
     engine.register_fn("set_impl", move |key: String, val: f64| {
         kv_set.lock().unwrap().insert(key, val);
@@ -3323,6 +3419,14 @@ pub fn run_polymarket_live_signal(
 
     let ast = engine.compile(&patched_script)
         .map_err(|e| anyhow::anyhow!("Script compile error (patched): {e}"))?;
+
+    // Use the same momentum-derived token price model as the backtest so that
+    // live decisions match backtest decisions. The real CLOB price is only used
+    // for order execution sizing, not for strategy logic.
+    let delta_abs = if window_open > 0.0 {
+        ((dec.close - window_open) / window_open * 100.0).abs()
+    } else { 0.0 };
+    let momentum_token_price = polymarket_token_price(delta_abs);
 
     let mut ctx_map = rhai::Map::new();
     ctx_map.insert("close".into(),          rhai::Dynamic::from(dec.close));
@@ -3338,7 +3442,7 @@ pub fn run_polymarket_live_signal(
     ctx_map.insert("open_positions".into(),  rhai::Dynamic::from(0i64));
     ctx_map.insert("window_open".into(),      rhai::Dynamic::from(window_open));
     ctx_map.insert("window_minutes".into(),   rhai::Dynamic::from(window_minutes as i64));
-    ctx_map.insert("token_price".into(),      rhai::Dynamic::from(0.5_f64));
+    ctx_map.insert("token_price".into(),      rhai::Dynamic::from(momentum_token_price));
     ctx_map.insert("threshold".into(),        rhai::Dynamic::from(0.0_f64));
     ctx_map.insert("resolution_value".into(), rhai::Dynamic::from(dec.close));
     ctx_map.insert("value".into(),            rhai::Dynamic::from(dec.close));
@@ -3356,7 +3460,350 @@ pub fn run_polymarket_live_signal(
         "flat".to_string()
     };
 
-    Ok(signal)
+    let kv_final = kv.lock().unwrap().clone();
+    let debug = kv_final.clone();
+    Ok(LiveSignalResult {
+        signal,
+        size: 0.25,
+        debug,
+        kv_state: kv_final,
+    })
+}
+
+/// Replay the BACKTEST engine on a buffer of 1m candles up to the current
+/// decision candle, returning the script's signal and debug values *as the
+/// backtester would compute them* at this same decision point.
+///
+/// Differs from `run_polymarket_live_signal` in three ways:
+///  1. State (`ctx.set/get`) accumulates across all completed windows in the
+///     buffer (matches BT engine), instead of being reset every call.
+///  2. ctx fields (`threshold`, `token_price`, `resolution_value`, `balance`)
+///     follow BT semantics (configured threshold, 0.50 for threshold markets,
+///     etc.) instead of the live-mode placeholders.
+///  3. Completed windows use the FUTURE resolution candle as `ctx.resolution_value`
+///     (this is the BT lookahead). The current (incomplete) window falls back
+///     to `dec.close` as `resolution_value` so the comparison is visible.
+///
+/// Use this at decision time to log "BT debug" alongside "LIVE debug" so the
+/// operator can spot script divergences between backtest and live execution.
+pub fn run_polymarket_bt_signal_preview(
+    script_content: &str,
+    candles: Vec<Candle>,
+    window_minutes: usize,
+    decision_minute: Option<i64>,
+    resolution_logic: &str,
+    threshold: Option<f64>,
+    initial_balance: f64,
+) -> anyhow::Result<LiveSignalResult> {
+    use rhai::{Engine, Scope};
+    use std::sync::{Arc, Mutex};
+
+    if candles.is_empty() {
+        return Err(anyhow::anyhow!("No candles for BT preview"));
+    }
+
+    let check = Engine::new();
+    let ast_check = check.compile(script_content)
+        .map_err(|e| anyhow::anyhow!("Script compile error: {e}"))?;
+    if !ast_check.iter_functions().any(|f| f.name == "on_candle") {
+        return Err(anyhow::anyhow!("Binary strategy requires an on_candle(ctx) function."));
+    }
+
+    let window_secs = (window_minutes as i64) * 60;
+    let last_candle_ts = candles.last().unwrap().open_time_ms / 1000;
+    let last_close_ts = last_candle_ts + 60;
+    let current_window = last_close_ts - (last_close_ts % window_secs);
+    let dec_min = decision_minute.unwrap_or((window_minutes as i64) - 2);
+
+    let ts_to_idx: std::collections::HashMap<i64, usize> = candles.iter().enumerate()
+        .map(|(idx, c)| (c.open_time_ms / 1000, idx))
+        .collect();
+
+    let closes:  Vec<f64> = candles.iter().map(|c| c.close).collect();
+    let highs:   Vec<f64> = candles.iter().map(|c| c.high).collect();
+    let lows:    Vec<f64> = candles.iter().map(|c| c.low).collect();
+    let volumes: Vec<f64> = candles.iter().map(|c| c.volume).collect();
+    let closes_arc  = Arc::new(closes);
+    let highs_arc   = Arc::new(highs);
+    let lows_arc    = Arc::new(lows);
+    let volumes_arc = Arc::new(volumes);
+
+    let patched_script = script_content
+        .replace("ctx.rsi(",             "rsi_impl(")
+        .replace("ctx.ema(",             "ema_impl(")
+        .replace("ctx.atr(",             "atr_impl(")
+        .replace("ctx.sma(",             "sma_impl(")
+        .replace("ctx.macd_hist(",       "macd_hist_impl(")
+        .replace("ctx.close_at(",        "close_at_impl(")
+        .replace("ctx.high_at(",         "high_at_impl(")
+        .replace("ctx.low_at(",          "low_at_impl(")
+        .replace("ctx.volume_at(",       "volume_at_impl(")
+        .replace("ctx.set_stop_loss(",   "set_stop_loss_impl(")
+        .replace("ctx.set_take_profit(", "set_take_profit_impl(")
+        .replace("ctx.buy(",             "buy_impl(")
+        .replace("ctx.sell(",            "sell_impl(")
+        .replace("ctx.short(",           "sell_impl(")
+        .replace("ctx.set(",             "set_impl(")
+        .replace("ctx.get(",             "get_impl(")
+        .replace("ctx.log(",             "log_impl(");
+
+    #[derive(Clone)]
+    struct PreviewState {
+        balance:      f64,
+        kv:           std::collections::HashMap<String, f64>,
+        pending_buy:  bool,
+        pending_sell: bool,
+    }
+    let state = Arc::new(Mutex::new(PreviewState {
+        balance: initial_balance,
+        kv: std::collections::HashMap::new(),
+        pending_buy: false,
+        pending_sell: false,
+    }));
+
+    let cur_idx = Arc::new(Mutex::new(0usize));
+
+    let mut engine = Engine::new();
+    engine.set_max_operations(500_000);
+    engine.set_max_call_levels(64);
+
+    let cl = closes_arc.clone();
+    engine.register_fn("close_at_impl",  move |idx: i64| -> f64 { cl.get(idx as usize).copied().unwrap_or(0.0) });
+    let vl = volumes_arc.clone();
+    engine.register_fn("volume_at_impl", move |idx: i64| -> f64 { vl.get(idx as usize).copied().unwrap_or(0.0) });
+    let hl = highs_arc.clone();
+    engine.register_fn("high_at_impl",   move |idx: i64| -> f64 { hl.get(idx as usize).copied().unwrap_or(0.0) });
+    let ll = lows_arc.clone();
+    engine.register_fn("low_at_impl",    move |idx: i64| -> f64 { ll.get(idx as usize).copied().unwrap_or(0.0) });
+
+    let ci = cur_idx.clone(); let cr = closes_arc.clone();
+    engine.register_fn("rsi_impl", move |period: i64| -> f64 {
+        let i = *ci.lock().unwrap();
+        let period = period as usize;
+        if i < period { return 50.0; }
+        let mut gain = 0.0_f64; let mut loss = 0.0_f64;
+        for j in (i - period + 1)..=i {
+            if j == 0 { continue; }
+            let d = cr[j] - cr[j - 1];
+            if d > 0.0 { gain += d; } else { loss += d.abs(); }
+        }
+        gain /= period as f64; loss /= period as f64;
+        if loss == 0.0 { 100.0 } else { 100.0 - 100.0 / (1.0 + gain / loss) }
+    });
+
+    let ci = cur_idx.clone(); let ce = closes_arc.clone();
+    engine.register_fn("ema_impl", move |period: i64| -> f64 {
+        let i = *ci.lock().unwrap();
+        let period = period as usize;
+        if period == 0 { return ce.get(i).copied().unwrap_or(0.0); }
+        let k = 2.0 / (period as f64 + 1.0);
+        let start = i.saturating_sub(period * 5);
+        let mut e = ce[start];
+        for j in (start + 1)..=i { e = ce[j] * k + e * (1.0 - k); }
+        e
+    });
+
+    let ci = cur_idx.clone(); let cs = closes_arc.clone();
+    engine.register_fn("sma_impl", move |period: i64| -> f64 {
+        let i = *ci.lock().unwrap();
+        let period = period as usize;
+        if period == 0 { return 0.0; }
+        let start = if i + 1 >= period { i + 1 - period } else { 0 };
+        cs[start..=i].iter().sum::<f64>() / (i - start + 1) as f64
+    });
+
+    let ci_macd = cur_idx.clone(); let ce_macd = closes_arc.clone();
+    engine.register_fn("macd_hist_impl", move |fast: i64, slow: i64, signal: i64| -> f64 {
+        let i = *ci_macd.lock().unwrap();
+        macd_hist_value(&ce_macd, i, fast as usize, slow as usize, signal as usize)
+    });
+
+    let ci = cur_idx.clone();
+    let ha = highs_arc.clone(); let la = lows_arc.clone(); let ca = closes_arc.clone();
+    engine.register_fn("atr_impl", move |period: i64| -> f64 {
+        let i = *ci.lock().unwrap();
+        let period = (period.max(1)) as usize;
+        if i == 0 { return 0.0; }
+        let start = i.saturating_sub(period * 3);
+        let tr_vals: Vec<f64> = ((start + 1)..=i).map(|j| {
+            (ha[j] - la[j]).max((ha[j] - ca[j-1]).abs()).max((la[j] - ca[j-1]).abs())
+        }).collect();
+        if tr_vals.is_empty() { return 0.0; }
+        if tr_vals.len() < period { return tr_vals.iter().sum::<f64>() / tr_vals.len() as f64; }
+        let mut atr = tr_vals[..period].iter().sum::<f64>() / period as f64;
+        for j in period..tr_vals.len() { atr = (atr * (period - 1) as f64 + tr_vals[j]) / period as f64; }
+        atr
+    });
+
+    engine.register_fn("set_stop_loss_impl",   |_: f64| {});
+    engine.register_fn("set_take_profit_impl", |_: f64| {});
+    engine.register_fn("log_impl", |_msg: rhai::Dynamic| {});
+
+    let sb = state.clone();
+    engine.register_fn("buy_impl", move |_frac: f64| {
+        let mut s = sb.lock().unwrap();
+        if !s.pending_buy && !s.pending_sell { s.pending_buy = true; }
+    });
+    let ss = state.clone();
+    engine.register_fn("sell_impl", move |_frac: f64| {
+        let mut s = ss.lock().unwrap();
+        if !s.pending_buy && !s.pending_sell { s.pending_sell = true; }
+    });
+    let sset = state.clone();
+    engine.register_fn("set_impl", move |key: String, val: f64| {
+        sset.lock().unwrap().kv.insert(key, val);
+    });
+    let sget = state.clone();
+    engine.register_fn("get_impl", move |key: String, def: f64| -> f64 {
+        sget.lock().unwrap().kv.get(&key).copied().unwrap_or(def)
+    });
+
+    let ast = engine.compile(&patched_script)
+        .map_err(|e| anyhow::anyhow!("Script compile error (patched): {e}"))?;
+
+    let first_ts = candles[0].open_time_ms / 1000;
+    let first_window = align_up_to(first_ts, window_secs);
+
+    // Replay completed windows (window strictly before current_window) to build kv state.
+    let mut window_ts = first_window;
+    while window_ts < current_window {
+        let minute0_ts    = window_ts;
+        let decision_ts   = window_ts + dec_min * 60;
+        let resolution_ts = window_ts + ((window_minutes as i64) - 1) * 60;
+        window_ts += window_secs;
+
+        let (Some(&m0_idx), Some(&dec_idx), Some(&res_idx)) = (
+            ts_to_idx.get(&minute0_ts),
+            ts_to_idx.get(&decision_ts),
+            ts_to_idx.get(&resolution_ts),
+        ) else { continue; };
+
+        let window_open = candles[m0_idx].open;
+        let dec         = &candles[dec_idx];
+        let res_close   = candles[res_idx].close;
+        let resolution_value = res_close;
+        let thr_val = threshold.unwrap_or(0.0);
+        let yes_token_price = match resolution_logic {
+            "threshold_above" | "threshold_below" => 0.50_f64,
+            _ => {
+                let delta_abs = if window_open > 0.0 {
+                    ((dec.close - window_open) / window_open * 100.0).abs()
+                } else { 0.0 };
+                polymarket_token_price(delta_abs)
+            }
+        };
+
+        {
+            let mut s = state.lock().unwrap();
+            s.pending_buy = false; s.pending_sell = false;
+        }
+        *cur_idx.lock().unwrap() = dec_idx;
+
+        let cur_balance = state.lock().unwrap().balance;
+        let mut ctx_map = rhai::Map::new();
+        ctx_map.insert("close".into(),            rhai::Dynamic::from(dec.close));
+        ctx_map.insert("open".into(),             rhai::Dynamic::from(dec.open));
+        ctx_map.insert("high".into(),             rhai::Dynamic::from(dec.high));
+        ctx_map.insert("low".into(),              rhai::Dynamic::from(dec.low));
+        ctx_map.insert("volume".into(),           rhai::Dynamic::from(dec.volume));
+        ctx_map.insert("index".into(),            rhai::Dynamic::from(dec_idx as i64));
+        ctx_map.insert("position".into(),         rhai::Dynamic::from(0.0_f64));
+        ctx_map.insert("entry_price".into(),      rhai::Dynamic::from(0.0_f64));
+        ctx_map.insert("entry_index".into(),      rhai::Dynamic::from(0i64));
+        ctx_map.insert("balance".into(),          rhai::Dynamic::from(cur_balance));
+        ctx_map.insert("open_positions".into(),   rhai::Dynamic::from(0i64));
+        ctx_map.insert("window_open".into(),      rhai::Dynamic::from(window_open));
+        ctx_map.insert("window_minutes".into(),   rhai::Dynamic::from(window_minutes as i64));
+        ctx_map.insert("token_price".into(),      rhai::Dynamic::from(yes_token_price));
+        ctx_map.insert("threshold".into(),        rhai::Dynamic::from(thr_val));
+        ctx_map.insert("resolution_value".into(), rhai::Dynamic::from(resolution_value));
+        ctx_map.insert("value".into(),            rhai::Dynamic::from(dec.close));
+
+        let mut scope = Scope::new();
+        let _ = engine.call_fn::<()>(&mut scope, &ast, "on_candle", (rhai::Dynamic::from_map(ctx_map),));
+    }
+
+    // Now process the CURRENT window's decision candle (no resolution candle yet).
+    let cur_dec_ts = current_window + dec_min * 60;
+    let cur_m0_idx = ts_to_idx.get(&current_window).copied();
+    let cur_dec_idx = ts_to_idx.get(&cur_dec_ts).copied().or_else(|| {
+        candles.iter().enumerate()
+            .filter(|(_, c)| (c.open_time_ms / 1000) <= cur_dec_ts)
+            .map(|(i, _)| i)
+            .last()
+    });
+
+    let Some(dec_idx) = cur_dec_idx else {
+        let s = state.lock().unwrap();
+        return Ok(LiveSignalResult {
+            signal: "flat".to_string(),
+            size: 0.25,
+            debug: s.kv.clone(),
+            kv_state: s.kv.clone(),
+        });
+    };
+
+    let dec = &candles[dec_idx];
+    let window_open = cur_m0_idx
+        .map(|i| candles[i].open)
+        .unwrap_or(dec.open);
+    let thr_val = threshold.unwrap_or(0.0);
+    let yes_token_price = match resolution_logic {
+        "threshold_above" | "threshold_below" => 0.50_f64,
+        _ => {
+            let delta_abs = if window_open > 0.0 {
+                ((dec.close - window_open) / window_open * 100.0).abs()
+            } else { 0.0 };
+            polymarket_token_price(delta_abs)
+        }
+    };
+    // No future candle available — fall back to dec.close so the script can run.
+    let resolution_value = dec.close;
+
+    {
+        let mut s = state.lock().unwrap();
+        s.pending_buy = false; s.pending_sell = false;
+    }
+    *cur_idx.lock().unwrap() = dec_idx;
+
+    let cur_balance = state.lock().unwrap().balance;
+    let mut ctx_map = rhai::Map::new();
+    ctx_map.insert("close".into(),            rhai::Dynamic::from(dec.close));
+    ctx_map.insert("open".into(),             rhai::Dynamic::from(dec.open));
+    ctx_map.insert("high".into(),             rhai::Dynamic::from(dec.high));
+    ctx_map.insert("low".into(),              rhai::Dynamic::from(dec.low));
+    ctx_map.insert("volume".into(),           rhai::Dynamic::from(dec.volume));
+    ctx_map.insert("index".into(),            rhai::Dynamic::from(dec_idx as i64));
+    ctx_map.insert("position".into(),         rhai::Dynamic::from(0.0_f64));
+    ctx_map.insert("entry_price".into(),      rhai::Dynamic::from(0.0_f64));
+    ctx_map.insert("entry_index".into(),      rhai::Dynamic::from(0i64));
+    ctx_map.insert("balance".into(),          rhai::Dynamic::from(cur_balance));
+    ctx_map.insert("open_positions".into(),   rhai::Dynamic::from(0i64));
+    ctx_map.insert("window_open".into(),      rhai::Dynamic::from(window_open));
+    ctx_map.insert("window_minutes".into(),   rhai::Dynamic::from(window_minutes as i64));
+    ctx_map.insert("token_price".into(),      rhai::Dynamic::from(yes_token_price));
+    ctx_map.insert("threshold".into(),        rhai::Dynamic::from(thr_val));
+    ctx_map.insert("resolution_value".into(), rhai::Dynamic::from(resolution_value));
+    ctx_map.insert("value".into(),            rhai::Dynamic::from(dec.close));
+
+    let mut scope = Scope::new();
+    engine.call_fn::<()>(&mut scope, &ast, "on_candle", (rhai::Dynamic::from_map(ctx_map),))
+        .map_err(|e| anyhow::anyhow!("Script runtime error: {e}"))?;
+
+    let s = state.lock().unwrap();
+    let signal = if s.pending_buy {
+        "yes".to_string()
+    } else if s.pending_sell {
+        "no".to_string()
+    } else {
+        "flat".to_string()
+    };
+    Ok(LiveSignalResult {
+        signal,
+        size: 0.25,
+        debug: s.kv.clone(),
+        kv_state: s.kv.clone(),
+    })
 }
 
 /// Run the Rhai polymarket binary strategy on a pre-built buffer of 1m candles.
@@ -3385,7 +3832,7 @@ pub fn run_polymarket_binary_on_candle_buffer(
         total_return_pct: 0.0, sharpe_ratio: 0.0, max_drawdown_pct: 0.0,
         win_rate_pct: 0.0, total_trades: 0, worst_trades: vec![], all_trades: vec![],
         avg_token_price: None, correct_direction_pct: None, break_even_win_rate: None,
-        markets_tested: None,
+        markets_tested: None, flat_debugs: vec![],
         analysis: format!("Polymarket strategy error: {e}"),
     })
 }

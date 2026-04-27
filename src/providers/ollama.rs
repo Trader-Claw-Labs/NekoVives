@@ -657,10 +657,54 @@ impl Provider for OllamaProvider {
         let text = if let Some(content) = Self::normalize_response_text(content) {
             content
         } else {
-            Self::fallback_text_for_empty_content(
-                &normalized_model,
-                response.message.thinking.as_deref(),
-            )
+            // Model returned empty content with no tool calls — likely doesn't support
+            // function calling. Retry the same conversation without tools so the model
+            // can respond as plain text.
+            tracing::warn!(
+                "Ollama model '{}' returned empty content with tools — retrying without tools",
+                normalized_model
+            );
+            let retry_messages = self.convert_messages(messages);
+            match self
+                .send_request(retry_messages, &normalized_model, temperature, should_auth, None)
+                .await
+            {
+                Ok(retry_response) => {
+                    if !retry_response.message.tool_calls.is_empty() {
+                        let tool_calls: Vec<ToolCall> = retry_response
+                            .message
+                            .tool_calls
+                            .iter()
+                            .map(|tc| {
+                                let (name, args) = self.extract_tool_name_and_args(tc);
+                                ToolCall {
+                                    id: tc.id.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                                    name,
+                                    arguments: serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string()),
+                                }
+                            })
+                            .collect();
+                        return Ok(ChatResponse {
+                            text: None,
+                            tool_calls,
+                            usage,
+                            reasoning_content: None,
+                        });
+                    }
+                    if let Some(t) = Self::normalize_response_text(retry_response.message.content) {
+                        t
+                    } else {
+                        Self::fallback_text_for_empty_content(
+                            &normalized_model,
+                            retry_response.message.thinking.as_deref(),
+                        )
+                    }
+                }
+                Err(_) => Self::fallback_text_for_empty_content(
+                    &normalized_model,
+                    response.message.thinking.as_deref(),
+                ),
+            }
         };
         Ok(ChatResponse {
             text: Some(text),

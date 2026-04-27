@@ -170,6 +170,10 @@ pub struct Config {
     #[serde(default)]
     pub chainlink: ChainlinkConfig,
 
+    /// Live strategy global defaults (`[live_strategy]`).
+    #[serde(default)]
+    pub live_strategy: LiveStrategyConfig,
+
     /// Custom RPC endpoints per chain (`[chains_rpc]`).
     #[serde(default)]
     pub chains_rpc: ChainsRpcConfig,
@@ -972,6 +976,27 @@ pub struct ChainlinkConfig {
 }
 
 fn default_chainlink_interval() -> u64 { 5 }
+
+// ── Live Strategy global defaults ────────────────────────────────
+
+/// Global defaults for live strategy runners (`[live_strategy]` section).
+///
+/// These values are used when a runner does not override them individually.
+///
+/// Example `config.toml`:
+/// ```toml
+/// [live_strategy]
+/// early_fire_secs = 10   # fire order 10s before the decision candle closes
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct LiveStrategyConfig {
+    /// Fire the order N seconds before the decision candle closes.
+    /// 0 = fire at exact candle close (default).
+    /// 10 = fire 10s early, avoiding bot-crowding at the candle boundary.
+    /// Only applies to polymarket_binary live runners.
+    #[serde(default)]
+    pub early_fire_secs: u32,
+}
 
 // ── Composio (managed tool surface) ─────────────────────────────
 
@@ -3751,6 +3776,7 @@ impl Default for Config {
             chains_rpc: ChainsRpcConfig::default(),
             polymarket: PolymarketConfig::default(),
             chainlink: ChainlinkConfig::default(),
+            live_strategy: LiveStrategyConfig::default(),
         }
     }
 }

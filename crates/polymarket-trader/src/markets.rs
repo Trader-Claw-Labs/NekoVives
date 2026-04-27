@@ -210,24 +210,46 @@ pub async fn get_market(slug: &str) -> Result<Market> {
             av.partial_cmp(&bv).unwrap_or(std::cmp::Ordering::Equal)
         });
 
+    // For newer market types (NegRisk / recurrent binary), Gamma token IDs
+    // and CLOB token IDs differ. ALWAYS fetch CLOB tokens by condition_id
+    // and replace Gamma's tokens when CLOB returns valid ones.
+    if let Some(ref mut market) = best {
+        if !market.condition_id.is_empty() {
+            match fetch_clob_tokens(&client, &market.condition_id).await {
+                Ok(clob_tokens) => {
+                    if let Some(yes) = clob_tokens.iter().find(|t|
+                        t.outcome.eq_ignore_ascii_case("Yes") || t.outcome.eq_ignore_ascii_case("Up")
+                    ) {
+                        market.yes_token_id = yes.token_id.clone();
+                    }
+                    if let Some(no) = clob_tokens.iter().find(|t|
+                        t.outcome.eq_ignore_ascii_case("No") || t.outcome.eq_ignore_ascii_case("Down")
+                    ) {
+                        market.no_token_id = no.token_id.clone();
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "[POLY-MARKETS] CLOB token fetch failed for condition_id {}: {}. Keeping Gamma tokens.",
+                        market.condition_id, e
+                    );
+                }
+            }
+        }
+    }
+
+    // Fallback: if Gamma /markets returned nothing, try the /events endpoint.
     if best.is_none() {
-        // Fallback: try the events endpoint. For 5m binary markets, Gamma hides the
-        // tokens in the /markets endpoint, but the /events endpoint includes the
-        // conditionId which we can use to fetch tokens from CLOB.
         let event_url = format!("https://gamma-api.polymarket.com/events?slug={}", slug);
         let events: Vec<GammaEvent> = client.get(&event_url).send().await?.json().await.unwrap_or_default();
 
         if let Some(event) = events.into_iter().next() {
             if let Some(mut m) = event.markets.into_iter().find(|m| m.slug == slug) {
-                // If it has no tokens, fetch them from CLOB using conditionId
                 if m.tokens.is_empty() && !m.condition_id.is_empty() {
-                    let clob_url = format!("https://clob.polymarket.com/markets/{}", m.condition_id);
-                    if let Ok(resp) = client.get(&clob_url).send().await {
-                        if let Ok(clob_market) = resp.json::<ClobMarketResponse>().await {
-                            m.tokens = clob_market.tokens.into_iter().map(|t| GammaToken {
-                                token_id: t.token_id,
-                                outcome: t.outcome,
-                            }).collect();
+                    match fetch_clob_tokens(&client, &m.condition_id).await {
+                        Ok(tokens) => m.tokens = tokens,
+                        Err(e) => {
+                            tracing::warn!("[POLY-MARKETS] CLOB token fetch failed in events fallback: {}", e);
                         }
                     }
                 }
@@ -242,6 +264,72 @@ pub async fn get_market(slug: &str) -> Result<Market> {
     }
 
     best.ok_or_else(|| anyhow!("No active market with valid tokens found for slug: {}", slug))
+}
+
+/// Fetch token IDs from the CLOB /markets/{condition_id} endpoint.
+/// Returns a list of GammaToken-style structs with the CLOB token IDs.
+async fn fetch_clob_tokens(client: &reqwest::Client, condition_id: &str) -> Result<Vec<GammaToken>> {
+    let clob_url = format!("https://clob.polymarket.com/markets/{}", condition_id);
+    tracing::info!("[POLY-MARKETS] CLOB token fetch: GET {}", clob_url);
+
+    let resp = client
+        .get(&clob_url)
+        .send()
+        .await
+        .map_err(|e| anyhow!("CLOB request failed: {}", e))?;
+
+    let status = resp.status();
+    let raw_body = resp.text().await.unwrap_or_default();
+    tracing::info!(
+        "[POLY-MARKETS] CLOB token fetch response: {} | {}",
+        status,
+        &raw_body[..raw_body.len().min(500)]
+    );
+
+    if !status.is_success() {
+        anyhow::bail!("CLOB returned non-success status: {}", status);
+    }
+
+    // Try the expected structured format first
+    if let Ok(clob_market) = serde_json::from_str::<ClobMarketResponse>(&raw_body) {
+        tracing::info!(
+            "[POLY-MARKETS] Parsed ClobMarketResponse with {} tokens",
+            clob_market.tokens.len()
+        );
+        return Ok(clob_market.tokens.into_iter().map(|t| GammaToken {
+            token_id: t.token_id,
+            outcome: t.outcome,
+        }).collect());
+    }
+
+    // Fallback: try to extract token IDs from generic JSON
+    let value: serde_json::Value = serde_json::from_str(&raw_body)
+        .map_err(|e| anyhow!("CLOB response is not valid JSON: {}", e))?;
+
+    if let Some(tokens) = value.get("tokens").and_then(|v| v.as_array()) {
+        tracing::info!(
+            "[POLY-MARKETS] Extracting {} tokens from generic JSON",
+            tokens.len()
+        );
+        let extracted: Vec<GammaToken> = tokens.iter().filter_map(|t| {
+            let token_id = t.get("token_id")
+                .or_else(|| t.get("tokenId"))
+                .or_else(|| t.get("asset_id"))
+                .and_then(|v| v.as_str())?;
+            let outcome = t.get("outcome")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            Some(GammaToken {
+                token_id: token_id.to_string(),
+                outcome: outcome.to_string(),
+            })
+        }).collect();
+        if !extracted.is_empty() {
+            return Ok(extracted);
+        }
+    }
+
+    anyhow::bail!("Could not extract tokens from CLOB response")
 }
 
 /// Get YES token price (0.0 to 1.0).

@@ -15,6 +15,14 @@ use tokio::task::AbortHandle;
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveSizingMode {
+    #[default]
+    Percent,
+    Fixed,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunnerConfig {
     pub id: String,
@@ -42,6 +50,9 @@ pub struct RunnerConfig {
     /// Polymarket NO token_id for the active market slug (resolved at start).
     #[serde(skip)]
     pub poly_no_token_id: Option<String>,
+    /// Polymarket condition_id for the active market slug (resolved at start).
+    #[serde(skip)]
+    pub poly_condition_id: Option<String>,
     /// Wallet address for live mode (read from config on creation).
     #[serde(skip)]
     pub wallet_address: Option<String>,
@@ -54,6 +65,21 @@ pub struct RunnerConfig {
     /// Chainlink polling interval in seconds.
     #[serde(default = "default_chainlink_interval")]
     pub chainlink_interval_secs: u64,
+    /// Live order sizing mode: "fixed" = USD amount, "percent" = % of balance.
+    #[serde(default)]
+    pub live_sizing_mode: LiveSizingMode,
+    /// Live order sizing value: USD amount if fixed, decimal fraction if percent.
+    #[serde(default)]
+    pub live_sizing_value: f64,
+    /// Stop-loss threshold: exit position early if token price drops this fraction
+    /// from entry (e.g. 0.40 = exit if we lose 40% of position value).
+    /// None = disabled. Only active in live polymarket_binary mode.
+    #[serde(default)]
+    pub stop_loss_pct: Option<f64>,
+    /// Fire order N seconds before the decision candle closes (0 = at close).
+    /// Overrides the global [live_strategy] early_fire_secs from config.toml.
+    #[serde(default)]
+    pub early_fire_secs: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,6 +101,12 @@ pub struct LiveOrder {
     pub amount_usdc: f64,
     pub order_id: String,
     pub status: String,
+    pub entry_price: Option<f64>,
+    pub result: Option<String>,
+    pub pnl: Option<f64>,
+    /// True when this position was closed early by the stop-loss monitor.
+    #[serde(default)]
+    pub stop_loss_triggered: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -457,7 +489,7 @@ async fn crypto_runner_loop(
 
 async fn polymarket_runner_loop(
     store: Arc<StrategyRunnerStore>,
-    config: RunnerConfig,
+    mut config: RunnerConfig,
     workspace_dir: PathBuf,
 ) {
     let id = config.id.clone();
@@ -579,45 +611,174 @@ async fn polymarket_runner_loop(
         }
     });
 
+    // ─ 1-second wall-clock timer: update dashboard window state in real time ─
+    // This prevents the dashboard from lagging 1 minute behind at window start,
+    // since candles only arrive when they close (1m delay).
+    let store_for_timer = store.clone();
+    let id_for_timer = id.clone();
+    let window_secs_for_timer = window_secs;
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            tick.tick().await;
+            let now = chrono::Utc::now().timestamp();
+            let current_window = now - (now % window_secs_for_timer as i64);
+            let next_window = current_window + window_secs_for_timer as i64;
+            let window_seconds_left = next_window - now;
+            let mut map = store_for_timer.runners.lock().unwrap();
+            if let Some(r) = map.get_mut(&id_for_timer) {
+                if let Some(ref mut result) = r.result {
+                    if let Some(ref mut feed) = result.live_feed {
+                        feed.window_timestamp = current_window;
+                        feed.window_seconds_left = window_seconds_left;
+                    }
+                }
+            }
+        }
+    });
+
     let mut last_window: i64 = -1;
     let mut last_decision_window: i64 = -1;
-    let mut prev_live_position: Option<(i64, String)> = None; // (window_ts, signal)
+    let mut prev_live_position: Option<(i64, String, std::collections::HashMap<String, f64>)> = None; // (window_ts, signal, debug)
     let mut price_history: std::collections::VecDeque<(i64, f64)> = std::collections::VecDeque::with_capacity(60);
+    // Persistent kv state for live signal — carries avg_vol and other ctx.set() values across windows.
+    // Pre-seed from a BT warmup run so avg_vol starts aligned with the backtester's historical value,
+    // preventing score divergence on the first windows after runner start.
+    let mut live_kv_state: std::collections::HashMap<String, f64> = {
+        let init_decision_minute = (window_minutes as i64) - 2;
+        let res_logic = config.resolution_logic.as_deref().unwrap_or("price_up");
+        match crate::tools::backtest::run_polymarket_bt_signal_preview(
+            &script_content,
+            buffer.iter().cloned().collect(),
+            window_minutes,
+            Some(init_decision_minute),
+            res_logic,
+            config.threshold,
+            config.initial_balance,
+        ) {
+            Ok(bt_seed) => {
+                let state: std::collections::HashMap<String, f64> = bt_seed.kv_state.iter()
+                    .filter(|(k, _)| !k.starts_with("debug_"))
+                    .map(|(k, v)| (k.clone(), *v))
+                    .collect();
+                tracing::info!("[RUNNER {id}] KV pre-seeded from BT warmup: {} state keys", state.len());
+                append_runner_log(&store, &id, &format!(
+                    "KV warmup: avg_vol={:.4}",
+                    state.get("avg_vol").copied().unwrap_or(0.0)
+                ));
+                state
+            }
+            Err(e) => {
+                tracing::warn!("[RUNNER {id}] BT warmup seed failed ({}), starting with empty kv", e);
+                std::collections::HashMap::new()
+            }
+        }
+    };
     // Live-mode counters (reset on runner start)
     let mut live_orders: Vec<LiveOrder> = Vec::new();
     let mut live_wins: u32 = 0;
     let mut live_total_trades: u32 = 0;
 
-    // Minute within the window to take the decision.
-    // For a 5m window: minute 0 starts at :00, decision at minute 4 (:04 candle close),
-    // resolution at minute 5 when the next window begins.
-    let decision_minute = (window_minutes as i64) - 1;
+    // Minute within the window to take the decision (0-based index).
+    // For a 5m window: decision at index 3 (the 4th candle, arriving at :34).
+    // This gives a full minute (:34-:35) for the order to execute before resolution.
+    let decision_minute = (window_minutes as i64) - 2;
 
-    while let Some(live) = candle_rx.recv().await {
-        let candle = crate::tools::backtest::Candle {
-            open_time_ms: live.open_time_ms,
-            open: live.open, high: live.high, low: live.low,
-            close: live.close, volume: live.volume,
+    // early_fire_secs: fire order N seconds before the decision candle closes.
+    // Resolved at runner creation (api.rs merges per-runner override with global config.toml).
+    let early_fire_secs = config.early_fire_secs.unwrap_or(0) as i64;
+
+    // Pinned sleep used for the optional early-fire timer.
+    // Initialized to far future so it never fires until armed.
+    let far_future = tokio::time::Instant::now() + std::time::Duration::from_secs(86400 * 365);
+    let early_sleep = tokio::time::sleep_until(far_future);
+    tokio::pin!(early_sleep);
+    let mut early_fire_armed_window: i64 = -1; // window_ts that the timer is armed for
+
+    loop {
+        // Either a new closed candle arrives, or the early-fire timer fires.
+        let early_fired = tokio::select! {
+            candle_opt = candle_rx.recv() => {
+                let live_inner = match candle_opt { Some(c) => c, None => break };
+                // Shadow `live` for the rest of the block
+                let live = live_inner;
+
+                let candle = crate::tools::backtest::Candle {
+                    open_time_ms: live.open_time_ms,
+                    open: live.open, high: live.high, low: live.low,
+                    close: live.close, volume: live.volume,
+                };
+                buffer.push_back(candle.clone());
+                if buffer.len() > MAX_BUFFER { buffer.pop_front(); }
+
+                // ── Arm early-fire timer when the candle BEFORE the decision arrives ──
+                // e.g. for 5m window with early_fire_secs=10: minute 2 candle arrives
+                // at ~T+2:00; we want to fire at T+3:50 (10s before minute-3 close).
+                if is_live && early_fire_secs > 0 && live.open_time_ms != 0 {
+                    let candle_ts = live.open_time_ms / 1000;
+                    let win = candle_ts - (candle_ts % window_secs as i64);
+                    let min_in_win = (candle_ts % window_secs as i64) / 60;
+                    if min_in_win == decision_minute - 1 && win != early_fire_armed_window && win != last_decision_window {
+                        // Decision candle closes at decision_minute * 60 into the window.
+                        let decision_close_ts = win + decision_minute * 60 + 60; // +60 = end of decision candle
+                        let fire_ts = decision_close_ts - early_fire_secs;
+                        let now_ts = chrono::Utc::now().timestamp();
+                        let delay_ms = ((fire_ts - now_ts).max(0) as u64) * 1000;
+                        early_sleep.as_mut().reset(
+                            tokio::time::Instant::now() + std::time::Duration::from_millis(delay_ms)
+                        );
+                        early_fire_armed_window = win;
+                        tracing::info!("[RUNNER {id}] Early fire armed for window {} — fires in {:.1}s", win, delay_ms as f64 / 1000.0);
+                        append_runner_log(&store, &id, &format!("Early fire armed: {}s before candle close", early_fire_secs));
+                    }
+                }
+
+                false // not an early fire event
+            }
+            _ = &mut early_sleep, if early_fire_armed_window != -1 && early_fire_armed_window != last_decision_window => {
+                // Reset timer to far future so it doesn't keep firing
+                early_sleep.as_mut().reset(tokio::time::Instant::now() + std::time::Duration::from_secs(86400 * 365));
+                tracing::info!("[RUNNER {id}] Early fire triggered for window {}", early_fire_armed_window);
+                append_runner_log(&store, &id, "Early fire: placing order before candle close");
+                true // signal that this is an early-fire tick
+            }
         };
 
-        buffer.push_back(candle.clone());
-        if buffer.len() > MAX_BUFFER { buffer.pop_front(); }
+        // When early fire triggers, synthesize window/candle timing from wall-clock.
+        let (live, current_window, next_window, minute_in_window) = if early_fired {
+            let now_ts = chrono::Utc::now().timestamp();
+            let win = now_ts - (now_ts % window_secs as i64);
+            let next_win = win + window_secs as i64;
+            let min_in_win = (now_ts % window_secs as i64) / 60;
+            // Use the last candle in the buffer as the "live" candle for context
+            let synth_live = buffer.back().map(|c| crate::live_feed::LiveCandle {
+                open_time_ms: c.open_time_ms,
+                open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume,
+            }).unwrap_or_else(|| crate::live_feed::LiveCandle {
+                open_time_ms: now_ts * 1000, open: 0.0, high: 0.0, low: 0.0, close: 0.0, volume: 0.0,
+            });
+            (synth_live, win, next_win, min_in_win)
+        } else {
+            // Normal candle path: recompute from buffer's last candle (just pushed)
+            let last = buffer.back().unwrap();
+            let candle_ts_secs = last.open_time_ms / 1000;
+            let win = candle_ts_secs - (candle_ts_secs % window_secs as i64);
+            let next_win = win + window_secs as i64;
+            let min_in_win = (candle_ts_secs % window_secs as i64) / 60;
+            let synth_live = crate::live_feed::LiveCandle {
+                open_time_ms: last.open_time_ms,
+                open: last.open, high: last.high, low: last.low, close: last.close, volume: last.volume,
+            };
+            (synth_live, win, next_win, min_in_win)
+        };
 
         // Track price history for live chart (keep last 60 points)
-        price_history.push_back((live.open_time_ms, live.close));
-        if price_history.len() > 60 { price_history.pop_front(); }
+        if !early_fired {
+            price_history.push_back((live.open_time_ms, live.close));
+            if price_history.len() > 60 { price_history.pop_front(); }
+        }
 
-        // Window this candle belongs to.
-        // Use candle *close* time for window detection so the new window is
-        // recognised immediately when the last 1m candle of the previous window
-        // closes (eliminates the ~1min inherent delay).
-        let candle_close_ts_secs = (live.open_time_ms / 1000) + 60;
-        let current_window = candle_close_ts_secs - (candle_close_ts_secs % window_secs as i64);
-        let next_window = current_window + window_secs as i64;
-        let window_seconds_left = next_window - candle_close_ts_secs;
-        // Minute within the current window (0-based from close time).
-        // For a 5m window: minute 0..4 correspond to candles 0..4.
-        let minute_in_window = (candle_close_ts_secs % window_secs as i64) / 60;
+        let window_seconds_left = next_window - (live.open_time_ms / 1000);
 
         // ── New window boundary: resolve previous window, prepare tokens ──
         if current_window != last_window {
@@ -634,16 +795,29 @@ async fn polymarket_runner_loop(
             if is_live {
                 if let Some(ref series_id) = config.series_id {
                     match resolve_token_for_window(series_id, current_window as u64).await {
-                        Ok((yes_id, no_id)) => {
+                        Ok((yes_id, no_id, condition_id)) => {
                             tracing::info!(
-                                "[RUNNER {id}] Resolved tokens for window {}: YES={} NO={}",
-                                current_window, yes_id, no_id
+                                "[RUNNER {id}] Resolved tokens for window {}: YES={} NO={} condition_id={}",
+                                current_window, yes_id, no_id, condition_id
                             );
+                            // Update BOTH the store and the local config so that
+                            // order placement and live-feed price checks use the
+                            // current window's tokens, not stale ones.
+                            config.poly_token_id = Some(yes_id.clone());
+                            config.poly_no_token_id = Some(no_id.clone());
+                            config.poly_condition_id = Some(condition_id.clone());
                             let mut map = store.runners.lock().unwrap();
                             if let Some(r) = map.get_mut(&id) {
                                 r.config.poly_token_id = Some(yes_id);
                                 r.config.poly_no_token_id = Some(no_id);
+                                r.config.poly_condition_id = Some(condition_id.clone());
                             }
+                            // Fetch and cache historical trades for this market window
+                            let ws = workspace_dir.clone();
+                            let cond = condition_id.clone();
+                            tokio::spawn(async move {
+                                update_trade_cache(&cond, &ws).await;
+                            });
                         }
                         Err(e) => {
                             tracing::error!(
@@ -659,28 +833,113 @@ async fn polymarket_runner_loop(
                 }
             }
 
-            // Resolve previous window outcome
+            // Run backtest on the full buffer so we can compare backtest vs live
+            // for the window that just completed.
+            let metrics = eval_polymarket(&script_content, &buffer, window_minutes, &config);
+
+            // Resolve previous window outcome and compare with backtest
             if is_live {
-                if let Some((prev_window, prev_signal)) = prev_live_position.take() {
+                if let Some((prev_window, prev_signal, prev_debug)) = prev_live_position.take() {
                     let res_logic = config.resolution_logic.as_deref().unwrap_or("price_up");
                     if let Some(went_up) = resolve_window_outcome(
                         &buffer, prev_window, window_secs as i64, res_logic, config.threshold,
                     ) {
-                        let won = (prev_signal.starts_with("yes") && went_up)
-                            || (prev_signal.starts_with("no") && !went_up);
-                        live_total_trades += 1;
-                        if won { live_wins += 1; }
                         let outcome = if went_up { "UP" } else { "DOWN" };
-                        let pos = if prev_signal.starts_with("yes") { "YES" } else { "NO" };
-                        let result = if won { "WIN" } else { "LOSS" };
-                        tracing::info!(
-                            "[RUNNER {id}] Window {} resolved {}. Position {} → {} (live win rate: {:.1}%)",
-                            prev_window, outcome, pos, result,
-                            if live_total_trades > 0 { live_wins as f64 / live_total_trades as f64 * 100.0 } else { 0.0 }
-                        );
+
+                        // ── Backtest vs Live comparison for this window ──
+                        let decision_ts = prev_window + ((window_minutes as i64) - 2) * 60;
+                        let decision_dt = chrono::DateTime::from_timestamp(decision_ts, 0)
+                            .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+                            .unwrap_or_default();
+
+                        let bt_trade = metrics.all_trades.iter()
+                            .find(|t| t.timestamp == decision_dt);
+
+                        let (bt_signal, bt_debug) = match bt_trade {
+                            Some(trade) => {
+                                let bt_side = if trade.side.starts_with("yes") { "yes" } else { "no" };
+                                if prev_signal.starts_with("flat") {
+                                    append_runner_log(
+                                        &store, &id,
+                                        &format!(
+                                            "DISCREPANCY window {}: live=flat but backtest={} bt_pnl={:.2}",
+                                            prev_window, bt_side, trade.pnl
+                                        ),
+                                    );
+                                }
+                                (bt_side.to_string(), trade.debug.clone())
+                            }
+                            None => {
+                                // Check flat_debugs for this window
+                                let flat_debug = metrics.flat_debugs.iter()
+                                    .find(|(ts, _)| *ts == decision_dt)
+                                    .map(|(_, d)| d.clone());
+                                if !prev_signal.starts_with("flat") {
+                                    append_runner_log(
+                                        &store, &id,
+                                        &format!(
+                                            "DISCREPANCY window {}: live={} but backtest=flat",
+                                            prev_window, prev_signal
+                                        ),
+                                    );
+                                }
+                                ("flat".to_string(), flat_debug)
+                            }
+                        };
+
+                        // Only count trades and log win/loss when live actually placed a bet.
+                        if prev_signal.starts_with("flat") {
+                            tracing::info!(
+                                "[RUNNER {id}] Window {} resolved {}. Position FLAT",
+                                prev_window, outcome
+                            );
+                            append_runner_log(
+                                &store, &id,
+                                &format!("Window {}: {} | Position FLAT", prev_window, outcome),
+                            );
+                        } else {
+                            let won = (prev_signal.starts_with("yes") && went_up)
+                                || (prev_signal.starts_with("no") && !went_up);
+                            live_total_trades += 1;
+                            if won { live_wins += 1; }
+                            let pos = if prev_signal.starts_with("yes") { "YES" } else { "NO" };
+                            let result = if won { "WIN" } else { "LOSS" };
+                            // Update matching order with result and P&L
+                            for order in live_orders.iter_mut() {
+                                if order.window_ts == prev_window && !order.stop_loss_triggered {
+                                    let ep = order.entry_price.unwrap_or(0.5).max(0.001);
+                                    order.result = Some(result.to_string());
+                                    order.pnl = Some(if won {
+                                        order.amount_usdc * (1.0 / ep - 1.0)
+                                    } else {
+                                        -order.amount_usdc
+                                    });
+                                }
+                            }
+                            tracing::info!(
+                                "[RUNNER {id}] Window {} resolved {}. Position {} → {} (live win rate: {:.1}%)",
+                                prev_window, outcome, pos, result,
+                                if live_total_trades > 0 { live_wins as f64 / live_total_trades as f64 * 100.0 } else { 0.0 }
+                            );
+                            append_runner_log(
+                                &store, &id,
+                                &format!("Window {}: {} | Position {} → {}", prev_window, outcome, pos, result),
+                            );
+                        }
+
+                        // Always print debug indicators for both live and backtest
+                        let live_debug_str = format_debug_values(&prev_debug);
+                        let bt_debug_str = format_debug_values(&bt_debug.unwrap_or_default());
                         append_runner_log(
                             &store, &id,
-                            &format!("Window {}: {} | Position {} → {}", prev_window, outcome, pos, result),
+                            &format!(
+                                "INDICATORS window {}: LIVE[signal={} {}] | BT[signal={} {}]",
+                                prev_window,
+                                prev_signal,
+                                if live_debug_str.is_empty() { "(no debug)".to_string() } else { live_debug_str },
+                                bt_signal,
+                                if bt_debug_str.is_empty() { "(no debug)".to_string() } else { bt_debug_str }
+                            ),
                         );
                     }
                 }
@@ -702,7 +961,6 @@ async fn polymarket_runner_loop(
                     fetch_usdc_balance_clob(client).await
                 } else { None }
             } else { None };
-            let metrics = eval_polymarket(&script_content, &buffer, window_minutes, &config);
             update_runner_result(
                 &store, &id, &config, &metrics, None,
                 config.wallet_address.clone(),
@@ -718,41 +976,144 @@ async fn polymarket_runner_loop(
         // ── Decision point: evaluate strategy and place order (once per window) ──
         if is_live && minute_in_window == decision_minute && current_window != last_decision_window {
             last_decision_window = current_window;
+            let display_minute = decision_minute + 1; // 1-based for user clarity
             tracing::info!(
-                "[RUNNER {id}] Decision point for window {} (minute {}), evaluating strategy...",
-                current_window, decision_minute
+                "[RUNNER {id}] Decision point for window {} (minute {}/{}, candle close at {:02}:{:02}), evaluating strategy...",
+                current_window, display_minute, window_minutes,
+                ((current_window % 86400) / 3600) as u64,
+                ((current_window % 3600) / 60) as u64
             );
+
+            // Log the candles that the strategy will see for this window
+            let window_candles: Vec<String> = buffer
+                .iter()
+                .filter(|c| {
+                    let ts = c.open_time_ms / 1000;
+                    ts >= current_window && ts < current_window + window_secs as i64
+                })
+                .map(|c| {
+                    let ts = c.open_time_ms / 1000;
+                    format!(
+                        "{} {:02}:{:02} O={:.2} H={:.2} L={:.2} C={:.2} V={:.5}",
+                        ts,
+                        ((ts % 86400) / 3600) as u64,
+                        ((ts % 3600) / 60) as u64,
+                        c.open,
+                        c.high,
+                        c.low,
+                        c.close,
+                        c.volume
+                    )
+                })
+                .collect();
+            if !window_candles.is_empty() {
+                let candles_log = window_candles.join(" | ");
+                tracing::info!("[RUNNER {id}] Window candles: {}", candles_log);
+                append_runner_log(&store, &id, &format!("Candles: {}", candles_log));
+            }
+
+            // Fetch real token prices so the strategy sees actual market pricing
+            let (yes_token_price, no_token_price) =
+                match (&config.poly_token_id, &config.poly_no_token_id) {
+                    (Some(yes), Some(no)) => fetch_token_prices(yes, no).await,
+                    _ => (0.0, 0.0),
+                };
 
             // Live signal: run script on the CURRENT (incomplete) window's decision candle.
             // This is NOT a backtest — it extracts buy/sell intent for the live market.
-            let current_signal = match crate::tools::backtest::run_polymarket_live_signal(
+            let live_result = match crate::tools::backtest::run_polymarket_live_signal(
                 &script_content,
                 buffer.iter().cloned().collect(),
                 window_minutes,
+                Some(decision_minute),
+                yes_token_price,
+                &live_kv_state,
             ) {
-                Ok(sig) => {
-                    tracing::info!("[RUNNER {id}] Live signal for window {}: {}", current_window, sig);
-                    append_runner_log(&store, &id, &format!("Signal window {}: {}", current_window, sig));
-                    sig
-                }
+                Ok(res) => res,
                 Err(e) => {
                     tracing::warn!("[RUNNER {id}] Live signal eval failed: {}", e);
                     append_runner_log(&store, &id, &format!("Signal eval FAILED: {}", e));
-                    "flat".to_string()
+                    crate::tools::backtest::LiveSignalResult {
+                        signal: "flat".to_string(),
+                        size: 0.0,
+                        debug: std::collections::HashMap::new(),
+                        kv_state: std::collections::HashMap::new(),
+                    }
                 }
             };
+            // Persist updated kv state for the next window.
+            // Only carry real state values (e.g. avg_vol) — strip debug_* keys so that
+            // if the script early-returns next window, stale indicator values don't leak.
+            live_kv_state = live_result.kv_state.iter()
+                .filter(|(k, _)| !k.starts_with("debug_"))
+                .map(|(k, v)| (k.clone(), *v))
+                .collect();
+
+            let current_signal = live_result.signal.clone();
+            tracing::info!("[RUNNER {id}] Live signal for window {}: {}", current_window, current_signal);
+            append_runner_log(&store, &id, &format!("Signal window {}: {}", current_window, current_signal));
+
+            // Log debug values (indicators) for every window, trade or flat.
+            let debug_str = format_debug_values(&live_result.debug);
+            if !debug_str.is_empty() {
+                append_runner_log(&store, &id, &format!("LIVE debug: {}", debug_str));
+            }
+
+            // Run BT-engine preview at the same decision point so the operator
+            // can compare BT indicators vs LIVE indicators side-by-side.
+            let res_logic = config.resolution_logic.as_deref().unwrap_or("price_up");
+            match crate::tools::backtest::run_polymarket_bt_signal_preview(
+                &script_content,
+                buffer.iter().cloned().collect(),
+                window_minutes,
+                Some(decision_minute),
+                res_logic,
+                config.threshold,
+                config.initial_balance,
+            ) {
+                Ok(bt_res) => {
+                    append_runner_log(&store, &id, &format!("BT signal: {}", bt_res.signal));
+                    let bt_debug_str = format_debug_values(&bt_res.debug);
+                    if !bt_debug_str.is_empty() {
+                        append_runner_log(&store, &id, &format!("BT debug: {}", bt_debug_str));
+                    }
+                }
+                Err(e) => {
+                    append_runner_log(&store, &id, &format!("BT preview FAILED: {}", e));
+                }
+            }
+
+            // Always record the live decision (flat or trade) so we can compare
+            // indicators with backtest when the window resolves.
+            prev_live_position = Some((current_window, current_signal.clone(), live_result.debug.clone()));
 
             if !current_signal.starts_with("flat") {
                 if let Some(ref client) = clob_client {
-                    if let Some(order) = execute_live_polymarket_signal(
-                        &id, client, &current_signal, &config, &live, &store, current_window,
+                    if let Some(mut order) = execute_live_polymarket_signal(
+                        &id, client, &current_signal, live_result.size, &config, &live, &store, current_window,
+                        yes_token_price, no_token_price,
                     ).await {
-                        prev_live_position = Some((current_window, current_signal.clone()));
+                        // ── Stop-loss monitor ──────────────────────────────────────────
+                        // Runs during the ~60s between decision (min 4) and resolution (min 5).
+                        // Polls token price every 10s; sells early if price drops too far.
+                        if let Some(sl_pct) = config.stop_loss_pct {
+                            if sl_pct > 0.0 {
+                                let ep = order.entry_price.unwrap_or(0.5).max(0.001);
+                                let stopped = monitor_stop_loss(
+                                    &id, client, &store, &mut order, sl_pct, next_window,
+                                ).await;
+                                if stopped {
+                                    // Mark result immediately — resolution logic will skip this order
+                                    let exit_p = order.entry_price.unwrap_or(ep);
+                                    order.result = Some("STOP".to_string());
+                                    order.pnl = Some(order.amount_usdc * (exit_p / ep - 1.0));
+                                    order.stop_loss_triggered = true;
+                                }
+                            }
+                        }
                         live_orders.push(order);
                     }
                 }
-            } else {
-                append_runner_log(&store, &id, "Signal: flat (no trade)");
             }
 
             // Metrics from backtest (historical) are still useful for display
@@ -830,41 +1191,181 @@ async fn polymarket_runner_loop(
 }
 
 /// Resolve both YES and NO token IDs for the current window slug.
-async fn resolve_token_for_window(series_id: &str, window_ts: u64) -> anyhow::Result<(String, String)> {
+async fn resolve_token_for_window(series_id: &str, window_ts: u64) -> anyhow::Result<(String, String, String)> {
     let series = crate::tools::series::builtin_series()
         .into_iter()
         .find(|s| s.id == series_id)
         .ok_or_else(|| anyhow::anyhow!("Selected Market Series is not recognized: {}", series_id))?;
 
-    let target_slug = format!("{}-{}", series.slug_prefix, window_ts);
+    // Polymarket recurrent markets may use seconds or milliseconds in the slug.
+    // Try seconds first, then milliseconds as fallback.
+    let slug_seconds = format!("{}-{}", series.slug_prefix, window_ts);
+    let slug_millis  = format!("{}-{}", series.slug_prefix, window_ts * 1000);
 
-    let market = polymarket_trader::markets::get_market(&target_slug)
-        .await
-        .map_err(|e| anyhow::anyhow!(
-            "No active Polymarket market found for slug {}. Error: {}",
-            target_slug,
-            e
-        ))?;
+    tracing::info!(
+        "[RESOLVE] Trying slug '{}' (seconds) for window {}",
+        slug_seconds, window_ts
+    );
+
+    let market = match polymarket_trader::markets::get_market(&slug_seconds).await {
+        Ok(m) => m,
+        Err(e1) => {
+            tracing::info!(
+                "[RESOLVE] Slug '{}' not found ({}). Trying milliseconds fallback '{}'...",
+                slug_seconds, e1, slug_millis
+            );
+            polymarket_trader::markets::get_market(&slug_millis)
+                .await
+                .map_err(|e2| anyhow::anyhow!(
+                    "No active Polymarket market found for slugs {} or {}. Errors: {} | {}",
+                    slug_seconds, slug_millis, e1, e2
+                ))?
+        }
+    };
 
     if market.yes_token_id.trim().is_empty() {
-        anyhow::bail!("The selected market has no YES token yet for slug {}.", target_slug);
+        anyhow::bail!("The selected market has no YES token yet for slug {}.", market.slug);
     }
     if market.no_token_id.trim().is_empty() {
-        anyhow::bail!("The selected market has no NO token yet for slug {}.", target_slug);
+        anyhow::bail!("The selected market has no NO token yet for slug {}.", market.slug);
     }
 
-    Ok((market.yes_token_id, market.no_token_id))
+    tracing::info!(
+        "[RESOLVE] Resolved tokens for slug '{}': YES={} NO={}",
+        market.slug, market.yes_token_id, market.no_token_id
+    );
+
+    Ok((market.yes_token_id, market.no_token_id, market.condition_id))
 }
 
 /// Returns the LiveOrder if successfully placed.
+/// Monitor an open position for stop-loss between decision and resolution.
+/// Polls token price every 10 seconds until `resolution_ts - 5s`.
+/// If price drops below `entry_price * (1 - stop_loss_pct)`, places a market
+/// sell order and returns `true`. Returns `false` if position held to resolution.
+async fn monitor_stop_loss(
+    id: &str,
+    client: &polymarket_trader::orders::ClobClient,
+    store: &Arc<StrategyRunnerStore>,
+    order: &mut LiveOrder,
+    stop_loss_pct: f64,
+    resolution_ts: i64,
+) -> bool {
+    use polymarket_trader::orders::Side;
+
+    let entry_price = match order.entry_price {
+        Some(p) if p > 0.0 => p,
+        _ => return false,
+    };
+    let stop_price = entry_price * (1.0 - stop_loss_pct);
+    let shares = (order.amount_usdc / entry_price).round().max(1.0);
+    let is_yes = order.side.starts_with("yes");
+
+    append_runner_log(
+        store, id,
+        &format!(
+            "Stop-loss active: entry={:.4} stop={:.4} ({:.0}% drop) shares={:.0}",
+            entry_price, stop_price, stop_loss_pct * 100.0, shares
+        ),
+    );
+
+    let poll_interval = std::time::Duration::from_secs(10);
+    let deadline = resolution_ts - 5; // stop checking 5s before resolution
+
+    loop {
+        tokio::time::sleep(poll_interval).await;
+
+        let now = chrono::Utc::now().timestamp();
+        if now >= deadline {
+            break;
+        }
+
+        // Fetch current token price
+        let http = reqwest::Client::new();
+        let side_str = if is_yes { "buy" } else { "buy" }; // we hold the token, price to sell
+        let price_url = format!(
+            "https://clob.polymarket.com/price?token_id={}&side={}",
+            order.token_id, side_str
+        );
+        let current_price = match http
+            .get(&price_url)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                if let Ok(body) = resp.text().await {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+                        v["price"].as_str()
+                            .and_then(|s| s.parse::<f64>().ok())
+                            .unwrap_or(entry_price)
+                    } else {
+                        entry_price
+                    }
+                } else {
+                    entry_price
+                }
+            }
+            Err(_) => entry_price,
+        };
+
+        tracing::debug!(
+            "[RUNNER {id}] Stop-loss poll: token={} current={:.4} stop={:.4}",
+            order.token_id, current_price, stop_price
+        );
+
+        if current_price <= stop_price {
+            // Exit: sell the token at market
+            let sell_price = (current_price * 0.97).max(0.01); // slightly below bid
+            tracing::warn!(
+                "[RUNNER {id}] STOP-LOSS triggered: price={:.4} <= stop={:.4}. Selling {:.0} shares.",
+                current_price, stop_price, shares
+            );
+            append_runner_log(
+                store, id,
+                &format!(
+                    "STOP-LOSS: price={:.4} ≤ stop={:.4} — selling {:.0} shares",
+                    current_price, stop_price, shares
+                ),
+            );
+
+            match client.create_limit_order(&order.token_id, Side::Sell, sell_price, shares).await {
+                Ok(resp) => {
+                    append_runner_log(
+                        store, id,
+                        &format!(
+                            "Stop-loss sell placed: {:.0} shares @ {:.4} (id={})",
+                            shares, sell_price, resp.order_id
+                        ),
+                    );
+                    // Update entry_price to the actual exit price for P&L
+                    order.entry_price = Some(current_price);
+                }
+                Err(e) => {
+                    append_runner_log(
+                        store, id,
+                        &format!("Stop-loss sell FAILED: {}", e),
+                    );
+                }
+            }
+            return true;
+        }
+    }
+
+    false
+}
+
 async fn execute_live_polymarket_signal(
     id: &str,
     client: &polymarket_trader::orders::ClobClient,
     signal: &str,
+    script_frac: f64,
     config: &RunnerConfig,
     _live: &crate::live_feed::LiveCandle,
     store: &Arc<StrategyRunnerStore>,
     window_ts: i64,
+    yes_token_price: f64,
+    no_token_price: f64,
 ) -> Option<LiveOrder> {
     use polymarket_trader::orders::Side;
 
@@ -893,44 +1394,190 @@ async fn execute_live_polymarket_signal(
         return None;
     };
 
-    // Use a fixed position size: $10 USDC per trade (safe default)
-    let amount_usdc = 10.0_f64;
+    // ── Position sizing: use the script's fraction clamped between 10% and 20%
+    // of the real USDC balance.  Minimum order on Polymarket is $5.
+    let balance = fetch_usdc_balance_clob(client).await.unwrap_or(0.0);
+    if balance <= 0.0 {
+        tracing::warn!("[RUNNER {id}] Cannot place order: zero or unknown USDC balance");
+        append_runner_log(store, id, "Skipped: zero USDC balance");
+        return None;
+    }
+    // Compute order amount based on configured sizing mode.
+    let amount_usdc = match config.live_sizing_mode {
+        LiveSizingMode::Fixed => {
+            let amt = config.live_sizing_value.max(5.0).round();
+            tracing::info!("[RUNNER {id}] Sizing (fixed): ${:.0}", amt);
+            amt
+        }
+        LiveSizingMode::Percent => {
+            let max_frac = config.live_sizing_value.max(0.0).min(1.0);
+            let frac = script_frac.clamp(0.0, max_frac);
+            let amt = (balance * frac).max(5.0).round();
+            tracing::info!(
+                "[RUNNER {id}] Sizing (percent): balance=${:.2} script_frac={:.4} max_frac={:.4} amount=${:.0}",
+                balance, script_frac, max_frac, amt
+            );
+            amt
+        }
+    };
+    // Polymarket CLOB rejects >2 decimal places because f64 → Decimal conversion
+    // preserves floating-point noise (e.g. 1224.16 becomes 1224.16000000000008…).
+    // The only robust fix is to round to whole integers — no decimals at all.
+
+    // ── Diagnostic: probe CLOB /price and /book for this token ──
+    let diag_client = reqwest::Client::new();
+    let price_url = format!("https://clob.polymarket.com/price?token_id={}&side=buy", token_id);
+    match diag_client.get(&price_url).timeout(std::time::Duration::from_secs(5)).send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            tracing::info!("[RUNNER {id}] DIAG /price for token {}: {} | {}", token_id, status, body);
+        }
+        Err(e) => {
+            tracing::warn!("[RUNNER {id}] DIAG /price request failed: {}", e);
+        }
+    }
+    let book_url = format!("https://clob.polymarket.com/book?token_id={}&side=buy", token_id);
+    match diag_client.get(&book_url).timeout(std::time::Duration::from_secs(5)).send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            tracing::info!("[RUNNER {id}] DIAG /book for token {}: {} | {}", token_id, status, body);
+        }
+        Err(e) => {
+            tracing::warn!("[RUNNER {id}] DIAG /book request failed: {}", e);
+        }
+    }
+
     // Market order: let the SDK calculate the real share price from the
     // orderbook.  Polymarket share prices are 0–1 (probabilities), not raw
     // crypto prices like $78k BTC, so live.close is not a valid worst_price.
     let worst_price = 0.0_f64;
 
-    tracing::info!(
-        "[RUNNER {id}] Live order: {:?} {} USDC on token {} @ ~{:.4}",
-        side, amount_usdc, token_id, worst_price
-    );
+    // Retry loop: Polymarket recurrent markets sometimes create tokens before
+    // the orderbook is ready.  Try market order first; if it fails with
+    // "No orderbook exists", fall back to a limit order at 0.50 (mid-price
+    // for a binary market) on the last attempt.
+    let max_retries = 3;
+    let retry_delay = std::time::Duration::from_secs(10);
+    let mut attempt = 0;
 
-    match client.create_market_order(&token_id, side, amount_usdc, worst_price).await {
-        Ok(resp) => {
+    loop {
+        attempt += 1;
+
+        // On the final attempt, if market order has been failing, try a limit
+        // order instead.  The SDK's market_order().build() calls /book internally
+        // to determine the execution price; limit orders may skip that step.
+        let is_final = attempt >= max_retries;
+
+        if is_final {
+            // Limit order size = shares, not USDC.  shares = amount / price.
+            // Round to whole integer — the SDK rejects f64 with >2 decimal places.
+            // Use the real CLOB token price instead of a hardcoded 0.50.
+            let limit_price = if signal.starts_with("yes") {
+                yes_token_price.max(0.01)
+            } else {
+                no_token_price.max(0.01)
+            };
+            let shares = (amount_usdc / limit_price).round();
             tracing::info!(
-                "[RUNNER {id}] Order placed: id={} status={}",
-                resp.order_id, resp.status
+                "[RUNNER {id}] Live LIMIT order (attempt {}/{}): {:?} {:.0} shares (~${:.0} USDC) on token {} @ {:.4}",
+                attempt, max_retries, side, shares, amount_usdc, token_id, limit_price
             );
-            append_runner_log(
-                store, id,
-                &format!("Order placed: {} {} USDC (id={})", signal, amount_usdc, resp.order_id),
-            );
-            Some(LiveOrder {
-                timestamp: chrono::Utc::now().to_rfc3339(),
-                window_ts,
-                side: signal.to_string(),
-                token_id,
-                amount_usdc,
-                order_id: resp.order_id,
-                status: resp.status,
-            })
+            match client.create_limit_order(&token_id, side, limit_price, shares).await {
+                Ok(resp) => {
+                    tracing::info!(
+                        "[RUNNER {id}] Limit order placed: id={} status={}",
+                        resp.order_id, resp.status
+                    );
+                    append_runner_log(
+                        store, id,
+                        &format!("Limit order placed: {} {} USDC @{:.4} (id={})", signal, amount_usdc, limit_price, resp.order_id),
+                    );
+                    let ep = if signal.starts_with("yes") { yes_token_price } else { no_token_price };
+                    return Some(LiveOrder {
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                        window_ts,
+                        side: signal.to_string(),
+                        token_id,
+                        amount_usdc,
+                        order_id: resp.order_id,
+                        status: resp.status,
+                        entry_price: Some(ep),
+                        result: None,
+                        pnl: None,
+                        stop_loss_triggered: false,
+                    });
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    tracing::warn!(
+                        "[RUNNER {id}] Limit order failed (attempt {}/{}): {}",
+                        attempt, max_retries, msg
+                    );
+                    append_runner_log(
+                        store, id,
+                        &format!(
+                            "Skipped: order failed for window {} after {} attempts (limit fallback also failed: {})",
+                            window_ts, max_retries, msg
+                        ),
+                    );
+                    return None;
+                }
+            }
         }
-        Err(e) => {
-            let msg = e.to_string();
-            tracing::error!("[RUNNER {id}] Order failed: {msg}");
-            append_runner_log(store, id, &format!("Order error: {msg}"));
-            // Don't abort the runner on a single failed order; just log it
-            None
+
+        tracing::info!(
+            "[RUNNER {id}] Live MARKET order (attempt {}/{}): {:?} {} USDC on token {}",
+            attempt, max_retries, side, amount_usdc, token_id
+        );
+
+        match client.create_market_order(&token_id, side, amount_usdc, worst_price).await {
+            Ok(resp) => {
+                tracing::info!(
+                    "[RUNNER {id}] Order placed: id={} status={}",
+                    resp.order_id, resp.status
+                );
+                append_runner_log(
+                    store, id,
+                    &format!("Order placed: {} {} USDC (id={})", signal, amount_usdc, resp.order_id),
+                );
+                let ep = if signal.starts_with("yes") { yes_token_price } else { no_token_price };
+                return Some(LiveOrder {
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    window_ts,
+                    side: signal.to_string(),
+                    token_id,
+                    amount_usdc,
+                    order_id: resp.order_id,
+                    status: resp.status,
+                    entry_price: Some(ep),
+                    result: None,
+                    pnl: None,
+                    stop_loss_triggered: false,
+                });
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                tracing::warn!(
+                    "[RUNNER {id}] Market order failed (attempt {}/{}): {}",
+                    attempt, max_retries, msg
+                );
+                if attempt < max_retries {
+                    tokio::time::sleep(retry_delay).await;
+                    continue;
+                }
+                // This should be unreachable because final attempt uses limit order,
+                // but keep as safety net.
+                append_runner_log(
+                    store, id,
+                    &format!(
+                        "Skipped: order failed for window {} after {} attempts: {}",
+                        window_ts, max_retries, msg
+                    ),
+                );
+                return None;
+            }
         }
     }
 }
@@ -949,7 +1596,14 @@ async fn fetch_token_prices(yes_token_id: &str, no_token_id: &str) -> (f64, f64)
                 .and_then(|s| s.parse::<f64>().ok())
                 .unwrap_or(0.0)
         }
-        _ => 0.0,
+        Ok(resp) => {
+            tracing::warn!("[PRICE] YES token /price failed: {} for token {}", resp.status(), yes_token_id);
+            0.0
+        }
+        Err(e) => {
+            tracing::warn!("[PRICE] YES token /price request error: {} for token {}", e, yes_token_id);
+            0.0
+        }
     };
 
     let no_url = format!("https://clob.polymarket.com/price?token_id={}&side=buy", no_token_id);
@@ -961,10 +1615,143 @@ async fn fetch_token_prices(yes_token_id: &str, no_token_id: &str) -> (f64, f64)
                 .and_then(|s| s.parse::<f64>().ok())
                 .unwrap_or(0.0)
         }
-        _ => 0.0,
+        Ok(resp) => {
+            tracing::warn!("[PRICE] NO token /price failed: {} for token {}", resp.status(), no_token_id);
+            0.0
+        }
+        Err(e) => {
+            tracing::warn!("[PRICE] NO token /price request error: {} for token {}", e, no_token_id);
+            0.0
+        }
     };
 
     (yes_price, no_price)
+}
+
+// ── Polymarket Data API trade cache (for backtesting calibration) ────────────
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct CachedTrade {
+    timestamp: i64,
+    price: f64,
+    size: f64,
+    side: String,
+    outcome: String,
+}
+
+async fn load_trade_cache(condition_id: &str, workspace_dir: &std::path::Path) -> Vec<CachedTrade> {
+    let file = workspace_dir
+        .join("polymarket_trade_cache")
+        .join(format!("{condition_id}.json"));
+    if !file.exists() {
+        return Vec::new();
+    }
+    match tokio::fs::read_to_string(&file).await {
+        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+        Err(e) => {
+            tracing::warn!("[TRADE-CACHE] Failed to read cache for {}: {}", condition_id, e);
+            Vec::new()
+        }
+    }
+}
+
+async fn save_trade_cache(condition_id: &str, workspace_dir: &std::path::Path, trades: &[CachedTrade]) {
+    let dir = workspace_dir.join("polymarket_trade_cache");
+    if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+        tracing::warn!("[TRADE-CACHE] Failed to create cache dir: {}", e);
+        return;
+    }
+    let file = dir.join(format!("{condition_id}.json"));
+    match serde_json::to_string_pretty(trades) {
+        Ok(json) => {
+            if let Err(e) = tokio::fs::write(&file, json).await {
+                tracing::warn!("[TRADE-CACHE] Failed to write cache for {}: {}", condition_id, e);
+            }
+        }
+        Err(e) => tracing::warn!("[TRADE-CACHE] Failed to serialize cache for {}: {}", condition_id, e),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct DataApiTradeItem {
+    price: f64,
+    #[serde(rename = "size")]
+    size: f64,
+    #[serde(rename = "timestamp")]
+    ts: i64,
+    side: String,
+    #[serde(default)]
+    outcome: String,
+}
+
+/// Fetch trades from Polymarket Data API and merge with local cache.
+async fn update_trade_cache(condition_id: &str, workspace_dir: &std::path::Path) -> Vec<CachedTrade> {
+    let mut cached = load_trade_cache(condition_id, workspace_dir).await;
+    let client = reqwest::Client::new();
+    let url = format!(
+        "https://data-api.polymarket.com/trades?market={}&limit=10000",
+        condition_id
+    );
+    match client.get(&url).timeout(std::time::Duration::from_secs(15)).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            let body = resp.text().await.unwrap_or_default();
+            match serde_json::from_str::<Vec<DataApiTradeItem>>(&body) {
+                Ok(items) => {
+                    let mut new_count = 0;
+                    for item in items {
+                        let price = item.price;
+                        let size = item.size;
+                        if price <= 0.0 || size <= 0.0 {
+                            continue;
+                        }
+                        // Simple dedup: same timestamp + price + size + side
+                        let exists = cached.iter().any(|c| {
+                            c.timestamp == item.ts
+                                && (c.price - price).abs() < 0.0001
+                                && (c.size - size).abs() < 0.0001
+                                && c.side == item.side
+                        });
+                        if !exists {
+                            cached.push(CachedTrade {
+                                timestamp: item.ts,
+                                price,
+                                size,
+                                side: item.side,
+                                outcome: item.outcome,
+                            });
+                            new_count += 1;
+                        }
+                    }
+                    cached.sort_by_key(|c| c.timestamp);
+                    tracing::info!(
+                        "[TRADE-CACHE] {}: {} total trades ({} new)",
+                        condition_id, cached.len(), new_count
+                    );
+                }
+                Err(e) => {
+                    let preview = if body.len() > 500 { &body[..500] } else { &body };
+                    tracing::warn!(
+                        "[TRADE-CACHE] Failed to parse trades for {}: {} | body preview: {}",
+                        condition_id, e, preview
+                    );
+                }
+            }
+        }
+        Ok(resp) => {
+            let status = resp.status();
+            let body_preview = resp.text().await.unwrap_or_default();
+            let preview = if body_preview.len() > 200 { &body_preview[..200] } else { &body_preview };
+            tracing::warn!(
+                "[TRADE-CACHE] Data API returned {} for {} | body: {}",
+                status, condition_id, preview
+            );
+        }
+        Err(e) => {
+            tracing::warn!("[TRADE-CACHE] Data API request failed for {}: {}", condition_id, e);
+        }
+    }
+    save_trade_cache(condition_id, workspace_dir, &cached).await;
+    cached
 }
 
 /// Determine the outcome of a completed window from the candle buffer.
@@ -1002,9 +1789,9 @@ fn append_runner_log(store: &Arc<StrategyRunnerStore>, id: &str, msg: &str) {
         } else {
             format!("{existing}\n{msg}")
         };
-        // Keep last 5 log lines
+        // Keep last 1000 log lines so the frontend scroll can show full history.
         let lines: Vec<&str> = updated.lines().collect();
-        let truncated = lines.iter().rev().take(5).rev().cloned().collect::<Vec<_>>().join("\n");
+        let truncated = lines.iter().rev().take(1000).rev().cloned().collect::<Vec<_>>().join("\n");
         r.status.error = Some(truncated);
     }
 }
@@ -1147,12 +1934,46 @@ fn binance_symbol_for_polymarket(symbol: &str) -> String {
     if s.ends_with("USDT") || s.ends_with("BTC") || s.ends_with("ETH") {
         return s;
     }
-    // Extract from Polymarket slug (e.g. "btc-updown-5m-..." → BTCUSDT)
+    // Extract from Polymarket slug (e.g. "sol-updown-5m-..." → SOLUSDT)
     let lower = symbol.to_lowercase();
-    if lower.starts_with("btc") || lower.contains("btc") { return "BTCUSDT".to_string(); }
-    if lower.starts_with("eth") || lower.contains("eth") { return "ETHUSDT".to_string(); }
+    if lower.starts_with("btc") || lower.contains("-btc-") { return "BTCUSDT".to_string(); }
+    if lower.starts_with("eth") || lower.contains("-eth-") { return "ETHUSDT".to_string(); }
+    if lower.starts_with("sol") || lower.contains("-sol-") { return "SOLUSDT".to_string(); }
+    if lower.starts_with("xrp") || lower.contains("-xrp-") { return "XRPUSDT".to_string(); }
+    if lower.starts_with("doge") || lower.contains("-doge-") { return "DOGEUSDT".to_string(); }
+    if lower.starts_with("hype") || lower.contains("-hype-") { return "HYPEUSDT".to_string(); }
+    if lower.starts_with("bnb") || lower.contains("-bnb-") { return "BNBUSDT".to_string(); }
     // Weather / other series: no Binance symbol; return as-is
     s
+}
+
+/// Format script debug values (score, win_pct, mom1, ema14, rsi, etc.) into a single string.
+fn format_debug_values(debug: &std::collections::HashMap<String, f64>) -> String {
+    let ordered_keys = [
+        "debug_score", "debug_win_pct", "debug_mom1", "debug_mom5",
+        "debug_ema9", "debug_ema21", "debug_ema14", "debug_sma50",
+        "debug_rsi", "debug_token_price", "debug_min_score",
+        "debug_avg_vol", "debug_volume",
+        "debug_est_prob", "debug_implied_p", "debug_edge",
+    ];
+    let mut parts: Vec<String> = Vec::new();
+    for key in &ordered_keys {
+        if let Some(v) = debug.get(*key) {
+            let short = key.strip_prefix("debug_").unwrap_or(key);
+            parts.push(format!("{}={:.4}", short, v));
+        }
+    }
+    for (key, v) in debug {
+        if !key.starts_with("debug_") || key == "debug_reason" {
+            continue;
+        }
+        if ordered_keys.contains(&key.as_str()) {
+            continue;
+        }
+        let short = key.strip_prefix("debug_").unwrap_or(key);
+        parts.push(format!("{}={:.4}", short, v));
+    }
+    parts.join(" | ")
 }
 
 fn interval_to_secs(interval: &str) -> u64 {

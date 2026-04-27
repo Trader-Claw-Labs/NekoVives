@@ -3821,6 +3821,14 @@ pub struct CreateRunnerBody {
     pub series_id: Option<String>,
     pub resolution_logic: Option<String>,
     pub threshold: Option<f64>,
+    #[serde(default)]
+    pub live_sizing_mode: Option<String>,
+    #[serde(default)]
+    pub live_sizing_value: Option<f64>,
+    #[serde(default)]
+    pub stop_loss_pct: Option<f64>,
+    #[serde(default)]
+    pub early_fire_secs: Option<u32>,
 }
 
 #[derive(serde::Deserialize)]
@@ -4032,10 +4040,21 @@ pub async fn handle_api_live_create(
         poly_creds: None,
         poly_token_id: None,
         poly_no_token_id: None,
+        poly_condition_id: None,
         wallet_address: None,
         chainlink_endpoint_url: None,
         chainlink_api_key: None,
         chainlink_interval_secs: 5,
+        live_sizing_mode: match body.live_sizing_mode.as_deref() {
+            Some("fixed") => crate::strategy_runner::LiveSizingMode::Fixed,
+            _ => crate::strategy_runner::LiveSizingMode::Percent,
+        },
+        live_sizing_value: body.live_sizing_value.unwrap_or(0.05),
+        stop_loss_pct: body.stop_loss_pct.filter(|&v| v > 0.0),
+        early_fire_secs: body.early_fire_secs.or_else(|| {
+            let v = state.config.lock().live_strategy.early_fire_secs;
+            if v > 0 { Some(v) } else { None }
+        }),
     };
 
     if let Err(e) = hydrate_live_runtime_config(&state, &mut config).await {

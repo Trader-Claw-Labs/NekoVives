@@ -21,7 +21,7 @@ fn on_candle(ctx) {
     let ema7  = ctx.ema(7);
     let ema14 = ctx.ema(14);
 
-    let mut score = 0.0;
+    let score = 0.0;
 
     // EMA trend signal (dominant)
     if ema7 > threshold + 1.0  { score += 3.0; }  // well above threshold
