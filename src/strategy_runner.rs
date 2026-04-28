@@ -1580,11 +1580,12 @@ async fn execute_live_polymarket_signal(
                 // Limit order size = shares, not USDC.  shares = amount / price.
                 // Round to whole integer — the SDK rejects f64 with >2 decimal places.
                 // Use the real CLOB token price instead of a hardcoded 0.50.
+                // Round to exactly 2 decimal places — CLOB rejects prices with >2dp.
                 let limit_price = if signal.starts_with("yes") {
-                    yes_token_price.max(0.01)
+                    (yes_token_price * 100.0).round() / 100.0
                 } else {
-                    no_token_price.max(0.01)
-                };
+                    (no_token_price * 100.0).round() / 100.0
+                }.max(0.01);
                 let shares = (amount_usdc / limit_price).round();
                 tracing::info!(
                     "[RUNNER {id}] Live LIMIT order (attempt {}/{}): {:?} {:.0} shares (~${:.0} USDC) on token {} @ {:.4}",
