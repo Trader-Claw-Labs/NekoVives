@@ -417,6 +417,12 @@ pub fn create_builder_headers(
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 
+// Anvil / Hardhat test account #0 private key.  This is a well-known
+// development key with *no real funds* on any mainnet.  It is used
+// exclusively in unit tests that verify EIP-712 signing and address
+// derivation without hitting the network.
+pub const ANVIL_TEST_KEY: &str = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -487,7 +493,7 @@ mod tests {
     #[test]
     fn test_eip712_sign() {
         // Known test private key (NOT a real key with funds)
-        let private_key_hex = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+        let private_key_hex = ANVIL_TEST_KEY;
         let key_bytes = hex::decode(private_key_hex).unwrap();
         let signing_key = SigningKey::from_slice(&key_bytes).unwrap();
 

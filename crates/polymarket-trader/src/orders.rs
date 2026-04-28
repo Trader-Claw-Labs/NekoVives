@@ -389,7 +389,7 @@ mod tests {
             secret: "test-secret".to_string(),
             passphrase: "test-pass".to_string(),
             wallet_address: "0x1234567890123456789012345678901234567890".to_string(),
-            private_key: Some("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80".to_string()),
+            private_key: Some(crate::auth::ANVIL_TEST_KEY.to_string()),
             is_builder: false,
             proxy_address: None,
         }

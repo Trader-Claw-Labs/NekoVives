@@ -425,7 +425,7 @@ mod tests {
 
     #[test]
     fn test_build_limit_order() {
-        let pk_hex = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+        let pk_hex = crate::auth::ANVIL_TEST_KEY;
         let key_bytes = hex::decode(pk_hex).unwrap();
         let signing_key = SigningKey::from_slice(&key_bytes).unwrap();
         let addr = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266";
