@@ -19,7 +19,7 @@ target/
 **/*.log
 
 .DS_Store
-.claude/
+.claude
 /web/dist
 .remember
 .firecrawl 
