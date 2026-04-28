@@ -1,4 +1,4 @@
-// Correlation Arbitrage v1.0 — Trader Claw (Lagged momentum + autocorrelation divergence)
+// Correlation Arbitrage v1.1 — Trader Claw (Lagged momentum + autocorrelation divergence)
 // Exploits temporary breakdowns in the asset's own autocorrelation structure.
 // When recent returns diverge significantly from their historical autocorrelation pattern,
 // mean-reversion is expected — the same principle as cross-asset correlation arb.
@@ -43,7 +43,6 @@ fn on_candle(ctx) {
     let ret_long   = if close_l > 0.0 { (close - close_l) / close_l * 100.0 } else { 0.0 };
 
     // Divergence: how much does short-term momentum deviate from medium-term baseline?
-    // Positive divergence = short-term overperforming (might revert)
     let divergence = ret_short - (ret_medium / medium_return_period * short_return_period);
 
     // Track divergence Z-score via rolling moments
@@ -68,14 +67,14 @@ fn on_candle(ctx) {
         let raw_pnl   = if ep > 0.0 { (close - ep) / ep * 100.0 } else { 0.0 };
         let eff_pnl   = if ctx.position < 0.0 { -raw_pnl } else { raw_pnl };
 
-        // Exit when divergence has converged (mean-reversion completed)
         let div_abs = if divergence < 0.0 { -divergence } else { divergence };
         let converged = div_abs < convergence_exit;
 
         if eff_pnl >= take_pft_pct || eff_pnl <= -max_loss_pct || bars_held >= max_hold || converged {
             ctx.sell(1.0);
             ctx.set("entry_div", 0.0);
-            ctx.log("EXIT corr_arb: pnl=" + eff_pnl + "% zscore=" + div_zscore + " converged=" + converged);
+            ctx.set("debug_exit_pnl", eff_pnl);
+            ctx.set("debug_exit_zscore", div_zscore);
         }
         return;
     }
@@ -83,22 +82,20 @@ fn on_candle(ctx) {
     let rsi = ctx.rsi(rsi_period);
 
     // ── Entry signals ─────────────────────────────────────────────────────────
-    // LONG: short-term significantly underperformed (div_zscore strongly negative)
-    //   → expect mean-reversion upward (convergence of short return to medium)
     if div_zscore < -2.2 && ret_long > -5.0 && rsi < 45.0 {
-        ctx.buy(1.0);
+        ctx.buy(0.25);
         ctx.set_stop_loss(close - atr * 2.0);
         ctx.set_take_profit(close * (1.0 + take_pft_pct / 100.0));
         ctx.set("entry_div", divergence);
-        ctx.log("LONG corr_arb: z=" + div_zscore + " div=" + divergence + "% ret_s=" + ret_short + "% ret_m=" + ret_medium + "%");
+        ctx.set("debug_entry", 1.0);
+        ctx.set("debug_zscore", div_zscore);
     }
-    // SHORT: short-term significantly outperformed (div_zscore strongly positive)
-    //   → expect mean-reversion downward (short return convergence to medium)
     else if div_zscore > 2.2 && ret_long < 5.0 && rsi > 55.0 {
         ctx.sell(1.0);
         ctx.set_stop_loss(close + atr * 2.0);
         ctx.set_take_profit(close * (1.0 - take_pft_pct / 100.0));
         ctx.set("entry_div", divergence);
-        ctx.log("SHORT corr_arb: z=" + div_zscore + " div=" + divergence + "% ret_s=" + ret_short + "% ret_m=" + ret_medium + "%");
+        ctx.set("debug_entry", -1.0);
+        ctx.set("debug_zscore", div_zscore);
     }
 }

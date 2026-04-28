@@ -754,6 +754,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         // ── Static assets (web dashboard) ──
         .route("/_app/{*path}", get(static_files::handle_static))
         .route("/assets/{*path}", get(static_files::handle_assets))
+        .route("/neko.png", get(static_files::handle_assets))
+        .route("/neko2.png", get(static_files::handle_assets))
         // ── Config PUT with larger body limit ──
         .merge(config_put_router)
         .with_state(state.clone())

@@ -1,4 +1,4 @@
-// CRYPTO 4-Minute Strategy v2.1 — Trader Claw (Binance, 4-of-4 confirmation + SMA-50 trend filter)
+// CRYPTO 4-Minute Strategy v2.2 — Trader Claw (Binance, 4-of-4 confirmation + EMA-50 trend filter)
 fn on_candle(ctx) {
     let lookback_4    = 4;
     let lookback_14   = 14;
@@ -29,7 +29,7 @@ fn on_candle(ctx) {
         let effective_pnl = if ctx.position < 0.0 { -pnl_pct } else { pnl_pct };
         if effective_pnl >= take_pft_pct || effective_pnl <= -max_loss_pct || bars_held >= max_hold {
             ctx.sell(1.0);
-            ctx.log("EXIT: PnL=" + effective_pnl + "% | bars=" + bars_held);
+            ctx.set("debug_exit_pnl", effective_pnl);
         }
         return;
     }
@@ -39,7 +39,7 @@ fn on_candle(ctx) {
     let close_1ago = ctx.close_at(idx - 1);
     let mom1 = if close_1ago > 0.0 { (close - close_1ago) / close_1ago * 100.0 } else { 0.0 };
     let ema14 = ctx.ema(lookback_14);
-    let sma50 = ctx.sma(lookback_50);
+    let ema50 = ctx.ema(lookback_50);
     let rsi   = ctx.rsi(lookback_14);
 
     let avg_vol = ctx.get("avg_vol", volume);
@@ -53,23 +53,26 @@ fn on_candle(ctx) {
     if mom4 > mom_threshold  { bull_count += 1; }
     if mom1 > mom1_threshold { bull_count += 1; }
     if rsi < rsi_oversold    { bull_count += 1; }
-    if vol_ok                { bull_count += 1; }
+    if vol_ok && mom4 > 0.0  { bull_count += 1; }  // directional volume confirmation
 
     let bear_count = 0;
     if mom4 < -mom_threshold  { bear_count += 1; }
     if mom1 < -mom1_threshold { bear_count += 1; }
     if rsi > rsi_overbought   { bear_count += 1; }
-    if vol_ok                 { bear_count += 1; }
+    if vol_ok && mom4 < 0.0   { bear_count += 1; }  // directional volume confirmation
 
-    if bull_count == 4 && close > ema14 && ema14 > sma50 {
-        ctx.buy(1.0);
+    ctx.set("debug_bull_count", bull_count);
+    ctx.set("debug_bear_count", bear_count);
+    ctx.set("debug_mom4", mom4);
+    ctx.set("debug_rsi", rsi);
+
+    if bull_count == 4 && close > ema14 && ema14 > ema50 {
+        ctx.buy(0.25);
         ctx.set_stop_loss(close - stop_dist);
         ctx.set_take_profit(close + tp_dist);
-        ctx.log("BUY: mom4=" + mom4 + "% | rsi=" + rsi + " | sma50=" + sma50);
-    } else if bear_count == 4 && close < ema14 && ema14 < sma50 {
+    } else if bear_count == 4 && close < ema14 && ema14 < ema50 {
         ctx.sell(1.0);
         ctx.set_stop_loss(close + stop_dist);
         ctx.set_take_profit(close - tp_dist);
-        ctx.log("SELL: mom4=" + mom4 + "% | rsi=" + rsi + " | sma50=" + sma50);
     }
 }

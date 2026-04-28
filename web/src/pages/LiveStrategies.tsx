@@ -137,13 +137,31 @@ function fmtUSD(v: number | null | undefined): string {
 
 /** Compute absolute P&L in USD for a runner. */
 function runnerPnlUSD(r: StoredRunner): number {
-  if (r.config.mode === 'live' && r.result?.live_orders) {
+  if (r.result?.live_orders && r.result.live_orders.length > 0) {
     return r.result.live_orders.reduce((s, o) => s + (o.pnl ?? 0), 0)
   }
   if (r.result?.total_return_pct != null && r.config.initial_balance != null) {
     return (r.result.total_return_pct / 100) * r.config.initial_balance
   }
   return 0
+}
+
+/** Convert live_orders to LiveTrade[] for equity chart rendering. */
+function liveOrdersToTrades(orders: LiveOrder[], initialBalance: number): LiveTrade[] {
+  let balance = initialBalance
+  return orders
+    .filter(o => o.pnl != null)
+    .map(o => {
+      balance += o.pnl!
+      return {
+        timestamp: o.timestamp,
+        side: o.side,
+        price: o.entry_price ?? 0.5,
+        size: o.amount_usdc,
+        pnl: o.pnl!,
+        balance,
+      }
+    })
 }
 
 /** Persistent total P&L that survives strategy deletion. */
@@ -704,8 +722,8 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript }: Crea
             </div>
           )}
 
-          {/* Live sizing config */}
-          {form.mode === 'live' && (
+          {/* Live sizing config — polymarket_binary supports these in both paper and live */}
+          {form.market_type === 'polymarket_binary' && (
             <div className="grid grid-cols-2 gap-3">
               <div>
                 <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>Sizing Mode</label>
@@ -1224,8 +1242,8 @@ function RunnerCard({ runner, onStop, onRestart, onDelete }: RunnerCardProps) {
       {expanded && (
         <>
 
-      {/* P&L summary — paper mode only */}
-      {result && config.mode === 'paper' && (
+      {/* P&L summary — paper mode only (non-polymarket) */}
+      {result && config.mode === 'paper' && config.market_type !== 'polymarket_binary' && (
         <div className="grid grid-cols-4 gap-2 px-4 pb-3 text-xs">
           <div>
             <div style={{ color: 'var(--color-text-muted)' }}>Return</div>
@@ -1249,8 +1267,8 @@ function RunnerCard({ runner, onStop, onRestart, onDelete }: RunnerCardProps) {
         </div>
       )}
 
-      {/* Live mode summary — live trades + signal */}
-      {config.mode === 'live' && (
+      {/* Live mode summary — live trades + signal (polymarket_binary in any mode) */}
+      {config.market_type === 'polymarket_binary' && (
         <div className="grid grid-cols-5 gap-2 px-4 pb-3 text-xs">
           <div>
             <div style={{ color: 'var(--color-text-muted)' }}>Last Signal</div>
@@ -1294,8 +1312,8 @@ function RunnerCard({ runner, onStop, onRestart, onDelete }: RunnerCardProps) {
         </div>
       )}
 
-      {/* Equity Chart — paper mode only */}
-      {config.mode === 'paper' && result && result.all_trades?.length > 0 && (
+      {/* Equity Chart — paper mode (crypto) or polymarket_binary (any mode) */}
+      {config.mode === 'paper' && config.market_type !== 'polymarket_binary' && result && result.all_trades?.length > 0 && (
         <div className="px-4 pb-2 border-t pt-3" style={{ borderColor: 'var(--color-border)' }}>
           <div className="flex items-center justify-between mb-1.5">
             <span className="text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>
@@ -1309,8 +1327,23 @@ function RunnerCard({ runner, onStop, onRestart, onDelete }: RunnerCardProps) {
         </div>
       )}
 
+      {/* Equity Chart for polymarket_binary live_orders */}
+      {config.market_type === 'polymarket_binary' && result?.live_orders && result.live_orders.length > 0 && (
+        <div className="px-4 pb-2 border-t pt-3" style={{ borderColor: 'var(--color-border)' }}>
+          <div className="flex items-center justify-between mb-1.5">
+            <span className="text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>
+              Equity Curve
+            </span>
+            <span className="text-xs" style={{ color: 'var(--color-text-muted)' }}>
+              {result.live_orders.filter(o => o.pnl != null).length} trades · ${fmtUSD(config.initial_balance + runnerPnlUSD(runner))}
+            </span>
+          </div>
+          <LiveEquityChart trades={liveOrdersToTrades(result.live_orders, config.initial_balance)} initialBalance={config.initial_balance} />
+        </div>
+      )}
+
       {/* Live order/activity log */}
-      {config.mode === 'live' && status.error && (
+      {config.market_type === 'polymarket_binary' && status.error && (
         <div className="mx-4 mb-3 rounded border overflow-hidden" style={{ borderColor: 'var(--color-border)' }}>
           <div className="px-3 py-1.5 text-xs font-semibold flex items-center justify-between"
             style={{ backgroundColor: 'var(--color-base)', borderBottom: showLog ? '1px solid var(--color-border)' : 'none' }}>
@@ -1332,12 +1365,12 @@ function RunnerCard({ runner, onStop, onRestart, onDelete }: RunnerCardProps) {
       )}
 
       {/* Live Feed Panel for binary recurring markets */}
-      {config.mode === 'live' && config.market_type === 'polymarket_binary' && result?.live_feed && (
+      {config.market_type === 'polymarket_binary' && result?.live_feed && (
         <LiveFeedPanel feed={result.live_feed} walletBalance={result.wallet_balance_usdc} liveOrders={result.live_orders} />
       )}
 
       {/* Live order history */}
-      {config.mode === 'live' && result?.live_orders && result.live_orders.length > 0 && (
+      {config.market_type === 'polymarket_binary' && result?.live_orders && result.live_orders.length > 0 && (
         <div className="mx-4 mb-3 rounded border overflow-hidden" style={{ borderColor: 'var(--color-border)' }}>
           <div className="px-3 py-2 text-xs font-semibold border-b flex items-center gap-2" style={{ borderColor: 'var(--color-border)', backgroundColor: 'var(--color-base)' }}>
             <TrendingUp size={12} style={{ color: 'var(--color-accent)' }} />
@@ -1583,6 +1616,17 @@ export default function LiveStrategies() {
             }}>
             Total P&L: {totalPnl >= 0 ? '+' : ''}${fmtUSD(totalPnl)}
           </span>
+          <button
+            onClick={() => {
+              localStorage.removeItem('live-strategies-total-pnl')
+              window.location.reload()
+            }}
+            className="text-[10px] px-2 py-0.5 rounded border hover:bg-white/5"
+            style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-muted)' }}
+            title="Reset Total P&L"
+          >
+            Reset
+          </button>
         </div>
         <div className="flex gap-2">
           <div className="relative">

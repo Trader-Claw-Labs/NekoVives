@@ -1,4 +1,4 @@
-// Liquidation Hunting v1.0 — Trader Claw (Volume cascade + reversal detector)
+// Liquidation Hunting v1.1 — Trader Claw (Volume cascade + reversal detector)
 // Identifies forced liquidation events by detecting abnormal volume spikes combined
 // with rapid price dislocations. After a cascade, fades the move (counter-trend).
 //
@@ -11,22 +11,20 @@
 // Works on Binance 4m/5m. Volume data required (Polymarket volume is synthetic).
 fn on_candle(ctx) {
     // ── Parameters ──────────────────────────────────────────────────────────
-    let vol_cascade_mult    = 4.0;   // Volume spike: must be 4× rolling average
-    let cascade_drop_pct    = 1.8;   // 1-bar price drop % to signal long liquidation
-    let cascade_rise_pct    = 1.8;   // 1-bar price rise % to signal short squeeze
-    let recovery_confirm    = 0.4;   // 1-bar recovery % after cascade (entry confirmation)
-    let rsi_exhaustion_low  = 22.0;  // RSI after long liq cascade (oversold exhaustion)
-    let rsi_exhaustion_high = 78.0;  // RSI after short squeeze (overbought exhaustion)
-    let stoch_low           = 15.0;  // Stochastic K < 15 confirms liquidation oversold
-    let stoch_high          = 85.0;  // Stochastic K > 85 confirms short squeeze
+    let vol_cascade_mult    = 4.0;
+    let cascade_drop_pct    = 1.8;
+    let cascade_rise_pct    = 1.8;
+    let recovery_confirm    = 0.4;
+    let rsi_exhaustion_low  = 22.0;
+    let rsi_exhaustion_high = 78.0;
     let bb_period           = 20;
     let bb_mult             = 2.2;
-    let atr_sl_mult         = 1.2;   // Tight stop: cascade entries are high-conviction
+    let atr_sl_mult         = 1.2;
     let atr_tp_mult         = 2.5;
     let max_loss_pct        = 2.5;
     let take_pft_pct        = 5.0;
-    let max_hold            = 10;    // Snap-backs are fast
-    let cooldown_bars       = 5;     // Min bars between trades (avoid whipsaws)
+    let max_hold            = 10;
+    let cooldown_bars       = 5;
     let min_idx             = 30;
 
     let idx = ctx.index;
@@ -51,12 +49,12 @@ fn on_candle(ctx) {
 
         if eff_pnl >= take_pft_pct || eff_pnl <= -max_loss_pct || bars_held >= max_hold {
             ctx.sell(1.0);
-            ctx.log("EXIT liq_hunt: pnl=" + eff_pnl + "% bars=" + bars_held);
+            ctx.set("debug_exit_pnl", eff_pnl);
         }
         return;
     }
 
-    // ── Cooldown (avoid re-entering immediately after a trade) ───────────────
+    // ── Cooldown ─────────────────────────────────────────────────────────────
     let last_trade_bar = ctx.get("last_trade_bar", 0.0);
     if idx - last_trade_bar < cooldown_bars { return; }
 
@@ -67,47 +65,49 @@ fn on_candle(ctx) {
     let bar_drop  = if close_1ago > 0.0 { (close_1ago - close) / close_1ago * 100.0 } else { 0.0 };
     let bar_rise  = if close_1ago > 0.0 { (close - close_1ago) / close_1ago * 100.0 } else { 0.0 };
 
-    // Check if previous candle had a big drop (potential long liquidation cascade)
     let prev_drop = if close_2ago > 0.0 { (close_2ago - close_1ago) / close_2ago * 100.0 } else { 0.0 };
     let prev_rise = if close_2ago > 0.0 { (close_1ago - close_2ago) / close_2ago * 100.0 } else { 0.0 };
 
     let vol_spiked = volume > avg_vol * vol_cascade_mult;
 
-    let rsi    = ctx.rsi(14);
-    let stoch  = ctx.stoch_k(14);
-    let bb_low = ctx.bb_lower(bb_period, bb_mult);
-    let bb_up  = ctx.bb_upper(bb_period, bb_mult);
+    let rsi = ctx.rsi(14);
+
+    // ATR bands as proxy for Bollinger Bands
+    let ema20  = ctx.ema(bb_period);
+    let bb_low = ema20 - atr * bb_mult;
+    let bb_up  = ema20 + atr * bb_mult;
+
+    ctx.set("debug_rsi", rsi);
+    ctx.set("debug_vol_ratio", volume / avg_vol);
 
     // ── LONG entry: detect long liquidation cascade + snap-back ──────────────
-    // Previous bar: large drop + volume spike (cascade)
-    // Current bar: recovery bounce (confirms exhaustion)
-    let long_cascade = prev_drop >= cascade_drop_pct && vol_spiked;
+    let long_cascade  = prev_drop >= cascade_drop_pct && vol_spiked;
     let long_recovery = bar_rise >= recovery_confirm;
-    let long_exhausted = rsi < rsi_exhaustion_low && stoch < stoch_low;
-    let long_bb_signal = close_1ago < bb_low;  // cascade pushed below lower band
+    let long_exhausted = rsi < rsi_exhaustion_low;
+    let long_bb_signal = close_1ago < bb_low;
 
     if long_cascade && (long_recovery || long_exhausted) && long_bb_signal {
-        ctx.buy(1.0);
+        ctx.buy(0.25);
         ctx.set_stop_loss(low - atr * atr_sl_mult);
         ctx.set_take_profit(close + atr * atr_tp_mult);
         ctx.set("last_trade_bar", idx);
-        ctx.log("LONG liq_hunt: cascade_drop=" + prev_drop + "% vol_ratio=" + (volume/avg_vol) + " rsi=" + rsi + " stoch=" + stoch);
+        ctx.set("debug_entry", 1.0);
+        ctx.set("debug_cascade_drop", prev_drop);
         return;
     }
 
     // ── SHORT entry: detect short squeeze cascade + reversal ──────────────────
-    // Previous bar: large rise + volume spike (forced short covering)
-    // Current bar: price starts fading (squeeze exhausted)
     let short_cascade  = prev_rise >= cascade_rise_pct && vol_spiked;
     let short_reversal = bar_drop >= recovery_confirm;
-    let short_exhausted = rsi > rsi_exhaustion_high && stoch > stoch_high;
-    let short_bb_signal = close_1ago > bb_up;  // squeeze pushed above upper band
+    let short_exhausted = rsi > rsi_exhaustion_high;
+    let short_bb_signal = close_1ago > bb_up;
 
     if short_cascade && (short_reversal || short_exhausted) && short_bb_signal {
-        ctx.sell(1.0);  // open short
+        ctx.sell(1.0);
         ctx.set_stop_loss(high + atr * atr_sl_mult);
         ctx.set_take_profit(close - atr * atr_tp_mult);
         ctx.set("last_trade_bar", idx);
-        ctx.log("SHORT liq_hunt: cascade_rise=" + prev_rise + "% vol_ratio=" + (volume/avg_vol) + " rsi=" + rsi + " stoch=" + stoch);
+        ctx.set("debug_entry", -1.0);
+        ctx.set("debug_cascade_rise", prev_rise);
     }
 }

@@ -714,7 +714,7 @@ async fn polymarket_runner_loop(
                 // ── Arm early-fire timer when the candle BEFORE the decision arrives ──
                 // e.g. for 5m window with early_fire_secs=10: minute 2 candle arrives
                 // at ~T+2:00; we want to fire at T+3:50 (10s before minute-3 close).
-                if is_live && early_fire_secs > 0 && live.open_time_ms != 0 {
+                if early_fire_secs > 0 && live.open_time_ms != 0 {
                     let candle_ts = live.open_time_ms / 1000;
                     let win = candle_ts - (candle_ts % window_secs as i64);
                     let min_in_win = (candle_ts % window_secs as i64) / 60;
@@ -791,9 +791,8 @@ async fn polymarket_runner_loop(
                     .unwrap_or_default()
             );
 
-            // Live mode: resolve tokens for the new window
-            if is_live {
-                if let Some(ref series_id) = config.series_id {
+            // Resolve tokens for the new window
+            if let Some(ref series_id) = config.series_id {
                     match resolve_token_for_window(series_id, current_window as u64).await {
                         Ok((yes_id, no_id, condition_id)) => {
                             tracing::info!(
@@ -831,15 +830,13 @@ async fn polymarket_runner_loop(
                         }
                     }
                 }
-            }
 
             // Run backtest on the full buffer so we can compare backtest vs live
             // for the window that just completed.
             let metrics = eval_polymarket(&script_content, &buffer, window_minutes, &config);
 
             // Resolve previous window outcome and compare with backtest
-            if is_live {
-                if let Some((prev_window, prev_signal, prev_debug)) = prev_live_position.take() {
+            if let Some((prev_window, prev_signal, prev_debug)) = prev_live_position.take() {
                     let res_logic = config.resolution_logic.as_deref().unwrap_or("price_up");
                     if let Some(went_up) = resolve_window_outcome(
                         &buffer, prev_window, window_secs as i64, res_logic, config.threshold,
@@ -943,7 +940,6 @@ async fn polymarket_runner_loop(
                         );
                     }
                 }
-            }
 
             let now = chrono::Utc::now().to_rfc3339();
             let next_ts = chrono::DateTime::from_timestamp(next_window, 0)
@@ -956,11 +952,11 @@ async fn polymarket_runner_loop(
                     r.status.next_tick_at = Some(next_ts);
                 }
             }
-            let wallet_balance = if is_live {
-                if let Some(ref client) = clob_client {
-                    fetch_usdc_balance_clob(client).await
-                } else { None }
-            } else { None };
+            let wallet_balance = if let Some(ref client) = clob_client {
+                fetch_usdc_balance_clob(client).await
+            } else {
+                Some(config.initial_balance)
+            };
             update_runner_result(
                 &store, &id, &config, &metrics, None,
                 config.wallet_address.clone(),
@@ -974,7 +970,7 @@ async fn polymarket_runner_loop(
         }
 
         // ── Decision point: evaluate strategy and place order (once per window) ──
-        if is_live && minute_in_window == decision_minute && current_window != last_decision_window {
+        if minute_in_window == decision_minute && current_window != last_decision_window {
             last_decision_window = current_window;
             let display_minute = decision_minute + 1; // 1-based for user clarity
             tracing::info!(
@@ -1088,31 +1084,30 @@ async fn polymarket_runner_loop(
             prev_live_position = Some((current_window, current_signal.clone(), live_result.debug.clone()));
 
             if !current_signal.starts_with("flat") {
-                if let Some(ref client) = clob_client {
-                    if let Some(mut order) = execute_live_polymarket_signal(
-                        &id, client, &current_signal, live_result.size, &config, &live, &store, current_window,
-                        yes_token_price, no_token_price,
-                    ).await {
-                        // ── Stop-loss monitor ──────────────────────────────────────────
-                        // Runs during the ~60s between decision (min 4) and resolution (min 5).
-                        // Polls token price every 10s; sells early if price drops too far.
-                        if let Some(sl_pct) = config.stop_loss_pct {
-                            if sl_pct > 0.0 {
-                                let ep = order.entry_price.unwrap_or(0.5).max(0.001);
-                                let stopped = monitor_stop_loss(
-                                    &id, client, &store, &mut order, sl_pct, next_window,
-                                ).await;
-                                if stopped {
-                                    // Mark result immediately — resolution logic will skip this order
-                                    let exit_p = order.entry_price.unwrap_or(ep);
-                                    order.result = Some("STOP".to_string());
-                                    order.pnl = Some(order.amount_usdc * (exit_p / ep - 1.0));
-                                    order.stop_loss_triggered = true;
-                                }
+                let client_ref = clob_client.as_deref();
+                if let Some(mut order) = execute_live_polymarket_signal(
+                    &id, client_ref, &current_signal, live_result.size, &config, &live, &store, current_window,
+                    yes_token_price, no_token_price,
+                ).await {
+                    // ── Stop-loss monitor ──────────────────────────────────────────
+                    // Runs during the ~60s between decision (min 4) and resolution (min 5).
+                    // Polls token price every 10s; sells early if price drops too far.
+                    if let Some(sl_pct) = config.stop_loss_pct {
+                        if sl_pct > 0.0 {
+                            let ep = order.entry_price.unwrap_or(0.5).max(0.001);
+                            let stopped = monitor_stop_loss(
+                                &id, client_ref, &store, &mut order, sl_pct, next_window,
+                            ).await;
+                            if stopped {
+                                // Mark result immediately — resolution logic will skip this order
+                                let exit_p = order.entry_price.unwrap_or(ep);
+                                order.result = Some("STOP".to_string());
+                                order.pnl = Some(order.amount_usdc * (exit_p / ep - 1.0));
+                                order.stop_loss_triggered = true;
                             }
                         }
-                        live_orders.push(order);
                     }
+                    live_orders.push(order);
                 }
             }
 
@@ -1120,7 +1115,9 @@ async fn polymarket_runner_loop(
             let metrics = eval_polymarket(&script_content, &buffer, window_minutes, &config);
             let wallet_balance = if let Some(ref client) = clob_client {
                 fetch_usdc_balance_clob(client).await
-            } else { None };
+            } else {
+                Some(config.initial_balance)
+            };
             update_runner_result(
                 &store, &id, &config, &metrics, None,
                 config.wallet_address.clone(),
@@ -1134,8 +1131,7 @@ async fn polymarket_runner_loop(
         }
 
         // Update live feed on every 1m candle (not just window boundaries)
-        if is_live {
-            let mut live_feed = None;
+        let mut live_feed = None;
             if let Some(series_id) = &config.series_id {
                 if let Some(series) = crate::tools::series::builtin_series().into_iter().find(|s| s.id == *series_id) {
                     let market_slug = format!("{}-{}", series.slug_prefix, current_window);
@@ -1178,12 +1174,11 @@ async fn polymarket_runner_loop(
                 }
             }
 
-            // Update live_feed in result without re-running metrics
-            let mut map = store.runners.lock().unwrap();
-            if let Some(r) = map.get_mut(&id) {
-                if let Some(ref mut result) = r.result {
-                    result.live_feed = live_feed;
-                }
+        // Update live_feed in result without re-running metrics
+        let mut map = store.runners.lock().unwrap();
+        if let Some(r) = map.get_mut(&id) {
+            if let Some(ref mut result) = r.result {
+                result.live_feed = live_feed;
             }
         }
     }
@@ -1238,14 +1233,13 @@ async fn resolve_token_for_window(series_id: &str, window_ts: u64) -> anyhow::Re
     Ok((market.yes_token_id, market.no_token_id, market.condition_id))
 }
 
-/// Returns the LiveOrder if successfully placed.
 /// Monitor an open position for stop-loss between decision and resolution.
 /// Polls token price every 10 seconds until `resolution_ts - 5s`.
 /// If price drops below `entry_price * (1 - stop_loss_pct)`, places a market
 /// sell order and returns `true`. Returns `false` if position held to resolution.
 async fn monitor_stop_loss(
     id: &str,
-    client: &polymarket_trader::orders::ClobClient,
+    client: Option<&polymarket_trader::orders::ClobClient>,
     store: &Arc<StrategyRunnerStore>,
     order: &mut LiveOrder,
     stop_loss_pct: f64,
@@ -1329,24 +1323,38 @@ async fn monitor_stop_loss(
                 ),
             );
 
-            match client.create_limit_order(&order.token_id, Side::Sell, sell_price, shares).await {
-                Ok(resp) => {
-                    append_runner_log(
-                        store, id,
-                        &format!(
-                            "Stop-loss sell placed: {:.0} shares @ {:.4} (id={})",
-                            shares, sell_price, resp.order_id
-                        ),
-                    );
-                    // Update entry_price to the actual exit price for P&L
-                    order.entry_price = Some(current_price);
+            if let Some(client) = client {
+                match client.create_limit_order(&order.token_id, Side::Sell, sell_price, shares).await {
+                    Ok(resp) => {
+                        append_runner_log(
+                            store, id,
+                            &format!(
+                                "Stop-loss sell placed: {:.0} shares @ {:.4} (id={})",
+                                shares, sell_price, resp.order_id
+                            ),
+                        );
+                        // Update entry_price to the actual exit price for P&L
+                        order.entry_price = Some(current_price);
+                    }
+                    Err(e) => {
+                        append_runner_log(
+                            store, id,
+                            &format!("Stop-loss sell FAILED: {}", e),
+                        );
+                        // FIX: record exit price even on failure so P&L reflects the loss
+                        order.entry_price = Some(current_price);
+                    }
                 }
-                Err(e) => {
-                    append_runner_log(
-                        store, id,
-                        &format!("Stop-loss sell FAILED: {}", e),
-                    );
-                }
+            } else {
+                // Paper mode: simulate stop-loss exit
+                append_runner_log(
+                    store, id,
+                    &format!(
+                        "Paper stop-loss: exited @ {:.4} (shares={:.0})",
+                        current_price, shares
+                    ),
+                );
+                order.entry_price = Some(current_price);
             }
             return true;
         }
@@ -1357,7 +1365,7 @@ async fn monitor_stop_loss(
 
 async fn execute_live_polymarket_signal(
     id: &str,
-    client: &polymarket_trader::orders::ClobClient,
+    client: Option<&polymarket_trader::orders::ClobClient>,
     signal: &str,
     script_frac: f64,
     config: &RunnerConfig,
@@ -1394,105 +1402,185 @@ async fn execute_live_polymarket_signal(
         return None;
     };
 
-    // ── Position sizing: use the script's fraction clamped between 10% and 20%
-    // of the real USDC balance.  Minimum order on Polymarket is $5.
-    let balance = fetch_usdc_balance_clob(client).await.unwrap_or(0.0);
-    if balance <= 0.0 {
-        tracing::warn!("[RUNNER {id}] Cannot place order: zero or unknown USDC balance");
-        append_runner_log(store, id, "Skipped: zero USDC balance");
-        return None;
-    }
-    // Compute order amount based on configured sizing mode.
-    let amount_usdc = match config.live_sizing_mode {
-        LiveSizingMode::Fixed => {
-            let amt = config.live_sizing_value.max(5.0).round();
-            tracing::info!("[RUNNER {id}] Sizing (fixed): ${:.0}", amt);
-            amt
+    // ── Position sizing ────────────────────────────────────────────
+    let (_balance, amount_usdc) = match client {
+        Some(c) => {
+            let bal = fetch_usdc_balance_clob(c).await.unwrap_or(0.0);
+            if bal <= 0.0 {
+                tracing::warn!("[RUNNER {id}] Cannot place order: zero or unknown USDC balance");
+                append_runner_log(store, id, "Skipped: zero USDC balance");
+                return None;
+            }
+            let amt = match config.live_sizing_mode {
+                LiveSizingMode::Fixed => {
+                    let amt = config.live_sizing_value.max(5.0).round();
+                    tracing::info!("[RUNNER {id}] Sizing (fixed): ${:.0}", amt);
+                    amt
+                }
+                LiveSizingMode::Percent => {
+                    let max_frac = config.live_sizing_value.max(0.0).min(1.0);
+                    let frac = script_frac.clamp(0.0, max_frac);
+                    let amt = (bal * frac).max(5.0).round();
+                    tracing::info!(
+                        "[RUNNER {id}] Sizing (percent): balance=${:.2} script_frac={:.4} max_frac={:.4} amount=${:.0}",
+                        bal, script_frac, max_frac, amt
+                    );
+                    amt
+                }
+            };
+            (bal, amt)
         }
-        LiveSizingMode::Percent => {
-            let max_frac = config.live_sizing_value.max(0.0).min(1.0);
-            let frac = script_frac.clamp(0.0, max_frac);
-            let amt = (balance * frac).max(5.0).round();
-            tracing::info!(
-                "[RUNNER {id}] Sizing (percent): balance=${:.2} script_frac={:.4} max_frac={:.4} amount=${:.0}",
-                balance, script_frac, max_frac, amt
-            );
-            amt
+        None => {
+            // Paper mode: use initial_balance as simulated balance
+            let bal = config.initial_balance;
+            let amt = match config.live_sizing_mode {
+                LiveSizingMode::Fixed => {
+                    let amt = config.live_sizing_value.max(5.0).round().min(bal);
+                    tracing::info!("[RUNNER {id}] Paper sizing (fixed): ${:.0}", amt);
+                    amt
+                }
+                LiveSizingMode::Percent => {
+                    let max_frac = config.live_sizing_value.max(0.0).min(1.0);
+                    let frac = script_frac.clamp(0.0, max_frac);
+                    let amt = (bal * frac).max(5.0).round().min(bal);
+                    tracing::info!(
+                        "[RUNNER {id}] Paper sizing (percent): balance=${:.2} script_frac={:.4} max_frac={:.4} amount=${:.0}",
+                        bal, script_frac, max_frac, amt
+                    );
+                    amt
+                }
+            };
+            if amt <= 0.0 || amt > bal {
+                tracing::warn!("[RUNNER {id}] Paper order: insufficient balance ${:.2} for amount ${:.0}", bal, amt);
+                append_runner_log(store, id, &format!("Skipped: insufficient paper balance ${:.2}", bal));
+                return None;
+            }
+            (bal, amt)
         }
     };
-    // Polymarket CLOB rejects >2 decimal places because f64 → Decimal conversion
-    // preserves floating-point noise (e.g. 1224.16 becomes 1224.16000000000008…).
-    // The only robust fix is to round to whole integers — no decimals at all.
 
-    // ── Diagnostic: probe CLOB /price and /book for this token ──
-    let diag_client = reqwest::Client::new();
-    let price_url = format!("https://clob.polymarket.com/price?token_id={}&side=buy", token_id);
-    match diag_client.get(&price_url).timeout(std::time::Duration::from_secs(5)).send().await {
-        Ok(resp) => {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            tracing::info!("[RUNNER {id}] DIAG /price for token {}: {} | {}", token_id, status, body);
+    let ep = if signal.starts_with("yes") { yes_token_price } else { no_token_price };
+
+    if let Some(client) = client {
+        // ── LIVE mode: place real order via CLOB ──────────────────
+
+        // ── Diagnostic: probe CLOB /price and /book for this token ──
+        let diag_client = reqwest::Client::new();
+        let price_url = format!("https://clob.polymarket.com/price?token_id={}&side=buy", token_id);
+        match diag_client.get(&price_url).timeout(std::time::Duration::from_secs(5)).send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                tracing::info!("[RUNNER {id}] DIAG /price for token {}: {} | {}", token_id, status, body);
+            }
+            Err(e) => {
+                tracing::warn!("[RUNNER {id}] DIAG /price request failed: {}", e);
+            }
         }
-        Err(e) => {
-            tracing::warn!("[RUNNER {id}] DIAG /price request failed: {}", e);
+        let book_url = format!("https://clob.polymarket.com/book?token_id={}&side=buy", token_id);
+        match diag_client.get(&book_url).timeout(std::time::Duration::from_secs(5)).send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                tracing::info!("[RUNNER {id}] DIAG /book for token {}: {} | {}", token_id, status, body);
+            }
+            Err(e) => {
+                tracing::warn!("[RUNNER {id}] DIAG /book request failed: {}", e);
+            }
         }
-    }
-    let book_url = format!("https://clob.polymarket.com/book?token_id={}&side=buy", token_id);
-    match diag_client.get(&book_url).timeout(std::time::Duration::from_secs(5)).send().await {
-        Ok(resp) => {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            tracing::info!("[RUNNER {id}] DIAG /book for token {}: {} | {}", token_id, status, body);
-        }
-        Err(e) => {
-            tracing::warn!("[RUNNER {id}] DIAG /book request failed: {}", e);
-        }
-    }
 
-    // Market order: let the SDK calculate the real share price from the
-    // orderbook.  Polymarket share prices are 0–1 (probabilities), not raw
-    // crypto prices like $78k BTC, so live.close is not a valid worst_price.
-    let worst_price = 0.0_f64;
+        // Market order: let the SDK calculate the real share price from the
+        // orderbook.  Polymarket share prices are 0–1 (probabilities), not raw
+        // crypto prices like $78k BTC, so live.close is not a valid worst_price.
+        let worst_price = 0.0_f64;
 
-    // Retry loop: Polymarket recurrent markets sometimes create tokens before
-    // the orderbook is ready.  Try market order first; if it fails with
-    // "No orderbook exists", fall back to a limit order at 0.50 (mid-price
-    // for a binary market) on the last attempt.
-    let max_retries = 3;
-    let retry_delay = std::time::Duration::from_secs(10);
-    let mut attempt = 0;
+        // Retry loop: Polymarket recurrent markets sometimes create tokens before
+        // the orderbook is ready.  Try market order first; if it fails with
+        // "No orderbook exists", fall back to a limit order at 0.50 (mid-price
+        // for a binary market) on the last attempt.
+        let max_retries = 3;
+        let retry_delay = std::time::Duration::from_secs(10);
+        let mut attempt = 0;
 
-    loop {
-        attempt += 1;
+        loop {
+            attempt += 1;
 
-        // On the final attempt, if market order has been failing, try a limit
-        // order instead.  The SDK's market_order().build() calls /book internally
-        // to determine the execution price; limit orders may skip that step.
-        let is_final = attempt >= max_retries;
+            // On the final attempt, if market order has been failing, try a limit
+            // order instead.  The SDK's market_order().build() calls /book internally
+            // to determine the execution price; limit orders may skip that step.
+            let is_final = attempt >= max_retries;
 
-        if is_final {
-            // Limit order size = shares, not USDC.  shares = amount / price.
-            // Round to whole integer — the SDK rejects f64 with >2 decimal places.
-            // Use the real CLOB token price instead of a hardcoded 0.50.
-            let limit_price = if signal.starts_with("yes") {
-                yes_token_price.max(0.01)
-            } else {
-                no_token_price.max(0.01)
-            };
-            let shares = (amount_usdc / limit_price).round();
+            if is_final {
+                // Limit order size = shares, not USDC.  shares = amount / price.
+                // Round to whole integer — the SDK rejects f64 with >2 decimal places.
+                // Use the real CLOB token price instead of a hardcoded 0.50.
+                let limit_price = if signal.starts_with("yes") {
+                    yes_token_price.max(0.01)
+                } else {
+                    no_token_price.max(0.01)
+                };
+                let shares = (amount_usdc / limit_price).round();
+                tracing::info!(
+                    "[RUNNER {id}] Live LIMIT order (attempt {}/{}): {:?} {:.0} shares (~${:.0} USDC) on token {} @ {:.4}",
+                    attempt, max_retries, side, shares, amount_usdc, token_id, limit_price
+                );
+                match client.create_limit_order(&token_id, side, limit_price, shares).await {
+                    Ok(resp) => {
+                        tracing::info!(
+                            "[RUNNER {id}] Limit order placed: id={} status={}",
+                            resp.order_id, resp.status
+                        );
+                        append_runner_log(
+                            store, id,
+                            &format!("Limit order placed: {} {} USDC @{:.4} (id={})", signal, amount_usdc, limit_price, resp.order_id),
+                        );
+                        let ep = if signal.starts_with("yes") { yes_token_price } else { no_token_price };
+                        return Some(LiveOrder {
+                            timestamp: chrono::Utc::now().to_rfc3339(),
+                            window_ts,
+                            side: signal.to_string(),
+                            token_id,
+                            amount_usdc,
+                            order_id: resp.order_id,
+                            status: resp.status,
+                            entry_price: Some(ep),
+                            result: None,
+                            pnl: None,
+                            stop_loss_triggered: false,
+                        });
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        tracing::warn!(
+                            "[RUNNER {id}] Limit order failed (attempt {}/{}): {}",
+                            attempt, max_retries, msg
+                        );
+                        append_runner_log(
+                            store, id,
+                            &format!(
+                                "Skipped: order failed for window {} after {} attempts (limit fallback also failed: {})",
+                                window_ts, max_retries, msg
+                            ),
+                        );
+                        return None;
+                    }
+                }
+            }
+
             tracing::info!(
-                "[RUNNER {id}] Live LIMIT order (attempt {}/{}): {:?} {:.0} shares (~${:.0} USDC) on token {} @ {:.4}",
-                attempt, max_retries, side, shares, amount_usdc, token_id, limit_price
+                "[RUNNER {id}] Live MARKET order (attempt {}/{}): {:?} {} USDC on token {}",
+                attempt, max_retries, side, amount_usdc, token_id
             );
-            match client.create_limit_order(&token_id, side, limit_price, shares).await {
+
+            match client.create_market_order(&token_id, side, amount_usdc, worst_price).await {
                 Ok(resp) => {
                     tracing::info!(
-                        "[RUNNER {id}] Limit order placed: id={} status={}",
+                        "[RUNNER {id}] Order placed: id={} status={}",
                         resp.order_id, resp.status
                     );
                     append_runner_log(
                         store, id,
-                        &format!("Limit order placed: {} {} USDC @{:.4} (id={})", signal, amount_usdc, limit_price, resp.order_id),
+                        &format!("Order placed: {} {} USDC (id={})", signal, amount_usdc, resp.order_id),
                     );
                     let ep = if signal.starts_with("yes") { yes_token_price } else { no_token_price };
                     return Some(LiveOrder {
@@ -1512,13 +1600,19 @@ async fn execute_live_polymarket_signal(
                 Err(e) => {
                     let msg = e.to_string();
                     tracing::warn!(
-                        "[RUNNER {id}] Limit order failed (attempt {}/{}): {}",
+                        "[RUNNER {id}] Market order failed (attempt {}/{}): {}",
                         attempt, max_retries, msg
                     );
+                    if attempt < max_retries {
+                        tokio::time::sleep(retry_delay).await;
+                        continue;
+                    }
+                    // This should be unreachable because final attempt uses limit order,
+                    // but keep as safety net.
                     append_runner_log(
                         store, id,
                         &format!(
-                            "Skipped: order failed for window {} after {} attempts (limit fallback also failed: {})",
+                            "Skipped: order failed for window {} after {} attempts: {}",
                             window_ts, max_retries, msg
                         ),
                     );
@@ -1526,59 +1620,30 @@ async fn execute_live_polymarket_signal(
                 }
             }
         }
-
+    } else {
+        // ── PAPER mode: simulate order ────────────────────────────
+        let order_id = format!("paper-{}", chrono::Utc::now().timestamp_millis());
         tracing::info!(
-            "[RUNNER {id}] Live MARKET order (attempt {}/{}): {:?} {} USDC on token {}",
-            attempt, max_retries, side, amount_usdc, token_id
+            "[RUNNER {id}] Paper order: {} ${:.0} on token {} @ {:.4}",
+            signal, amount_usdc, token_id, ep
         );
-
-        match client.create_market_order(&token_id, side, amount_usdc, worst_price).await {
-            Ok(resp) => {
-                tracing::info!(
-                    "[RUNNER {id}] Order placed: id={} status={}",
-                    resp.order_id, resp.status
-                );
-                append_runner_log(
-                    store, id,
-                    &format!("Order placed: {} {} USDC (id={})", signal, amount_usdc, resp.order_id),
-                );
-                let ep = if signal.starts_with("yes") { yes_token_price } else { no_token_price };
-                return Some(LiveOrder {
-                    timestamp: chrono::Utc::now().to_rfc3339(),
-                    window_ts,
-                    side: signal.to_string(),
-                    token_id,
-                    amount_usdc,
-                    order_id: resp.order_id,
-                    status: resp.status,
-                    entry_price: Some(ep),
-                    result: None,
-                    pnl: None,
-                    stop_loss_triggered: false,
-                });
-            }
-            Err(e) => {
-                let msg = e.to_string();
-                tracing::warn!(
-                    "[RUNNER {id}] Market order failed (attempt {}/{}): {}",
-                    attempt, max_retries, msg
-                );
-                if attempt < max_retries {
-                    tokio::time::sleep(retry_delay).await;
-                    continue;
-                }
-                // This should be unreachable because final attempt uses limit order,
-                // but keep as safety net.
-                append_runner_log(
-                    store, id,
-                    &format!(
-                        "Skipped: order failed for window {} after {} attempts: {}",
-                        window_ts, max_retries, msg
-                    ),
-                );
-                return None;
-            }
-        }
+        append_runner_log(
+            store, id,
+            &format!("Paper order: {} ${:.0} @ {:.4} (id={})", signal, amount_usdc, ep, order_id),
+        );
+        Some(LiveOrder {
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            window_ts,
+            side: signal.to_string(),
+            token_id,
+            amount_usdc,
+            order_id,
+            status: "LIVE".to_string(),
+            entry_price: Some(ep),
+            result: None,
+            pnl: None,
+            stop_loss_triggered: false,
+        })
     }
 }
 

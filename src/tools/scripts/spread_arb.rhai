@@ -1,4 +1,4 @@
-// Spread Arbitrage v1.0 — Trader Claw (Statistical spread mean-reversion on single asset)
+// Spread Arbitrage v1.1 — Trader Claw (Statistical spread mean-reversion on single asset)
 // Models "spread" as the deviation between a fast EMA and a slow EMA (synthetic spread).
 // When the spread is extreme (Z-score > threshold), mean-reversion is expected.
 // This captures the same alpha as cross-asset spread arb but works on one price feed.
@@ -32,10 +32,8 @@ fn on_candle(ctx) {
     // ── Compute synthetic spread (EMA deviation) ─────────────────────────────
     let fast_ema = ctx.ema(fast_period);
     let slow_ema = ctx.ema(slow_period);
-    let spread   = fast_ema - slow_ema;   // positive = fast above slow (bullish bias)
+    let spread   = fast_ema - slow_ema;
 
-    // Track spread history in KV for Z-score calculation
-    // We store last N spread values using a rolling mean + variance approximation
     let spread_mean = ctx.get("spread_mean", spread);
     let spread_var  = ctx.get("spread_var",  0.0);
     let spread_n    = ctx.get("spread_n",    1.0);
@@ -58,11 +56,11 @@ fn on_candle(ctx) {
         let raw_pnl   = if ep > 0.0 { (close - ep) / ep * 100.0 } else { 0.0 };
         let eff_pnl   = if ctx.position < 0.0 { -raw_pnl } else { raw_pnl };
 
-        // Exit when Z-score normalizes (spread mean-reverted)
         let z_abs = if zscore < 0.0 { -zscore } else { zscore };
         if z_abs < exit_z || eff_pnl >= take_pft_pct || eff_pnl <= -max_loss_pct || bars_held >= max_hold {
             ctx.sell(1.0);
-            ctx.log("EXIT spread_arb: pnl=" + eff_pnl + "% zscore=" + zscore + " bars=" + bars_held);
+            ctx.set("debug_exit_pnl", eff_pnl);
+            ctx.set("debug_exit_z", zscore);
         }
         return;
     }
@@ -72,19 +70,20 @@ fn on_candle(ctx) {
 
     let rsi   = ctx.rsi(rsi_period);
 
-    // ── Entry: Long when spread unusually negative (fast<slow = oversold fast) ──
-    // Interpretation: asset deviated too far below its trend → expect snap-back long
+    // ── Entry: Long when spread unusually negative ──
     if zscore < -entry_z && rsi < 45.0 {
-        ctx.buy(1.0);
+        ctx.buy(0.25);
         ctx.set_stop_loss(close - atr * atr_sl_mult);
         ctx.set_take_profit(close * (1.0 + take_pft_pct / 100.0));
-        ctx.log("LONG spread_arb: z=" + zscore + " spread=" + spread + " rsi=" + rsi);
+        ctx.set("debug_entry", 1.0);
+        ctx.set("debug_z", zscore);
     }
-    // ── Entry: Short when spread unusually positive (fast>slow = overbought fast) ──
+    // ── Entry: Short when spread unusually positive ──
     else if zscore > entry_z && rsi > 55.0 {
         ctx.sell(1.0);
         ctx.set_stop_loss(close + atr * atr_sl_mult);
         ctx.set_take_profit(close * (1.0 - take_pft_pct / 100.0));
-        ctx.log("SHORT spread_arb: z=" + zscore + " spread=" + spread + " rsi=" + rsi);
+        ctx.set("debug_entry", -1.0);
+        ctx.set("debug_z", zscore);
     }
 }

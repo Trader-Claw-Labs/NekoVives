@@ -1,4 +1,4 @@
-// Grid Trading v1.0 — Trader Claw (KV-based price ladder simulation)
+// Grid Trading v1.1 — Trader Claw (KV-based price ladder simulation)
 // Simulates a grid bot: places virtual buy orders at fixed price levels below current price
 // and sell orders above. Profits from price oscillation without predicting direction.
 //
@@ -25,19 +25,18 @@ fn on_candle(ctx) {
     let initialized = ctx.get("grid_init", 0.0);
     if initialized == 0.0 {
         ctx.set("grid_init",    1.0);
-        ctx.set("grid_base",    close);          // center of the grid
-        ctx.set("grid_filled",  0.0);            // total filled slots
-        ctx.set("grid_pnl",     0.0);            // cumulative realized PnL
+        ctx.set("grid_base",    close);
+        ctx.set("grid_filled",  0.0);
+        ctx.set("grid_pnl",     0.0);
         ctx.set("grid_buys",    0.0);
         ctx.set("grid_sells",   0.0);
 
-        // Initialize all slots as empty (0 = empty)
         let i = 0;
         while i < grid_count {
             ctx.set("slot_" + i, 0.0);
             i += 1;
         }
-        ctx.log("GRID INIT: base=" + close + " levels=" + grid_count + " spacing=" + grid_spacing_pct + "%");
+        ctx.set("debug_grid_base", close);
         return;
     }
 
@@ -46,10 +45,6 @@ fn on_candle(ctx) {
     let grid_pnl      = ctx.get("grid_pnl", 0.0);
 
     // ── Compute grid levels ─────────────────────────────────────────────────
-    // Grid i is centered symmetrically around base:
-    // Level i below base = base * (1 - (i+1) * spacing)
-    // We buy at level i, sell at level i + profit_margin above buy
-
     let new_buys  = 0;
     let new_sells = 0;
     let new_filled = grid_filled;
@@ -63,45 +58,38 @@ fn on_candle(ctx) {
         let slot_entry = ctx.get(slot_key, 0.0);
 
         if slot_entry == 0.0 {
-            // Slot empty: buy if price drops to or below the level
-            if close <= buy_price * 1.001 {  // small tolerance (0.1%)
+            if close <= buy_price * 1.001 {
                 ctx.set(slot_key, buy_price);
                 new_filled += 1.0;
                 new_buys   += 1;
-                ctx.log("GRID BUY slot=" + i + " buy_level=" + buy_price + " close=" + close);
+                ctx.set("debug_last_buy_slot", i);
             }
         } else {
-            // Slot filled: sell if price rises to or above sell target
             if close >= sell_price * 0.999 {
-                let pnl = (sell_price - slot_entry);  // per unit
+                let pnl = (sell_price - slot_entry);
                 new_pnl += pnl;
                 new_filled -= 1.0;
                 new_sells  += 1;
-                ctx.set(slot_key, 0.0);  // mark slot empty again
-                ctx.log("GRID SELL slot=" + i + " entry=" + slot_entry + " sell=" + sell_price + " pnl=" + pnl);
+                ctx.set(slot_key, 0.0);
+                ctx.set("debug_last_sell_pnl", pnl);
             }
         }
 
         i += 1;
     }
 
-    // Update state
     ctx.set("grid_filled", new_filled);
     ctx.set("grid_pnl",    new_pnl);
 
-    // Use engine's buy/sell to track overall exposure (for metrics)
-    // When grid fills (exposure increases), buy proportional fraction
-    // When grid empties (exposure decreases), sell proportional fraction
     if new_buys > 0 && ctx.balance > 0.0 {
-        let fraction = new_buys / (grid_count + 1);  // proportional to total grid
+        let fraction = new_buys / (grid_count + 1);
         ctx.buy(fraction);
         ctx.set("grid_buys", ctx.get("grid_buys", 0.0) + new_buys);
     }
 
     if new_sells > 0 && ctx.position > 0.0 {
-        // Partial sell proportional to slots closed
         let fraction = new_sells / (grid_count + 1);
-        ctx.sell(fraction);  // Note: this closes partial position
+        ctx.sell(fraction);
         ctx.set("grid_sells", ctx.get("grid_sells", 0.0) + new_sells);
     }
 
@@ -115,6 +103,6 @@ fn on_candle(ctx) {
         }
         ctx.set("grid_filled", 0.0);
         ctx.set("last_rebase", idx);
-        ctx.log("GRID REBASE: new_base=" + close + " total_pnl=" + new_pnl);
+        ctx.set("debug_rebase_pnl", new_pnl);
     }
 }

@@ -1,75 +1,89 @@
-// Polymarket 5-Minute Binary Strategy v2.1 — Trader Claw (3-of-4 confirmation)
+// Polymarket 5-Minute Binary Strategy v3.0 — Trader Claw
+// Optimized for Polymarket recurring binary prediction markets (5 min windows).
+// Uses window_open as dominant signal + RSI + momentum + volume (score-based).
+// Only bets when token price is in the fair-value zone (35–65¢) and edge > 0.
 fn on_candle(ctx) {
-    let lookback_4    = 4;
-    let lookback_14   = 14;
-    let lookback_50   = 50;
+    let min_idx        = 20;
+    let max_token_p    = 0.65;
+    let min_edge       = 0.0;
+    let min_score      = 2.0;
+    let lookback_4     = 4;
+    let lookback_14    = 14;
     let mom_threshold  = 1.2;
     let mom1_threshold = 0.3;
     let rsi_oversold   = 30.0;
     let rsi_overbought = 70.0;
-    let atr_sl_mult    = 1.5;
-    let atr_tp_mult    = 2.5;
-    let max_loss_pct   = 2.5;
-    let take_pft_pct   = 5.0;
     let min_vol_mult   = 1.2;
-    let max_hold       = 12;
-    let min_idx        = 80;
-    let min_confirmations = 3;
 
     let idx = ctx.index;
     if idx < min_idx { return; }
+    if ctx.open_positions > 0 { return; }
+
+    let window_open = ctx.window_open;
+    if window_open <= 0.0 { return; }
+    if ctx.token_price > max_token_p { ctx.set("debug_reason", 1.0); return; }
+    if ctx.token_price < (1.0 - max_token_p) { ctx.set("debug_reason", 2.0); return; }
 
     let close  = ctx.close;
     let volume = ctx.volume;
-    let atr    = ctx.atr(14);
 
-    if ctx.position != 0.0 {
-        let ep          = ctx.entry_price;
-        let bars_held   = idx - ctx.entry_index;
-        let pnl_pct     = if ep > 0.0 { (close - ep) / ep * 100.0 } else { 0.0 };
-        let effective_pnl = if ctx.position < 0.0 { -pnl_pct } else { pnl_pct };
-        if effective_pnl >= take_pft_pct || effective_pnl <= -max_loss_pct || bars_held >= max_hold {
-            ctx.sell(1.0);
-            ctx.log("EXIT: PnL=" + effective_pnl + "% | bars=" + bars_held);
-        }
-        return;
-    }
+    // Window-open momentum (dominant signal — weight 5-7)
+    let win_pct = (close - window_open) / window_open * 100.0;
+    let score = 0.0;
+    if win_pct >  0.10 { score +=  7.0; }
+    else if win_pct >  0.02 { score +=  5.0; }
+    else if win_pct >  0.005 { score +=  3.0; }
+    else if win_pct >  0.001 { score +=  1.0; }
+    else if win_pct < -0.001 { score -=  1.0; }
+    else if win_pct < -0.005 { score -=  3.0; }
+    else if win_pct < -0.02  { score -=  5.0; }
+    else if win_pct < -0.10  { score -=  7.0; }
 
+    // 4-bar momentum
     let close_4ago = ctx.close_at(idx - lookback_4);
     let mom4 = if close_4ago > 0.0 { (close - close_4ago) / close_4ago * 100.0 } else { 0.0 };
+    if mom4 > mom_threshold       { score += 2.0; }
+    else if mom4 < -mom_threshold { score -= 2.0; }
+
+    // 1-bar momentum
     let close_1ago = ctx.close_at(idx - 1);
     let mom1 = if close_1ago > 0.0 { (close - close_1ago) / close_1ago * 100.0 } else { 0.0 };
-    let ema14 = ctx.ema(lookback_14);
-    let rsi   = ctx.rsi(lookback_14);
+    if mom1 > mom1_threshold       { score += 1.0; }
+    else if mom1 < -mom1_threshold { score -= 1.0; }
 
+    // EMA trend
+    let ema14 = ctx.ema(lookback_14);
+    if close > ema14 { score += 0.5; } else { score -= 0.5; }
+
+    // RSI
+    let rsi = ctx.rsi(lookback_14);
+    if rsi < rsi_oversold       { score += 2.0; }
+    else if rsi > rsi_overbought { score -= 2.0; }
+
+    // Volume confirmation (directional)
     let avg_vol = ctx.get("avg_vol", volume);
     ctx.set("avg_vol", avg_vol * 0.9 + volume * 0.1);
-    let vol_ok = volume > avg_vol * min_vol_mult;
-
-    let stop_dist = atr * atr_sl_mult;
-    let tp_dist   = atr * atr_tp_mult;
-
-    let bull_count = 0;
-    if mom4 > mom_threshold  { bull_count += 1; }
-    if mom1 > mom1_threshold { bull_count += 1; }
-    if rsi < rsi_oversold    { bull_count += 1; }
-    if vol_ok                { bull_count += 1; }
-
-    let bear_count = 0;
-    if mom4 < -mom_threshold  { bear_count += 1; }
-    if mom1 < -mom1_threshold { bear_count += 1; }
-    if rsi > rsi_overbought   { bear_count += 1; }
-    if vol_ok                 { bear_count += 1; }
-
-    if bull_count >= min_confirmations && close > ema14 {
-        ctx.buy(1.0);
-        ctx.set_stop_loss(close - stop_dist);
-        ctx.set_take_profit(close + tp_dist);
-        ctx.log("BUY: bull=" + bull_count + " | mom4=" + mom4 + "% | rsi=" + rsi);
-    } else if bear_count >= min_confirmations && close < ema14 {
-        ctx.sell(1.0);
-        ctx.set_stop_loss(close + stop_dist);
-        ctx.set_take_profit(close - tp_dist);
-        ctx.log("SELL: bear=" + bear_count + " | mom4=" + mom4 + "% | rsi=" + rsi);
+    if volume > avg_vol * min_vol_mult {
+        if win_pct > 0.0 { score += 1.0; } else if win_pct < 0.0 { score -= 1.0; }
     }
+
+    ctx.set("debug_score", score);
+    ctx.set("debug_win_pct", win_pct);
+    ctx.set("debug_mom4", mom4);
+    ctx.set("debug_rsi", rsi);
+    ctx.set("debug_token_price", ctx.token_price);
+
+    // Edge filter
+    let abs_score = if score >= 0.0 { score } else { -score };
+    let est_prob = if abs_score >= 8.0 { 0.85 } else if abs_score >= 7.0 { 0.80 }
+                   else if abs_score >= 6.0 { 0.75 } else if abs_score >= 5.0 { 0.70 }
+                   else if abs_score >= 4.0 { 0.65 } else { 0.62 };
+    let implied_p = if score > 0.0 { ctx.token_price } else { 1.0 - ctx.token_price };
+    let edge = est_prob - implied_p;
+    ctx.set("debug_edge", edge);
+    ctx.set("debug_est_prob", est_prob);
+    if edge < min_edge { return; }
+
+    if score >= min_score { ctx.buy(0.25); }
+    else if score <= -min_score { ctx.sell(0.25); }
 }
