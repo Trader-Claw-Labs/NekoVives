@@ -5,14 +5,14 @@ export default function Help() {
     <div className="p-6 max-w-4xl mx-auto space-y-8">
       <div className="flex items-center gap-3">
         <BookOpen size={24} style={{ color: 'var(--color-accent)' }} />
-        <h1 className="text-xl font-bold">Trader Claw Help</h1>
+        <h1 className="text-xl font-bold">Neko Vives Help</h1>
       </div>
 
       <div className="rounded-lg border p-5" style={{ backgroundColor: 'var(--color-surface)', borderColor: 'var(--color-border)' }}>
         <h2 className="text-sm font-bold mb-4">Quick Start</h2>
         <div className="space-y-4">
           <p className="text-sm" style={{ color: 'var(--color-text-muted)' }}>
-            Trader Claw is an autonomous agent-driven trading platform.
+            Neko Vives is an autonomous agent-driven trading platform.
           </p>
           <ul className="list-disc list-inside text-sm space-y-2" style={{ color: 'var(--color-text-muted)' }}>
             <li><strong>Dashboard:</strong> View system status, health, and quick stats.</li>

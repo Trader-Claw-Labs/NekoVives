@@ -91,15 +91,15 @@ export default function Sidebar() {
         className="flex items-center gap-2 px-3 py-4 border-b"
         style={{ borderColor: 'var(--color-border)' }}
       >
-        <div
-          className="flex items-center justify-center w-8 h-8 rounded text-xs font-bold flex-shrink-0"
-          style={{ backgroundColor: 'var(--color-accent)', color: '#000' }}
-        >
-          TC
-        </div>
+        <img
+          src="/neko.png"
+          alt="Neko Vives"
+          className="flex-shrink-0 rounded"
+          style={{ width: 32, height: 32, objectFit: 'cover' }}
+        />
         {!collapsed && (
           <span className="font-bold text-sm tracking-widest" style={{ color: 'var(--color-accent)' }}>
-            TRADER CLAW
+            NEKO VIVES
           </span>
         )}
       </div>

@@ -1,4 +1,5 @@
-import { useState, useRef, useEffect } from 'react'
+import { useState, useRef, useEffect, lazy, Suspense } from 'react'
+const NekoLogoCanvas = lazy(() => import('../components/NekoLogoCanvas'))
 import {
   Plus, X, Wifi, WifiOff, Pencil, Send, Square,
   Zap, BarChart2, Search, Wallet, BookOpen, Settings2, Terminal,
@@ -595,21 +596,19 @@ function ChatWindow({ session, onUpdate, connected, send }: ChatWindowProps) {
         {isEmpty ? (
           /* Empty state */
           <div className="flex flex-col items-center justify-center h-full gap-6 px-6 pb-16">
-            <div className="text-center">
-              <div
-                className="inline-flex items-center justify-center rounded-2xl mb-4"
-                style={{
-                  width: 48, height: 48,
-                  background: 'linear-gradient(135deg, var(--color-accent) 0%, #00b8ff 100%)',
-                }}
-              >
-                <span style={{ fontSize: 22 }}>🤖</span>
-              </div>
-              <h2 className="text-lg font-semibold mb-1" style={{ color: 'var(--color-text)' }}>
-                Trader Claw Agent
+            <div className="text-center flex flex-col items-center">
+              <Suspense fallback={
+                <div style={{ width: 140, height: 150, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  <span style={{ fontSize: 48 }}>🐾</span>
+                </div>
+              }>
+                <NekoLogoCanvas size={140} />
+              </Suspense>
+              <h2 className="text-lg font-semibold mt-3 mb-1" style={{ color: 'var(--color-text)', fontFamily: "'Press Start 2P', monospace", fontSize: 14, letterSpacing: 2 }}>
+                NEKO VIVES
               </h2>
               <p className="text-sm" style={{ color: 'var(--color-text-muted)' }}>
-                Markets · Strategies · Wallets · Backtesting
+                Tu gato de la suerte en los mercados 🍀
               </p>
             </div>
 

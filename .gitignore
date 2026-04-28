@@ -24,3 +24,7 @@ target/
 .remember
 .firecrawl 
 CLAUDE.md
+strategy/config.json
+
+web/dist/
+web/node_modules/

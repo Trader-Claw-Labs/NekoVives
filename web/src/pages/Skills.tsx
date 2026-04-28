@@ -217,7 +217,7 @@ export default function Skills() {
           Skills are instructions and capabilities that extend the AI agent. They help the agent perform specialized tasks like generating trading strategies, analyzing markets, or interacting with specific protocols.
         </p>
         <p className="text-xs" style={{ color: 'var(--color-text-muted)' }}>
-          Skills are stored in <code className="px-1 rounded" style={{ backgroundColor: 'var(--color-base)' }}>~/.traderclaw/workspace/skills/</code>
+          Skills are stored in <code className="px-1 rounded" style={{ backgroundColor: 'var(--color-base)' }}>~/.neko-vives/workspace/skills/</code>
         </p>
       </div>
 
@@ -233,7 +233,7 @@ export default function Skills() {
             No skills installed
           </p>
           <p className="text-xs" style={{ color: 'var(--color-text-muted)' }}>
-            Create a skill folder in ~/.traderclaw/workspace/skills/ with a SKILL.md file
+            Create a skill folder in ~/.neko-vives/workspace/skills/ with a SKILL.md file
           </p>
         </div>
       ) : (

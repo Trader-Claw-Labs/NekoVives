@@ -141,7 +141,7 @@ export default function PairingModal({ onPaired }: Props) {
             className="px-1 py-0.5 rounded"
             style={{ backgroundColor: 'var(--color-surface-2)', color: 'var(--color-accent)' }}
           >
-            trader-claw gateway
+            neko-vives gateway
           </code>{' '}
           and look for the pairing code in the terminal output.
         </p>

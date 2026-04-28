@@ -168,7 +168,7 @@ export default function OnboardingModal({ onDone }: Props) {
         >
           <div className="flex items-center gap-2">
             <Brain size={16} style={{ color: 'var(--color-accent)' }} />
-            <span className="text-sm font-bold">Setup Trader Claw</span>
+            <span className="text-sm font-bold">Setup Neko Vives</span>
           </div>
           {/* Step dots */}
           <div className="flex items-center gap-1.5">
@@ -189,7 +189,7 @@ export default function OnboardingModal({ onDone }: Props) {
               >
                 <Brain size={32} style={{ color: 'var(--color-accent)' }} />
               </div>
-              <h2 className="text-xl font-bold mb-2">Welcome to Trader Claw</h2>
+              <h2 className="text-xl font-bold mb-2">Welcome to Neko Vives</h2>
               <p className="text-sm max-w-sm" style={{ color: 'var(--color-text-muted)' }}>
                 Let's get you set up in a few steps. You'll choose your AI provider and configure your API key so the agent can start working.
               </p>
