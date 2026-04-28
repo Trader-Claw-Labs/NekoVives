@@ -1,0 +1,625 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Neko Vives — Logo</title>
+<link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  background: #03030d;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  font-family: 'Press Start 2P', 'Courier New', monospace;
+}
+
+/* BG grid */
+body::before {
+  content: '';
+  position: fixed; inset: 0;
+  background-image:
+    linear-gradient(rgba(0,255,136,.05) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0,255,136,.05) 1px, transparent 1px);
+  background-size: 36px 36px;
+  pointer-events: none;
+}
+
+/* Scanlines */
+body::after {
+  content: '';
+  position: fixed; inset: 0;
+  background: repeating-linear-gradient(
+    to bottom,
+    transparent 0, transparent 3px,
+    rgba(0,0,0,.14) 3px, rgba(0,0,0,.14) 4px
+  );
+  pointer-events: none;
+  z-index: 100;
+}
+
+.logo-wrap {
+  position: relative;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 24px;
+}
+
+canvas#cat {
+  display: block;
+  width: 280px;
+  height: 300px;
+  image-rendering: pixelated;
+}
+
+.glow-wrap {
+  display: block;
+  width: 280px;
+  height: 300px;
+  filter:
+    drop-shadow(0 0 14px rgba(0,255,136,.6))
+    drop-shadow(0 0 40px rgba(0,255,136,.25));
+}
+
+.brand-name {
+  font-size: 30px;
+  letter-spacing: 6px;
+  color: #f0efe8;
+  text-shadow:
+    0 0 8px rgba(0,255,136,.8),
+    0 0 28px rgba(0,255,136,.35),
+    4px 4px 0 #000;
+  animation: flicker 6s ease-in-out infinite;
+}
+@keyframes flicker {
+  0%,91%,95%,100% { opacity:1; }
+  93%             { opacity:.6; }
+}
+
+.tagline {
+  margin-top: 8px;
+  font-size: 8px;
+  letter-spacing: 3px;
+  color: #00ff88;
+  opacity: .8;
+  text-shadow: 0 0 10px rgba(0,255,136,.6);
+}
+
+.badge {
+  position: absolute;
+  top: 4px; right: -18px;
+  background: #00ff88;
+  color: #03030d;
+  font-size: 7px;
+  padding: 3px 5px;
+  letter-spacing: 1px;
+  box-shadow: 2px 2px 0 #006633;
+  animation: badgeBlink 1.2s step-end infinite;
+}
+@keyframes badgeBlink {
+  0%,100% { opacity:1; }
+  50%     { opacity:.4; }
+}
+
+/* Ticker */
+.ticker {
+  position: fixed; bottom: 0; left: 0; right: 0;
+  border-top: 1px solid rgba(0,255,136,.25);
+  background: rgba(0,255,136,.06);
+  color: #00ff88;
+  font-size: 7px;
+  letter-spacing: 1.5px;
+  padding: 7px 0;
+  z-index: 50;
+  overflow: hidden;
+  white-space: nowrap;
+}
+.ticker span {
+  display: inline-block;
+  animation: scroll 22s linear infinite;
+}
+@keyframes scroll {
+  from { transform: translateX(100vw); }
+  to   { transform: translateX(-100%); }
+}
+
+/* Matrix canvas */
+#matrix {
+  position: fixed; inset: 0;
+  z-index: 1;
+  pointer-events: none;
+  opacity: 0.18;
+}
+
+/* Floating candles */
+#particles {
+  position: fixed; inset: 0;
+  pointer-events: none;
+  z-index: 2;
+  overflow: hidden;
+}
+.fc {
+  position: absolute;
+  bottom: -60px;
+  animation: rise linear infinite;
+  opacity: 0;
+}
+@keyframes rise {
+  0%   { transform: translateY(0);      opacity:0; }
+  8%   { opacity:.28; }
+  92%  { opacity:.28; }
+  100% { transform: translateY(-110vh); opacity:0; }
+}
+</style>
+</head>
+<body>
+
+<div id="particles"></div>
+
+<div class="logo-wrap">
+  <div style="position:relative">
+    <div class="glow-wrap">
+      <canvas id="cat" width="280" height="300"></canvas>
+    </div>
+  </div>
+  <div style="text-align:center">
+    <div class="brand-name">NEKO VIVES</div>
+    <div class="tagline">▲ VIVE TRADING CAT AGENT ▲</div>
+  </div>
+</div>
+
+<!-- Ticker -->
+<div class="ticker">
+  <span>
+    ◆ NKVO/USDT +8.32% &nbsp;&nbsp;
+    BTC/USDT +2.14% &nbsp;&nbsp;
+    ETH/USDT +3.77% &nbsp;&nbsp;
+    SOL/USDT ‑0.84% &nbsp;&nbsp;
+    AI SIGNAL: COMPRAR &nbsp;&nbsp;
+    PORTAFOLIO: +12.4% MTD &nbsp;&nbsp;
+    NEKO BOT: ACTIVO &nbsp;&nbsp;
+    ◆ NKVO/USDT +8.32% &nbsp;&nbsp;
+    BTC/USDT +2.14% &nbsp;&nbsp;
+    ETH/USDT +3.77% &nbsp;&nbsp;
+    SOL/USDT ‑0.84% &nbsp;&nbsp;
+    AI SIGNAL: COMPRAR &nbsp;&nbsp;
+    PORTAFOLIO: +12.4% MTD &nbsp;&nbsp;
+    NEKO BOT: ACTIVO
+  </span>
+</div>
+
+<canvas id="matrix"></canvas>
+
+<script>
+// ═══════════════════════════════════════════════
+//  DRAW MANEKI NEKO ON CANVAS
+// ═══════════════════════════════════════════════
+const cv  = document.getElementById('cat');
+const ctx = cv.getContext('2d');
+
+// Colors
+const C = {
+  body:    '#f0efe8',
+  outline: '#111927',
+  red:     '#ff2244',
+  gold:    '#ffd700',
+  goldDk:  '#b8860b',
+  cyan:    '#00ccff',
+  green:   '#00ff88',
+  pink:    '#f9a8b8',
+  bg:      '#03030d',
+  chartBg: '#08081a',
+};
+
+// Pixel helper: draw a filled rectangle with outline
+function px(x,y,w,h, fill, stroke, sw=3) {
+  ctx.fillStyle = fill;
+  ctx.fillRect(x,y,w,h);
+  if (stroke) {
+    ctx.strokeStyle = stroke;
+    ctx.lineWidth = sw;
+    ctx.strokeRect(x+sw/2, y+sw/2, w-sw, h-sw);
+  }
+}
+
+// Rounded rect
+function rr(x,y,w,h,r,fill,stroke,sw=3) {
+  ctx.beginPath();
+  ctx.roundRect(x,y,w,h,r);
+  ctx.fillStyle = fill;
+  ctx.fill();
+  if (stroke) {
+    ctx.beginPath();
+    ctx.roundRect(x+sw/2,y+sw/2,w-sw,h-sw,r);
+    ctx.strokeStyle = stroke;
+    ctx.lineWidth = sw;
+    ctx.stroke();
+  }
+}
+
+// Circle
+function circ(x,y,r,fill,stroke,sw=3) {
+  ctx.beginPath();
+  ctx.arc(x,y,r,0,Math.PI*2);
+  ctx.fillStyle = fill;
+  ctx.fill();
+  if (stroke) {
+    ctx.strokeStyle = stroke;
+    ctx.lineWidth = sw;
+    ctx.stroke();
+  }
+}
+
+// Line
+function ln(x1,y1,x2,y2,col,w=2) {
+  ctx.beginPath();
+  ctx.moveTo(x1,y1);
+  ctx.lineTo(x2,y2);
+  ctx.strokeStyle = col;
+  ctx.lineWidth = w;
+  ctx.lineCap = 'round';
+  ctx.stroke();
+}
+
+// Polygon
+function poly(pts, fill, stroke, sw=3) {
+  ctx.beginPath();
+  ctx.moveTo(pts[0][0], pts[0][1]);
+  for (let i=1;i<pts.length;i++) ctx.lineTo(pts[i][0],pts[i][1]);
+  ctx.closePath();
+  ctx.fillStyle = fill;
+  ctx.fill();
+  if (stroke) {
+    ctx.strokeStyle = stroke;
+    ctx.lineWidth = sw;
+    ctx.stroke();
+  }
+}
+
+// Ellipse
+function ell(x,y,rx,ry,fill,stroke,sw=2) {
+  ctx.beginPath();
+  ctx.ellipse(x,y,rx,ry,0,0,Math.PI*2);
+  ctx.fillStyle = fill;
+  ctx.fill();
+  if (stroke) { ctx.strokeStyle=stroke; ctx.lineWidth=sw; ctx.stroke(); }
+}
+
+// ── Animation state ──
+let pawAngle = 0;
+let bellAngle = 0;
+let chartProgress = 0;
+let t = 0;
+
+// Eye wink: cycles chart(220f) → wink(60f)
+let eyePhase = 0, eyeTimer = 0;
+const EYE_DUR = [220, 60];
+
+// Volatility aura bolts
+const BOLTS = Array.from({length:14},(_,i)=>({
+  angle:(i/14)*Math.PI*2+Math.random()*.4,
+  len:14+Math.random()*28,
+  life:Math.random(),
+  spd:0.013+Math.random()*.022
+}));
+function drawBolts(){
+  BOLTS.forEach(b=>{
+    b.life+=b.spd;
+    if(b.life>1){b.life=0;b.angle=Math.random()*Math.PI*2;b.len=14+Math.random()*28;}
+    const a=Math.sin(b.life*Math.PI);
+    if(a<0.06)return;
+    const sx=148+Math.cos(b.angle)*128;
+    const sy=172+Math.sin(b.angle)*128;
+    const ex=sx+Math.cos(b.angle)*b.len;
+    const ey=sy+Math.sin(b.angle)*b.len;
+    const mx_=sx+(ex-sx)*.45+(Math.random()-.5)*7;
+    const my_=sy+(ey-sy)*.45+(Math.random()-.5)*7;
+    ctx.beginPath();ctx.moveTo(sx,sy);ctx.lineTo(mx_,my_);ctx.lineTo(ex,ey);
+    ctx.strokeStyle=`rgba(0,255,136,${a*.85})`;ctx.lineWidth=1.5;
+    ctx.lineJoin='round';ctx.lineCap='round';ctx.stroke();
+    ctx.beginPath();ctx.arc(ex,ey,2,0,Math.PI*2);
+    ctx.fillStyle=`rgba(0,255,136,${a*.65})`;ctx.fill();
+  });
+}
+
+function draw() {
+  ctx.clearRect(0,0,280,300);
+
+  // ── EYE TIMER ──
+  eyeTimer++;
+  if(eyeTimer>=EYE_DUR[eyePhase]){eyeTimer=0;eyePhase=(eyePhase+1)%2;}
+  const isWink=(eyePhase===1);
+
+  // ── GLOW RING ──
+  const ringR = 128 + Math.sin(t*.02)*6;
+  ctx.beginPath();
+  ctx.arc(148, 172, ringR, 0, Math.PI*2);
+  ctx.strokeStyle = `rgba(0,255,136,${.1+Math.sin(t*.02)*.08})`;
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  // ── VOLATILITY AURA ──
+  drawBolts();
+
+  // ── LEFT ARM + CHART ──
+  // Arm
+  rr(44,195,28,54,12, C.body, C.outline, 3);
+  circ(58,193,15, C.body, C.outline, 3);
+
+  // Chart screen
+  rr(2,130,68,64,5, C.chartBg, C.green, 2.5);
+  rr(6,134,60,56,3, '#030310', null);
+
+  // Candles
+  const candles = [
+    {x:12, yH:162, h:14, bull:false},
+    {x:24, yH:150, h:14, bull:true},
+    {x:36, yH:146, h:12, bull:false},
+    {x:48, yH:136, h:14, bull:true},
+    {x:60, yH:126, h:13, bull:true},
+  ];
+  candles.forEach(c => {
+    const col = c.bull ? C.green : C.red;
+    ln(c.x+3, c.yH-4, c.x+3, c.yH, col, 1.5);
+    ln(c.x+3, c.yH+c.h, c.x+3, c.yH+c.h+4, col, 1.5);
+    px(c.x, c.yH, 7, c.h, col, null);
+  });
+
+  // Trend line
+  if (chartProgress < 1) chartProgress += .008;
+  const pts = [[12,176],[24,164],[36,160],[48,147],[60,136],[70,124]];
+  ctx.beginPath();
+  ctx.moveTo(pts[0][0], pts[0][1]);
+  const drawTo = Math.floor(chartProgress * (pts.length-1));
+  for (let i=1; i<=drawTo; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+  if (drawTo < pts.length-1) {
+    const frac = (chartProgress * (pts.length-1)) - drawTo;
+    const px_ = pts[drawTo][0] + (pts[drawTo+1][0]-pts[drawTo][0])*frac;
+    const py_ = pts[drawTo][1] + (pts[drawTo+1][1]-pts[drawTo][1])*frac;
+    ctx.lineTo(px_, py_);
+  }
+  ctx.strokeStyle = C.cyan;
+  ctx.lineWidth = 2;
+  ctx.lineJoin = 'round';
+  ctx.lineCap = 'round';
+  ctx.stroke();
+
+  // Up arrow
+  poly([[60,121],[66,121],[63,117]], C.cyan);
+
+  // Labels
+  ctx.fillStyle = C.green;
+  ctx.font = '6px monospace';
+  ctx.fillText('NKVO', 6, 188);
+  ctx.fillText('+8.3%', 40, 188);
+
+  // ── BODY ──
+  rr(74,190,152,106,20, C.body, C.outline, 3.5);
+
+  // Body circuit decoration
+  ctx.strokeStyle = `rgba(0,204,255,${.3+Math.sin(t*.04)*.2})`;
+  ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.roundRect(108,228,64,44,4); ctx.stroke();
+  ln(140,228,140,272, `rgba(0,204,255,.3)`, 1);
+  ln(108,250,172,250, `rgba(0,204,255,.3)`, 1);
+  circ(140,250,5, `rgba(0,204,255,${.4+Math.sin(t*.06+1)*.3})`, null);
+  circ(120,238,3, `rgba(0,204,255,${.4+Math.sin(t*.06+2)*.3})`, null);
+  circ(160,262,3, `rgba(0,204,255,${.4+Math.sin(t*.06+3)*.3})`, null);
+
+  // ── HEAD ──
+  ctx.save();
+  ctx.beginPath();
+  ctx.ellipse(148,152,70,66,0,0,Math.PI*2);
+  ctx.fillStyle = C.body;
+  ctx.fill();
+  ctx.strokeStyle = C.outline;
+  ctx.lineWidth = 3.5;
+  ctx.stroke();
+  ctx.restore();
+
+  // ── EARS ──
+  poly([[92,104],[72,62],[118,94]], C.body, C.outline, 3);
+  poly([[90,100],[79,70],[112,92]], C.red, null);
+  poly([[208,104],[228,62],[182,94]], C.body, C.outline, 3);
+  poly([[210,100],[221,70],[188,92]], C.red, null);
+
+  // ── EYES — circuit style + wink on right eye ──
+  [[112,136,false],[168,136,true]].forEach(([ex,ey,isRight]) => {
+    if(isRight && isWink) {
+      // Wink: draw closed arc
+      ctx.beginPath();
+      ctx.moveTo(ex+2, ey+14);
+      ctx.bezierCurveTo(ex+6,ey+6, ex+18,ey+6, ex+22,ey+14);
+      ctx.strokeStyle = C.outline; ctx.lineWidth = 4; ctx.lineCap='round'; ctx.stroke();
+      // lashes
+      [6,10,14,18].forEach(lx=>{
+        const ly=ey+14-Math.sin((lx-2)/22*Math.PI)*8;
+        ln(ex+lx,ly,ex+lx,ly-7,C.outline,2.5);
+      });
+      return;
+    }
+    // Normal circuit eye
+    rr(ex,ey,24,24,4,'#0a1020',C.cyan,2);
+    ln(ex+4,ey+6,ex+20,ey+6, C.cyan, 1.5);
+    ln(ex+4,ey+18,ex+20,ey+18, C.cyan, 1.5);
+    ln(ex+12,ey+2,ex+12,ey+22, C.cyan, 1.5);
+    ln(ex+4,ey+2,ex+4,ey+6, C.cyan, 1.5);
+    ln(ex+20,ey+2,ex+20,ey+6, C.cyan, 1.5);
+    ln(ex+4,ey+18,ex+4,ey+22, C.cyan, 1.5);
+    ln(ex+20,ey+18,ex+20,ey+22, C.cyan, 1.5);
+    const g = .5 + Math.sin(t*.05)*0.45;
+    ctx.globalAlpha = g;
+    circ(ex+12,ey+12,5, C.cyan, null);
+    ctx.globalAlpha = .15 + g*.2;
+    circ(ex+12,ey+12,9, C.cyan, null);
+    ctx.globalAlpha = 1;
+  });
+
+  // ── NOSE ──
+  poly([[148,166],[142,174],[154,174]], C.red, null);
+
+  // ── MOUTH ──
+  ctx.beginPath();
+  ctx.moveTo(138,178);
+  ctx.quadraticCurveTo(148,190,158,178);
+  ctx.strokeStyle = C.outline;
+  ctx.lineWidth = 2.5;
+  ctx.lineCap = 'round';
+  ctx.stroke();
+
+  // ── CHEEKS ──
+  ctx.globalAlpha = .5;
+  ell(118,177,13,8, C.pink, null);
+  ell(178,177,13,8, C.pink, null);
+  ctx.globalAlpha = 1;
+
+  // ── WHISKERS ──
+  ctx.globalAlpha = .65;
+  ln(100,170,136,172, C.outline, 1.5);
+  ln(100,179,136,177, C.outline, 1.5);
+  ln(160,172,196,170, C.outline, 1.5);
+  ln(160,177,196,179, C.outline, 1.5);
+  ctx.globalAlpha = 1;
+
+  // ── RAISED PAW — brazo completo, rota desde hombro, arriba y a la derecha ──
+  // Hombro al lado derecho del cuerpo
+  // Base +0.35 rad (inclinado a la derecha), ola ±0.3 rad
+  pawAngle = 0.35 + Math.sin(t * .045) * 0.3;
+  ctx.save();
+  ctx.translate(206, 200);  // hombro derecho
+  ctx.rotate(pawAngle);
+  // Brazo dibujado hacia ARRIBA desde hombro (y negativo)
+  rr(-13, -72, 26, 72, 13, C.body, C.outline, 3);
+  circ(0, -78, 20, C.body, C.outline, 3);
+  ln(-10, -97, -10, -86, C.outline, 2.5);
+  ln(  0,-100,   0, -88, C.outline, 2.5);
+  ln( 10, -97,  10, -86, C.outline, 2.5);
+  ell(0, -76, 7, 5, C.pink, null);
+  circ(-10, -82, 4, C.pink, null);
+  circ( 10, -82, 4, C.pink, null);
+  ctx.restore();
+
+  // ── COLLAR ──
+  rr(88,206,124,24,12, C.red, C.outline, 3);
+  // Studs
+  [102,116,172,186].forEach(sx => {
+    px(sx,213,7,7, '#ff6680', null);
+    ctx.globalAlpha=.6;
+    px(sx,213,7,7, '#ff6680', null);
+    ctx.globalAlpha=1;
+  });
+
+  // ── BELL ──
+  bellAngle = Math.sin(t*.025)*0.15;
+  ctx.save();
+  ctx.translate(150,240);
+  ctx.rotate(bellAngle);
+  ctx.translate(-150,-240);
+  // Hook
+  rr(148,222,4,8,2, C.goldDk, null);
+  // Bell body
+  circ(150,244,17, C.gold, C.outline, 2.5);
+  // Shine
+  ctx.globalAlpha=.5;
+  ell(144,238,5,3, '#fff9aa', null);
+  ctx.globalAlpha=1;
+  // Symbol centered
+  ctx.fillStyle = C.goldDk;
+  ctx.font = 'bold 22px serif';
+  ctx.textAlign = 'center';
+  ctx.fillText('₿', 150, 252);
+  ctx.textAlign = 'left';
+  ctx.restore();
+
+  // ── FEET ──
+  ell(108,288,26,12, C.body, C.outline, 2.5);
+  ell(192,288,26,12, C.body, C.outline, 2.5);
+  [[96,108,120],[180,192,204]].forEach(xs =>
+    xs.forEach(x => ln(x,284,x,292, C.outline, 2))
+  );
+
+  // ── PIXEL CORNER DECORATIONS ──
+  ctx.globalAlpha = .5;
+  ctx.fillStyle = C.green;
+  [[0,0],[274,0],[0,294],[274,294]].forEach(([cx,cy]) => {
+    ctx.fillRect(cx,cy,6,6);
+    ctx.globalAlpha=.3;
+    const ox = cx>0 ? -10 : 10;
+    const oy = cy>0 ? -8  : 8;
+    ctx.fillRect(cx+ox,cy,4,4);
+    ctx.fillRect(cx,cy+oy,4,4);
+    ctx.globalAlpha=.5;
+  });
+  ctx.globalAlpha = 1;
+
+  t++;
+  requestAnimationFrame(draw);
+}
+
+draw();
+
+// ── Floating candle particles ──
+const parts = document.getElementById('particles');
+for (let i=0; i<20; i++) {
+  const up = Math.random()>.38;
+  const d  = document.createElement('div');
+  d.className = 'fc';
+  d.style.cssText = `
+    left:${Math.random()*98}%;
+    width:${3+Math.random()*5}px;
+    height:${10+Math.random()*22}px;
+    background:${up?'rgba(0,255,136,.28)':'rgba(255,34,68,.28)'};
+    border-top:1px solid ${up?'rgba(0,255,136,.6)':'rgba(255,34,68,.6)'};
+    border-bottom:1px solid ${up?'rgba(0,255,136,.6)':'rgba(255,34,68,.6)'};
+    animation-duration:${9+Math.random()*14}s;
+    animation-delay:${Math.random()*18}s;
+  `;
+  parts.appendChild(d);
+}
+
+// ── Matrix rain ──
+(function() {
+  const mc = document.getElementById('matrix');
+  const mx = mc.getContext('2d');
+  // Mix of trading symbols and katakana
+  const chars = 'アイウエオカキクケコサシスセソタチツテトナニヌネノハヒフヘホ01₿Ξ▲▼◆+-×÷%$€¥BUYSEL';
+  let cols, drops;
+
+  function resize() {
+    mc.width  = window.innerWidth;
+    mc.height = window.innerHeight;
+    cols  = Math.floor(mc.width / 18);
+    drops = Array.from({length: cols}, () => Math.random() * -50);
+  }
+  resize();
+  window.addEventListener('resize', resize);
+
+  function tickMatrix() {
+    mx.fillStyle = 'rgba(3,3,13,0.18)';
+    mx.fillRect(0, 0, mc.width, mc.height);
+    for (let i = 0; i < cols; i++) {
+      const ch = chars[Math.floor(Math.random() * chars.length)];
+      const brightness = Math.random();
+      mx.fillStyle = brightness > 0.92
+        ? '#ffffff'
+        : brightness > 0.7
+          ? '#00ff88'
+          : 'rgba(0,200,100,0.7)';
+      mx.font = `${13 + Math.floor(Math.random()*4)}px monospace`;
+      mx.fillText(ch, i * 18, drops[i] * 18);
+      if (drops[i] * 18 > mc.height && Math.random() > 0.975) drops[i] = 0;
+      drops[i] += 0.4 + Math.random() * 0.3;
+    }
+  }
+  setInterval(tickMatrix, 60);
+})();
+</script>
+</body>
+</html>
