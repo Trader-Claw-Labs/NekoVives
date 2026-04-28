@@ -164,28 +164,30 @@ function liveOrdersToTrades(orders: LiveOrder[], initialBalance: number): LiveTr
     })
 }
 
-/** Persistent total P&L that survives strategy deletion. */
-function usePersistentTotalPnL(runners: StoredRunner[]) {
-  const [persisted, setPersisted] = useState(() => {
+/** Resettable total P&L — baseline is captured on Reset so the badge
+ *  shows gains/losses since that point. Deleted strategies no longer
+ *  contribute because we use the live current sum, not a monotonic max. */
+function useResettableTotalPnL(runners: StoredRunner[]) {
+  const [baseline, setBaseline] = useState(() => {
     try {
-      return Number(localStorage.getItem('live-strategies-total-pnl') || '0')
+      return Number(localStorage.getItem('live-strategies-pnl-baseline') || '0')
     } catch {
       return 0
     }
   })
 
-  useEffect(() => {
-    const current = runners.reduce((s, r) => s + runnerPnlUSD(r), 0)
-    setPersisted(prev => {
-      const next = Math.max(prev, current)
-      try {
-        localStorage.setItem('live-strategies-total-pnl', String(next))
-      } catch {}
-      return next
-    })
-  }, [runners])
+  const current = runners.reduce((s, r) => s + runnerPnlUSD(r), 0)
+  const display = current - baseline
 
-  return persisted
+  const reset = () => {
+    const next = runners.reduce((s, r) => s + runnerPnlUSD(r), 0)
+    setBaseline(next)
+    try {
+      localStorage.setItem('live-strategies-pnl-baseline', String(next))
+    } catch {}
+  }
+
+  return { display, reset }
 }
 
 // ── Live Equity Chart ────────────────────────────────────────────────
@@ -1142,7 +1144,21 @@ interface RunnerCardProps {
 }
 
 function RunnerCard({ runner, onStop, onRestart, onDelete }: RunnerCardProps) {
-  const [expanded, setExpanded] = useState(true)
+  const [expanded, setExpanded] = useState(() => {
+    try {
+      const stored = localStorage.getItem(`runner-expanded-${runner.config.id}`)
+      return stored === null ? false : stored === 'true'
+    } catch {
+      return false
+    }
+  })
+  const toggleExpanded = () => {
+    setExpanded(e => {
+      const next = !e
+      try { localStorage.setItem(`runner-expanded-${runner.config.id}`, String(next)) } catch {}
+      return next
+    })
+  }
   const [showLog, setShowLog] = useState(false)
   const [showLowBalanceModal, setShowLowBalanceModal] = useState(false)
   const [lowBalanceShownOnce, setLowBalanceShownOnce] = useState(() => {
@@ -1177,14 +1193,15 @@ function RunnerCard({ runner, onStop, onRestart, onDelete }: RunnerCardProps) {
   // Trigger celebration on profitable trades (paper mode only — live trades are real orders)
   useEffect(() => {
     if (config.mode === 'live') return
-    if (!result?.all_trades) return
-    const newTrades = result.all_trades.slice(prevTradesRef.current)
-    const profitTrades = newTrades.filter(t => t.pnl && t.pnl > 0)
+    const trades = config.market_type === 'polymarket_binary' ? result?.live_orders : result?.all_trades
+    if (!trades) return
+    const newTrades = trades.slice(prevTradesRef.current)
+    const profitTrades = newTrades.filter((t: any) => t.pnl && t.pnl > 0)
     if (profitTrades.length > 0) {
       celebrate()
     }
-    prevTradesRef.current = result.all_trades.length
-  }, [result?.all_trades, celebrate, config.mode])
+    prevTradesRef.current = trades.length
+  }, [result?.all_trades, result?.live_orders, celebrate, config.mode, config.market_type])
 
   return (
     <div
@@ -1215,6 +1232,9 @@ function RunnerCard({ runner, onStop, onRestart, onDelete }: RunnerCardProps) {
           <p className="text-xs font-mono truncate" style={{ color: 'var(--color-text-muted)' }}>
             {config.script.split('/').pop()} · {config.symbol} · {config.interval} · {config.mode}
             {config.market_type === 'polymarket_binary' ? ` · ${config.resolution_logic ?? 'price_up'}${config.threshold !== undefined && config.threshold !== null ? `(${config.threshold})` : ''}` : ''}
+            {config.market_type === 'polymarket_binary' && config.live_sizing_mode
+              ? ` · ${config.live_sizing_mode === 'percent' ? `${config.live_sizing_value}%` : `$${config.live_sizing_value}`}`
+              : ''}
           </p>
         </div>
         <div className="flex items-center gap-1 flex-shrink-0">
@@ -1233,14 +1253,12 @@ function RunnerCard({ runner, onStop, onRestart, onDelete }: RunnerCardProps) {
             className="p-1.5 rounded hover:bg-white/5" style={{ color: 'var(--color-text-muted)' }}>
             <Trash2 size={14} />
           </button>
-          <button onClick={() => setExpanded(e => !e)}
+          <button onClick={toggleExpanded}
             className="p-1.5 rounded hover:bg-white/5" style={{ color: 'var(--color-text-muted)' }}>
             {expanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
           </button>
         </div>
       </div>
-      {expanded && (
-        <>
 
       {/* P&L summary — paper mode only (non-polymarket) */}
       {result && config.mode === 'paper' && config.market_type !== 'polymarket_binary' && (
@@ -1311,6 +1329,9 @@ function RunnerCard({ runner, onStop, onRestart, onDelete }: RunnerCardProps) {
           </div>
         </div>
       )}
+
+      {expanded && (
+        <>
 
       {/* Equity Chart — paper mode (crypto) or polymarket_binary (any mode) */}
       {config.mode === 'paper' && config.market_type !== 'polymarket_binary' && result && result.all_trades?.length > 0 && (
@@ -1594,7 +1615,7 @@ export default function LiveStrategies() {
   const runners = data?.runners ?? []
   const scripts = scriptsData?.scripts ?? []
   const running = runners.filter(r => r.status.status === 'running').length
-  const totalPnl = usePersistentTotalPnL(runners)
+  const { display: totalPnl, reset: resetTotalPnl } = useResettableTotalPnL(runners)
 
   return (
     <div className="p-6 max-w-5xl mx-auto">
@@ -1617,10 +1638,7 @@ export default function LiveStrategies() {
             Total P&L: {totalPnl >= 0 ? '+' : ''}${fmtUSD(totalPnl)}
           </span>
           <button
-            onClick={() => {
-              localStorage.removeItem('live-strategies-total-pnl')
-              window.location.reload()
-            }}
+            onClick={resetTotalPnl}
             className="text-[10px] px-2 py-0.5 rounded border hover:bg-white/5"
             style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-muted)' }}
             title="Reset Total P&L"

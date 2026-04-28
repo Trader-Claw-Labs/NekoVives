@@ -43,7 +43,12 @@ export default function StrategyWithChatLayout({ children }: StrategyWithChatLay
         }}
       >
         <div className="h-full flex flex-col" style={{ backgroundColor: 'var(--color-surface)' }}>
-          <div className="h-10 border-b flex items-center justify-end gap-1 px-2" style={{ borderColor: 'var(--color-border)' }}>
+          <div className="h-10 border-b flex items-center justify-end gap-1 px-2 relative" style={{ borderColor: 'var(--color-border)' }}>
+            {!isHidden && (
+              <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                <span className="text-sm font-semibold" style={{ color: 'var(--color-accent)' }}>Neko Agent</span>
+              </div>
+            )}
             <button
               type="button"
               onClick={() => handleSetSize('30')}
@@ -80,7 +85,12 @@ export default function StrategyWithChatLayout({ children }: StrategyWithChatLay
           </div>
 
           {isHidden ? (
-            <div className="flex-1 flex items-center justify-center" style={{ color: 'var(--color-text-muted)' }}>
+            <div
+              className="flex-1 flex items-center justify-center cursor-pointer hover:opacity-80"
+              onClick={() => handleSetSize('30')}
+              style={{ color: 'var(--color-accent)' }}
+              title="Open chat"
+            >
               <MessageSquare size={16} />
             </div>
           ) : (

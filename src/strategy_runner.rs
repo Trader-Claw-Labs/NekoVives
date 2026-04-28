@@ -895,33 +895,46 @@ async fn polymarket_runner_loop(
                                 &format!("Window {}: {} | Position FLAT", prev_window, outcome),
                             );
                         } else {
-                            let won = (prev_signal.starts_with("yes") && went_up)
-                                || (prev_signal.starts_with("no") && !went_up);
-                            live_total_trades += 1;
-                            if won { live_wins += 1; }
-                            let pos = if prev_signal.starts_with("yes") { "YES" } else { "NO" };
-                            let result = if won { "WIN" } else { "LOSS" };
-                            // Update matching order with result and P&L
-                            for order in live_orders.iter_mut() {
-                                if order.window_ts == prev_window && !order.stop_loss_triggered {
-                                    let ep = order.entry_price.unwrap_or(0.5).max(0.001);
-                                    order.result = Some(result.to_string());
-                                    order.pnl = Some(if won {
-                                        order.amount_usdc * (1.0 / ep - 1.0)
-                                    } else {
-                                        -order.amount_usdc
-                                    });
+                            // Only count this as a trade if an order was actually placed for this window.
+                            let has_order = live_orders.iter().any(|o| o.window_ts == prev_window);
+                            if !has_order {
+                                tracing::info!(
+                                    "[RUNNER {id}] Window {} resolved {}. Signal={} but NO ORDER PLACED",
+                                    prev_window, outcome, prev_signal
+                                );
+                                append_runner_log(
+                                    &store, &id,
+                                    &format!("Window {}: {} | Signal {} | NO ORDER PLACED", prev_window, outcome, prev_signal),
+                                );
+                            } else {
+                                let won = (prev_signal.starts_with("yes") && went_up)
+                                    || (prev_signal.starts_with("no") && !went_up);
+                                live_total_trades += 1;
+                                if won { live_wins += 1; }
+                                let pos = if prev_signal.starts_with("yes") { "YES" } else { "NO" };
+                                let result = if won { "WIN" } else { "LOSS" };
+                                // Update matching order with result and P&L
+                                for order in live_orders.iter_mut() {
+                                    if order.window_ts == prev_window && !order.stop_loss_triggered {
+                                        let ep = order.entry_price.unwrap_or(0.5).max(0.001);
+                                        order.result = Some(result.to_string());
+                                        order.pnl = Some(if won {
+                                            order.amount_usdc * (1.0 / ep - 1.0)
+                                        } else {
+                                            -order.amount_usdc
+                                        });
+                                    }
                                 }
+                                tracing::info!(
+                                    "[RUNNER {id}] Window {} resolved {}. Position {} → {} (live win rate: {:.1}%)",
+                                    prev_window, outcome, pos, result,
+                                    if live_total_trades > 0 { live_wins as f64 / live_total_trades as f64 * 100.0 } else { 0.0 }
+                                );
+                                append_runner_log(
+                                    &store, &id,
+                                    &format!("Window {}: {} | Position {} → {}", prev_window, outcome, pos, result),
+                                );
                             }
-                            tracing::info!(
-                                "[RUNNER {id}] Window {} resolved {}. Position {} → {} (live win rate: {:.1}%)",
-                                prev_window, outcome, pos, result,
-                                if live_total_trades > 0 { live_wins as f64 / live_total_trades as f64 * 100.0 } else { 0.0 }
-                            );
-                            append_runner_log(
-                                &store, &id,
-                                &format!("Window {}: {} | Position {} → {}", prev_window, outcome, pos, result),
-                            );
                         }
 
                         // Always print debug indicators for both live and backtest

@@ -608,7 +608,7 @@ function ChatWindow({ session, onUpdate, connected, send }: ChatWindowProps) {
                 NEKO VIVES
               </h2>
               <p className="text-sm" style={{ color: 'var(--color-text-muted)' }}>
-                Tu gato de la suerte en los mercados 🍀
+                Your lucky cat in the markets 🍀
               </p>
             </div>
 
