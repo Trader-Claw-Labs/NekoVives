@@ -222,6 +222,16 @@ impl StrategyRunnerStore {
     pub fn restart_previously_running(self: &Arc<Self>, workspace_dir: PathBuf) -> usize {
         let configs = self.list_restartable_configs();
         let count = configs.len();
+        // Clear stale timestamps so the UI doesn't show a "next tick" in the past
+        {
+            let mut map = self.runners.lock().unwrap();
+            for c in &configs {
+                if let Some(r) = map.get_mut(&c.id) {
+                    r.status.next_tick_at = None;
+                    r.status.last_tick_at = None;
+                }
+            }
+        }
         for config in configs {
             let id = config.id.clone();
             if self.handles.lock().unwrap().contains_key(&id) {

@@ -62,7 +62,7 @@ impl Tool for StrategyTickTool {
 
         let metrics = crate::tools::backtest::run_backtest_engine(
             &script_path, market_type, symbol, interval, &from, &to,
-            initial_balance, fee_pct, &self.workspace_dir,
+            initial_balance, fee_pct, "price_up", None, None, None, "percent", 1.0, &self.workspace_dir,
         ).await;
 
         let last_signal = metrics.all_trades.last().map(|t| t.side.as_str()).unwrap_or("flat");

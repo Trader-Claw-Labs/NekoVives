@@ -38,7 +38,7 @@ use dialoguer::{Input, Password};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use tracing::{info, warn};
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
     let t: f64 = s.parse().map_err(|e| format!("{e}"))?;
@@ -717,20 +717,30 @@ async fn main() -> Result<()> {
     );
 
     // Initialize logging - respects RUST_LOG env var, defaults to INFO (or DEBUG with --debug)
-    // Suppress noisy DEBUG from HTTP/connection crates and live_feed ticker spam.
+    // Writes to both stdout and a rolling log file under ~/.traderclaw/logs/
     let default_filter = if debug_mode {
         "debug".to_string()
     } else {
         "info,trader_claw::live_feed=warn,h2=warn,hyper_util=warn,hyper=warn".to_string()
     };
-    let subscriber = fmt::Subscriber::builder()
-        .with_env_filter(
+    let log_dir = directories::BaseDirs::new()
+        .map(|b| b.home_dir().to_path_buf())
+        .unwrap_or_else(std::env::temp_dir)
+        .join(".traderclaw")
+        .join("logs");
+    let _ = std::fs::create_dir_all(&log_dir);
+    let file_appender = tracing_appender::rolling::daily(&log_dir, "gateway");
+    let (non_blocking, _log_guard) = tracing_appender::non_blocking(file_appender);
+    let stdout_layer = fmt::layer().with_writer(std::io::stdout);
+    let file_layer = fmt::layer().with_writer(non_blocking).with_ansi(false);
+    tracing_subscriber::registry()
+        .with(
             EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| EnvFilter::new(default_filter)),
         )
-        .finish();
-
-    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
+        .with(stdout_layer)
+        .with(file_layer)
+        .init();
 
     if debug_mode {
         tracing::info!("Debug logging enabled — all agent loop, HTTP and tool events will be printed");

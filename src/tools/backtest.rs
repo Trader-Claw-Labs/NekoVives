@@ -301,7 +301,7 @@ impl Tool for BacktestRunTool {
         // Run the real Rhai backtest engine
         let metrics = run_backtest_engine(
             &script_path, market_type, symbol, interval, from_date, to_date,
-            initial_balance, fee_pct, "price_up", None, None, &self.workspace_dir
+            initial_balance, fee_pct, "price_up", None, None, None, "percent", 1.0, &self.workspace_dir
         ).await;
 
         let worst_trades_text = metrics
@@ -1006,6 +1006,9 @@ fn run_rhai_backtest(
     candles: Vec<Candle>,
     initial_balance: f64,
     fee_pct: f64,
+    max_entry_price: Option<f64>,
+    sizing_mode: &str,
+    sizing_value: f64,
 ) -> anyhow::Result<BacktestMetrics> {
     use rhai::{Dynamic, Engine, Map, Scope};
     use std::sync::{Arc, Mutex};
@@ -1493,8 +1496,17 @@ let ctx = #{
             let buy_price = c.close;
             let _buy_ts   = ts.clone();
             let buy_fee   = fee_pct;
+            let max_ep    = max_entry_price;
+            let sz_mode   = sizing_mode.to_string();
+            let sz_val    = sizing_value;
             eng2.register_fn("buy_impl", move |size: f64| {
                 let mut s = sb.lock().unwrap();
+                // Skip if price exceeds max entry price threshold
+                if let Some(max_entry) = max_ep {
+                    if buy_price > max_entry {
+                        return;
+                    }
+                }
                 // If short, close the short first
                 if s.position < 0.0 {
                     let fee_factor = 1.0 - buy_fee / 100.0;
@@ -1515,8 +1527,14 @@ let ctx = #{
                     s.take_profit = 0.0;
                 }
                 if s.balance > 0.0 {
-                    let fraction = size.max(0.0).min(1.0);
-                    let amount = s.balance * fraction;
+                    let amount = if sz_mode == "fixed" {
+                        sz_val.min(s.balance)
+                    } else {
+                        let max_frac = sz_val.max(0.0).min(1.0);
+                        let frac = size.max(0.0).min(1.0).min(max_frac);
+                        s.balance * frac
+                    };
+                    if amount <= 0.0 { return; }
                     let fee_factor = 1.0 - buy_fee / 100.0;
                     let qty = (amount * fee_factor) / buy_price;
                     if s.position == 0.0 {
@@ -2560,6 +2578,9 @@ fn run_polymarket_slug_backtest(
     resolution_logic: &str,
     threshold: Option<f64>,
     max_stake_usd: Option<f64>,
+    max_entry_price: Option<f64>,
+    sizing_mode: &str,
+    sizing_value: f64,
 ) -> anyhow::Result<BacktestMetrics> {
     use rhai::{Engine, Scope};
     use std::collections::HashMap;
@@ -2829,7 +2850,11 @@ fn run_polymarket_slug_backtest(
 
         if pb || ps {
             let bet_up  = pb;
-            let raw_stake = (bal * 0.25).max(0.0);
+            let raw_stake = if sizing_mode == "fixed" {
+                sizing_value.min(bal).max(0.0)
+            } else {
+                (bal * sizing_value.max(0.0).min(1.0)).max(0.0)
+            };
             // Enforce Polymarket position limit: stake cannot exceed available market liquidity.
             // Real 5-min binary markets typically have $500-$3,000 USDC of liquidity per window.
             let stake = if let Some(max_s) = max_stake_usd {
@@ -2840,6 +2865,12 @@ fn run_polymarket_slug_backtest(
             // Also enforce minimum order size ($5 USDC per Polymarket API)
             if stake < 5.0 { continue; }
             let token_p = if bet_up { yes_token_price } else { (1.0 - yes_token_price).max(0.03) };
+            // Skip if token price exceeds max entry price threshold
+            if let Some(max_ep) = max_entry_price {
+                if token_p > max_ep {
+                    continue;
+                }
+            }
             let won     = (bet_up && went_up) || (!bet_up && !went_up);
             let tokens  = if token_p > 0.0 { stake / token_p } else { 0.0 };
             let net_pay = if won { tokens * (1.0 - fee_pct / 100.0) } else { 0.0 };
@@ -2948,6 +2979,9 @@ pub async fn run_backtest_engine(
     resolution_logic: &str,
     threshold: Option<f64>,
     max_position_usd: Option<f64>,
+    max_entry_price: Option<f64>,
+    sizing_mode: &str,
+    sizing_value: f64,
     workspace_dir: &std::path::Path,
 ) -> BacktestMetrics {
     tracing::info!(
@@ -3019,9 +3053,10 @@ pub async fn run_backtest_engine(
         };
 
         let script_for_log = script_content.clone();
+        let sizing_mode_owned = sizing_mode.to_string();
 
         return match tokio::task::spawn_blocking(move || {
-            run_polymarket_slug_backtest(script_content, candles, initial_balance, fee_pct, window_minutes, &rl, thr, max_position_usd)
+            run_polymarket_slug_backtest(script_content, candles, initial_balance, fee_pct, window_minutes, &rl, thr, max_position_usd, max_entry_price, &sizing_mode_owned, sizing_value)
         })
         .await
         {
@@ -3118,11 +3153,12 @@ pub async fn run_backtest_engine(
     let interval_for_log = interval.to_string();
     let data_source_for_log = data_source.to_string();
     let script_for_log = script_content.clone();
+    let sizing_mode_owned = sizing_mode.to_string();
 
     // Run Rhai engine in blocking thread (CPU-bound)
     tracing::info!("[BACKTEST] Running Rhai engine on {} candles...", num_candles);
     match tokio::task::spawn_blocking(move || {
-        run_rhai_backtest(script_content, candles, initial_balance, fee_pct)
+        run_rhai_backtest(script_content, candles, initial_balance, fee_pct, max_entry_price, &sizing_mode_owned, sizing_value)
     })
     .await
     {
@@ -3174,7 +3210,7 @@ pub fn run_rhai_on_candle_buffer(
     initial_balance: f64,
     fee_pct: f64,
 ) -> BacktestMetrics {
-    run_rhai_backtest(script_content.to_string(), candles, initial_balance, fee_pct)
+    run_rhai_backtest(script_content.to_string(), candles, initial_balance, fee_pct, None, "percent", 1.0)
         .unwrap_or_else(|e| BacktestMetrics {
             total_return_pct: 0.0, sharpe_ratio: 0.0, max_drawdown_pct: 0.0,
             win_rate_pct: 0.0, total_trades: 0, worst_trades: vec![], all_trades: vec![],
@@ -3827,6 +3863,9 @@ pub fn run_polymarket_binary_on_candle_buffer(
         resolution_logic,
         threshold,
         max_stake_usd,
+        None,
+        "percent",
+        1.0,
     )
     .unwrap_or_else(|e| BacktestMetrics {
         total_return_pct: 0.0, sharpe_ratio: 0.0, max_drawdown_pct: 0.0,

@@ -167,27 +167,44 @@ function liveOrdersToTrades(orders: LiveOrder[], initialBalance: number): LiveTr
 /** Resettable total P&L — baseline is captured on Reset so the badge
  *  shows gains/losses since that point. Deleted strategies no longer
  *  contribute because we use the live current sum, not a monotonic max. */
-function useResettableTotalPnL(runners: StoredRunner[]) {
-  const [baseline, setBaseline] = useState(() => {
+interface StatsBaseline {
+  pnl: number
+  trades: number
+  wins: number
+}
+
+function useResettableStats(runners: StoredRunner[]) {
+  const [baseline, setBaseline] = useState<StatsBaseline>(() => {
     try {
-      return Number(localStorage.getItem('live-strategies-pnl-baseline') || '0')
+      return JSON.parse(localStorage.getItem('live-strategies-stats-baseline') || '{"pnl":0,"trades":0,"wins":0}')
     } catch {
-      return 0
+      return { pnl: 0, trades: 0, wins: 0 }
     }
   })
 
-  const current = runners.reduce((s, r) => s + runnerPnlUSD(r), 0)
-  const display = current - baseline
+  const currentPnl = runners.reduce((s, r) => s + runnerPnlUSD(r), 0)
+  const currentTrades = runners.reduce((s, r) => s + (r.config.mode === 'live' ? (r.result?.live_total_trades ?? 0) : (r.result?.total_trades ?? 0)), 0)
+  const currentWins = runners.reduce((s, r) => {
+    if (r.config.mode === 'live') {
+      return s + (r.result?.live_wins ?? 0)
+    }
+    return s + Math.round((r.result?.win_rate_pct ?? 0) / 100 * (r.result?.total_trades ?? 0))
+  }, 0)
 
   const reset = () => {
-    const next = runners.reduce((s, r) => s + runnerPnlUSD(r), 0)
+    const next: StatsBaseline = { pnl: currentPnl, trades: currentTrades, wins: currentWins }
     setBaseline(next)
     try {
-      localStorage.setItem('live-strategies-pnl-baseline', String(next))
+      localStorage.setItem('live-strategies-stats-baseline', JSON.stringify(next))
     } catch {}
   }
 
-  return { display, reset }
+  return {
+    pnlDisplay: currentPnl - baseline.pnl,
+    tradesDisplay: currentTrades - baseline.trades,
+    winsDisplay: currentWins - baseline.wins,
+    reset,
+  }
 }
 
 // ── Live Equity Chart ────────────────────────────────────────────────
@@ -660,7 +677,7 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript }: Crea
                   />
                 </button>
                 <span className="text-sm font-medium">
-                  {form.mode === 'live' ? 'Live Trading' : 'Paper Trading'}
+                  {form.mode === 'live' ? 'Live Trading' : 'Dry Run'}
                 </span>
               </div>
             </div>
@@ -703,7 +720,7 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript }: Crea
             </div>
           )}
 
-          {/* Paper trading fields — hidden in live mode */}
+          {/* Dry Run fields — hidden in live mode */}
           {form.mode === 'paper' && (
             <div className="grid grid-cols-3 gap-3">
               <div>
@@ -942,6 +959,59 @@ function LowBalanceModal({
             className="px-4 py-2 rounded text-sm font-medium hover:bg-white/5"
           >
             I understand
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ── Delete Confirmation Modal ─────────────────────────────────────────
+
+function DeleteConfirmModal({
+  name,
+  onConfirm,
+  onCancel,
+}: {
+  name: string
+  onConfirm: () => void
+  onCancel: () => void
+}) {
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+      onClick={(e) => { if (e.target === e.currentTarget) onCancel() }}
+    >
+      <div
+        className="rounded-lg border w-full max-w-sm"
+        style={{ backgroundColor: 'var(--color-surface)', borderColor: 'var(--color-border)' }}
+      >
+        <div className="p-4 border-b flex items-center justify-between" style={{ borderColor: 'var(--color-border)' }}>
+          <div className="flex items-center gap-2">
+            <AlertCircle size={16} style={{ color: 'var(--color-danger)' }} />
+            <h2 className="font-semibold">Delete Strategy</h2>
+          </div>
+          <button onClick={onCancel} className="p-1 rounded hover:bg-white/10" style={{ color: 'var(--color-text-muted)' }}>
+            <X size={16} />
+          </button>
+        </div>
+        <div className="p-4 text-sm" style={{ color: 'var(--color-text-muted)' }}>
+          Are you sure you want to delete <strong style={{ color: 'var(--color-text)' }}>{name}</strong>? This action cannot be undone.
+        </div>
+        <div className="p-4 border-t flex gap-2" style={{ borderColor: 'var(--color-border)' }}>
+          <button
+            onClick={onConfirm}
+            className="flex-1 py-2 rounded text-sm font-medium"
+            style={{ backgroundColor: 'var(--color-danger)', color: '#fff' }}
+          >
+            Delete
+          </button>
+          <button
+            onClick={onCancel}
+            className="px-4 py-2 rounded text-sm border hover:bg-white/5"
+            style={{ borderColor: 'var(--color-border)' }}
+          >
+            Cancel
           </button>
         </div>
       </div>
@@ -1230,7 +1300,7 @@ function RunnerCard({ runner, onStop, onRestart, onDelete }: RunnerCardProps) {
             )}
           </div>
           <p className="text-xs font-mono truncate" style={{ color: 'var(--color-text-muted)' }}>
-            {config.script.split('/').pop()} · {config.symbol} · {config.interval} · {config.mode}
+            {config.script.split('/').pop()} · {config.symbol} · {config.interval} · {config.mode === 'paper' ? 'dry run' : config.mode}
             {config.market_type === 'polymarket_binary' ? ` · ${config.resolution_logic ?? 'price_up'}${config.threshold !== undefined && config.threshold !== null ? `(${config.threshold})` : ''}` : ''}
             {config.market_type === 'polymarket_binary' && config.live_sizing_mode
               ? ` · ${config.live_sizing_mode === 'percent' ? `${config.live_sizing_value}%` : `$${config.live_sizing_value}`}`
@@ -1615,7 +1685,8 @@ export default function LiveStrategies() {
   const runners = data?.runners ?? []
   const scripts = scriptsData?.scripts ?? []
   const running = runners.filter(r => r.status.status === 'running').length
-  const { display: totalPnl, reset: resetTotalPnl } = useResettableTotalPnL(runners)
+  const { pnlDisplay: totalPnl, tradesDisplay: totalTradesDelta, winsDisplay: totalWinsDelta, reset: resetStats } = useResettableStats(runners)
+  const [deleteTarget, setDeleteTarget] = useState<StoredRunner | null>(null)
 
   return (
     <div className="p-6 max-w-5xl mx-auto">
@@ -1638,10 +1709,10 @@ export default function LiveStrategies() {
             Total P&L: {totalPnl >= 0 ? '+' : ''}${fmtUSD(totalPnl)}
           </span>
           <button
-            onClick={resetTotalPnl}
+            onClick={resetStats}
             className="text-[10px] px-2 py-0.5 rounded border hover:bg-white/5"
             style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-muted)' }}
-            title="Reset Total P&L"
+            title="Reset Stats"
           >
             Reset
           </button>
@@ -1703,22 +1774,8 @@ export default function LiveStrategies() {
           {[
             { label: 'Runners', value: runners.length, icon: <Activity size={14} /> },
             { label: 'Running', value: running, icon: <Bot size={14} /> },
-            { label: 'Total Trades', value: runners.reduce((s, r) => s + (r.config.mode === 'live' ? (r.result?.live_total_trades ?? 0) : (r.result?.total_trades ?? 0)), 0), icon: <TrendingUp size={14} /> },
-            { label: 'Avg Win Rate', value: (() => {
-              const liveRunners = runners.filter(r => r.config.mode === 'live' && (r.result?.live_total_trades ?? 0) > 0)
-              const paperRunners = runners.filter(r => r.config.mode !== 'live')
-              let totalWins = 0
-              let totalTrades = 0
-              liveRunners.forEach(r => {
-                totalWins += r.result?.live_wins ?? 0
-                totalTrades += r.result?.live_total_trades ?? 0
-              })
-              paperRunners.forEach(r => {
-                totalWins += Math.round((r.result?.win_rate_pct ?? 0) / 100 * (r.result?.total_trades ?? 0))
-                totalTrades += r.result?.total_trades ?? 0
-              })
-              return totalTrades > 0 ? `${((totalWins / totalTrades) * 100).toFixed(1)}%` : '—'
-            })(), icon: <TrendingDown size={14} /> },
+            { label: 'Total Trades', value: totalTradesDelta, icon: <TrendingUp size={14} /> },
+            { label: 'Avg Win Rate', value: totalTradesDelta > 0 ? `${((totalWinsDelta / totalTradesDelta) * 100).toFixed(1)}%` : '—', icon: <TrendingDown size={14} /> },
           ].map(stat => (
             <div key={stat.label} className="rounded-lg border p-3"
               style={{ backgroundColor: 'var(--color-surface)', borderColor: 'var(--color-border)' }}>
@@ -1740,7 +1797,7 @@ export default function LiveStrategies() {
           <Bot size={48} className="mx-auto mb-4 opacity-20" />
           <p className="text-sm mb-1" style={{ color: 'var(--color-text-muted)' }}>No live strategies running</p>
           <p className="text-xs mb-4" style={{ color: 'var(--color-text-muted)' }}>
-            Start a strategy to run it on live or paper market data
+            Start a strategy to run it on live or dry run mode
           </p>
           <button onClick={() => setShowCreate(true)}
             className="px-4 py-2 rounded text-sm font-medium"
@@ -1757,9 +1814,7 @@ export default function LiveStrategies() {
               runner={runner}
               onStop={() => stopMutation.mutate(runner.config.id)}
               onRestart={() => restartMutation.mutate(runner.config.id)}
-              onDelete={() => {
-                if (confirm(`Delete "${runner.config.name}"?`)) deleteMutation.mutate(runner.config.id)
-              }}
+              onDelete={() => setDeleteTarget(runner)}
             />
           ))}
         </div>
@@ -1770,6 +1825,16 @@ export default function LiveStrategies() {
           scripts={scripts}
           onClose={() => setShowCreate(false)}
           onCreated={() => qc.invalidateQueries({ queryKey: ['live-strategies'] })}
+        />
+      )}
+      {deleteTarget && (
+        <DeleteConfirmModal
+          name={deleteTarget.config.name}
+          onConfirm={() => {
+            deleteMutation.mutate(deleteTarget.config.id)
+            setDeleteTarget(null)
+          }}
+          onCancel={() => setDeleteTarget(null)}
         />
       )}
     </div>

@@ -3401,6 +3401,13 @@ pub struct BacktestRunBody {
     /// Polymarket recurring 5-min binary windows have ~$500-$3,000 liquidity each.
     /// Default (None) = no cap (use for crypto backtests).
     pub max_position_usd: Option<f64>,
+    /// Maximum entry price threshold. If the current price (crypto) or token price
+    /// (binary) exceeds this value, the trade/bet is skipped.
+    pub max_entry_price: Option<f64>,
+    /// Position sizing mode: 'fixed' = fixed USD amount, 'percent' = cap fraction of balance.
+    pub sizing_mode: Option<String>,
+    /// Sizing value: USD amount for fixed mode, or max fraction (0.0-1.0) for percent mode.
+    pub sizing_value: Option<f64>,
 }
 
 fn default_market_type() -> String {
@@ -3462,6 +3469,9 @@ pub async fn handle_api_backtest_run(
          body.threshold)
     };
 
+    let sizing_mode = body.sizing_mode.as_deref().unwrap_or("percent");
+    let sizing_value = body.sizing_value.unwrap_or(1.0);
+
     let metrics = crate::tools::backtest::run_backtest_engine(
         &script_path,
         &body.market_type,
@@ -3474,6 +3484,9 @@ pub async fn handle_api_backtest_run(
         &resolution_logic,
         threshold,
         body.max_position_usd,
+        body.max_entry_price,
+        sizing_mode,
+        sizing_value,
         &workspace_dir,
     )
     .await;
@@ -4324,6 +4337,49 @@ async fn apply_import_zip(config: &crate::config::Config, bytes: Vec<u8>) -> any
     }
 
     Ok(imported)
+}
+
+/// GET /api/logs — return recent gateway log lines (last ~500)
+pub async fn handle_api_logs(
+    _headers: HeaderMap,
+) -> impl IntoResponse {
+    // Public endpoint — no auth required so logs can be viewed during troubleshooting
+    let log_dir = directories::BaseDirs::new()
+        .map(|b| b.home_dir().to_path_buf())
+        .unwrap_or_else(std::env::temp_dir)
+        .join(".traderclaw")
+        .join("logs");
+    // Find the newest gateway log file
+    let mut entries: Vec<_> = match tokio::fs::read_dir(&log_dir).await {
+        Ok(mut rd) => {
+            let mut v = Vec::new();
+            while let Ok(Some(entry)) = rd.next_entry().await {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with("gateway") {
+                    if let Ok(meta) = entry.metadata().await {
+                        if let Ok(modified) = meta.modified() {
+                            v.push((modified, entry.path()));
+                        }
+                    }
+                }
+            }
+            v
+        }
+        Err(_) => Vec::new(),
+    };
+    entries.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
+    let lines: Vec<String> = if let Some((_, path)) = entries.first() {
+        match tokio::fs::read_to_string(path).await {
+            Ok(content) => {
+                let all: Vec<String> = content.lines().map(String::from).collect();
+                all.into_iter().rev().take(500).collect::<Vec<_>>().into_iter().rev().collect()
+            }
+            Err(_) => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+    Json(serde_json::json!({ "lines": lines, "file": entries.first().map(|e| e.1.to_string_lossy().to_string()).unwrap_or_default() })).into_response()
 }
 
 #[cfg(test)]

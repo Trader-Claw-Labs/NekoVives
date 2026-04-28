@@ -18,7 +18,7 @@ import Config from './pages/Config'
 import Backtesting from './pages/Backtesting'
 import LiveStrategies from './pages/LiveStrategies'
 import SystemHealth from './pages/SystemHealth'
-import Memory from './pages/Memory'
+import Logs from './pages/Logs'
 import Help from './pages/Help'
 import { apiFetch, getAuthToken, setAuthErrorCallback } from './hooks/useApi'
 
@@ -147,7 +147,7 @@ export default function App() {
             <Route path="/backtesting" element={<StrategyWithChatLayout><Backtesting /></StrategyWithChatLayout>} />
             <Route path="/live" element={<StrategyWithChatLayout><LiveStrategies /></StrategyWithChatLayout>} />
             <Route path="/health" element={<SystemHealth />} />
-            <Route path="/memory" element={<Memory />} />
+            <Route path="/logs" element={<Logs />} />
             <Route path="/help" element={<Help />} />
             <Route path="/settings/llm" element={<LLMSettings />} />
             <Route path="/settings/config" element={<Config />} />

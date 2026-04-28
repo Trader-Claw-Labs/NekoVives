@@ -14,7 +14,7 @@ import {
   FlaskConical,
   Bot,
   Heart,
-  Database,
+  FileText,
   Blocks,
   HelpCircle,
 } from 'lucide-react'
@@ -42,7 +42,7 @@ const mainNavItems: NavItem[] = [
 
 const settingsNavItems: NavItem[] = [
   { to: '/health', icon: <Heart size={18} />, label: 'System Health' },
-  { to: '/memory', icon: <Database size={18} />, label: 'Memory' },
+  { to: '/logs', icon: <FileText size={18} />, label: 'Gateway Log' },
   { to: '/settings/llm', icon: <Brain size={18} />, label: 'LLM Settings' },
   { to: '/settings/config', icon: <Settings size={18} />, label: 'Config' },
 ]

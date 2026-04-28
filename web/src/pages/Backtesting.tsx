@@ -23,6 +23,7 @@ interface BacktestScript {
     sharpe_ratio: number | null
     win_rate_pct: number
     total_trades: number
+    final_balance: number
     run_date: string
   }
 }
@@ -1126,8 +1127,9 @@ export default function Backtesting() {
   const [showLiveModal, setShowLiveModal] = useState(false)
   const [selectedScripts, setSelectedScripts] = useState<string[]>([])
   const [batchProgress, setBatchProgress] = useState<{ current: number; total: number; script: string } | null>(null)
-  type SortMode = 'default' | 'win_rate_desc'
+  type SortMode = 'default' | 'win_rate_desc' | 'trades_desc' | 'balance_desc'
   const [sortBy, setSortBy] = useState<SortMode>('default')
+  const SORT_MODES: SortMode[] = ['default', 'win_rate_desc', 'trades_desc', 'balance_desc']
   // Show result only when it belongs to the currently selected script; fall back to cached
   const displayResult = (result && result.script === config.script)
     ? result
@@ -1220,6 +1222,7 @@ export default function Backtesting() {
             sharpe_ratio: result.sharpe_ratio,
             win_rate_pct: result.win_rate_pct,
             total_trades: result.total_trades,
+            final_balance: result.final_balance,
             run_date: new Date().toISOString(),
           }
         }).then(() => {
@@ -1239,12 +1242,22 @@ export default function Backtesting() {
   const isBatchMode = selectedScripts.length > 1
   const canRun = (isBatchMode || !!config.script) && !isRunning && !batchProgress
 
-  // Sort scripts by win rate descending when requested
+  // Sort scripts by selected metric descending
   const sortedScripts = [...scripts].sort((a, b) => {
     if (sortBy === 'win_rate_desc') {
       const awr = a.last_run_stats?.win_rate_pct ?? -1
       const bwr = b.last_run_stats?.win_rate_pct ?? -1
       return bwr - awr
+    }
+    if (sortBy === 'trades_desc') {
+      const at = a.last_run_stats?.total_trades ?? -1
+      const bt = b.last_run_stats?.total_trades ?? -1
+      return bt - at
+    }
+    if (sortBy === 'balance_desc') {
+      const ab = a.last_run_stats?.final_balance ?? -1
+      const bb = b.last_run_stats?.final_balance ?? -1
+      return bb - ab
     }
     return a.name.localeCompare(b.name)
   })
@@ -1274,6 +1287,7 @@ export default function Backtesting() {
           sharpe_ratio: res.sharpe_ratio,
           win_rate_pct: res.win_rate_pct,
           total_trades: res.total_trades,
+          final_balance: res.final_balance,
           run_date: new Date().toISOString(),
         }
       })
@@ -1636,8 +1650,120 @@ export default function Backtesting() {
             </div>
           )}
 
+          {/* Max Entry Price — skip trades above this price/token price */}
+          <div className="lg:col-span-2">
+            <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>
+              Max Entry Price
+              <span
+                className="ml-1 px-1 rounded text-[9px]"
+                style={{ backgroundColor: 'var(--color-surface-2)', color: 'var(--color-text-muted)' }}
+                title={config.market_type === 'polymarket_binary' ? 'Skip bets when token price exceeds this threshold' : 'Skip buys when market price exceeds this threshold'}
+              >
+                skip above
+              </span>
+            </label>
+            <input
+              type="number"
+              min={0}
+              step={0.01}
+              value={config.max_entry_price ?? ''}
+              onChange={(e) => {
+                const val = e.target.value
+                set('max_entry_price', val === '' ? undefined : Number(val))
+              }}
+              placeholder="No limit"
+              className="w-full rounded px-2 py-2 text-sm font-mono"
+              style={{
+                backgroundColor: 'var(--color-surface-2)',
+                border: '1px solid var(--color-border)',
+                color: 'var(--color-text)',
+              }}
+            />
+          </div>
+
+          {/* Sizing Mode */}
+          <div className="lg:col-span-2">
+            <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>
+              Sizing Mode
+            </label>
+            <select
+              value={config.sizing_mode ?? 'percent'}
+              onChange={(e) => {
+                const mode = e.target.value as 'fixed' | 'percent'
+                set('sizing_mode', mode)
+                if (mode === 'percent' && (config.sizing_value == null || config.sizing_value > 1)) {
+                  set('sizing_value', 0.25)
+                }
+              }}
+              className="w-full rounded px-2 py-2 text-sm"
+              style={{
+                backgroundColor: 'var(--color-surface-2)',
+                border: '1px solid var(--color-border)',
+                color: 'var(--color-text)',
+              }}
+            >
+              <option value="percent">% of Balance</option>
+              <option value="fixed">Fixed USD</option>
+            </select>
+          </div>
+
+          {/* Sizing Value */}
+          {(() => {
+            const isPercent = (config.sizing_mode ?? 'percent') === 'percent'
+            // stored as fraction 0-1; display as 0-100
+            const displayVal = isPercent
+              ? Math.round((config.sizing_value ?? 0.25) * 1000) / 10
+              : (config.sizing_value ?? 100)
+            // upper bound: can't produce a stake > max_position_usd
+            const maxPct = isPercent && config.max_position_usd && config.initial_balance > 0
+              ? Math.min(100, Math.round((config.max_position_usd / config.initial_balance) * 1000) / 10)
+              : 100
+            const effectiveDollar = isPercent
+              ? Math.min(
+                  config.initial_balance * (config.sizing_value ?? 0.25),
+                  config.max_position_usd ?? Infinity
+                )
+              : (config.sizing_value ?? 100)
+            const exceedsMax = isPercent && config.max_position_usd != null
+              && config.initial_balance * (config.sizing_value ?? 0.25) > config.max_position_usd
+
+            return (
+              <div className="lg:col-span-2">
+                <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>
+                  {isPercent ? 'Max % of Balance' : 'Amount ($)'}
+                </label>
+                <input
+                  type="number"
+                  min={isPercent ? 0.1 : 1}
+                  max={isPercent ? maxPct : undefined}
+                  step={isPercent ? 0.1 : 1}
+                  value={displayVal}
+                  onChange={(e) => {
+                    const v = Number(e.target.value)
+                    set('sizing_value', isPercent ? Math.min(v, maxPct) / 100 : v)
+                  }}
+                  className="w-full rounded px-2 py-2 text-sm font-mono"
+                  style={{
+                    backgroundColor: 'var(--color-surface-2)',
+                    border: `1px solid ${exceedsMax ? 'var(--color-danger, #ef4444)' : 'var(--color-border)'}`,
+                    color: 'var(--color-text)',
+                  }}
+                />
+                <p className="text-[10px] mt-0.5" style={{ color: exceedsMax ? 'var(--color-danger, #ef4444)' : 'var(--color-text-muted)' }}>
+                  {isPercent
+                    ? exceedsMax
+                      ? `Exceeds Max Pos — capped at $${config.max_position_usd?.toFixed(0)}`
+                      : effectiveDollar === Infinity
+                        ? 'Fraction of balance per trade'
+                        : `≈ $${effectiveDollar.toFixed(0)} per trade (capped at Max Pos)`
+                    : 'Fixed USDC amount per trade'}
+                </p>
+              </div>
+            )
+          })()}
+
           {/* Run + Live Trading buttons */}
-          <div className={clsx('col-span-2 flex gap-2', config.market_type !== 'polymarket_binary' && 'lg:col-span-4')}>
+          <div className={clsx('col-span-2 flex gap-2', config.market_type !== 'polymarket_binary' && 'lg:col-span-2')}>
             <button
               onClick={() => {
                 if (isBatchMode) {
@@ -1755,13 +1881,16 @@ export default function Backtesting() {
                     )}
                   </label>
                   <button
-                    onClick={() => setSortBy(prev => prev === 'default' ? 'win_rate_desc' : 'default')}
+                    onClick={() => setSortBy(prev => {
+                      const idx = SORT_MODES.indexOf(prev)
+                      return SORT_MODES[(idx + 1) % SORT_MODES.length]
+                    })}
                     className="flex items-center gap-1 text-[10px] px-2 py-1 rounded hover:bg-[var(--color-surface-2)]"
-                    style={{ color: sortBy === 'win_rate_desc' ? 'var(--color-accent)' : 'var(--color-text-muted)' }}
-                    title={sortBy === 'win_rate_desc' ? 'Sorted by Win Rate' : 'Sort by Win Rate'}
+                    style={{ color: sortBy !== 'default' ? 'var(--color-accent)' : 'var(--color-text-muted)' }}
+                    title={sortBy === 'default' ? 'Click to sort' : `Sorted by ${sortBy.replace('_desc', '').replace(/_/g, ' ')}`}
                   >
                     <ArrowUpDown size={10} />
-                    {sortBy === 'win_rate_desc' ? 'Win Rate ↓' : 'Sort'}
+                    {sortBy === 'default' ? 'Sort' : sortBy === 'win_rate_desc' ? 'Win Rate ↓' : sortBy === 'trades_desc' ? 'Trades ↓' : 'Balance ↓'}
                   </button>
                 </div>
               )}

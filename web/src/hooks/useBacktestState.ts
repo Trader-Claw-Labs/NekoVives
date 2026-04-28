@@ -57,6 +57,13 @@ export interface BacktestConfig {
   // Polymarket position limit: max stake per trade in USD.
   // Reflects real market liquidity caps (~$500-$3,000 per 5-min window).
   max_position_usd?: number
+  // Maximum entry price threshold. If the current price (crypto) or token
+  // price (binary) exceeds this value, the trade/bet is skipped.
+  max_entry_price?: number
+  // Position sizing mode: fixed USD amount or percentage of balance.
+  sizing_mode?: 'fixed' | 'percent'
+  // Sizing value: USD amount for fixed mode, or max fraction (0-1) for percent mode.
+  sizing_value?: number
 }
 
 export interface TradeLog {
@@ -125,6 +132,8 @@ const DEFAULT_CONFIG: BacktestConfig = {
   resolution_logic: 'price_up',
   // Default $500 per trade reflects real Polymarket 5-min binary window liquidity
   max_position_usd: 500,
+  sizing_mode: 'percent',
+  sizing_value: 1.0,
 }
 
 const DEFAULT_STATE: BacktestState = {
