@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Trader Claw — The Rust AI Trading Agent</title>
-  <meta name="description" content="Trader Claw is a 100% Rust AI trading agent. Trade EVM, Solana, TON and Polymarket prediction markets with blazing-fast execution, sandboxed strategy backtesting, and Telegram integration." />
+  <title>Neko Vives — The Rust AI Trading Agent</title>
+  <meta name="description" content="Neko Vives is a 100% Rust AI trading agent. Trade EVM, Solana, TON and Polymarket prediction markets with blazing-fast execution, sandboxed strategy backtesting, and Telegram integration." />
 
   <!-- Fonts -->
   <link rel="preconnect" href="https://fonts.googleapis.com" />
@@ -939,8 +939,8 @@
 <nav>
   <div class="nav-inner">
     <a href="#" class="logo">
-      <div class="logo-icon">🦀</div>
-      Trader<span>Claw</span>
+      <img src="Neko.png" alt="Neko Vives" class="logo-img" style="height:36px;width:auto;border-radius:8px;" />
+      Neko<span>Vives</span>
     </a>
     <ul class="nav-links">
       <li><a href="#dashboard">Dashboard</a></li>
@@ -961,15 +961,9 @@
   <div class="hero-glow-2"></div>
   <div class="container" style="position:relative;z-index:1;">
 
-    <!-- ASCII title banner -->
-    <div style="overflow-x:auto;margin-bottom:36px;">
-      <div class="ascii-title" aria-label="TRADER CLAW" style="display:inline-block;text-align:left;"><span class="t1">████████╗██████╗  █████╗ ██████╗ ███████╗██████╗  </span><span class="t2"> ██████╗██╗      █████╗ ██╗    ██╗</span>
-<span class="t1">╚══██╔══╝██╔══██╗██╔══██╗██╔══██╗██╔════╝██╔══██╗</span><span class="t2">██╔════╝██║     ██╔══██╗██║    ██║</span>
-<span class="t1">   ██║   ██████╔╝███████║██║  ██║█████╗  ██████╔╝</span><span class="t2">██║     ██║     ███████║██║ █╗ ██║</span>
-<span class="t1">   ██║   ██╔══██╗██╔══██║██║  ██║██╔══╝  ██╔══██╗</span><span class="t2">██║     ██║     ██╔══██║██║███╗██║</span>
-<span class="t1">   ██║   ██║  ██║██║  ██║██████╔╝███████╗██║  ██║</span><span class="t2">╚██████╗███████╗██║  ██║╚███╔███╔╝</span>
-<span class="t3">   ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═╝╚═════╝ ╚══════╝╚═╝  ╚═╝ ╚═════╝╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝ </span>
-<span class="t3">  // 100% Rust · EVM · Solana · TON · Polymarket</span></div>
+    <!-- Logo banner -->
+    <div style="margin-bottom:36px;">
+      <img src="Neko.png" alt="Neko Vives" style="height:160px;width:auto;margin:0 auto;display:block;filter:drop-shadow(0 0 40px rgba(0,255,136,0.25));" />
     </div>
 
     <div class="badge">
@@ -983,7 +977,7 @@
     </h1>
 
     <p class="hero-sub">
-      Trader Claw is an AI-powered trading agent written 100% in Rust.
+      Neko Vives is an AI-powered trading agent written 100% in Rust.
       Execute swaps on EVM, Solana, and TON — and trade Polymarket prediction markets —
       all from a single secure, sandboxed environment.
     </p>
@@ -1003,16 +997,16 @@
         <div class="dot dot-r"></div>
         <div class="dot dot-y"></div>
         <div class="dot dot-g"></div>
-        <div class="terminal-title">trader-claw — gateway</div>
+        <div class="terminal-title">neko-vives — gateway</div>
       </div>
       <div class="terminal-body">
-        <div><span class="t-prompt">$</span> <span class="t-cmd">trader-claw gateway</span></div>
-        <div class="t-out">  🦀 Trader Claw v0.1.7 — Rust AI Trading Agent</div>
-        <div class="t-out">  ✓ Config loaded from ~/.traderclaw/config.toml</div>
+        <div><span class="t-prompt">$</span> <span class="t-cmd">neko-vives gateway</span></div>
+        <div class="t-out">  🐱 Neko Vives v0.1.7 — Rust AI Trading Agent</div>
+        <div class="t-out">  ✓ Config loaded from ~/.nekovi/config.toml</div>
         <div class="t-out">  ✓ Wallets: <span class="t-val">3 registered</span> (EVM · Solana · TON)</div>
         <div class="t-out">  ✓ Chains:  <span class="t-val">8 EVM chains</span> + Solana + TON</div>
         <div class="t-out">  ✓ Polymarket CLOB: <span class="t-ok">connected</span></div>
-        <div class="t-out">  ✓ Telegram bot: <span class="t-ok">@traderclaw_bot online</span></div>
+        <div class="t-out">  ✓ Telegram bot: <span class="t-ok">@nekovi_bot online</span></div>
         <div class="t-out">  ✓ Backtesting engine: <span class="t-val">Rhai sandbox ready</span></div>
         <div class="t-out">  🌐 Dashboard: <span class="t-val">http://127.0.0.1:3000</span></div>
         <div style="margin-top:4px"><span class="t-prompt">▶</span> <span class="t-out">Waiting for instructions...</span> <span class="t-cursor"></span></div>
@@ -1065,9 +1059,9 @@
         <div class="dot dot-r"></div>
         <div class="dot dot-y"></div>
         <div class="dot dot-g"></div>
-        <div class="dashboard-frame-url">http://127.0.0.1:3000 — Trader Claw Dashboard</div>
+        <div class="dashboard-frame-url">http://127.0.0.1:3000 — Neko Vives Dashboard</div>
       </div>
-      <img src="screenshot.png" alt="Trader Claw Dashboard — showing stat cards, system health, market scanner, and quick access panel" loading="lazy" />
+      <img src="screenshot.png" alt="Neko Vives Dashboard — showing stat cards, system health, market scanner, and quick access panel" loading="lazy" />
     </div>
   </div>
 </section>
@@ -1125,7 +1119,7 @@
       <div class="feature-card">
         <div class="feature-icon">✈️</div>
         <h3>Telegram Integration</h3>
-        <p>Control Trader Claw from any Telegram app. Query balances, browse markets, place orders and get trade confirmations — all via natural language commands or structured slash commands.</p>
+        <p>Control Neko Vives from any Telegram app. Query balances, browse markets, place orders and get trade confirmations — all via natural language commands or structured slash commands.</p>
       </div>
 
       <div class="feature-card">
@@ -1152,7 +1146,7 @@
     <div class="section-tag">Supported Networks</div>
     <h2>One agent. Every chain.</h2>
     <p class="section-lead" style="margin:0 auto;">
-      Trader Claw connects to every major blockchain with custom RPC override support per chain.
+      Neko Vives connects to every major blockchain with custom RPC override support per chain.
     </p>
 
     <div class="chain-logos">
@@ -1226,7 +1220,7 @@
             <div class="t-out" style="color:var(--text)">Buy $50 of SOL on Solana when RSI goes below 28, then sell when it crosses 65.</div>
           </div>
           <div style="margin-bottom:10px">
-            <div style="color:var(--accent);margin-bottom:4px">🦀 TraderClaw:</div>
+            <div style="color:var(--accent);margin-bottom:4px">🐱 NekoVives:</div>
             <div class="t-out">Strategy understood. Let me backtest first…</div>
             <div class="t-out" style="margin-top:4px">📊 Backtest (90d): <span class="t-ok">+31.4% PnL</span> · Sharpe <span class="t-val">1.82</span> · Win rate <span class="t-val">71%</span></div>
             <div class="t-out" style="margin-top:4px">Looks solid. Shall I activate this strategy?</div>
@@ -1236,7 +1230,7 @@
             <div class="t-out" style="color:var(--text)">Yes, activate it.</div>
           </div>
           <div style="margin-top:10px">
-            <div style="color:var(--accent);margin-bottom:4px">🦀 TraderClaw:</div>
+            <div style="color:var(--accent);margin-bottom:4px">🐱 NekoVives:</div>
             <div class="t-out"><span class="t-ok">✓</span> Cron strategy scheduled. Watching RSI on SOL/USDT.</div>
           </div>
         </div>
@@ -1337,9 +1331,9 @@
       <!-- Telegram mock chat -->
       <div class="tg-chat fade-in">
         <div class="tg-header">
-          <div class="tg-avatar">🦀</div>
+          <div class="tg-avatar">🐱</div>
           <div>
-            <div class="tg-name">TraderClaw Bot</div>
+            <div class="tg-name">NekoVives Bot</div>
             <div class="tg-status">● online</div>
           </div>
         </div>
@@ -1413,7 +1407,7 @@
       <div class="section-tag">Security</div>
       <h2>Your keys. Your rules.<br>Zero compromise.</h2>
       <p class="section-lead">
-        Trader Claw runs entirely on your machine. No cloud custody, no shared infrastructure.
+        Neko Vives runs entirely on your machine. No cloud custody, no shared infrastructure.
         Every secret is encrypted before it ever touches disk.
       </p>
     </div>
@@ -1493,14 +1487,14 @@
 <span class="kw">cargo</span> build --release
 
 <span class="comment"># 4. Start the gateway</span>
-./target/release/<span class="str">trader-claw</span> gateway
+./target/release/<span class="str">neko-vives</span> gateway
 
 <span class="comment"># 5. Open the dashboard</span>
 <span class="comment"># → http://127.0.0.1:3000</span></pre>
       </div>
 
       <p style="font-size:0.83rem;color:var(--muted);margin-top:20px;">
-        On first launch, Trader Claw prints a one-time pairing code.
+        On first launch, Neko Vives prints a one-time pairing code.
         Enter it in the dashboard to authenticate and start trading.
       </p>
     </div>
@@ -1530,8 +1524,8 @@
     <div class="footer-inner">
       <div class="footer-brand">
         <div class="logo">
-          <div class="logo-icon">🦀</div>
-          Trader<span style="color:var(--accent)">Claw</span>
+          <img src="Neko.png" alt="Neko Vives" style="height:32px;width:auto;border-radius:6px;" />
+          Neko<span style="color:var(--accent)">Vives</span>
         </div>
         <p>A 100% Rust AI trading agent for EVM, Solana, TON, and Polymarket prediction markets.</p>
       </div>
@@ -1567,7 +1561,7 @@
     </div>
 
     <div class="footer-bottom">
-      <div>© 2025 Trader Claw. Open source under MIT License.</div>
+      <div>© 2025 Neko Vives. Open source under MIT License.</div>
       <div class="rust-badge">Built with <span>♥</span> in <span>Rust</span></div>
     </div>
   </div>
