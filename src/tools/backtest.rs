@@ -2893,11 +2893,11 @@ fn run_polymarket_slug_backtest(
             s.trades.push(Trade { timestamp: ts_str, side: side_str.into(), price: token_p, size: tokens, pnl, debug: Some(debug) });
         } else {
             let s = state.lock().unwrap();
-            let kv = s.kv.clone();
+            let mut kv = s.kv.clone();
+            let bal = s.balance;
             drop(s);
-            if !kv.is_empty() {
-                flat_debugs.push((ts_str, kv));
-            }
+            kv.insert("debug_bt_balance".into(), bal);
+            flat_debugs.push((ts_str, kv));
         }
 
         let snap = state.lock().unwrap().balance;

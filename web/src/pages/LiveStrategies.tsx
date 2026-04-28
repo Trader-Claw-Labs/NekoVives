@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { apiFetch, apiPost, apiDelete } from '../hooks/useApi'
+import { apiFetch, apiPost, apiDelete, apiPatch } from '../hooks/useApi'
 import { type MarketSeries, POLY_BINARY_PRESETS } from '../hooks/useBacktestState'
 import { useProfitCelebration } from '../hooks/useProfitCelebration'
 import {
@@ -29,6 +29,7 @@ interface RunnerConfig {
   live_sizing_value?: number
   stop_loss_pct?: number | null
   early_fire_secs?: number | null
+  max_entry_price?: number | null
 }
 
 interface RunnerStatus {
@@ -519,6 +520,7 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript }: Crea
     live_sizing_value: 5,
     stop_loss_pct: null as number | null,
     early_fire_secs: null as number | null,
+    max_entry_price: 0.65 as number | null,
   })
   const [error, setError] = useState('')
   const [showMissingApiKeyModal, setShowMissingApiKeyModal] = useState(false)
@@ -841,6 +843,39 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript }: Crea
               </div>
             </div>
           )}
+
+          {/* Max Entry Price */}
+          <div>
+            <label className="block text-[11px] font-medium mb-1" style={{ color: 'var(--color-text-muted)' }}>
+              Max Entry Price
+            </label>
+            <div className="flex items-center gap-2">
+              <input
+                type="number"
+                className="w-20 rounded border px-2 py-1 text-xs"
+                style={{ background: 'var(--color-surface-2)', borderColor: 'var(--color-border)', color: 'var(--color-text)' }}
+                placeholder="0.65"
+                min={0.01}
+                max={0.99}
+                step={0.01}
+                value={form.max_entry_price != null ? form.max_entry_price : ''}
+                onChange={e => set('max_entry_price', e.target.value === '' ? null : Number(e.target.value))}
+              />
+              <button
+                type="button"
+                className="text-[10px] px-2 py-1 rounded"
+                style={{ background: form.max_entry_price == null ? 'var(--color-surface-3)' : 'rgba(99,102,241,0.15)', color: form.max_entry_price == null ? 'var(--color-text-muted)' : '#818cf8' }}
+                onClick={() => set('max_entry_price', form.max_entry_price == null ? 0.65 : null)}
+              >
+                {form.max_entry_price == null ? 'Enable' : 'Disable'}
+              </button>
+            </div>
+            <p className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
+              {form.max_entry_price != null
+                ? `Skip trades when token price exceeds $${form.max_entry_price.toFixed(2)} — protects against overpriced entries`
+                : 'Disabled — trades at any token price'}
+            </p>
+          </div>
 
           {/* Live mode notice */}
           {form.mode === 'live' && (
@@ -1211,9 +1246,11 @@ interface RunnerCardProps {
   onStop: () => void
   onRestart: () => void
   onDelete: () => void
+  onUpdateConfig?: (updates: { live_sizing_mode?: string; live_sizing_value?: number; max_entry_price?: number | null }) => void
+  isPatching?: boolean
 }
 
-function RunnerCard({ runner, onStop, onRestart, onDelete }: RunnerCardProps) {
+function RunnerCard({ runner, onStop, onRestart, onDelete, onUpdateConfig, isPatching }: RunnerCardProps) {
   const [expanded, setExpanded] = useState(() => {
     try {
       const stored = localStorage.getItem(`runner-expanded-${runner.config.id}`)
@@ -1305,6 +1342,9 @@ function RunnerCard({ runner, onStop, onRestart, onDelete }: RunnerCardProps) {
             {config.market_type === 'polymarket_binary' && config.live_sizing_mode
               ? ` · ${config.live_sizing_mode === 'percent' ? `${config.live_sizing_value}%` : `$${config.live_sizing_value}`}`
               : ''}
+            {config.market_type === 'polymarket_binary' && config.max_entry_price != null
+              ? ` · max≤$${config.max_entry_price.toFixed(2)}`
+              : ''}
           </p>
         </div>
         <div className="flex items-center gap-1 flex-shrink-0">
@@ -1329,6 +1369,80 @@ function RunnerCard({ runner, onStop, onRestart, onDelete }: RunnerCardProps) {
           </button>
         </div>
       </div>
+
+      {/* Sizing config editor — visible when stopped so user can adjust before restart */}
+      {!isRunning && onUpdateConfig && (
+        <div className="px-4 pb-3 border-b" style={{ borderColor: 'var(--color-border)' }}>
+          <div className="flex items-center gap-3 text-xs">
+            <span style={{ color: 'var(--color-text-muted)' }} className="font-medium">Sizing:</span>
+            <select
+              className="rounded border px-1.5 py-0.5 text-xs"
+              style={{ background: 'var(--color-surface-2)', borderColor: 'var(--color-border)', color: 'var(--color-text)' }}
+              value={config.live_sizing_mode ?? 'percent'}
+              onChange={e => onUpdateConfig({ live_sizing_mode: e.target.value })}
+              disabled={isPatching}
+            >
+              <option value="percent">% of Balance</option>
+              <option value="fixed">Fixed USD</option>
+            </select>
+            <div className="flex items-center gap-1">
+              <input
+                type="number"
+                className="w-16 rounded border px-1.5 py-0.5 text-xs"
+                style={{ background: 'var(--color-surface-2)', borderColor: 'var(--color-border)', color: 'var(--color-text)' }}
+                min={1}
+                max={config.live_sizing_mode === 'percent' ? 100 : undefined}
+                step={config.live_sizing_mode === 'percent' ? 1 : 1}
+                value={config.live_sizing_value ?? (config.live_sizing_mode === 'percent' ? 5 : 50)}
+                onChange={e => {
+                  const val = Number(e.target.value)
+                  if (!Number.isNaN(val)) {
+                    onUpdateConfig({ live_sizing_value: val })
+                  }
+                }}
+                disabled={isPatching}
+              />
+              <span style={{ color: 'var(--color-text-muted)' }}>
+                {config.live_sizing_mode === 'percent' ? '%' : 'USDC'}
+              </span>
+            </div>
+            {isPatching && (
+              <span className="text-[10px] animate-pulse" style={{ color: 'var(--color-text-muted)' }}>Saving…</span>
+            )}
+          </div>
+          <div className="flex items-center gap-3 text-xs mt-2">
+            <span style={{ color: 'var(--color-text-muted)' }} className="font-medium">Max Entry:</span>
+            <div className="flex items-center gap-1">
+              <input
+                type="number"
+                className="w-16 rounded border px-1.5 py-0.5 text-xs"
+                style={{ background: 'var(--color-surface-2)', borderColor: 'var(--color-border)', color: 'var(--color-text)' }}
+                min={0.01}
+                max={0.99}
+                step={0.01}
+                value={config.max_entry_price != null ? config.max_entry_price : ''}
+                onChange={e => {
+                  const val = e.target.value === '' ? null : Number(e.target.value)
+                  if (val === null || !Number.isNaN(val)) {
+                    onUpdateConfig({ max_entry_price: val })
+                  }
+                }}
+                disabled={isPatching}
+              />
+              <span style={{ color: 'var(--color-text-muted)' }}>$</span>
+            </div>
+            <button
+              type="button"
+              className="text-[10px] px-1.5 py-0.5 rounded"
+              style={{ background: config.max_entry_price == null ? 'var(--color-surface-3)' : 'rgba(99,102,241,0.15)', color: config.max_entry_price == null ? 'var(--color-text-muted)' : '#818cf8' }}
+              onClick={() => onUpdateConfig({ max_entry_price: config.max_entry_price == null ? 0.65 : null })}
+              disabled={isPatching}
+            >
+              {config.max_entry_price == null ? 'Enable' : 'Disable'}
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* P&L summary — paper mode only (non-polymarket) */}
       {result && config.mode === 'paper' && config.market_type !== 'polymarket_binary' && (
@@ -1677,6 +1791,12 @@ export default function LiveStrategies() {
     onSuccess: () => qc.invalidateQueries({ queryKey: ['live-strategies'] }),
   })
 
+  const patchMutation = useMutation({
+    mutationFn: ({ id, body }: { id: string; body: { live_sizing_mode?: string; live_sizing_value?: number } }) =>
+      apiPatch(`/api/live/strategies/${id}`, body),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['live-strategies'] }),
+  })
+
   const deleteMutation = useMutation({
     mutationFn: (id: string) => apiDelete(`/api/live/strategies/${id}`),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['live-strategies'] }),
@@ -1815,6 +1935,10 @@ export default function LiveStrategies() {
               onStop={() => stopMutation.mutate(runner.config.id)}
               onRestart={() => restartMutation.mutate(runner.config.id)}
               onDelete={() => setDeleteTarget(runner)}
+              onUpdateConfig={(updates) =>
+                patchMutation.mutate({ id: runner.config.id, body: updates })
+              }
+              isPatching={patchMutation.isPending}
             />
           ))}
         </div>

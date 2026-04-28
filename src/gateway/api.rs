@@ -3842,11 +3842,16 @@ pub struct CreateRunnerBody {
     pub stop_loss_pct: Option<f64>,
     #[serde(default)]
     pub early_fire_secs: Option<u32>,
+    #[serde(default)]
+    pub max_entry_price: Option<f64>,
 }
 
 #[derive(serde::Deserialize)]
 pub struct PatchRunnerBody {
     pub auto_restart: Option<bool>,
+    pub live_sizing_mode: Option<String>,
+    pub live_sizing_value: Option<f64>,
+    pub max_entry_price: Option<f64>,
 }
 
 async fn hydrate_live_runtime_config(state: &AppState, config: &mut crate::strategy_runner::RunnerConfig) -> anyhow::Result<()> {
@@ -3970,20 +3975,28 @@ pub async fn handle_api_live_patch(
 ) -> impl IntoResponse {
     if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
 
-    let auto_restart = match body.auto_restart {
-        Some(v) => v,
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": "Missing auto_restart field" })),
-            ).into_response();
+    if let Some(auto_restart) = body.auto_restart {
+        match state.strategy_runner.set_auto_restart(&id, auto_restart) {
+            Some(runner) => return Json(serde_json::json!({ "runner": runner })).into_response(),
+            None => return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "runner not found" }))).into_response(),
         }
-    };
-
-    match state.strategy_runner.set_auto_restart(&id, auto_restart) {
-        Some(runner) => Json(serde_json::json!({ "runner": runner })).into_response(),
-        None => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "runner not found" }))).into_response(),
     }
+
+    if body.live_sizing_mode.is_some() || body.live_sizing_value.is_some() || body.max_entry_price.is_some() {
+        let mode = body.live_sizing_mode.map(|m| match m.as_str() {
+            "fixed" => crate::strategy_runner::LiveSizingMode::Fixed,
+            _ => crate::strategy_runner::LiveSizingMode::Percent,
+        });
+        match state.strategy_runner.update_runner_config(&id, mode, body.live_sizing_value, body.max_entry_price) {
+            Some(runner) => return Json(serde_json::json!({ "runner": runner })).into_response(),
+            None => return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "runner not found" }))).into_response(),
+        }
+    }
+
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({ "error": "No valid fields to patch" })),
+    ).into_response()
 }
 
 /// GET /api/live/strategies — list all strategy runners
@@ -4068,6 +4081,7 @@ pub async fn handle_api_live_create(
             let v = state.config.lock().live_strategy.early_fire_secs;
             if v > 0 { Some(v) } else { None }
         }),
+        max_entry_price: body.max_entry_price,
     };
 
     if let Err(e) = hydrate_live_runtime_config(&state, &mut config).await {

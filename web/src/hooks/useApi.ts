@@ -65,3 +65,10 @@ export async function apiPut<T>(path: string, body: unknown): Promise<T> {
 export async function apiDelete<T>(path: string): Promise<T> {
   return apiFetch<T>(path, { method: 'DELETE' })
 }
+
+export async function apiPatch<T>(path: string, body: unknown): Promise<T> {
+  return apiFetch<T>(path, {
+    method: 'PATCH',
+    body: JSON.stringify(body),
+  })
+}

@@ -80,6 +80,10 @@ pub struct RunnerConfig {
     /// Overrides the global [live_strategy] early_fire_secs from config.toml.
     #[serde(default)]
     pub early_fire_secs: Option<u32>,
+    /// Maximum token entry price. If the current token price exceeds this
+    /// value, the trade/bet is skipped. Applies to live and paper modes.
+    #[serde(default)]
+    pub max_entry_price: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -209,6 +213,33 @@ impl StrategyRunnerStore {
             r.config.auto_restart = auto_restart;
             if !auto_restart && (r.status.status == "starting") {
                 r.status.status = "stopped".to_string();
+            }
+            r.clone()
+        });
+        drop(map);
+        if updated.is_some() {
+            self.persist();
+        }
+        updated
+    }
+
+    pub fn update_runner_config(
+        &self,
+        id: &str,
+        live_sizing_mode: Option<LiveSizingMode>,
+        live_sizing_value: Option<f64>,
+        max_entry_price: Option<f64>,
+    ) -> Option<StoredRunner> {
+        let mut map = self.runners.lock().unwrap();
+        let updated = map.get_mut(id).map(|r| {
+            if let Some(mode) = live_sizing_mode {
+                r.config.live_sizing_mode = mode;
+            }
+            if let Some(val) = live_sizing_value {
+                r.config.live_sizing_value = val;
+            }
+            if let Some(val) = max_entry_price {
+                r.config.max_entry_price = Some(val);
             }
             r.clone()
         });
@@ -1483,6 +1514,18 @@ async fn execute_live_polymarket_signal(
     };
 
     let ep = if signal.starts_with("yes") { yes_token_price } else { no_token_price };
+
+    // Skip trade if entry price exceeds the configured maximum
+    if let Some(max_ep) = config.max_entry_price {
+        if ep > max_ep {
+            tracing::info!("[RUNNER {id}] Skipped: entry price {:.4} > max {:.4}", ep, max_ep);
+            append_runner_log(
+                store, id,
+                &format!("Skipped: entry price {:.4} exceeds max {:.4}", ep, max_ep),
+            );
+            return None;
+        }
+    }
 
     if let Some(client) = client {
         // ── LIVE mode: place real order via CLOB ──────────────────

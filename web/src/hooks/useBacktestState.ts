@@ -31,11 +31,16 @@ export interface PolyBinaryPreset {
 }
 
 export const POLY_BINARY_PRESETS: PolyBinaryPreset[] = [
-  { id: 'btc_5m',  label: 'BTC — 5-min binary',  symbol: 'BTCUSDT', defaultInterval: '5m',  description: 'Will BTC go up in the next 5 minutes?' },
-  { id: 'btc_15m', label: 'BTC — 15-min binary', symbol: 'BTCUSDT', defaultInterval: '15m', description: 'Will BTC go up in the next 15 minutes?' },
-  { id: 'btc_1h',  label: 'BTC — 1-hour binary', symbol: 'BTCUSDT', defaultInterval: '1h',  description: 'Will BTC go up in the next hour?' },
-  { id: 'eth_5m',  label: 'ETH — 5-min binary',  symbol: 'ETHUSDT', defaultInterval: '5m',  description: 'Will ETH go up in the next 5 minutes?' },
-  { id: 'eth_15m', label: 'ETH — 15-min binary', symbol: 'ETHUSDT', defaultInterval: '15m', description: 'Will ETH go up in the next 15 minutes?' },
+  { id: 'btc_5m',   label: 'BTC UP/DOWN 5-min',  symbol: 'BTCUSDT',  defaultInterval: '5m',  description: 'Will BTC go up in the next 5 minutes?' },
+  { id: 'btc_15m',  label: 'BTC UP/DOWN 15-min', symbol: 'BTCUSDT',  defaultInterval: '15m', description: 'Will BTC go up in the next 15 minutes?' },
+  { id: 'btc_1h',   label: 'BTC UP/DOWN 1-hour', symbol: 'BTCUSDT',  defaultInterval: '1h',  description: 'Will BTC go up in the next hour?' },
+  { id: 'eth_5m',   label: 'ETH UP/DOWN 5-min',  symbol: 'ETHUSDT',  defaultInterval: '5m',  description: 'Will ETH go up in the next 5 minutes?' },
+  { id: 'eth_15m',  label: 'ETH UP/DOWN 15-min', symbol: 'ETHUSDT',  defaultInterval: '15m', description: 'Will ETH go up in the next 15 minutes?' },
+  { id: 'sol_5m',   label: 'SOL UP/DOWN 5-min',  symbol: 'SOLUSDT',  defaultInterval: '5m',  description: 'Will SOL go up in the next 5 minutes?' },
+  { id: 'xrp_5m',   label: 'XRP UP/DOWN 5-min',  symbol: 'XRPUSDT',  defaultInterval: '5m',  description: 'Will XRP go up in the next 5 minutes?' },
+  { id: 'doge_5m',  label: 'DOGE UP/DOWN 5-min', symbol: 'DOGEUSDT', defaultInterval: '5m',  description: 'Will DOGE go up in the next 5 minutes?' },
+  { id: 'hype_5m',  label: 'HYPE UP/DOWN 5-min', symbol: 'HYPEUSDT', defaultInterval: '5m',  description: 'Will HYPE go up in the next 5 minutes?' },
+  { id: 'bnb_5m',   label: 'BNB UP/DOWN 5-min',  symbol: 'BNBUSDT',  defaultInterval: '5m',  description: 'Will BNB go up in the next 5 minutes?' },
 ]
 
 export interface BacktestConfig {
