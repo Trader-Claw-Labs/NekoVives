@@ -662,26 +662,14 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript }: Crea
             </div>
             <div>
               <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>Mode</label>
-              <div className="flex items-center gap-2">
-                <button
-                  type="button"
-                  className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 ${
-                    form.mode === 'live' ? 'bg-blue-500' : 'bg-gray-300 dark:bg-gray-600'
-                  }`}
-                  onClick={() => set('mode', form.mode === 'live' ? 'paper' : 'live')}
-                  disabled={form.market_type !== 'polymarket_binary'}
-                  aria-pressed={form.mode === 'live'}
-                >
-                  <span
-                    className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
-                      form.mode === 'live' ? 'translate-x-6' : 'translate-x-1'
-                    }`}
-                  />
-                </button>
-                <span className="text-sm font-medium">
-                  {form.mode === 'live' ? 'Live Trading' : 'Dry Run'}
-                </span>
-              </div>
+              <SegmentedToggle
+                value={form.mode === 'live'}
+                onChange={(v) => set('mode', v ? 'live' : 'paper')}
+                leftLabel="Dry Run"
+                rightLabel="Live"
+                activeColor={form.mode === 'live' ? 'var(--color-warning)' : 'var(--color-accent)'}
+                disabled={form.market_type !== 'polymarket_binary'}
+              />
             </div>
           </div>
 
@@ -794,14 +782,13 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript }: Crea
                     value={form.stop_loss_pct != null ? form.stop_loss_pct * 100 : ''}
                     onChange={e => set('stop_loss_pct', e.target.value === '' ? null : Number(e.target.value) / 100)}
                   />
-                  <button
-                    type="button"
-                    className="text-[10px] px-2 py-1 rounded"
-                    style={{ background: form.stop_loss_pct == null ? 'var(--color-surface-3)' : 'rgba(239,68,68,0.15)', color: form.stop_loss_pct == null ? 'var(--color-text-muted)' : 'var(--color-danger)' }}
-                    onClick={() => set('stop_loss_pct', form.stop_loss_pct == null ? 0.40 : null)}
-                  >
-                    {form.stop_loss_pct == null ? 'Enable' : 'Disable'}
-                  </button>
+                  <SegmentedToggle
+                    value={form.stop_loss_pct != null}
+                    onChange={(v) => set('stop_loss_pct', v ? 0.40 : null)}
+                    leftLabel="Off"
+                    rightLabel="On"
+                    activeColor="var(--color-danger)"
+                  />
                 </div>
                 <p className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
                   {form.stop_loss_pct != null
@@ -826,14 +813,13 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript }: Crea
                     value={form.early_fire_secs != null ? form.early_fire_secs : ''}
                     onChange={e => set('early_fire_secs', e.target.value === '' ? null : Number(e.target.value))}
                   />
-                  <button
-                    type="button"
-                    className="text-[10px] px-2 py-1 rounded"
-                    style={{ background: form.early_fire_secs == null ? 'var(--color-surface-3)' : 'rgba(99,102,241,0.15)', color: form.early_fire_secs == null ? 'var(--color-text-muted)' : '#818cf8' }}
-                    onClick={() => set('early_fire_secs', form.early_fire_secs == null ? 10 : null)}
-                  >
-                    {form.early_fire_secs == null ? 'Enable' : 'Disable'}
-                  </button>
+                  <SegmentedToggle
+                    value={form.early_fire_secs != null}
+                    onChange={(v) => set('early_fire_secs', v ? 10 : null)}
+                    leftLabel="Off"
+                    rightLabel="On"
+                    activeColor="#818cf8"
+                  />
                 </div>
                 <p className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
                   {form.early_fire_secs != null && form.early_fire_secs > 0
@@ -861,14 +847,13 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript }: Crea
                 value={form.max_entry_price != null ? form.max_entry_price : ''}
                 onChange={e => set('max_entry_price', e.target.value === '' ? null : Number(e.target.value))}
               />
-              <button
-                type="button"
-                className="text-[10px] px-2 py-1 rounded"
-                style={{ background: form.max_entry_price == null ? 'var(--color-surface-3)' : 'rgba(99,102,241,0.15)', color: form.max_entry_price == null ? 'var(--color-text-muted)' : '#818cf8' }}
-                onClick={() => set('max_entry_price', form.max_entry_price == null ? 0.65 : null)}
-              >
-                {form.max_entry_price == null ? 'Enable' : 'Disable'}
-              </button>
+              <SegmentedToggle
+                value={form.max_entry_price != null}
+                onChange={(v) => set('max_entry_price', v ? 0.65 : null)}
+                leftLabel="Off"
+                rightLabel="On"
+                activeColor="#818cf8"
+              />
             </div>
             <p className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
               {form.max_entry_price != null
@@ -997,6 +982,59 @@ function LowBalanceModal({
           </button>
         </div>
       </div>
+    </div>
+  )
+}
+
+// ── Segmented Toggle (two-option switch) ──────────────────────────────
+
+function SegmentedToggle({
+  value,
+  onChange,
+  leftLabel,
+  rightLabel,
+  activeColor = 'var(--color-accent)',
+  disabled = false,
+}: {
+  value: boolean
+  onChange: (v: boolean) => void
+  leftLabel: string
+  rightLabel: string
+  activeColor?: string
+  disabled?: boolean
+}) {
+  return (
+    <div
+      className="relative inline-flex h-8 rounded-full border p-0.5 transition-colors"
+      style={{
+        borderColor: 'var(--color-border)',
+        backgroundColor: 'var(--color-surface-2)',
+        opacity: disabled ? 0.5 : 1,
+        cursor: disabled ? 'not-allowed' : 'pointer',
+      }}
+      onClick={() => !disabled && onChange(!value)}
+    >
+      {/* Sliding pill background */}
+      <div
+        className="absolute top-0.5 h-7 rounded-full transition-all duration-200"
+        style={{
+          width: 'calc(50% - 2px)',
+          left: value ? 'calc(50%)' : '2px',
+          backgroundColor: activeColor,
+        }}
+      />
+      <span
+        className="relative z-10 flex-1 px-3 text-xs font-semibold flex items-center justify-center select-none transition-colors duration-200"
+        style={{ color: !value ? '#000' : 'var(--color-text-muted)' }}
+      >
+        {leftLabel}
+      </span>
+      <span
+        className="relative z-10 flex-1 px-3 text-xs font-semibold flex items-center justify-center select-none transition-colors duration-200"
+        style={{ color: value ? '#000' : 'var(--color-text-muted)' }}
+      >
+        {rightLabel}
+      </span>
     </div>
   )
 }
@@ -1431,15 +1469,14 @@ function RunnerCard({ runner, onStop, onRestart, onDelete, onUpdateConfig, isPat
               />
               <span style={{ color: 'var(--color-text-muted)' }}>$</span>
             </div>
-            <button
-              type="button"
-              className="text-[10px] px-1.5 py-0.5 rounded"
-              style={{ background: config.max_entry_price == null ? 'var(--color-surface-3)' : 'rgba(99,102,241,0.15)', color: config.max_entry_price == null ? 'var(--color-text-muted)' : '#818cf8' }}
-              onClick={() => onUpdateConfig({ max_entry_price: config.max_entry_price == null ? 0.65 : null })}
+            <SegmentedToggle
+              value={config.max_entry_price != null}
+              onChange={(v) => onUpdateConfig({ max_entry_price: v ? 0.65 : null })}
+              leftLabel="Off"
+              rightLabel="On"
+              activeColor="#818cf8"
               disabled={isPatching}
-            >
-              {config.max_entry_price == null ? 'Enable' : 'Disable'}
-            </button>
+            />
           </div>
         </div>
       )}
