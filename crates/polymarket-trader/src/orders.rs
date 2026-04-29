@@ -3,16 +3,18 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr as _;
 
-use polymarket_client_sdk::POLYGON;
-use polymarket_client_sdk::auth::{Credentials as SdkCredentials, LocalSigner, Signer, Uuid};
-use polymarket_client_sdk::clob::types::request::OrdersRequest;
-use polymarket_client_sdk::clob::types::{Amount, AssetType, OrderType, Side as SdkSide, SignatureType};
-use polymarket_client_sdk::clob::{Client as SdkClient, Config as SdkConfig};
-use polymarket_client_sdk::clob::types::request::BalanceAllowanceRequest;
-use polymarket_client_sdk::derive_proxy_wallet;
-use polymarket_client_sdk::derive_safe_wallet;
-use polymarket_client_sdk::types::{Decimal, U256};
+use polymarket_client_sdk_v2::POLYGON;
+use polymarket_client_sdk_v2::auth::{Credentials as SdkCredentials, LocalSigner, Signer, Uuid};
+use polymarket_client_sdk_v2::clob::types::request::OrdersRequest;
+use polymarket_client_sdk_v2::clob::types::{Amount, AssetType, OrderType, Side as SdkSide, SignatureType};
+use polymarket_client_sdk_v2::clob::{Client as SdkClient, Config as SdkConfig};
+use polymarket_client_sdk_v2::clob::types::request::BalanceAllowanceRequest;
+use polymarket_client_sdk_v2::derive_proxy_wallet;
+use polymarket_client_sdk_v2::derive_safe_wallet;
+use polymarket_client_sdk_v2::types::{Decimal, U256};
 
+// V2 protocol is served at the same host. clob-v2.polymarket.com just 301-redirects
+// here, which breaks POST. The SDK queries /version to pick V1 vs V2 payload shape.
 const CLOB_BASE_URL: &str = "https://clob.polymarket.com";
 
 /// Order side
@@ -92,7 +94,7 @@ impl ClobClient {
     }
 
     /// Parse the stored private key into a LocalSigner.
-    fn make_signer(&self) -> Result<polymarket_client_sdk::auth::LocalSigner<k256::ecdsa::SigningKey>> {
+    fn make_signer(&self) -> Result<polymarket_client_sdk_v2::auth::LocalSigner<k256::ecdsa::SigningKey>> {
         let pk_hex = self
             .creds
             .private_key
@@ -117,7 +119,7 @@ impl ClobClient {
     /// Build an authenticated SDK CLOB client.
     /// Automatically detects whether the user has a Gnosis Safe or an EIP-1167 proxy
     /// (MetaMask users typically get a Safe; Magic/email users get a Proxy).
-    async fn sdk_client(&self) -> Result<SdkClient<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>> {
+    async fn sdk_client(&self) -> Result<SdkClient<polymarket_client_sdk_v2::auth::state::Authenticated<polymarket_client_sdk_v2::auth::Normal>>> {
         let signer = self.make_signer()?;
         let sdk_creds = self.sdk_credentials()?;
 
@@ -138,7 +140,7 @@ impl ClobClient {
                 "proxy" => {
                     let proxy_addr = self.creds.proxy_address.as_deref()
                         .filter(|s| !s.is_empty())
-                        .and_then(|s| s.parse::<polymarket_client_sdk::types::Address>().ok())
+                        .and_then(|s| s.parse::<polymarket_client_sdk_v2::types::Address>().ok())
                         .or_else(|| derive_proxy_wallet(signer_addr, POLYGON));
                     if let Some(addr) = proxy_addr {
                         tracing::info!("CLOB auth: forced Proxy {}", addr);
@@ -151,7 +153,7 @@ impl ClobClient {
                 "gnosis_safe" | "safe" => {
                     let safe_addr = self.creds.proxy_address.as_deref()
                         .filter(|s| !s.is_empty())
-                        .and_then(|s| s.parse::<polymarket_client_sdk::types::Address>().ok())
+                        .and_then(|s| s.parse::<polymarket_client_sdk_v2::types::Address>().ok())
                         .or_else(|| derive_safe_wallet(signer_addr, POLYGON));
                     if let Some(addr) = safe_addr {
                         tracing::info!("CLOB auth: forced Gnosis Safe {}", addr);
@@ -173,7 +175,7 @@ impl ClobClient {
 
         let auth = match self.creds.proxy_address.as_deref() {
             Some(proxy) if !proxy.is_empty() => {
-                let proxy_addr = proxy.parse::<polymarket_client_sdk::types::Address>()
+                let proxy_addr = proxy.parse::<polymarket_client_sdk_v2::types::Address>()
                     .map_err(|e| anyhow::anyhow!("Invalid proxy address: {e}"))?;
 
                 // Determine whether the explicit address matches a derived Safe or Proxy
@@ -339,7 +341,7 @@ impl ClobClient {
 
         let orders: Vec<Order> = page.data
             .into_iter()
-            .filter(|o| matches!(o.status, polymarket_client_sdk::clob::types::OrderStatusType::Live))
+            .filter(|o| matches!(o.status, polymarket_client_sdk_v2::clob::types::OrderStatusType::Live))
             .map(|o| Order {
                 id: o.id,
                 token_id: o.asset_id.to_string(),
@@ -514,6 +516,7 @@ mod tests {
             private_key: Some(crate::auth::ANVIL_TEST_KEY.to_string()),
             is_builder: false,
             proxy_address: None,
+            signature_type: None,
         }
     }
 

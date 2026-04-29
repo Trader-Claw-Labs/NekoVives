@@ -21,6 +21,8 @@ pub mod series;
 pub mod browser;
 pub mod market_scan;
 pub mod polymarket_balance;
+pub mod polymarket_historical;
+pub mod polymarket_historical_types;
 pub mod polymarket_scan;
 pub mod shell_exec;
 pub mod trade_swap;

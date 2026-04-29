@@ -1,7 +1,10 @@
 use super::traits::{Tool, ToolResult};
 use async_trait::async_trait;
 use serde_json::json;
+use std::collections::HashMap;
 use std::path::PathBuf;
+
+use super::polymarket_historical_types::HistoricalMarketWindow;
 
 // ── Bundled default strategy scripts (embedded at compile time) ──────────────
 
@@ -2618,9 +2621,9 @@ fn run_polymarket_slug_backtest(
     max_entry_price: Option<f64>,
     sizing_mode: &str,
     sizing_value: f64,
+    historical_data: Option<HashMap<i64, HistoricalMarketWindow>>,
 ) -> anyhow::Result<BacktestMetrics> {
     use rhai::{Engine, Scope};
-    use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
     if candles.is_empty() {
@@ -2698,6 +2701,13 @@ fn run_polymarket_slug_backtest(
     let mut max_dd = 0.0_f64;
     let mut markets_tested: u32 = 0;
     let mut flat_debugs: Vec<(String, std::collections::HashMap<String, f64>)> = Vec::new();
+
+    // Tracking for historical vs estimated token prices
+    let mut windows_with_real_price: u32 = 0;
+    let mut windows_with_estimated_price: u32 = 0;
+    let mut sum_real_token_price: f64 = 0.0;
+    let mut sum_estimated_token_price: f64 = 0.0;
+    let historical = historical_data.unwrap_or_default();
 
     // ── Build engine ONCE — compile AST once, reuse across all windows ────────
     let cur_idx = Arc::new(Mutex::new(0usize));
@@ -2826,16 +2836,40 @@ fn run_polymarket_slug_backtest(
         };
         let resolution_value = res_close;
         let thr_val = threshold.unwrap_or(0.0);
-        // Token price: for price markets use momentum model; for threshold markets use flat 0.50
-        let yes_token_price = match resolution_logic {
-            "threshold_above" | "threshold_below" => 0.50_f64,
+
+        // Token price: prefer historical on-chain data, fallback to momentum model
+        let (yes_token_price, used_real_price) = match resolution_logic {
+            "threshold_above" | "threshold_below" => (0.50_f64, false),
             _ => {
-                let delta_abs = if window_open > 0.0 {
-                    ((dec.close - window_open) / window_open * 100.0).abs()
-                } else { 0.0 };
-                polymarket_token_price(delta_abs)
+                // Look up historical data for this window
+                if let Some(hist) = historical.get(&minute0_ts) {
+                    if let Some(real_price) = hist.yes_token_price {
+                        (real_price, true)
+                    } else {
+                        // Historical record exists but no price — fallback to estimate
+                        let delta_abs = if window_open > 0.0 {
+                            ((dec.close - window_open) / window_open * 100.0).abs()
+                        } else { 0.0 };
+                        (polymarket_token_price(delta_abs), false)
+                    }
+                } else {
+                    // No historical data — use momentum model
+                    let delta_abs = if window_open > 0.0 {
+                        ((dec.close - window_open) / window_open * 100.0).abs()
+                    } else { 0.0 };
+                    (polymarket_token_price(delta_abs), false)
+                }
             }
         };
+
+        if used_real_price {
+            windows_with_real_price += 1;
+            sum_real_token_price += yes_token_price;
+        } else {
+            windows_with_estimated_price += 1;
+            sum_estimated_token_price += yes_token_price;
+        }
+
         markets_tested += 1;
 
         {
@@ -2979,8 +3013,19 @@ fn run_polymarket_slug_backtest(
         avg_token_price, correct_direction_pct, break_even_win_rate,
         window_minutes,
     );
+
+    let historical_price_note = if windows_with_real_price > 0 {
+        let avg_real = if windows_with_real_price > 0 { sum_real_token_price / windows_with_real_price as f64 } else { 0.0 };
+        let avg_est = if windows_with_estimated_price > 0 { sum_estimated_token_price / windows_with_estimated_price as f64 } else { 0.0 };
+        format!(
+            " | Historical prices: {windows_with_real_price} real (avg ${avg_real:.3}), {windows_with_estimated_price} estimated (avg ${avg_est:.3})"
+        )
+    } else {
+        " | All prices estimated from momentum model".to_string()
+    };
+
     let analysis = format!(
-        "[{markets_tested} markets btc-updown-{window_minutes}m \u{00b7} decision @ minuto {dm}] {base_analysis}"
+        "[{markets_tested} markets btc-updown-{window_minutes}m \u{00b7} decision @ minuto {dm}] {base_analysis}{historical_price_note}"
     );
 
     Ok(BacktestMetrics {
@@ -3089,11 +3134,23 @@ pub async fn run_backtest_engine(
             }
         };
 
+        // Attempt to load historical on-chain Polymarket data for more accurate backtesting
+        let series_id = format!("{}_{}", symbol.to_lowercase().replace("usdt", ""), interval);
+        let historical_data = super::polymarket_historical::load_historical_data(
+            workspace_dir, &series_id, from_date, to_date
+        ).ok();
+        if historical_data.as_ref().map(|h| !h.is_empty()).unwrap_or(false) {
+            tracing::info!("[BACKTEST] Loaded {} historical on-chain price records for {}", historical_data.as_ref().unwrap().len(), series_id);
+        } else {
+            tracing::info!("[BACKTEST] No historical on-chain data found for {}. Using momentum price model.", series_id);
+        }
+
         let script_for_log = script_content.clone();
         let sizing_mode_owned = sizing_mode.to_string();
+        let hist_clone = historical_data.clone();
 
         return match tokio::task::spawn_blocking(move || {
-            run_polymarket_slug_backtest(script_content, candles, initial_balance, fee_pct, window_minutes, &rl, thr, max_position_usd, max_entry_price, &sizing_mode_owned, sizing_value)
+            run_polymarket_slug_backtest(script_content, candles, initial_balance, fee_pct, window_minutes, &rl, thr, max_position_usd, max_entry_price, &sizing_mode_owned, sizing_value, hist_clone)
         })
         .await
         {
@@ -3903,6 +3960,7 @@ pub fn run_polymarket_binary_on_candle_buffer(
         None,
         "percent",
         1.0,
+        None,
     )
     .unwrap_or_else(|e| BacktestMetrics {
         total_return_pct: 0.0, sharpe_ratio: 0.0, max_drawdown_pct: 0.0,

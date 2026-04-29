@@ -466,6 +466,28 @@ Examples:
         shell: CompletionShell,
     },
 
+    /// Sync historical Polymarket on-chain data for realistic backtesting.
+    #[command(long_about = "\
+Fetch real token prices and market resolutions from Polymarket's
+Gamma + CLOB APIs for accurate backtesting of recurring binary markets.
+
+Stores results in <workspace>/data/polymarket_historical/ as JSONL.
+
+Examples:
+  trader-claw backtest-sync --series btc_5m --from 2026-01-29 --to 2026-04-29
+  trader-claw backtest-sync --series eth_5m --from 2026-03-01 --to 2026-04-01")]
+    BacktestSync {
+        /// Series ID (e.g. btc_5m, eth_5m)
+        #[arg(long)]
+        series: String,
+        /// Start date (inclusive) YYYY-MM-DD
+        #[arg(long)]
+        from: String,
+        /// End date (inclusive) YYYY-MM-DD
+        #[arg(long)]
+        to: String,
+    },
+
     /// Update trader-claw to the latest release from GitHub
     #[command(long_about = "\
 Update trader-claw to the latest release.
@@ -1076,6 +1098,20 @@ async fn main() -> Result<()> {
 
         Commands::Peripheral { peripheral_command } => {
             peripherals::handle_command(peripheral_command.clone(), &config).await
+        }
+
+        Commands::BacktestSync { series, from, to } => {
+            println!("Syncing historical Polymarket data for series={} from {} to {}...", series, from, to);
+            match tools::polymarket_historical::scrape_series(&series, &from, &to, &config.workspace_dir).await {
+                Ok(count) => {
+                    println!("Successfully synced {} market windows.", count);
+                    Ok(())
+                }
+                Err(e) => {
+                    eprintln!("Sync failed: {}", e);
+                    std::process::exit(1);
+                }
+            }
         }
 
         Commands::Config { config_command } => match config_command {
