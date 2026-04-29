@@ -14,7 +14,7 @@ const STRATEGY_SCRIPT: &str = include_str!("scripts/strategy.rhai");
 
 const WEATHER_BINARY_SCRIPT: &str = include_str!("scripts/weather_binary.rhai");
 
-// ── 8 Advanced Strategy Scripts ──────────────────────────────────────────────
+// ── Advanced Strategy Scripts ─────────────────────────────────────────────────
 const MEAN_REVERSION_SCRIPT: &str = include_str!("scripts/mean_reversion.rhai");
 const DCA_BOT_SCRIPT: &str = include_str!("scripts/dca_bot.rhai");
 const PUMP_DETECTION_SCRIPT: &str = include_str!("scripts/pump_detection.rhai");
@@ -24,25 +24,62 @@ const EVENT_DRIVEN_SCRIPT: &str = include_str!("scripts/event_driven.rhai");
 const CORRELATION_ARB_SCRIPT: &str = include_str!("scripts/correlation_arb.rhai");
 const LIQUIDATION_HUNT_SCRIPT: &str = include_str!("scripts/liquidation_hunt.rhai");
 
+// ── BTC OPT Series (Polymarket binary, ctx-based) ────────────────────────────
+const BTC_OPT_V1_SCRIPT: &str = include_str!("scripts/btc_opt_v1.rhai");
+const BTC_OPT_V3_EARLY_SCRIPT: &str = include_str!("scripts/btc_opt_v3_early.rhai");
+const BTC_OPT_V4_MACD_SCRIPT: &str = include_str!("scripts/btc_opt_v4_macd.rhai");
+const BTC_OPT_V5_AGGRESSIVE_SCRIPT: &str = include_str!("scripts/btc_opt_v5_aggressive.rhai");
+const BTC_OPT_V6_CONSERVATIVE_SCRIPT: &str = include_str!("scripts/btc_opt_v6_conservative.rhai");
+const BTC_OPT_V7_EARLY_MACD_SCRIPT: &str = include_str!("scripts/btc_opt_v7_early_macd.rhai");
+const BTC_OPT_V8_TRIPLE_EMA_SCRIPT: &str = include_str!("scripts/btc_opt_v8_triple_ema.rhai");
+const BTC_OPT_V10_BB_SQUEEZE_SCRIPT: &str = include_str!("scripts/btc_opt_v10_bb_squeeze.rhai");
+const BTC_OPT_V11_REFINED_SCRIPT: &str = include_str!("scripts/btc_opt_v11_refined.rhai");
+const BTC_OPT_V15_BB_MEAN_REV_SCRIPT: &str = include_str!("scripts/btc_opt_v15_bb_mean_rev.rhai");
+
+// ── Polymarket Hybrid Series ──────────────────────────────────────────────────
+const POLY_BTC_HYBRID_SCRIPT: &str = include_str!("scripts/polymarket_btc_updown_5m_hybrid.rhai");
+const POLY_BTC_HYBRID_V2_SCRIPT: &str = include_str!("scripts/polymarket_btc_updown_5m_hybrid_v2.rhai");
+
+// ── Classic Indicators ────────────────────────────────────────────────────────
+const RSI_STRATEGY_SCRIPT: &str = include_str!("scripts/rsi_strategy.rhai");
+
 /// Write bundled default scripts to `<workspace>/scripts/` if they don't exist yet.
 /// Called by both backtest tools so the scripts are always available on first run.
 /// All bundled default scripts as (filename, content) pairs.
-const DEFAULT_SCRIPTS: [(&str, &str); 15] = [
-    ("polymarket_4min.rhai",        POLYMARKET_4MIN_SCRIPT),
-    ("polymarket_5min.rhai",        POLYMARKET_5MIN_SCRIPT),
-    ("polymarket_btc_binary.rhai",  POLYMARKET_BTC_BINARY_SCRIPT),
-    ("weather_binary.rhai",         WEATHER_BINARY_SCRIPT),
-    ("crypto_4min.rhai",            CRYPTO_4MIN_SCRIPT),
-    ("strategy_reference.rhai",     STRATEGY_REFERENCE_SCRIPT),
-    ("strategy.rhai",               STRATEGY_SCRIPT),
-    ("mean_reversion.rhai",         MEAN_REVERSION_SCRIPT),
-    ("dca_bot.rhai",                DCA_BOT_SCRIPT),
-    ("pump_detection.rhai",         PUMP_DETECTION_SCRIPT),
-    ("grid_trading.rhai",           GRID_TRADING_SCRIPT),
-    ("spread_arb.rhai",             SPREAD_ARB_SCRIPT),
-    ("event_driven.rhai",           EVENT_DRIVEN_SCRIPT),
-    ("correlation_arb.rhai",        CORRELATION_ARB_SCRIPT),
-    ("liquidation_hunt.rhai",       LIQUIDATION_HUNT_SCRIPT),
+const DEFAULT_SCRIPTS: [(&str, &str); 28] = [
+    // ── Polymarket binary ──────────────────────────────────────────────────────
+    ("polymarket_btc_binary.rhai",              POLYMARKET_BTC_BINARY_SCRIPT),
+    ("polymarket_4min.rhai",                    POLYMARKET_4MIN_SCRIPT),
+    ("polymarket_5min.rhai",                    POLYMARKET_5MIN_SCRIPT),
+    ("polymarket_btc_updown_5m_hybrid.rhai",    POLY_BTC_HYBRID_SCRIPT),
+    ("polymarket_btc_updown_5m_hybrid_v2.rhai", POLY_BTC_HYBRID_V2_SCRIPT),
+    ("weather_binary.rhai",                     WEATHER_BINARY_SCRIPT),
+    // ── BTC OPT series ────────────────────────────────────────────────────────
+    ("btc_opt_v1.rhai",                         BTC_OPT_V1_SCRIPT),
+    ("btc_opt_v3_early.rhai",                   BTC_OPT_V3_EARLY_SCRIPT),
+    ("btc_opt_v4_macd.rhai",                    BTC_OPT_V4_MACD_SCRIPT),
+    ("btc_opt_v5_aggressive.rhai",              BTC_OPT_V5_AGGRESSIVE_SCRIPT),
+    ("btc_opt_v6_conservative.rhai",            BTC_OPT_V6_CONSERVATIVE_SCRIPT),
+    ("btc_opt_v7_early_macd.rhai",              BTC_OPT_V7_EARLY_MACD_SCRIPT),
+    ("btc_opt_v8_triple_ema.rhai",              BTC_OPT_V8_TRIPLE_EMA_SCRIPT),
+    ("btc_opt_v10_bb_squeeze.rhai",             BTC_OPT_V10_BB_SQUEEZE_SCRIPT),
+    ("btc_opt_v11_refined.rhai",                BTC_OPT_V11_REFINED_SCRIPT),
+    ("btc_opt_v15_bb_mean_rev.rhai",            BTC_OPT_V15_BB_MEAN_REV_SCRIPT),
+    // ── Classic indicators ────────────────────────────────────────────────────
+    ("rsi_strategy.rhai",                       RSI_STRATEGY_SCRIPT),
+    ("crypto_4min.rhai",                        CRYPTO_4MIN_SCRIPT),
+    // ── Advanced strategy library ─────────────────────────────────────────────
+    ("mean_reversion.rhai",                     MEAN_REVERSION_SCRIPT),
+    ("dca_bot.rhai",                            DCA_BOT_SCRIPT),
+    ("pump_detection.rhai",                     PUMP_DETECTION_SCRIPT),
+    ("grid_trading.rhai",                       GRID_TRADING_SCRIPT),
+    ("spread_arb.rhai",                         SPREAD_ARB_SCRIPT),
+    ("event_driven.rhai",                       EVENT_DRIVEN_SCRIPT),
+    ("correlation_arb.rhai",                    CORRELATION_ARB_SCRIPT),
+    ("liquidation_hunt.rhai",                   LIQUIDATION_HUNT_SCRIPT),
+    // ── Reference & templates ─────────────────────────────────────────────────
+    ("strategy_reference.rhai",                 STRATEGY_REFERENCE_SCRIPT),
+    ("strategy.rhai",                           STRATEGY_SCRIPT),
 ];
 
 pub fn ensure_default_scripts(workspace_dir: &std::path::Path) {

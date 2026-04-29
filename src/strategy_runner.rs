@@ -250,7 +250,7 @@ impl StrategyRunnerStore {
         updated
     }
 
-    pub fn restart_previously_running(self: &Arc<Self>, workspace_dir: PathBuf) -> usize {
+    pub fn restart_previously_running(self: &Arc<Self>, workspace_dir: PathBuf, config_path: Option<PathBuf>) -> usize {
         let configs = self.list_restartable_configs();
         let count = configs.len();
         // Clear stale timestamps so the UI doesn't show a "next tick" in the past
@@ -270,8 +270,9 @@ impl StrategyRunnerStore {
             }
             let store = self.clone();
             let ws_dir = workspace_dir.clone();
+            let cfg_path = config_path.clone();
             let task = tokio::spawn(async move {
-                runner_loop(store, config, ws_dir).await;
+                runner_loop(store, config, ws_dir, cfg_path).await;
             });
             self.register_handle(id, task.abort_handle());
         }
@@ -382,6 +383,7 @@ pub fn start_runner(
     store: Arc<StrategyRunnerStore>,
     config: RunnerConfig,
     workspace_dir: PathBuf,
+    config_path: Option<PathBuf>,
 ) -> StoredRunner {
     let id = config.id.clone();
     let now = chrono::Utc::now().to_rfc3339();
@@ -401,7 +403,7 @@ pub fn start_runner(
     let store_clone = store.clone();
     let ws_dir = workspace_dir.clone();
     let task = tokio::spawn(async move {
-        runner_loop(store_clone, config, ws_dir).await;
+        runner_loop(store_clone, config, ws_dir, config_path).await;
     });
     store.register_handle(id, task.abort_handle());
 
@@ -414,10 +416,11 @@ async fn runner_loop(
     store: Arc<StrategyRunnerStore>,
     config: RunnerConfig,
     workspace_dir: PathBuf,
+    config_path: Option<PathBuf>,
 ) {
     // Dispatch to the correct loop based on market type
     if config.market_type == "polymarket_binary" {
-        polymarket_runner_loop(store, config, workspace_dir).await;
+        polymarket_runner_loop(store, config, workspace_dir, config_path).await;
     } else {
         crypto_runner_loop(store, config, workspace_dir).await;
     }
@@ -532,6 +535,7 @@ async fn polymarket_runner_loop(
     store: Arc<StrategyRunnerStore>,
     mut config: RunnerConfig,
     workspace_dir: PathBuf,
+    config_path: Option<PathBuf>,
 ) {
     let id = config.id.clone();
     let is_live = config.mode == "live";
@@ -548,7 +552,7 @@ async fn polymarket_runner_loop(
     };
 
     // ─ Live mode: validate credentials/token and build CLOB client
-    let clob_client: Option<std::sync::Arc<polymarket_trader::orders::ClobClient>> = if is_live {
+    let mut clob_client: Option<std::sync::Arc<polymarket_trader::orders::ClobClient>> = if is_live {
         if config.poly_token_id.as_deref().unwrap_or("").trim().is_empty() {
             set_runner_error(
                 &store,
@@ -680,7 +684,10 @@ async fn polymarket_runner_loop(
 
     let mut last_window: i64 = -1;
     let mut last_decision_window: i64 = -1;
-    let mut prev_live_position: Option<(i64, String, std::collections::HashMap<String, f64>)> = None; // (window_ts, signal, debug)
+    // (window_ts, live_signal, bt_preview_signal, debug)
+    // bt_preview_signal is captured at decision time (stateless, no capital constraint)
+    // and used for signal comparison so a depleted BT balance doesn't cause false DISCREPANCYs.
+    let mut prev_live_position: Option<(i64, String, String, std::collections::HashMap<String, f64>)> = None;
     let mut price_history: std::collections::VecDeque<(i64, f64)> = std::collections::VecDeque::with_capacity(60);
     // Persistent kv state for live signal — carries avg_vol and other ctx.set() values across windows.
     // Pre-seed from a BT warmup run so avg_vol starts aligned with the backtester's historical value,
@@ -877,7 +884,7 @@ async fn polymarket_runner_loop(
             let metrics = eval_polymarket(&script_content, &buffer, window_minutes, &config);
 
             // Resolve previous window outcome and compare with backtest
-            if let Some((prev_window, prev_signal, prev_debug)) = prev_live_position.take() {
+            if let Some((prev_window, prev_signal, prev_bt_signal, prev_debug)) = prev_live_position.take() {
                     let res_logic = config.resolution_logic.as_deref().unwrap_or("price_up");
                     if let Some(went_up) = resolve_window_outcome(
                         &buffer, prev_window, window_secs as i64, res_logic, config.threshold,
@@ -890,40 +897,38 @@ async fn polymarket_runner_loop(
                             .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
                             .unwrap_or_default();
 
+                        // Use the BT preview signal captured at decision time for comparison.
+                        // The full backtest (all_trades) can show "flat" simply because the
+                        // simulated balance was depleted — that's a capital constraint, not a
+                        // signal divergence.  The preview signal is stateless and reflects
+                        // what the strategy logic would say given the same candle data.
+                        let bt_signal = prev_bt_signal.clone();
+
+                        // Still pull debug and pnl from all_trades when available.
                         let bt_trade = metrics.all_trades.iter()
                             .find(|t| t.timestamp == decision_dt);
+                        let bt_debug: Option<std::collections::HashMap<String, f64>> =
+                            bt_trade.and_then(|t| t.debug.clone())
+                            .or_else(|| metrics.flat_debugs.iter()
+                                .find(|(ts, _)| *ts == decision_dt)
+                                .map(|(_, d)| d.clone()));
 
-                        let (bt_signal, bt_debug) = match bt_trade {
-                            Some(trade) => {
-                                let bt_side = if trade.side.starts_with("yes") { "yes" } else { "no" };
-                                if prev_signal.starts_with("flat") {
-                                    append_runner_log(
-                                        &store, &id,
-                                        &format!(
-                                            "DISCREPANCY window {}: live=flat but backtest={} bt_pnl={:.2}",
-                                            prev_window, bt_side, trade.pnl
-                                        ),
-                                    );
-                                }
-                                (bt_side.to_string(), trade.debug.clone())
-                            }
-                            None => {
-                                // Check flat_debugs for this window
-                                let flat_debug = metrics.flat_debugs.iter()
-                                    .find(|(ts, _)| *ts == decision_dt)
-                                    .map(|(_, d)| d.clone());
-                                if !prev_signal.starts_with("flat") {
-                                    append_runner_log(
-                                        &store, &id,
-                                        &format!(
-                                            "DISCREPANCY window {}: live={} but backtest=flat",
-                                            prev_window, prev_signal
-                                        ),
-                                    );
-                                }
-                                ("flat".to_string(), flat_debug)
-                            }
-                        };
+                        // Signal direction: ignore sizing suffix (e.g. "yes 10" → "yes")
+                        let live_dir = prev_signal.split_whitespace().next().unwrap_or("flat");
+                        let bt_dir   = bt_signal.split_whitespace().next().unwrap_or("flat");
+
+                        if live_dir != bt_dir {
+                            let bt_pnl_note = bt_trade
+                                .map(|t| format!(" bt_pnl={:.2}", t.pnl))
+                                .unwrap_or_default();
+                            append_runner_log(
+                                &store, &id,
+                                &format!(
+                                    "DISCREPANCY window {}: live={} but backtest={}{}",
+                                    prev_window, live_dir, bt_dir, bt_pnl_note
+                                ),
+                            );
+                        }
 
                         // Only count trades and log win/loss when live actually placed a bet.
                         if prev_signal.starts_with("flat") {
@@ -980,7 +985,8 @@ async fn polymarket_runner_loop(
 
                         // Always print debug indicators for both live and backtest
                         let live_debug_str = format_debug_values(&prev_debug);
-                        let bt_debug_str = format_debug_values(&bt_debug.unwrap_or_default());
+                        let bt_debug_map = bt_debug.unwrap_or_default();
+                        let bt_debug_str = format_debug_values(&bt_debug_map);
                         append_runner_log(
                             &store, &id,
                             &format!(
@@ -1111,8 +1117,11 @@ async fn polymarket_runner_loop(
 
             // Run BT-engine preview at the same decision point so the operator
             // can compare BT indicators vs LIVE indicators side-by-side.
+            // Capture the signal here; it is stored in prev_live_position for
+            // discrepancy detection at the next window tick (avoids false positives
+            // when the full BT balance is depleted and all_trades has no entry).
             let res_logic = config.resolution_logic.as_deref().unwrap_or("price_up");
-            match crate::tools::backtest::run_polymarket_bt_signal_preview(
+            let bt_preview_signal = match crate::tools::backtest::run_polymarket_bt_signal_preview(
                 &script_content,
                 buffer.iter().cloned().collect(),
                 window_minutes,
@@ -1127,25 +1136,43 @@ async fn polymarket_runner_loop(
                     if !bt_debug_str.is_empty() {
                         append_runner_log(&store, &id, &format!("BT debug: {}", bt_debug_str));
                     }
+                    bt_res.signal
                 }
                 Err(e) => {
                     append_runner_log(&store, &id, &format!("BT preview FAILED: {}", e));
+                    "flat".to_string()
                 }
-            }
+            };
 
             // Always record the live decision (flat or trade) so we can compare
             // indicators with backtest when the window resolves.
-            prev_live_position = Some((current_window, current_signal.clone(), live_result.debug.clone()));
+            prev_live_position = Some((current_window, current_signal.clone(), bt_preview_signal, live_result.debug.clone()));
 
             if !current_signal.starts_with("flat") {
-                let client_ref = clob_client.as_deref();
-                if let Some(mut order) = execute_live_polymarket_signal(
-                    &id, client_ref, &current_signal, live_result.size, &config, &live, &store, current_window,
+                let (order_result, renewed_client) = execute_live_polymarket_signal(
+                    &id, clob_client.clone(), &current_signal, live_result.size, &config, &live, &store, current_window,
                     yes_token_price, no_token_price,
-                ).await {
+                ).await;
+                // If credentials were renewed, update the runner's client so all
+                // subsequent windows use the fresh L2 session, and persist to disk.
+                if let Some(new_client) = renewed_client {
+                    if let Some(ref path) = config_path {
+                        let creds = new_client.credentials().clone();
+                        let path_clone = path.clone();
+                        let id_clone = id.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = persist_polymarket_creds(&path_clone, &creds).await {
+                                tracing::warn!("[RUNNER {id_clone}] Failed to persist renewed credentials: {e}");
+                            } else {
+                                tracing::info!("[RUNNER {id_clone}] Renewed credentials persisted to config");
+                            }
+                        });
+                    }
+                    clob_client = Some(new_client);
+                }
+                if let Some(mut order) = order_result {
                     // ── Stop-loss monitor ──────────────────────────────────────────
-                    // Runs during the ~60s between decision (min 4) and resolution (min 5).
-                    // Polls token price every 10s; sells early if price drops too far.
+                    let client_ref = clob_client.as_deref();
                     if let Some(sl_pct) = config.stop_loss_pct {
                         if sl_pct > 0.0 {
                             let ep = order.entry_price.unwrap_or(0.5).max(0.001);
@@ -1417,9 +1444,11 @@ async fn monitor_stop_loss(
     false
 }
 
+/// Returns the placed order (if any) and optionally a renewed ClobClient when
+/// credentials were refreshed due to order_version_mismatch.
 async fn execute_live_polymarket_signal(
     id: &str,
-    client: Option<&polymarket_trader::orders::ClobClient>,
+    client: Option<Arc<polymarket_trader::orders::ClobClient>>,
     signal: &str,
     script_frac: f64,
     config: &RunnerConfig,
@@ -1428,7 +1457,7 @@ async fn execute_live_polymarket_signal(
     window_ts: i64,
     yes_token_price: f64,
     no_token_price: f64,
-) -> Option<LiveOrder> {
+) -> (Option<LiveOrder>, Option<Arc<polymarket_trader::orders::ClobClient>>) {
     use polymarket_trader::orders::Side;
 
     // In binary markets YES/NO are complementary tokens.
@@ -1439,7 +1468,7 @@ async fn execute_live_polymarket_signal(
             _ => {
                 tracing::warn!("[RUNNER {id}] Live mode: no YES token_id configured, skipping order");
                 append_runner_log(store, id, "No Polymarket YES token_id configured.");
-                return None;
+                return (None, None);
             }
         }
     } else if signal.starts_with("no") {
@@ -1448,22 +1477,22 @@ async fn execute_live_polymarket_signal(
             _ => {
                 tracing::warn!("[RUNNER {id}] Live mode: no NO token_id configured, skipping order");
                 append_runner_log(store, id, "No Polymarket NO token_id configured.");
-                return None;
+                return (None, None);
             }
         }
     } else {
         tracing::debug!("[RUNNER {id}] Signal '{signal}' — no order placed");
-        return None;
+        return (None, None);
     };
 
     // ── Position sizing ────────────────────────────────────────────
-    let (_balance, amount_usdc) = match client {
+    let (_balance, amount_usdc) = match client.as_deref() {
         Some(c) => {
             let bal = fetch_usdc_balance_clob(c).await.unwrap_or(0.0);
             if bal <= 0.0 {
                 tracing::warn!("[RUNNER {id}] Cannot place order: zero or unknown USDC balance");
                 append_runner_log(store, id, "Skipped: zero USDC balance");
-                return None;
+                return (None, None);
             }
             let amt = match config.live_sizing_mode {
                 LiveSizingMode::Fixed => {
@@ -1507,7 +1536,7 @@ async fn execute_live_polymarket_signal(
             if amt <= 0.0 || amt > bal {
                 tracing::warn!("[RUNNER {id}] Paper order: insufficient balance ${:.2} for amount ${:.0}", bal, amt);
                 append_runner_log(store, id, &format!("Skipped: insufficient paper balance ${:.2}", bal));
-                return None;
+                return (None, None);
             }
             (bal, amt)
         }
@@ -1523,11 +1552,11 @@ async fn execute_live_polymarket_signal(
                 store, id,
                 &format!("Skipped: entry price {:.4} exceeds max {:.4}", ep, max_ep),
             );
-            return None;
+            return (None, None);
         }
     }
 
-    if let Some(client) = client {
+    if let Some(ref client_arc) = client {
         // ── LIVE mode: place real order via CLOB ──────────────────
 
         // ── Diagnostic: probe CLOB /price and /book for this token ──
@@ -1555,32 +1584,29 @@ async fn execute_live_polymarket_signal(
             }
         }
 
-        // Market order: let the SDK calculate the real share price from the
-        // orderbook.  Polymarket share prices are 0–1 (probabilities), not raw
-        // crypto prices like $78k BTC, so live.close is not a valid worst_price.
         let worst_price = 0.0_f64;
-
-        // Retry loop: Polymarket recurrent markets sometimes create tokens before
-        // the orderbook is ready.  Try market order first; if it fails with
-        // "No orderbook exists", fall back to a limit order at 0.50 (mid-price
-        // for a binary market) on the last attempt.
         let max_retries = 3;
         let retry_delay = std::time::Duration::from_secs(10);
         let mut attempt = 0;
 
+        // Holds a freshly-renewed client when order_version_mismatch triggers
+        // re-authentication.  Returned to the caller so the runner loop can
+        // replace its clob_client reference for all subsequent windows.
+        let mut renewed: Option<Arc<polymarket_trader::orders::ClobClient>> = None;
+
+        // Helper: borrow whichever client is currently active.
+        // After renewal, all order calls go through the renewed client.
+        macro_rules! active {
+            () => {
+                renewed.as_deref().unwrap_or(client_arc.as_ref())
+            };
+        }
+
         loop {
             attempt += 1;
-
-            // On the final attempt, if market order has been failing, try a limit
-            // order instead.  The SDK's market_order().build() calls /book internally
-            // to determine the execution price; limit orders may skip that step.
             let is_final = attempt >= max_retries;
 
             if is_final {
-                // Limit order size = shares, not USDC.  shares = amount / price.
-                // Round to whole integer — the SDK rejects f64 with >2 decimal places.
-                // Use the real CLOB token price instead of a hardcoded 0.50.
-                // Round to exactly 2 decimal places — CLOB rejects prices with >2dp.
                 let limit_price = if signal.starts_with("yes") {
                     (yes_token_price * 100.0).round() / 100.0
                 } else {
@@ -1591,7 +1617,7 @@ async fn execute_live_polymarket_signal(
                     "[RUNNER {id}] Live LIMIT order (attempt {}/{}): {:?} {:.0} shares (~${:.0} USDC) on token {} @ {:.4}",
                     attempt, max_retries, side, shares, amount_usdc, token_id, limit_price
                 );
-                match client.create_limit_order(&token_id, side, limit_price, shares).await {
+                match active!().create_limit_order(&token_id, side, limit_price, shares).await {
                     Ok(resp) => {
                         tracing::info!(
                             "[RUNNER {id}] Limit order placed: id={} status={}",
@@ -1602,7 +1628,7 @@ async fn execute_live_polymarket_signal(
                             &format!("Limit order placed: {} {} USDC @{:.4} (id={})", signal, amount_usdc, limit_price, resp.order_id),
                         );
                         let ep = if signal.starts_with("yes") { yes_token_price } else { no_token_price };
-                        return Some(LiveOrder {
+                        return (Some(LiveOrder {
                             timestamp: chrono::Utc::now().to_rfc3339(),
                             window_ts,
                             side: signal.to_string(),
@@ -1614,7 +1640,7 @@ async fn execute_live_polymarket_signal(
                             result: None,
                             pnl: None,
                             stop_loss_triggered: false,
-                        });
+                        }), renewed);
                     }
                     Err(e) => {
                         let msg = e.to_string();
@@ -1629,7 +1655,7 @@ async fn execute_live_polymarket_signal(
                                 window_ts, max_retries, msg
                             ),
                         );
-                        return None;
+                        return (None, renewed);
                     }
                 }
             }
@@ -1639,7 +1665,7 @@ async fn execute_live_polymarket_signal(
                 attempt, max_retries, side, amount_usdc, token_id
             );
 
-            match client.create_market_order(&token_id, side, amount_usdc, worst_price).await {
+            match active!().create_market_order(&token_id, side, amount_usdc, worst_price).await {
                 Ok(resp) => {
                     tracing::info!(
                         "[RUNNER {id}] Order placed: id={} status={}",
@@ -1650,7 +1676,7 @@ async fn execute_live_polymarket_signal(
                         &format!("Order placed: {} {} USDC (id={})", signal, amount_usdc, resp.order_id),
                     );
                     let ep = if signal.starts_with("yes") { yes_token_price } else { no_token_price };
-                    return Some(LiveOrder {
+                    return (Some(LiveOrder {
                         timestamp: chrono::Utc::now().to_rfc3339(),
                         window_ts,
                         side: signal.to_string(),
@@ -1662,7 +1688,7 @@ async fn execute_live_polymarket_signal(
                         result: None,
                         pnl: None,
                         stop_loss_triggered: false,
-                    });
+                    }), renewed);
                 }
                 Err(e) => {
                     let msg = e.to_string();
@@ -1671,11 +1697,28 @@ async fn execute_live_polymarket_signal(
                         attempt, max_retries, msg
                     );
                     if attempt < max_retries {
-                        tokio::time::sleep(retry_delay).await;
+                        if msg.contains("order_version_mismatch") {
+                            tracing::warn!(
+                                "[RUNNER {id}] order_version_mismatch — renewing L2 credentials then falling back to limit order"
+                            );
+                            // Re-authenticate via L1 EIP-712 to get fresh L2 session.
+                            match client_arc.renew().await {
+                                Ok(new_client) => {
+                                    tracing::info!("[RUNNER {id}] Credentials renewed successfully");
+                                    append_runner_log(store, id, "Credentials auto-renewed (order_version_mismatch)");
+                                    renewed = Some(Arc::new(new_client));
+                                }
+                                Err(e) => {
+                                    tracing::warn!("[RUNNER {id}] Credential renewal failed: {e} — proceeding with limit order fallback");
+                                    append_runner_log(store, id, &format!("Credential renewal failed: {e}"));
+                                }
+                            }
+                            attempt = max_retries - 1;
+                        } else {
+                            tokio::time::sleep(retry_delay).await;
+                        }
                         continue;
                     }
-                    // This should be unreachable because final attempt uses limit order,
-                    // but keep as safety net.
                     append_runner_log(
                         store, id,
                         &format!(
@@ -1683,7 +1726,7 @@ async fn execute_live_polymarket_signal(
                             window_ts, max_retries, msg
                         ),
                     );
-                    return None;
+                    return (None, renewed);
                 }
             }
         }
@@ -1698,7 +1741,7 @@ async fn execute_live_polymarket_signal(
             store, id,
             &format!("Paper order: {} ${:.0} @ {:.4} (id={})", signal, amount_usdc, ep, order_id),
         );
-        Some(LiveOrder {
+        (Some(LiveOrder {
             timestamp: chrono::Utc::now().to_rfc3339(),
             window_ts,
             side: signal.to_string(),
@@ -1710,7 +1753,7 @@ async fn execute_live_polymarket_signal(
             result: None,
             pnl: None,
             stop_loss_triggered: false,
-        })
+        }), None)
     }
 }
 
@@ -1909,6 +1952,23 @@ fn resolve_window_outcome(
     };
 
     Some(went_up)
+}
+
+/// Patch `[polymarket]` api_key/secret/passphrase in config.toml after renewal.
+async fn persist_polymarket_creds(
+    config_path: &std::path::Path,
+    creds: &polymarket_trader::auth::PolyCredentials,
+) -> anyhow::Result<()> {
+    let raw = tokio::fs::read_to_string(config_path).await?;
+    let mut doc: toml::Value = raw.parse()?;
+    if let Some(pm) = doc.get_mut("polymarket").and_then(|v| v.as_table_mut()) {
+        pm.insert("api_key".to_string(), toml::Value::String(creds.api_key.clone()));
+        pm.insert("secret".to_string(), toml::Value::String(creds.secret.clone()));
+        pm.insert("passphrase".to_string(), toml::Value::String(creds.passphrase.clone()));
+    }
+    let updated = toml::to_string_pretty(&doc)?;
+    tokio::fs::write(config_path, updated).await?;
+    Ok(())
 }
 
 fn append_runner_log(store: &Arc<StrategyRunnerStore>, id: &str, msg: &str) {
