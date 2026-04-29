@@ -15,9 +15,9 @@ impl Tool for PolymarketBalanceTool {
     }
 
     fn description(&self) -> &str {
-        "Fetch the USDC balance of the configured Polymarket wallet. \
+        "Fetch the USDC/pUSD balance of the configured Polymarket wallet. \
         Queries the Polymarket CLOB API first (reflects available trading balance), \
-        then falls back to the Polygon RPC balance. \
+        then falls back to the Polygon RPC balance (USDC.e + pUSD). \
         Use this whenever the user asks about their Polymarket balance, available funds, \
         or how much USDC they have on Polymarket. \
         Requires Polymarket credentials to be configured in Settings."
@@ -45,6 +45,7 @@ impl Tool for PolymarketBalanceTool {
                         private_key: pm.private_key.clone().filter(|k| !k.is_empty()),
                         is_builder: pm.is_builder.unwrap_or(false),
                         proxy_address: pm.proxy_address.clone().filter(|k| !k.is_empty()).map(|s| s.to_lowercase()),
+                        signature_type: pm.signature_type.clone().filter(|k| !k.is_empty()),
                     })
                 }
                 _ => None,
@@ -92,7 +93,7 @@ impl Tool for PolymarketBalanceTool {
         Ok(ToolResult {
             success: true,
             output: format!(
-                "Polymarket USDC balance: ${:.2} (source: {}, wallet: {})",
+                "Polymarket USDC/pUSD balance: ${:.2} (source: {}, wallet: {})",
                 balance, source, wallet
             ),
             error: None,

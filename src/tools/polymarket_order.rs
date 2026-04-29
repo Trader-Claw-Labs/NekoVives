@@ -64,6 +64,7 @@ impl Tool for PolymarketOrderTool {
                         private_key: pm.private_key.clone().filter(|k| !k.is_empty()),
                         is_builder: pm.is_builder.unwrap_or(false),
                         proxy_address: pm.proxy_address.clone().filter(|k| !k.is_empty()).map(|s| s.to_lowercase()),
+                        signature_type: pm.signature_type.clone().filter(|k| !k.is_empty()),
                     })
                 }
                 _ => None,

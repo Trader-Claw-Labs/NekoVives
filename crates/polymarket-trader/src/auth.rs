@@ -29,6 +29,12 @@ pub struct PolyCredentials {
     /// When set, orders use proxy signature_type=1 with this address as maker/signer.
     #[serde(default)]
     pub proxy_address: Option<String>,
+    /// Override the EIP-712 signature type used for order signing.
+    /// Values: "eoa" | "proxy" | "gnosis_safe".
+    /// When unset, auto-detected from proxy_address derivation (defaults to gnosis_safe,
+    /// which causes order_version_mismatch for plain EOA wallets).
+    #[serde(default)]
+    pub signature_type: Option<String>,
 }
 
 // ── EIP-712 helpers ──────────────────────────────────────────────────────────
@@ -173,15 +179,20 @@ struct ApiKeyResponse {
 ///
 /// The CLOB expects L1 auth as **headers** (not JSON body):
 /// POLY_ADDRESS, POLY_SIGNATURE, POLY_TIMESTAMP, POLY_NONCE.
-pub async fn setup_credentials(private_key_hex: &str) -> Result<PolyCredentials> {
+///
+/// `wallet_address` overrides the address used in `POLY_ADDRESS` and the EIP-712
+/// struct hash.  Use this when the Polymarket account is registered under a proxy
+/// or GnosisSafe address rather than the raw EOA address derived from the key.
+pub async fn setup_credentials(private_key_hex: &str, wallet_address: Option<&str>) -> Result<PolyCredentials> {
     // 1. Parse private key (never log it)
     let key_bytes = hex::decode(private_key_hex.strip_prefix("0x").unwrap_or(private_key_hex))
         .map_err(|e| PolyError::Auth(format!("Invalid private key hex: {e}")))?;
     let signing_key = SigningKey::from_slice(&key_bytes)
         .map_err(|e| PolyError::Auth(format!("Invalid private key: {e}")))?;
 
-    // 2. Derive address
-    let address = address_from_signing_key(&signing_key);
+    // 2. Derive EOA address; use provided wallet_address override if supplied
+    let eoa_address = address_from_signing_key(&signing_key);
+    let address = wallet_address.map(str::to_string).unwrap_or(eoa_address);
 
     // 3. Get current timestamp
     let timestamp = Utc::now().timestamp() as u64;
@@ -220,6 +231,60 @@ pub async fn setup_credentials(private_key_hex: &str) -> Result<PolyCredentials>
         private_key: None,
         is_builder: false,
         proxy_address: None,
+        signature_type: None,
+    })
+}
+
+/// Deterministically derive existing L2 credentials via L1 EIP-712 auth.
+///
+/// Polymarket's `GET /auth/derive-api-key` endpoint returns the SAME api_key/secret/
+/// passphrase that were created originally (derived from the signature as a seed).
+/// Use this for credential renewal — `POST /auth/api-key` (used by setup_credentials)
+/// fails with `"Could not create api key"` when one already exists.
+pub async fn derive_api_key(private_key_hex: &str) -> Result<PolyCredentials> {
+    let key_bytes = hex::decode(private_key_hex.strip_prefix("0x").unwrap_or(private_key_hex))
+        .map_err(|e| PolyError::Auth(format!("Invalid private key hex: {e}")))?;
+    let signing_key = SigningKey::from_slice(&key_bytes)
+        .map_err(|e| PolyError::Auth(format!("Invalid private key: {e}")))?;
+
+    // L1 auth always uses the EOA signer address; proxy/Safe context is not relevant here
+    let address = address_from_signing_key(&signing_key);
+
+    let timestamp = Utc::now().timestamp() as u64;
+    let timestamp_str = timestamp.to_string();
+    let nonce: u64 = 0;
+
+    let digest = eip712_digest(&address, &timestamp_str, nonce)?;
+    let signature = sign_eip712(&signing_key, &digest)?;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get("https://clob.polymarket.com/auth/derive-api-key")
+        .header("POLY_ADDRESS", &address)
+        .header("POLY_SIGNATURE", &signature)
+        .header("POLY_TIMESTAMP", &timestamp_str)
+        .header("POLY_NONCE", "0")
+        .send()
+        .await
+        .map_err(PolyError::Http)?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(PolyError::Auth(format!("derive-api-key failed ({}): {}", status, text)).into());
+    }
+
+    let api_resp: ApiKeyResponse = resp.json().await.map_err(PolyError::Http)?;
+
+    Ok(PolyCredentials {
+        api_key: api_resp.api_key,
+        secret: api_resp.secret,
+        passphrase: api_resp.passphrase,
+        wallet_address: address,
+        private_key: None,
+        is_builder: false,
+        proxy_address: None,
+        signature_type: None,
     })
 }
 
@@ -251,6 +316,7 @@ pub fn load_credentials(config_path: &str) -> Result<PolyCredentials> {
         private_key: None,
         is_builder: false,
         proxy_address: None,
+        signature_type: None,
     })
 }
 
@@ -437,6 +503,7 @@ mod tests {
             private_key: None,
             is_builder: false,
             proxy_address: None,
+            signature_type: None,
         }
     }
 
@@ -522,7 +589,7 @@ mod tests {
     async fn test_setup_credentials_network() {
         let private_key = std::env::var("POLY_PRIVATE_KEY")
             .expect("Set POLY_PRIVATE_KEY env var to run this test");
-        let creds = setup_credentials(&private_key).await.expect("L1 auth failed");
+        let creds = setup_credentials(&private_key, None).await.expect("L1 auth failed");
         assert!(!creds.api_key.is_empty());
         assert!(!creds.secret.is_empty());
         assert!(!creds.passphrase.is_empty());

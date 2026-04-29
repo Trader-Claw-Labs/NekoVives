@@ -621,7 +621,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     };
 
     // Restart any strategies that were running before the last shutdown
-    let restarted = state.strategy_runner.restart_previously_running(config.workspace_dir.clone());
+    let restarted = state.strategy_runner.restart_previously_running(
+        config.workspace_dir.clone(),
+        Some(config.config_path.clone()),
+    );
     if restarted > 0 {
         tracing::info!("Restarted {} strategy runner(s) from disk", restarted);
     }

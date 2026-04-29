@@ -383,6 +383,7 @@ function PlaceOrderTab() {
 export default function Polymarket() {
   const [activeTab, setActiveTab] = useState<'markets' | 'orders' | 'positions'>('markets')
   const [walletAddress, setWalletAddress] = useState('')
+  const [signatureType, setSignatureType] = useState('')
   const [apiKeys, setApiKeys] = useState<ApiKeyEntry[]>([
     { id: genId(), label: 'API Key 1', key: '', secret: '', passphrase: '', private_key: '', show: false, expanded: true },
   ])
@@ -424,6 +425,7 @@ export default function Polymarket() {
   useEffect(() => {
     if (!savedConfig?.configured) return
     if (savedConfig.wallet_address) setWalletAddress(savedConfig.wallet_address)
+    if ((savedConfig as any).signature_type) setSignatureType((savedConfig as any).signature_type)
     if (savedConfig.api_key_masked) {
       // Leave secret / passphrase / private_key blank. Backend preserves the
       // stored values when these fields come empty, so the user doesn't have
@@ -450,6 +452,7 @@ export default function Polymarket() {
         secret: apiKeys[0]?.secret ?? '',
         passphrase: apiKeys[0]?.passphrase ?? '',
         private_key: apiKeys[0]?.private_key ?? '',
+        signature_type: signatureType || undefined,
       }),
     onSuccess: () => {
       setSaveMsg('Saved!')
@@ -908,6 +911,23 @@ export default function Polymarket() {
                         onChange={(v) => updateApiKey(entry.id, 'private_key', v)}
                         placeholder="0x..."
                       />
+                    </div>
+                    <div className="md:col-span-2">
+                      <label className="block text-xs font-medium mb-1" style={{ color: 'var(--color-text-secondary)' }}>
+                        Signature Type
+                        <span className="ml-1 font-normal opacity-60">(set "eoa" if you get order_version_mismatch errors)</span>
+                      </label>
+                      <select
+                        value={signatureType}
+                        onChange={(e) => setSignatureType(e.target.value)}
+                        className="w-full px-2 py-1.5 rounded text-sm border"
+                        style={{ background: 'var(--color-surface)', color: 'var(--color-text)', borderColor: 'var(--color-border)' }}
+                      >
+                        <option value="">Auto-detect (default)</option>
+                        <option value="gnosis_safe">gnosis_safe — MetaMask / browser wallet</option>
+                        <option value="proxy">proxy — Magic / email wallet</option>
+                        <option value="eoa">eoa — Plain private key (no proxy)</option>
+                      </select>
                     </div>
                   </div>
                 )}

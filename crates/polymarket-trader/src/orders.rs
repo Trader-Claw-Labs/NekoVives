@@ -59,6 +59,38 @@ impl ClobClient {
         Self { creds }
     }
 
+    /// Re-authenticate via Polymarket L1 EIP-712 to obtain fresh L2 session
+    /// credentials (api_key / secret / passphrase).  Returns a new ClobClient
+    /// that carries the renewed credentials while preserving private_key,
+    /// proxy_address, and signature_type from the original.
+    /// Requires private_key to be set in the stored credentials.
+    pub async fn renew(&self) -> Result<Self> {
+        let pk = self.creds.private_key.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Cannot renew credentials: private_key not configured"))?;
+        // Use derive-api-key (deterministic) instead of create-api-key, since the
+        // L2 credentials already exist and create-api-key returns "Could not create".
+        tracing::info!("CLOB credentials renewing via derive-api-key…");
+        let fresh = crate::auth::derive_api_key(pk).await?;
+        tracing::info!("CLOB credentials renewed: new api_key={}", &fresh.api_key[..8.min(fresh.api_key.len())]);
+        Ok(Self {
+            creds: PolyCredentials {
+                api_key: fresh.api_key,
+                secret: fresh.secret,
+                passphrase: fresh.passphrase,
+                wallet_address: self.creds.wallet_address.clone(), // keep original wallet address
+                private_key: self.creds.private_key.clone(),
+                is_builder: self.creds.is_builder,
+                proxy_address: self.creds.proxy_address.clone(),
+                signature_type: self.creds.signature_type.clone(),
+            },
+        })
+    }
+
+    /// Return the current credentials (cloned).  Used to persist renewed creds.
+    pub fn credentials(&self) -> &PolyCredentials {
+        &self.creds
+    }
+
     /// Parse the stored private key into a LocalSigner.
     fn make_signer(&self) -> Result<polymarket_client_sdk::auth::LocalSigner<k256::ecdsa::SigningKey>> {
         let pk_hex = self
@@ -93,6 +125,51 @@ impl ClobClient {
         let auth = client.authentication_builder(&signer).credentials(sdk_creds);
         let signer_addr = signer.address();
         tracing::info!("CLOB signer address derived from private_key: {}", signer_addr);
+
+        // If the user has explicitly set a signature_type, honour it — this
+        // overrides auto-detection and fixes order_version_mismatch for wallets
+        // that are plain EOA or a Proxy that wasn't derived from this signer.
+        if let Some(sig_type) = self.creds.signature_type.as_deref() {
+            let auth = match sig_type.to_lowercase().as_str() {
+                "eoa" => {
+                    tracing::info!("CLOB auth: forced EOA (no proxy/funder)");
+                    auth
+                }
+                "proxy" => {
+                    let proxy_addr = self.creds.proxy_address.as_deref()
+                        .filter(|s| !s.is_empty())
+                        .and_then(|s| s.parse::<polymarket_client_sdk::types::Address>().ok())
+                        .or_else(|| derive_proxy_wallet(signer_addr, POLYGON));
+                    if let Some(addr) = proxy_addr {
+                        tracing::info!("CLOB auth: forced Proxy {}", addr);
+                        auth.funder(addr).signature_type(SignatureType::Proxy)
+                    } else {
+                        tracing::warn!("CLOB auth: forced proxy but no proxy address derivable, using EOA");
+                        auth
+                    }
+                }
+                "gnosis_safe" | "safe" => {
+                    let safe_addr = self.creds.proxy_address.as_deref()
+                        .filter(|s| !s.is_empty())
+                        .and_then(|s| s.parse::<polymarket_client_sdk::types::Address>().ok())
+                        .or_else(|| derive_safe_wallet(signer_addr, POLYGON));
+                    if let Some(addr) = safe_addr {
+                        tracing::info!("CLOB auth: forced Gnosis Safe {}", addr);
+                        auth.funder(addr).signature_type(SignatureType::GnosisSafe)
+                    } else {
+                        tracing::warn!("CLOB auth: forced gnosis_safe but no safe address derivable, using EOA");
+                        auth
+                    }
+                }
+                other => {
+                    tracing::warn!("CLOB auth: unknown signature_type '{}', falling back to auto-detect", other);
+                    // fall through to auto-detect below by re-entering default path
+                    auth
+                }
+            };
+            let authenticated = auth.authenticate().await?;
+            return Ok(authenticated);
+        }
 
         let auth = match self.creds.proxy_address.as_deref() {
             Some(proxy) if !proxy.is_empty() => {
@@ -169,8 +246,14 @@ impl ClobClient {
 
         let token_id_u256 = U256::from_str(token_id)
             .map_err(|e| anyhow::anyhow!("Invalid token_id: {e}"))?;
-        let price_dec = Decimal::from_f64_retain(price)
-            .ok_or_else(|| anyhow::anyhow!("Invalid price: {price}"))?;
+        // Use string formatting to ensure exactly 2dp — from_f64_retain would
+        // preserve IEEE-754 noise (e.g. 0.41 → 0.4099999…28dp) and the CLOB
+        // rejects prices with more decimal places than the tick size (0.01).
+        let price_dec = price.to_string().parse::<Decimal>()
+            .or_else(|_| format!("{price:.2}").parse::<Decimal>())
+            .map_err(|e| anyhow::anyhow!("Invalid price {price}: {e}"))?;
+        // Round to 2dp explicitly so any float noise is stripped.
+        let price_dec = price_dec.round_dp(2);
         let size_dec = Decimal::from_f64_retain(size)
             .ok_or_else(|| anyhow::anyhow!("Invalid size: {size}"))?;
 
@@ -335,45 +418,84 @@ impl ClobClient {
 
 /// USDC.e contract on Polygon (Bridged USDC)
 const USDC_E_CONTRACT: &str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
+/// pUSD contract on Polygon (Polymarket wrapped USDC)
+const PUSD_CONTRACT: &str = "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb";
 
-async fn fetch_polygon_usdc_balance(wallet_address: &str) -> Result<f64> {
-    let client = reqwest::Client::new();
+/// Public Polygon RPC endpoints used as a fallback chain.
+/// `polygon-rpc.com` requires an API key for anonymous traffic and rejects calls,
+/// so it is intentionally not the first choice.
+const POLYGON_RPCS: &[&str] = &[
+    "https://polygon.drpc.org",
+    "https://1rpc.io/matic",
+    "https://polygon-bor-rpc.publicnode.com",
+    "https://polygon.llamarpc.com",
+];
 
+async fn fetch_polygon_token_balance(client: &reqwest::Client, token: &str, wallet_address: &str) -> Result<f64> {
     let addr_clean = wallet_address.strip_prefix("0x").unwrap_or(wallet_address);
     let data = format!("0x70a08231{:0>64}", addr_clean.to_lowercase());
 
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "method": "eth_call",
-        "params": [
-            {
-                "to": USDC_E_CONTRACT,
-                "data": data
-            },
-            "latest"
-        ],
+        "params": [{ "to": token, "data": data }, "latest"],
         "id": 1
     });
 
-    let resp = client
-        .post("https://polygon-rpc.com")
-        .json(&body)
-        .send()
-        .await?;
+    let mut last_err: Option<anyhow::Error> = None;
+    for rpc in POLYGON_RPCS {
+        let resp = match client
+            .post(*rpc)
+            .timeout(std::time::Duration::from_secs(8))
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => { last_err = Some(anyhow::anyhow!("{} → {}", rpc, e)); continue; }
+        };
+        if !resp.status().is_success() {
+            last_err = Some(anyhow::anyhow!("{} → HTTP {}", rpc, resp.status()));
+            continue;
+        }
+        let resp_json: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => { last_err = Some(anyhow::anyhow!("{} → {}", rpc, e)); continue; }
+        };
+        let Some(hex_result) = resp_json.get("result").and_then(|v| v.as_str()) else {
+            last_err = Some(anyhow::anyhow!("{} → no result ({})", rpc, resp_json));
+            continue;
+        };
+        let raw = u128::from_str_radix(hex_result.strip_prefix("0x").unwrap_or(hex_result), 16)
+            .map_err(|e| anyhow::anyhow!("Failed to parse Polygon balance hex for {}: {}", token, e))?;
+        return Ok(raw as f64 / 1_000_000.0);
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("all Polygon RPCs failed for {}", token)))
+}
 
-    let resp_json: serde_json::Value = resp.json().await?;
-    tracing::debug!("Polygon RPC raw response: {}", resp_json);
+/// Sum USDC.e + pUSD balances for the wallet. Polymarket migrated from USDC.e
+/// to pUSD; users may hold either or both.
+async fn fetch_polygon_usdc_balance(wallet_address: &str) -> Result<f64> {
+    let client = reqwest::Client::new();
+    let mut total = 0.0;
 
-    let hex_result = resp_json
-        .get("result")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("Polygon RPC returned no result"))?;
+    match fetch_polygon_token_balance(&client, USDC_E_CONTRACT, wallet_address).await {
+        Ok(b) => {
+            tracing::info!("Polygon USDC.e balance: ${:.2}", b);
+            total += b;
+        }
+        Err(e) => tracing::warn!("Failed to fetch USDC.e balance: {}", e),
+    }
 
-    let raw = u128::from_str_radix(hex_result.strip_prefix("0x").unwrap_or(hex_result), 16)
-        .map_err(|e| anyhow::anyhow!("Failed to parse Polygon balance hex: {}", e))?;
+    match fetch_polygon_token_balance(&client, PUSD_CONTRACT, wallet_address).await {
+        Ok(b) => {
+            tracing::info!("Polygon pUSD balance: ${:.2}", b);
+            total += b;
+        }
+        Err(e) => tracing::warn!("Failed to fetch pUSD balance: {}", e),
+    }
 
-    let balance = raw as f64 / 1_000_000.0;
-    Ok(balance)
+    Ok(total)
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

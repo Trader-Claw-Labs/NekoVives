@@ -722,6 +722,8 @@ pub struct PolymarketConfigBody {
     pub secret: Option<String>,
     pub passphrase: Option<String>,
     pub private_key: Option<String>,
+    #[serde(default)]
+    pub signature_type: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1368,6 +1370,7 @@ pub async fn handle_api_polymarket_configure_get(
         "has_secret": pm.secret.as_deref().map(|s| !s.is_empty()).unwrap_or(false),
         "has_passphrase": pm.passphrase.as_deref().map(|p| !p.is_empty()).unwrap_or(false),
         "has_private_key": pm.private_key.as_deref().map(|k| !k.is_empty()).unwrap_or(false),
+        "signature_type": pm.signature_type,
     }))
     .into_response()
 }
@@ -1433,6 +1436,7 @@ pub async fn handle_api_polymarket_configure(
         private_key,
         is_builder: existing.is_builder,
         proxy_address: existing.proxy_address,
+        signature_type: body.signature_type.filter(|s| !s.is_empty()).or(existing.signature_type),
     };
     if let Err(e) = config.save().await {
         return (
@@ -1594,6 +1598,7 @@ pub async fn handle_api_polymarket_test(
         private_key: None,
         is_builder: stored.is_builder.unwrap_or(false),
         proxy_address: stored.proxy_address.clone().filter(|k| !k.is_empty()).map(|s| s.to_lowercase()),
+        signature_type: stored.signature_type.clone().filter(|k| !k.is_empty()),
     };
 
     /// Probe result: http status (0 = network error), response body, error detail.
@@ -1848,6 +1853,7 @@ pub async fn handle_api_polymarket_diagnose_auth(
             private_key: None,
             is_builder: body.is_builder.unwrap_or(false),
             proxy_address: body.proxy_address.clone().filter(|k| !k.is_empty()),
+            signature_type: None,
         };
 
         // ── Test 1: POST /order with dummy body ──
@@ -1951,7 +1957,7 @@ pub async fn handle_api_polymarket_refresh_credentials(
         }
     };
 
-    match polymarket_trader::auth::setup_credentials(&private_key).await {
+    match polymarket_trader::auth::setup_credentials(&private_key, None).await {
         Ok(creds) => {
             Json(serde_json::json!({
                 "success": true,
@@ -1986,6 +1992,7 @@ fn get_poly_creds(state: &AppState) -> Option<polymarket_trader::auth::PolyCrede
         private_key: pm.private_key.clone().filter(|k| !k.is_empty()),
         is_builder: pm.is_builder.unwrap_or(false),
         proxy_address: pm.proxy_address.clone().filter(|k| !k.is_empty()).map(|s| s.to_lowercase()),
+        signature_type: pm.signature_type.clone().filter(|k| !k.is_empty()),
     })
 }
 
@@ -2060,50 +2067,97 @@ fn calculate_resolution_windows(now_secs: u64, seconds: u64) -> Vec<u64> {
     ]
 }
 
-async fn ensure_live_wallet_has_min_balance(wallet_address: &str, min_usdc: f64) -> anyhow::Result<()> {
-    let url = format!("https://clob.polymarket.com/positions?user={wallet_address}");
-    let resp = reqwest::Client::new()
-        .get(&url)
-        .timeout(std::time::Duration::from_secs(12))
-        .send()
-        .await?;
+/// Query USDC balance on Polygon via public RPC for the EOA + (optional) proxy
+/// wallet, summing across native USDC and bridged USDC.e contracts.
+/// Polymarket may hold trading funds in either contract / either wallet
+/// depending on how the user funded the account.
+async fn ensure_live_wallet_has_min_balance(
+    wallet_address: &str,
+    proxy_address: Option<&str>,
+    min_usdc: f64,
+) -> anyhow::Result<()> {
+    const USDC_E:    &str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"; // bridged
+    const USDC_NATIVE: &str = "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359";
+    const PUSD:      &str = "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb";
+    let tokens = [("USDC.e", USDC_E), ("USDC", USDC_NATIVE), ("pUSD", PUSD)];
 
-    if !resp.status().is_success() {
-        let code = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        tracing::warn!(
-            "Skipping Polymarket wallet balance pre-check (endpoint unavailable: {}): {}",
-            code,
-            body
-        );
+    let mut addrs: Vec<String> = Vec::with_capacity(2);
+    for raw in [Some(wallet_address), proxy_address].into_iter().flatten() {
+        let clean = raw.trim().trim_start_matches("0x").to_lowercase();
+        if clean.len() == 40 && !addrs.contains(&clean) {
+            addrs.push(clean);
+        }
+    }
+    if addrs.is_empty() { return Ok(()); }
+
+    let rpcs = ["https://polygon.drpc.org", "https://1rpc.io/matic", "https://polygon-bor-rpc.publicnode.com"];
+    let client = reqwest::Client::new();
+
+    async fn read_balance(client: &reqwest::Client, rpcs: &[&str], token: &str, addr: &str) -> anyhow::Result<u128> {
+        let calldata = format!("0x70a08231000000000000000000000000{}", addr);
+        let body = serde_json::json!({
+            "jsonrpc":"2.0","method":"eth_call","id":1,
+            "params":[{"to":token,"data":calldata},"latest"],
+        });
+        let mut last_err: Option<anyhow::Error> = None;
+        for rpc in rpcs {
+            let resp = match client.post(*rpc).timeout(std::time::Duration::from_secs(8)).json(&body).send().await {
+                Ok(r) => r, Err(e) => { last_err = Some(e.into()); continue; }
+            };
+            if !resp.status().is_success() {
+                last_err = Some(anyhow::anyhow!("RPC {} → {}", rpc, resp.status()));
+                continue;
+            }
+            let json: serde_json::Value = match resp.json().await {
+                Ok(v) => v, Err(e) => { last_err = Some(e.into()); continue; }
+            };
+            let Some(hex) = json.get("result").and_then(|v| v.as_str()) else {
+                last_err = Some(anyhow::anyhow!("missing result: {}", json)); continue;
+            };
+            return u128::from_str_radix(hex.trim_start_matches("0x"), 16)
+                .map_err(|e| anyhow::anyhow!("hex parse: {e}"));
+        }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("all RPCs failed")))
+    }
+
+    let mut total_units: u128 = 0;
+    let mut all_failed = true;
+    let mut breakdown: Vec<String> = Vec::new();
+    for addr in &addrs {
+        for (label, token) in tokens.iter() {
+            match read_balance(&client, &rpcs, token, addr).await {
+                Ok(units) => {
+                    all_failed = false;
+                    total_units = total_units.saturating_add(units);
+                    if units > 0 {
+                        breakdown.push(format!("0x{}…/{}: ${:.4}", &addr[..6], label, (units as f64) / 1_000_000.0));
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("balance check 0x{}/{} failed: {}", &addr[..6], label, e);
+                }
+            }
+        }
+    }
+
+    if all_failed {
+        tracing::warn!("Skipping Polymarket wallet balance pre-check (all RPCs unreachable)");
         return Ok(());
     }
 
-    let data: serde_json::Value = resp.json().await?;
+    let total_usdc = (total_units as f64) / 1_000_000.0;
+    tracing::info!(
+        "Polymarket wallet balance check: total ${:.4} ({})",
+        total_usdc,
+        if breakdown.is_empty() { "all zero".to_string() } else { breakdown.join(", ") }
+    );
 
-    fn as_num(v: Option<&serde_json::Value>) -> Option<f64> {
-        let x = v?;
-        if let Some(n) = x.as_f64() { return Some(n); }
-        x.as_str().and_then(|s| s.parse::<f64>().ok())
-    }
-
-    let candidates = [
-        as_num(data.get("availableBalance")),
-        as_num(data.get("available_balance")),
-        as_num(data.get("cash")),
-        as_num(data.get("balance")),
-        as_num(data.get("usdc_balance")),
-    ];
-
-    let available = candidates.into_iter().flatten().next().unwrap_or(0.0);
-    if available < min_usdc {
+    if total_usdc + 1e-6 < min_usdc {
         anyhow::bail!(
-            "Insufficient wallet balance for live mode. Required at least ${:.2} USDC, detected ${:.2}.",
-            min_usdc,
-            available
+            "Insufficient wallet balance for live mode. Required at least ${:.2} USDC/pUSD, detected ${:.2} across EOA+proxy on USDC + USDC.e + pUSD.",
+            min_usdc, total_usdc
         );
     }
-
     Ok(())
 }
 
@@ -3876,9 +3930,10 @@ async fn hydrate_live_runtime_config(state: &AppState, config: &mut crate::strat
     }
 
     let (yes_token_id, no_token_id) = resolve_live_token_ids(config.series_id.as_deref()).await?;
-    let min_live_usdc = 10.0;
+    let min_live_usdc = 1.0;
     if config.mode == "live" {
-        ensure_live_wallet_has_min_balance(&wallet_address, min_live_usdc).await?;
+        let proxy_for_check = poly.proxy_address.clone().filter(|k| !k.trim().is_empty());
+        ensure_live_wallet_has_min_balance(&wallet_address, proxy_for_check.as_deref(), min_live_usdc).await?;
     }
 
     let creds = polymarket_trader::auth::PolyCredentials {
@@ -3889,6 +3944,7 @@ async fn hydrate_live_runtime_config(state: &AppState, config: &mut crate::strat
         private_key,
         is_builder: poly.is_builder.unwrap_or(false),
         proxy_address: poly.proxy_address.clone().filter(|k| !k.is_empty()).map(|s| s.to_lowercase()),
+        signature_type: poly.signature_type.clone().filter(|k| !k.is_empty()),
     };
 
     // Pre-flight: verify L2 auth actually works before starting the runner.
@@ -3953,11 +4009,15 @@ pub async fn restart_stored_runners(state: &AppState) {
         }
         let _ = state.strategy_runner.set_starting(&id);
 
-        let workspace_dir = state.config.lock().workspace_dir.clone();
+        let (workspace_dir, cfg_path) = {
+            let c = state.config.lock();
+            (c.workspace_dir.clone(), c.config_path.clone())
+        };
         let _ = crate::strategy_runner::start_runner(
             state.strategy_runner.clone(),
             config,
             workspace_dir,
+            Some(cfg_path),
         );
         restarted += 1;
     }
@@ -4091,11 +4151,15 @@ pub async fn handle_api_live_create(
         ).into_response();
     }
 
-    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let (workspace_dir, cfg_path) = {
+        let c = state.config.lock();
+        (c.workspace_dir.clone(), c.config_path.clone())
+    };
     let runner = crate::strategy_runner::start_runner(
         state.strategy_runner.clone(),
         config,
         workspace_dir,
+        Some(cfg_path),
     );
 
     (StatusCode::CREATED, Json(serde_json::json!({ "runner": runner }))).into_response()
@@ -4159,11 +4223,15 @@ pub async fn handle_api_live_restart(
         ).into_response();
     }
 
-    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let (workspace_dir, cfg_path) = {
+        let c = state.config.lock();
+        (c.workspace_dir.clone(), c.config_path.clone())
+    };
     let runner = crate::strategy_runner::start_runner(
         state.strategy_runner.clone(),
         config,
         workspace_dir,
+        Some(cfg_path),
     );
     Json(serde_json::json!({ "runner": runner })).into_response()
 }

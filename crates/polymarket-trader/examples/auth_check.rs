@@ -32,6 +32,7 @@ async fn main() {
         private_key: None,
         is_builder: false,
         proxy_address: None,
+        signature_type: None,
     };
 
     // ── Paso 1: Conectividad pública ────────────────────────────────────
@@ -132,7 +133,7 @@ async fn main() {
                 Err(e) => println!("  ✗ Error derivando dirección: {e}"),
             }
 
-            match setup_credentials(&pk).await {
+            match setup_credentials(&pk, None).await {
                 Ok(new_creds) => {
                     println!("\n  ✓ L1 auth SUCCESS!");
                     println!("  api_key     : {}", new_creds.api_key);

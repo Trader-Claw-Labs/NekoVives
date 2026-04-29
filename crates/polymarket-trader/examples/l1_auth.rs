@@ -37,7 +37,7 @@ async fn main() {
 
     println!("Sending L1 auth request to Polymarket...\n");
 
-    match setup_credentials(&pk).await {
+    match setup_credentials(&pk, None).await {
         Ok(creds) => {
             println!("✓ L1 auth SUCCESS!");
             println!("");

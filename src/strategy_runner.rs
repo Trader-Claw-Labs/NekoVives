@@ -529,7 +529,7 @@ async fn crypto_runner_loop(
 // Paper mode: uses a 1m Binance WebSocket feed and re-runs full slug simulation
 //             at each window boundary to generate a fresh decision.
 // Live mode:  same signal generation, but then calls Polymarket CLOB API to
-//             place/cancel real orders. Verifies credentials and USDC balance first.
+//             place/cancel real orders. Verifies credentials and USDC/pUSD balance first.
 
 async fn polymarket_runner_loop(
     store: Arc<StrategyRunnerStore>,
@@ -1490,8 +1490,8 @@ async fn execute_live_polymarket_signal(
         Some(c) => {
             let bal = fetch_usdc_balance_clob(c).await.unwrap_or(0.0);
             if bal <= 0.0 {
-                tracing::warn!("[RUNNER {id}] Cannot place order: zero or unknown USDC balance");
-                append_runner_log(store, id, "Skipped: zero USDC balance");
+                tracing::warn!("[RUNNER {id}] Cannot place order: zero or unknown USDC/pUSD balance");
+                append_runner_log(store, id, "Skipped: zero USDC/pUSD balance");
                 return (None, None);
             }
             let amt = match config.live_sizing_mode {
@@ -1955,18 +1955,74 @@ fn resolve_window_outcome(
 }
 
 /// Patch `[polymarket]` api_key/secret/passphrase in config.toml after renewal.
+/// Uses line-based replacement (no full TOML parse) so it tolerates the slight
+/// schema quirks that trip up `toml::Value::parse` on some real-world configs
+/// and preserves comments / formatting / ordering.
 async fn persist_polymarket_creds(
     config_path: &std::path::Path,
     creds: &polymarket_trader::auth::PolyCredentials,
 ) -> anyhow::Result<()> {
     let raw = tokio::fs::read_to_string(config_path).await?;
-    let mut doc: toml::Value = raw.parse()?;
-    if let Some(pm) = doc.get_mut("polymarket").and_then(|v| v.as_table_mut()) {
-        pm.insert("api_key".to_string(), toml::Value::String(creds.api_key.clone()));
-        pm.insert("secret".to_string(), toml::Value::String(creds.secret.clone()));
-        pm.insert("passphrase".to_string(), toml::Value::String(creds.passphrase.clone()));
+    let mut out: Vec<String> = Vec::with_capacity(raw.lines().count() + 4);
+    let mut in_polymarket = false;
+    let mut found_section = false;
+    let mut wrote_api_key = false;
+    let mut wrote_secret = false;
+    let mut wrote_passphrase = false;
+
+    let api_line = format!("api_key = \"{}\"", creds.api_key);
+    let secret_line = format!("secret = \"{}\"", creds.secret);
+    let passphrase_line = format!("passphrase = \"{}\"", creds.passphrase);
+
+    for line in raw.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('[') {
+            // Section boundary: if leaving [polymarket], append any creds we never saw.
+            if in_polymarket {
+                if !wrote_api_key { out.push(api_line.clone()); wrote_api_key = true; }
+                if !wrote_secret { out.push(secret_line.clone()); wrote_secret = true; }
+                if !wrote_passphrase { out.push(passphrase_line.clone()); wrote_passphrase = true; }
+            }
+            in_polymarket = trimmed.starts_with("[polymarket]");
+            if in_polymarket { found_section = true; }
+            out.push(line.to_string());
+            continue;
+        }
+        if in_polymarket {
+            if trimmed.starts_with("api_key") && trimmed.contains('=') {
+                out.push(api_line.clone());
+                wrote_api_key = true;
+                continue;
+            }
+            if trimmed.starts_with("secret") && trimmed.contains('=') {
+                out.push(secret_line.clone());
+                wrote_secret = true;
+                continue;
+            }
+            if trimmed.starts_with("passphrase") && trimmed.contains('=') {
+                out.push(passphrase_line.clone());
+                wrote_passphrase = true;
+                continue;
+            }
+        }
+        out.push(line.to_string());
     }
-    let updated = toml::to_string_pretty(&doc)?;
+
+    // EOF reached while still in [polymarket] — flush any missing keys.
+    if in_polymarket {
+        if !wrote_api_key { out.push(api_line); }
+        if !wrote_secret { out.push(secret_line); }
+        if !wrote_passphrase { out.push(passphrase_line); }
+    }
+
+    if !found_section {
+        anyhow::bail!("[polymarket] section not found in {}", config_path.display());
+    }
+
+    let mut updated = out.join("\n");
+    if raw.ends_with('\n') && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
     tokio::fs::write(config_path, updated).await?;
     Ok(())
 }
@@ -2033,29 +2089,41 @@ fn set_runner_status(store: &Arc<StrategyRunnerStore>, id: &str, status: &str) {
     store.persist();
 }
 
-/// Fetch USDC trading balance from Polymarket CLOB API.
+/// Fetch USDC/pUSD trading balance from Polymarket CLOB API + Polygon RPC.
+/// Combines both sources because the CLOB API may not report pUSD balance
+/// (Polymarket migrated from USDC.e to pUSD). Uses the higher of the two.
 async fn fetch_usdc_balance_clob(client: &polymarket_trader::orders::ClobClient) -> Option<f64> {
-    // Prefer CLOB API balance (always works as long as L2 auth is valid).
-    // Fall back to Polygon RPC only if the API call fails.
-    match client.get_api_balance().await {
-        Ok(api_bal) => {
-            tracing::info!("Polymarket CLOB API balance: ${:.2}", api_bal);
-            return Some(api_bal);
+    let api_bal = match client.get_api_balance().await {
+        Ok(b) => {
+            tracing::info!("Polymarket CLOB API balance: ${:.2}", b);
+            Some(b)
         }
         Err(e) => {
             tracing::warn!("Failed to fetch Polymarket CLOB API balance: {e}");
-        }
-    }
-
-    match client.get_balance().await {
-        Ok(bal) => {
-            tracing::info!("Polymarket CLOB RPC balance: ${:.2}", bal);
-            Some(bal)
-        }
-        Err(e) => {
-            tracing::warn!("Failed to fetch Polymarket CLOB RPC balance: {e}");
             None
         }
+    };
+
+    let rpc_bal = match client.get_balance().await {
+        Ok(b) => {
+            tracing::info!("Polymarket Polygon RPC balance: ${:.2}", b);
+            Some(b)
+        }
+        Err(e) => {
+            tracing::warn!("Failed to fetch Polymarket Polygon RPC balance: {e}");
+            None
+        }
+    };
+
+    match (api_bal, rpc_bal) {
+        (Some(a), Some(r)) => {
+            let best = a.max(r);
+            tracing::info!("Polymarket combined balance (CLOB ${:.2} vs RPC ${:.2}): ${:.2}", a, r, best);
+            Some(best)
+        }
+        (Some(a), None) => Some(a),
+        (None, Some(r)) => Some(r),
+        (None, None) => None,
     }
 }
 

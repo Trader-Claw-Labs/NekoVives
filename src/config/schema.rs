@@ -949,6 +949,12 @@ pub struct PolymarketConfig {
     /// When set, orders are signed with proxy signature_type=1 and maker/signer use this address.
     #[serde(default)]
     pub proxy_address: Option<String>,
+    /// Override EIP-712 signature type for order signing.
+    /// Values: "eoa" | "proxy" | "gnosis_safe".
+    /// Set to "eoa" if you get order_version_mismatch errors and you use a plain
+    /// private key without a Polymarket proxy/safe wallet.
+    #[serde(default)]
+    pub signature_type: Option<String>,
 }
 
 // ── Chainlink Data Streams ──────────────────────────────────────

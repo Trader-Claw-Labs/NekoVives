@@ -956,7 +956,7 @@ function LowBalanceModal({
 
           <div className="rounded p-3 border space-y-2" style={{ backgroundColor: 'var(--color-base)', borderColor: 'var(--color-border)' }}>
             <div className="text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>
-              Send USDC.e (Polygon) to your wallet:
+              Send USDC.e or pUSD (Polygon) to your wallet:
             </div>
             <div className="flex items-center gap-2">
               <code className="flex-1 px-2 py-1.5 rounded text-xs break-all" style={{ backgroundColor: 'rgba(0,0,0,0.2)' }}>
