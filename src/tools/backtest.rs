@@ -3438,8 +3438,9 @@ pub fn run_polymarket_live_signal(
     struct LiveState {
         pending_buy: bool,
         pending_sell: bool,
+        size: f64,
     }
-    let state = Arc::new(Mutex::new(LiveState { pending_buy: false, pending_sell: false }));
+    let state = Arc::new(Mutex::new(LiveState { pending_buy: false, pending_sell: false, size: 0.0 }));
 
     let mut engine = Engine::new();
     engine.set_max_operations(500_000);
@@ -3522,12 +3523,16 @@ pub fn run_polymarket_live_signal(
     engine.register_fn("log_impl", |_msg: rhai::Dynamic| {});
 
     let sb = state.clone();
-    engine.register_fn("buy_impl", move |_frac: f64| {
-        sb.lock().unwrap().pending_buy = true;
+    engine.register_fn("buy_impl", move |frac: f64| {
+        let mut s = sb.lock().unwrap();
+        s.pending_buy = true;
+        s.size = frac;
     });
     let ss = state.clone();
-    engine.register_fn("sell_impl", move |_frac: f64| {
-        ss.lock().unwrap().pending_sell = true;
+    engine.register_fn("sell_impl", move |frac: f64| {
+        let mut s = ss.lock().unwrap();
+        s.pending_sell = true;
+        s.size = frac;
     });
     // Seed the kv with only non-debug state from the previous window.
     // If the script early-returns, stale debug_* values must not leak
@@ -3594,7 +3599,7 @@ pub fn run_polymarket_live_signal(
     let debug = kv_final.clone();
     Ok(LiveSignalResult {
         signal,
-        size: 0.25,
+        size: s.size,
         debug,
         kv_state: kv_final,
     })
@@ -3683,12 +3688,14 @@ pub fn run_polymarket_bt_signal_preview(
         kv:           std::collections::HashMap<String, f64>,
         pending_buy:  bool,
         pending_sell: bool,
+        size:         f64,
     }
     let state = Arc::new(Mutex::new(PreviewState {
         balance: initial_balance,
         kv: std::collections::HashMap::new(),
         pending_buy: false,
         pending_sell: false,
+        size: 0.0,
     }));
 
     let cur_idx = Arc::new(Mutex::new(0usize));
@@ -3770,14 +3777,16 @@ pub fn run_polymarket_bt_signal_preview(
     engine.register_fn("log_impl", |_msg: rhai::Dynamic| {});
 
     let sb = state.clone();
-    engine.register_fn("buy_impl", move |_frac: f64| {
+    engine.register_fn("buy_impl", move |frac: f64| {
         let mut s = sb.lock().unwrap();
         if !s.pending_buy && !s.pending_sell { s.pending_buy = true; }
+        s.size = frac;
     });
     let ss = state.clone();
-    engine.register_fn("sell_impl", move |_frac: f64| {
+    engine.register_fn("sell_impl", move |frac: f64| {
         let mut s = ss.lock().unwrap();
         if !s.pending_buy && !s.pending_sell { s.pending_sell = true; }
+        s.size = frac;
     });
     let sset = state.clone();
     engine.register_fn("set_impl", move |key: String, val: f64| {
@@ -3825,7 +3834,7 @@ pub fn run_polymarket_bt_signal_preview(
 
         {
             let mut s = state.lock().unwrap();
-            s.pending_buy = false; s.pending_sell = false;
+            s.pending_buy = false; s.pending_sell = false; s.size = 0.0;
         }
         *cur_idx.lock().unwrap() = dec_idx;
 
@@ -3867,7 +3876,7 @@ pub fn run_polymarket_bt_signal_preview(
         let s = state.lock().unwrap();
         return Ok(LiveSignalResult {
             signal: "flat".to_string(),
-            size: 0.25,
+            size: s.size,
             debug: s.kv.clone(),
             kv_state: s.kv.clone(),
         });
@@ -3930,7 +3939,7 @@ pub fn run_polymarket_bt_signal_preview(
     };
     Ok(LiveSignalResult {
         signal,
-        size: 0.25,
+        size: s.size,
         debug: s.kv.clone(),
         kv_state: s.kv.clone(),
     })
