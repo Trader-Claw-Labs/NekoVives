@@ -7,7 +7,7 @@ import {
   FlaskConical, Play, FileCode2, BarChart2, TrendingDown,
   AlertCircle, ChevronDown, ChevronRight, RefreshCw, Trash2,
   Pencil, Save, X, FolderOpen, Activity, Check, Eye, Code2,
-  Info, Zap, ArrowUpDown, ListChecks,
+  Info, Zap, ArrowUpDown, ListChecks, Database, TrendingUp,
 } from 'lucide-react'
 import clsx from 'clsx'
 
@@ -424,6 +424,67 @@ function ResultPanel({ result }: { result: BacktestResult }) {
             sub="called direction correctly"
             color={result.correct_direction_pct! >= 50 ? 'var(--color-accent)' : 'var(--color-warning)'}
           />
+        </div>
+      )}
+
+      {/* Historical Data Indicator */}
+      {isBinary && result.windows_with_real_price != null && result.windows_with_real_price > 0 && (
+        <div
+          className="rounded-lg border p-3 text-sm"
+          style={{
+            backgroundColor: 'rgba(34, 197, 94, 0.08)',
+            borderColor: 'rgba(34, 197, 94, 0.35)',
+          }}
+        >
+          <div className="flex items-center gap-2 mb-1">
+            <Database size={14} style={{ color: '#22c55e', flexShrink: 0 }} />
+            <span className="font-semibold" style={{ color: '#22c55e' }}>
+              Real On-Chain Data
+            </span>
+            <span
+              className="px-1.5 py-0.5 rounded text-[10px] font-bold uppercase"
+              style={{ backgroundColor: 'rgba(34, 197, 94, 0.15)', color: '#22c55e' }}
+            >
+              {result.historical_data_coverage_pct != null
+                ? `${result.historical_data_coverage_pct.toFixed(1)}% coverage`
+                : `${result.windows_with_real_price.toLocaleString()} windows`}
+            </span>
+          </div>
+          <div className="text-xs" style={{ color: 'var(--color-text-muted)' }}>
+            {result.windows_with_real_price.toLocaleString()} windows used real CLOB token prices
+            {result.windows_with_estimated_price != null && result.windows_with_estimated_price > 0
+              ? ` · ${result.windows_with_estimated_price.toLocaleString()} estimated from momentum model`
+              : ''}
+            {result.recommended_max_stake_usd != null && (
+              <span className="ml-1">
+                {' · '}
+                <span style={{ color: 'var(--color-accent)' }}>
+                  Recommended max stake: ${result.recommended_max_stake_usd.toLocaleString()}
+                </span>
+                {' (based on observed liquidity)'}
+              </span>
+            )}
+          </div>
+        </div>
+      )}
+      {isBinary && result.windows_with_real_price != null && result.windows_with_real_price === 0 && (
+        <div
+          className="rounded-lg border p-3 text-sm"
+          style={{
+            backgroundColor: 'rgba(234, 179, 8, 0.06)',
+            borderColor: 'rgba(234, 179, 8, 0.25)',
+          }}
+        >
+          <div className="flex items-center gap-2">
+            <AlertCircle size={14} style={{ color: '#eab308', flexShrink: 0 }} />
+            <span style={{ color: 'var(--color-text-muted)' }}>
+              No historical on-chain data available. All prices estimated from momentum model.
+              {' '}
+              <span className="font-semibold" style={{ color: '#eab308' }}>
+                Run: trader-claw backtest-sync --series btc_5m --from YYYY-MM-DD --to YYYY-MM-DD
+              </span>
+            </span>
+          </div>
         </div>
       )}
 

@@ -2620,6 +2620,7 @@ pub async fn handle_api_telegram_configure(
         draft_update_interval_ms: 1500,
         interrupt_on_new_message: false,
         mention_only: false,
+        chat_id: None,
     });
     tg.bot_token = token;
     if let Some(users) = body.allowed_users {
@@ -4135,7 +4136,7 @@ pub async fn handle_api_live_create(
             Some("fixed") => crate::strategy_runner::LiveSizingMode::Fixed,
             _ => crate::strategy_runner::LiveSizingMode::Percent,
         },
-        live_sizing_value: body.live_sizing_value.unwrap_or(0.05),
+        live_sizing_value: body.live_sizing_value.unwrap_or(5.0), // stored as 0–100 percent
         stop_loss_pct: body.stop_loss_pct.filter(|&v| v > 0.0),
         early_fire_secs: body.early_fire_secs.or_else(|| {
             let v = state.config.lock().live_strategy.early_fire_secs;

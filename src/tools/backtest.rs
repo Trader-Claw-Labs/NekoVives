@@ -420,6 +420,17 @@ pub struct BacktestMetrics {
     // Number of Polymarket market windows tested (slug-aligned binary mode only)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub markets_tested: Option<u32>,
+    /// How many windows used real on-chain token prices vs momentum model estimates.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub windows_with_real_price: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub windows_with_estimated_price: Option<u32>,
+    /// % of tested windows that had real historical data (0-100).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub historical_data_coverage_pct: Option<f64>,
+    /// Data-driven max stake recommendation based on observed liquidity in historical dataset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recommended_max_stake_usd: Option<f64>,
     /// Debug values captured for flat (no-trade) windows, keyed by timestamp.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub flat_debugs: Vec<(String, std::collections::HashMap<String, f64>)>,
@@ -1691,6 +1702,10 @@ let ctx = #{
             eng2.register_fn("set_impl", move |key: String, val: f64| {
                 sset.lock().unwrap().kv.insert(key, val);
             });
+            let sset_i = state_set.clone();
+            eng2.register_fn("set_impl", move |key: String, val: i64| {
+                sset_i.lock().unwrap().kv.insert(key, val as f64);
+            });
             let sget = state_get.clone();
             eng2.register_fn("get_impl", move |key: String, default: f64| -> f64 {
                 sget.lock().unwrap().kv.get(&key).copied().unwrap_or(default)
@@ -1998,7 +2013,12 @@ on_candle(ctx);
         avg_token_price: None,
         correct_direction_pct: None,
         break_even_win_rate: None,
-        markets_tested: None, flat_debugs: vec![],
+        markets_tested: None,
+        windows_with_real_price: None,
+        windows_with_estimated_price: None,
+        historical_data_coverage_pct: None,
+        recommended_max_stake_usd: None,
+        flat_debugs: vec![],
     })
 }
 
@@ -2438,6 +2458,10 @@ fn run_polymarket_binary_backtest(
         eng.register_fn("set_impl", move |key: String, val: f64| {
             sset.lock().unwrap().kv.insert(key, val);
         });
+        let sset_i = state.clone();
+        eng.register_fn("set_impl", move |key: String, val: i64| {
+            sset_i.lock().unwrap().kv.insert(key, val as f64);
+        });
         let sget = state.clone();
         eng.register_fn("get_impl", move |key: String, def: f64| -> f64 {
             sget.lock().unwrap().kv.get(&key).copied().unwrap_or(def)
@@ -2589,7 +2613,12 @@ on_candle(ctx);
         avg_token_price,
         correct_direction_pct,
         break_even_win_rate,
-        markets_tested: None, flat_debugs: vec![],
+        markets_tested: None,
+        windows_with_real_price: None,
+        windows_with_estimated_price: None,
+        historical_data_coverage_pct: None,
+        recommended_max_stake_usd: None,
+        flat_debugs: vec![],
     })
 }
 
@@ -2707,6 +2736,29 @@ fn run_polymarket_slug_backtest(
     let mut windows_with_estimated_price: u32 = 0;
     let mut sum_real_token_price: f64 = 0.0;
     let mut sum_estimated_token_price: f64 = 0.0;
+
+    // Compute data-driven max stake recommendation from observed historical prices
+    // before consuming historical_data. Liquidity is highest near 0.50 and drops at extremes.
+    let recommended_max_stake = if let Some(ref hist) = historical_data {
+        let mut liquidity_scores: Vec<f64> = hist.values()
+            .filter_map(|w| w.yes_token_price)
+            .map(|p| {
+                let dist = (p - 0.50).abs();
+                let liq_factor = (1.0 - dist * 1.8).max(0.1);
+                500.0 + 2500.0 * liq_factor
+            })
+            .collect();
+        if !liquidity_scores.is_empty() {
+            liquidity_scores.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let idx = liquidity_scores.len() / 4;
+            Some(liquidity_scores[idx].round())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let historical = historical_data.unwrap_or_default();
 
     // ── Build engine ONCE — compile AST once, reuse across all windows ────────
@@ -2801,6 +2853,10 @@ fn run_polymarket_slug_backtest(
     let sset = state.clone();
     engine.register_fn("set_impl", move |key: String, val: f64| {
         sset.lock().unwrap().kv.insert(key, val);
+    });
+    let sset_i = state.clone();
+    engine.register_fn("set_impl", move |key: String, val: i64| {
+        sset_i.lock().unwrap().kv.insert(key, val as f64);
     });
     let sget = state.clone();
     engine.register_fn("get_impl", move |key: String, def: f64| -> f64 {
@@ -3024,6 +3080,12 @@ fn run_polymarket_slug_backtest(
         " | All prices estimated from momentum model".to_string()
     };
 
+    let coverage_pct = if markets_tested > 0 {
+        Some((windows_with_real_price as f64 / markets_tested as f64) * 100.0)
+    } else {
+        None
+    };
+
     let analysis = format!(
         "[{markets_tested} markets btc-updown-{window_minutes}m \u{00b7} decision @ minuto {dm}] {base_analysis}{historical_price_note}"
     );
@@ -3041,6 +3103,10 @@ fn run_polymarket_slug_backtest(
         correct_direction_pct,
         break_even_win_rate,
         markets_tested: Some(markets_tested),
+        windows_with_real_price: Some(windows_with_real_price as u32),
+        windows_with_estimated_price: Some(windows_with_estimated_price as u32),
+        historical_data_coverage_pct: coverage_pct,
+        recommended_max_stake_usd: recommended_max_stake,
         flat_debugs,
     })
 }
@@ -3083,7 +3149,8 @@ pub async fn run_backtest_engine(
                 total_return_pct: 0.0, sharpe_ratio: 0.0, max_drawdown_pct: 0.0,
                 win_rate_pct: 0.0, total_trades: 0, worst_trades: vec![], all_trades: vec![],
                 avg_token_price: None, correct_direction_pct: None, break_even_win_rate: None,
-                markets_tested: None, flat_debugs: vec![],
+                markets_tested: None, windows_with_real_price: None, windows_with_estimated_price: None,
+                historical_data_coverage_pct: None, recommended_max_stake_usd: None, flat_debugs: vec![],
                 analysis: format!("Error reading script: {e}"),
             };
         }
@@ -3105,13 +3172,13 @@ pub async fn run_backtest_engine(
                 Ok(_) => return BacktestMetrics {
                     total_return_pct: 0.0, sharpe_ratio: 0.0, max_drawdown_pct: 0.0,
                     win_rate_pct: 0.0, total_trades: 0, worst_trades: vec![], all_trades: vec![],
-                    avg_token_price: None, correct_direction_pct: None, break_even_win_rate: None, markets_tested: None, flat_debugs: vec![],
+                    avg_token_price: None, correct_direction_pct: None, break_even_win_rate: None, markets_tested: None, windows_with_real_price: None, windows_with_estimated_price: None, historical_data_coverage_pct: None, recommended_max_stake_usd: None, flat_debugs: vec![],
                     analysis: format!("No weather data from Open-Meteo for '{symbol}' ({from_date}->{to_date}). Check city name."),
                 },
                 Err(e) => return BacktestMetrics {
                     total_return_pct: 0.0, sharpe_ratio: 0.0, max_drawdown_pct: 0.0,
                     win_rate_pct: 0.0, total_trades: 0, worst_trades: vec![], all_trades: vec![],
-                    avg_token_price: None, correct_direction_pct: None, break_even_win_rate: None, markets_tested: None, flat_debugs: vec![],
+                    avg_token_price: None, correct_direction_pct: None, break_even_win_rate: None, markets_tested: None, windows_with_real_price: None, windows_with_estimated_price: None, historical_data_coverage_pct: None, recommended_max_stake_usd: None, flat_debugs: vec![],
                     analysis: format!("Failed to fetch Open-Meteo data: {e}"),
                 },
             }
@@ -3122,13 +3189,13 @@ pub async fn run_backtest_engine(
                 Ok(_) => return BacktestMetrics {
                     total_return_pct: 0.0, sharpe_ratio: 0.0, max_drawdown_pct: 0.0,
                     win_rate_pct: 0.0, total_trades: 0, worst_trades: vec![], all_trades: vec![],
-                    avg_token_price: None, correct_direction_pct: None, break_even_win_rate: None, markets_tested: None, flat_debugs: vec![],
+                    avg_token_price: None, correct_direction_pct: None, break_even_win_rate: None, markets_tested: None, windows_with_real_price: None, windows_with_estimated_price: None, historical_data_coverage_pct: None, recommended_max_stake_usd: None, flat_debugs: vec![],
                     analysis: format!("No 1m candle data from Binance for {symbol} ({from_date}->{to_date}). Check symbol."),
                 },
                 Err(e) => return BacktestMetrics {
                     total_return_pct: 0.0, sharpe_ratio: 0.0, max_drawdown_pct: 0.0,
                     win_rate_pct: 0.0, total_trades: 0, worst_trades: vec![], all_trades: vec![],
-                    avg_token_price: None, correct_direction_pct: None, break_even_win_rate: None, markets_tested: None, flat_debugs: vec![],
+                    avg_token_price: None, correct_direction_pct: None, break_even_win_rate: None, markets_tested: None, windows_with_real_price: None, windows_with_estimated_price: None, historical_data_coverage_pct: None, recommended_max_stake_usd: None, flat_debugs: vec![],
                     analysis: format!("Failed to fetch Binance data: {e}"),
                 },
             }
@@ -3169,7 +3236,8 @@ pub async fn run_backtest_engine(
                     total_return_pct: 0.0, sharpe_ratio: 0.0, max_drawdown_pct: 0.0,
                     win_rate_pct: 0.0, total_trades: 0, worst_trades: vec![], all_trades: vec![],
                     avg_token_price: None, correct_direction_pct: None, break_even_win_rate: None,
-                    markets_tested: None, flat_debugs: vec![],
+                    markets_tested: None, windows_with_real_price: None, windows_with_estimated_price: None,
+                historical_data_coverage_pct: None, recommended_max_stake_usd: None, flat_debugs: vec![],
                     analysis: format!("Binary slug engine error: {e}"),
                 }
             }
@@ -3177,7 +3245,8 @@ pub async fn run_backtest_engine(
                 total_return_pct: 0.0, sharpe_ratio: 0.0, max_drawdown_pct: 0.0,
                 win_rate_pct: 0.0, total_trades: 0, worst_trades: vec![], all_trades: vec![],
                 avg_token_price: None, correct_direction_pct: None, break_even_win_rate: None,
-                markets_tested: None, flat_debugs: vec![],
+                markets_tested: None, windows_with_real_price: None, windows_with_estimated_price: None,
+                historical_data_coverage_pct: None, recommended_max_stake_usd: None, flat_debugs: vec![],
                 analysis: format!("Binary slug task panicked: {e}"),
             },
         };
@@ -3196,7 +3265,8 @@ pub async fn run_backtest_engine(
                     total_return_pct: 0.0, sharpe_ratio: 0.0, max_drawdown_pct: 0.0,
                     win_rate_pct: 0.0, total_trades: 0, worst_trades: vec![], all_trades: vec![],
                     avg_token_price: None, correct_direction_pct: None, break_even_win_rate: None,
-                    markets_tested: None, flat_debugs: vec![],
+                    markets_tested: None, windows_with_real_price: None, windows_with_estimated_price: None,
+                historical_data_coverage_pct: None, recommended_max_stake_usd: None, flat_debugs: vec![],
                     analysis: format!(
                         "Could not fetch historical data from Polymarket: {e}. \
                         Ensure the condition ID is valid."
@@ -3224,7 +3294,8 @@ pub async fn run_backtest_engine(
                         "No candle data returned from Binance for {symbol} ({from_date}→{to_date}). \
                         Check the symbol name and date range."
                     ),
-                    markets_tested: None, flat_debugs: vec![],
+                    markets_tested: None, windows_with_real_price: None, windows_with_estimated_price: None,
+                historical_data_coverage_pct: None, recommended_max_stake_usd: None, flat_debugs: vec![],
                 };
             }
             Err(e) => {
@@ -3233,7 +3304,8 @@ pub async fn run_backtest_engine(
                     total_return_pct: 0.0, sharpe_ratio: 0.0, max_drawdown_pct: 0.0,
                     win_rate_pct: 0.0, total_trades: 0, worst_trades: vec![], all_trades: vec![],
                     avg_token_price: None, correct_direction_pct: None, break_even_win_rate: None,
-                    markets_tested: None, flat_debugs: vec![],
+                    markets_tested: None, windows_with_real_price: None, windows_with_estimated_price: None,
+                historical_data_coverage_pct: None, recommended_max_stake_usd: None, flat_debugs: vec![],
                     analysis: format!(
                         "Could not fetch historical data from Binance: {e}. \
                         Ensure the gateway has internet access."
@@ -3275,7 +3347,8 @@ pub async fn run_backtest_engine(
                 total_return_pct: 0.0, sharpe_ratio: 0.0, max_drawdown_pct: 0.0,
                 win_rate_pct: 0.0, total_trades: 0, worst_trades: vec![], all_trades: vec![],
                 avg_token_price: None, correct_direction_pct: None, break_even_win_rate: None,
-                markets_tested: None, flat_debugs: vec![],
+                markets_tested: None, windows_with_real_price: None, windows_with_estimated_price: None,
+                historical_data_coverage_pct: None, recommended_max_stake_usd: None, flat_debugs: vec![],
                 analysis: format!("Rhai execution error: {e}"),
             }
         }
@@ -3285,7 +3358,8 @@ pub async fn run_backtest_engine(
                 total_return_pct: 0.0, sharpe_ratio: 0.0, max_drawdown_pct: 0.0,
                 win_rate_pct: 0.0, total_trades: 0, worst_trades: vec![], all_trades: vec![],
                 avg_token_price: None, correct_direction_pct: None, break_even_win_rate: None,
-                markets_tested: None, flat_debugs: vec![],
+                markets_tested: None, windows_with_real_price: None, windows_with_estimated_price: None,
+                historical_data_coverage_pct: None, recommended_max_stake_usd: None, flat_debugs: vec![],
                 analysis: format!("Backtest task panicked: {e}"),
             }
         }
@@ -3309,7 +3383,8 @@ pub fn run_rhai_on_candle_buffer(
             total_return_pct: 0.0, sharpe_ratio: 0.0, max_drawdown_pct: 0.0,
             win_rate_pct: 0.0, total_trades: 0, worst_trades: vec![], all_trades: vec![],
             avg_token_price: None, correct_direction_pct: None, break_even_win_rate: None,
-            markets_tested: None, flat_debugs: vec![],
+            markets_tested: None, windows_with_real_price: None, windows_with_estimated_price: None,
+            historical_data_coverage_pct: None, recommended_max_stake_usd: None, flat_debugs: vec![],
             analysis: format!("Strategy error: {e}"),
         })
 }
@@ -3364,7 +3439,7 @@ pub fn run_polymarket_live_signal(
     candles: Vec<Candle>,
     window_minutes: usize,
     decision_minute: Option<i64>,
-    _yes_token_price: f64, // real CLOB price kept for API compatibility; strategy uses momentum model
+    yes_token_price: f64,
     kv_seed: &std::collections::HashMap<String, f64>,
 ) -> anyhow::Result<LiveSignalResult> {
     use rhai::{Engine, Scope};
@@ -3547,6 +3622,10 @@ pub fn run_polymarket_live_signal(
     engine.register_fn("set_impl", move |key: String, val: f64| {
         kv_set.lock().unwrap().insert(key, val);
     });
+    let kv_set_i = kv.clone();
+    engine.register_fn("set_impl", move |key: String, val: i64| {
+        kv_set_i.lock().unwrap().insert(key, val as f64);
+    });
     let kv_get = kv.clone();
     engine.register_fn("get_impl", move |key: String, def: f64| -> f64 {
         kv_get.lock().unwrap().get(&key).copied().unwrap_or(def)
@@ -3555,13 +3634,16 @@ pub fn run_polymarket_live_signal(
     let ast = engine.compile(&patched_script)
         .map_err(|e| anyhow::anyhow!("Script compile error (patched): {e}"))?;
 
-    // Use the same momentum-derived token price model as the backtest so that
-    // live decisions match backtest decisions. The real CLOB price is only used
-    // for order execution sizing, not for strategy logic.
-    let delta_abs = if window_open > 0.0 {
-        ((dec.close - window_open) / window_open * 100.0).abs()
-    } else { 0.0 };
-    let momentum_token_price = polymarket_token_price(delta_abs);
+    // Use the real CLOB price when available (matches slug backtest behaviour).
+    // Fall back to the momentum model only if the caller couldn't fetch a price.
+    let token_price_for_ctx = if yes_token_price > 0.0 && yes_token_price < 1.0 {
+        yes_token_price
+    } else {
+        let delta_abs = if window_open > 0.0 {
+            ((dec.close - window_open) / window_open * 100.0).abs()
+        } else { 0.0 };
+        polymarket_token_price(delta_abs)
+    };
 
     let mut ctx_map = rhai::Map::new();
     ctx_map.insert("close".into(),          rhai::Dynamic::from(dec.close));
@@ -3577,7 +3659,7 @@ pub fn run_polymarket_live_signal(
     ctx_map.insert("open_positions".into(),  rhai::Dynamic::from(0i64));
     ctx_map.insert("window_open".into(),      rhai::Dynamic::from(window_open));
     ctx_map.insert("window_minutes".into(),   rhai::Dynamic::from(window_minutes as i64));
-    ctx_map.insert("token_price".into(),      rhai::Dynamic::from(momentum_token_price));
+    ctx_map.insert("token_price".into(),      rhai::Dynamic::from(token_price_for_ctx));
     ctx_map.insert("threshold".into(),        rhai::Dynamic::from(0.0_f64));
     ctx_map.insert("resolution_value".into(), rhai::Dynamic::from(dec.close));
     ctx_map.insert("value".into(),            rhai::Dynamic::from(dec.close));
@@ -3792,6 +3874,10 @@ pub fn run_polymarket_bt_signal_preview(
     engine.register_fn("set_impl", move |key: String, val: f64| {
         sset.lock().unwrap().kv.insert(key, val);
     });
+    let sset_i = state.clone();
+    engine.register_fn("set_impl", move |key: String, val: i64| {
+        sset_i.lock().unwrap().kv.insert(key, val as f64);
+    });
     let sget = state.clone();
     engine.register_fn("get_impl", move |key: String, def: f64| -> f64 {
         sget.lock().unwrap().kv.get(&key).copied().unwrap_or(def)
@@ -3975,7 +4061,8 @@ pub fn run_polymarket_binary_on_candle_buffer(
         total_return_pct: 0.0, sharpe_ratio: 0.0, max_drawdown_pct: 0.0,
         win_rate_pct: 0.0, total_trades: 0, worst_trades: vec![], all_trades: vec![],
         avg_token_price: None, correct_direction_pct: None, break_even_win_rate: None,
-        markets_tested: None, flat_debugs: vec![],
+        markets_tested: None, windows_with_real_price: None, windows_with_estimated_price: None,
+        historical_data_coverage_pct: None, recommended_max_stake_usd: None, flat_debugs: vec![],
         analysis: format!("Polymarket strategy error: {e}"),
     })
 }

@@ -2897,6 +2897,12 @@ pub struct TelegramConfig {
     pub bot_token: String,
     /// Allowed Telegram user IDs or usernames. Empty = deny all.
     pub allowed_users: Vec<String>,
+    /// Default Telegram chat ID to use as delivery target when a cron job's
+    /// `delivery.to` is not set. Set this to your personal chat ID so the agent
+    /// can send scheduled notifications without needing an explicit recipient.
+    /// You can find your chat ID by messaging @userinfobot on Telegram.
+    #[serde(default)]
+    pub chat_id: Option<String>,
     /// Streaming mode for progressive response delivery via message edits.
     #[serde(default)]
     pub stream_mode: StreamMode,

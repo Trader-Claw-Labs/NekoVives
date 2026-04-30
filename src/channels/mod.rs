@@ -2647,18 +2647,19 @@ fn collect_configured_channels(config: &Config) -> Vec<ConfiguredChannel> {
     let mut channels = Vec::new();
 
     if let Some(ref tg) = config.channels_config.telegram {
+        let mut tg_channel = TelegramChannel::new(
+            tg.bot_token.clone(),
+            tg.allowed_users.clone(),
+            tg.mention_only,
+        )
+        .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
+        .with_transcription(config.transcription.clone())
+        .with_workspace_dir(config.workspace_dir.clone())
+        .with_config_path(config.config_path.clone());
+
         channels.push(ConfiguredChannel {
             display_name: "Telegram",
-            channel: Arc::new(
-                TelegramChannel::new(
-                    tg.bot_token.clone(),
-                    tg.allowed_users.clone(),
-                    tg.mention_only,
-                )
-                .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
-                .with_transcription(config.transcription.clone())
-                .with_workspace_dir(config.workspace_dir.clone()),
-            ),
+            channel: Arc::new(tg_channel),
         });
     }
 

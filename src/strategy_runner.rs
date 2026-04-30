@@ -1501,7 +1501,8 @@ async fn execute_live_polymarket_signal(
                     amt
                 }
                 LiveSizingMode::Percent => {
-                    let max_frac = config.live_sizing_value.max(0.0).min(1.0);
+                    // live_sizing_value is stored as 0–100 (e.g. 5 = 5%); convert to 0–1 fraction
+                    let max_frac = (config.live_sizing_value / 100.0).max(0.0).min(1.0);
                     let frac = script_frac.clamp(0.0, max_frac);
                     let amt = (bal * frac).max(5.0).round();
                     tracing::info!(
@@ -1523,7 +1524,8 @@ async fn execute_live_polymarket_signal(
                     amt
                 }
                 LiveSizingMode::Percent => {
-                    let max_frac = config.live_sizing_value.max(0.0).min(1.0);
+                    // live_sizing_value is stored as 0–100 (e.g. 5 = 5%); convert to 0–1 fraction
+                    let max_frac = (config.live_sizing_value / 100.0).max(0.0).min(1.0);
                     let frac = script_frac.clamp(0.0, max_frac);
                     let amt = (bal * frac).max(5.0).round().min(bal);
                     tracing::info!(

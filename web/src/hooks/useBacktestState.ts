@@ -98,6 +98,11 @@ export interface BacktestResult {
   correct_direction_pct?: number
   break_even_win_rate?: number
   markets_tested?: number
+  // Historical data usage tracking
+  windows_with_real_price?: number
+  windows_with_estimated_price?: number
+  historical_data_coverage_pct?: number
+  recommended_max_stake_usd?: number
 }
 
 export interface ProgressState {
