@@ -341,7 +341,7 @@ impl Tool for BacktestRunTool {
         // Run the real Rhai backtest engine
         let metrics = run_backtest_engine(
             &script_path, market_type, symbol, interval, from_date, to_date,
-            initial_balance, fee_pct, "price_up", None, None, None, "percent", 1.0, &self.workspace_dir
+            initial_balance, fee_pct, "price_up", None, None, None, "percent", 1.0, "historical", &self.workspace_dir
         ).await;
 
         let worst_trades_text = metrics
@@ -2650,6 +2650,7 @@ fn run_polymarket_slug_backtest(
     max_entry_price: Option<f64>,
     sizing_mode: &str,
     sizing_value: f64,
+    price_mode: &str,
     historical_data: Option<HashMap<i64, HistoricalMarketWindow>>,
 ) -> anyhow::Result<BacktestMetrics> {
     use rhai::{Engine, Scope};
@@ -2869,9 +2870,11 @@ fn run_polymarket_slug_backtest(
 
     let mut window_ts = first_window;
     while window_ts + window_secs <= last_ts {
-        // For a 5m window: minute0=T, decision=T+180s, resolution=T+240s
+        // For a 5m window starting at T:
+        //   decision candle  open=T+240s close=T+300s  (ctx.close = last candle)
+        //   resolution uses the same candle's close (res_close = decision close)
         let minute0_ts    = window_ts;
-        let decision_ts   = window_ts + ((window_minutes as i64) - 2) * 60;
+        let decision_ts   = window_ts + ((window_minutes as i64) - 1) * 60;
         let resolution_ts = window_ts + ((window_minutes as i64) - 1) * 60;
         window_ts += window_secs;
 
@@ -2881,7 +2884,8 @@ fn run_polymarket_slug_backtest(
             ts_to_idx.get(&resolution_ts),
         ) else { continue; };
 
-        let window_open       = candles[m0_idx].open;
+        let window_open        = candles[m0_idx].open;
+        let prev_window_close  = if m0_idx > 0 { candles[m0_idx - 1].close } else { window_open };
         let dec               = &candles[dec_idx];
         let res_close         = candles[res_idx].close;
         // Resolution: use logic from the series definition
@@ -2893,27 +2897,36 @@ fn run_polymarket_slug_backtest(
         let resolution_value = res_close;
         let thr_val = threshold.unwrap_or(0.0);
 
-        // Token price: prefer historical on-chain data, fallback to momentum model
-        let (yes_token_price, used_real_price) = match resolution_logic {
-            "threshold_above" | "threshold_below" => (0.50_f64, false),
+        // Token prices: prefer historical on-chain data, fallback to momentum model.
+        // Returns (yes_price, no_price, used_real_price).
+        let (yes_token_price, no_token_price_hist, used_real_price) = match resolution_logic {
+            "threshold_above" | "threshold_below" => (0.50_f64, 0.50_f64, false),
             _ => {
-                // Look up historical data for this window
                 if let Some(hist) = historical.get(&minute0_ts) {
-                    if let Some(real_price) = hist.yes_token_price {
-                        (real_price, true)
+                    if let Some(real_yes) = hist.yes_token_price {
+                        let real_no = hist.no_token_price.unwrap_or(1.0 - real_yes);
+                        if price_mode == "mid" {
+                            let yes_sell = (1.0 - real_no).max(0.01);
+                            let mid_yes  = ((real_yes + yes_sell) / 2.0).clamp(0.01, 0.99);
+                            let no_sell  = (1.0 - real_yes).max(0.01);
+                            let mid_no   = ((real_no + no_sell) / 2.0).clamp(0.01, 0.99);
+                            (mid_yes, mid_no, true)
+                        } else {
+                            (real_yes, real_no, true)
+                        }
                     } else {
-                        // Historical record exists but no price — fallback to estimate
                         let delta_abs = if window_open > 0.0 {
                             ((dec.close - window_open) / window_open * 100.0).abs()
                         } else { 0.0 };
-                        (polymarket_token_price(delta_abs), false)
+                        let est = polymarket_token_price(delta_abs);
+                        (est, 1.0 - est, false)
                     }
                 } else {
-                    // No historical data — use momentum model
                     let delta_abs = if window_open > 0.0 {
                         ((dec.close - window_open) / window_open * 100.0).abs()
                     } else { 0.0 };
-                    (polymarket_token_price(delta_abs), false)
+                    let est = polymarket_token_price(delta_abs);
+                    (est, 1.0 - est, false)
                 }
             }
         };
@@ -2957,7 +2970,8 @@ fn run_polymarket_slug_backtest(
         ctx_map.insert("entry_index".into(),     rhai::Dynamic::from(0i64));
         ctx_map.insert("balance".into(),         rhai::Dynamic::from(cur_balance));
         ctx_map.insert("open_positions".into(),  rhai::Dynamic::from(0i64));
-        ctx_map.insert("window_open".into(),       rhai::Dynamic::from(window_open));
+        ctx_map.insert("window_open".into(),         rhai::Dynamic::from(window_open));
+        ctx_map.insert("prev_window_close".into(),  rhai::Dynamic::from(prev_window_close));
         ctx_map.insert("window_minutes".into(),    rhai::Dynamic::from(window_minutes as i64));
         ctx_map.insert("token_price".into(),       rhai::Dynamic::from(yes_token_price));
         ctx_map.insert("threshold".into(),         rhai::Dynamic::from(thr_val));
@@ -2991,7 +3005,7 @@ fn run_polymarket_slug_backtest(
             };
             // Also enforce minimum order size ($5 USDC per Polymarket API)
             if stake < 5.0 { continue; }
-            let token_p = if bet_up { yes_token_price } else { (1.0 - yes_token_price).max(0.03) };
+            let token_p = if bet_up { yes_token_price } else { no_token_price_hist.max(0.03) };
             // Skip if token price exceeds max entry price threshold
             if let Some(max_ep) = max_entry_price {
                 if token_p > max_ep {
@@ -3130,6 +3144,7 @@ pub async fn run_backtest_engine(
     max_entry_price: Option<f64>,
     sizing_mode: &str,
     sizing_value: f64,
+    price_mode: &str,
     workspace_dir: &std::path::Path,
 ) -> BacktestMetrics {
     tracing::info!(
@@ -3214,10 +3229,11 @@ pub async fn run_backtest_engine(
 
         let script_for_log = script_content.clone();
         let sizing_mode_owned = sizing_mode.to_string();
+        let price_mode_owned = price_mode.to_string();
         let hist_clone = historical_data.clone();
 
         return match tokio::task::spawn_blocking(move || {
-            run_polymarket_slug_backtest(script_content, candles, initial_balance, fee_pct, window_minutes, &rl, thr, max_position_usd, max_entry_price, &sizing_mode_owned, sizing_value, hist_clone)
+            run_polymarket_slug_backtest(script_content, candles, initial_balance, fee_pct, window_minutes, &rl, thr, max_position_usd, max_entry_price, &sizing_mode_owned, sizing_value, &price_mode_owned, hist_clone)
         })
         .await
         {
@@ -3440,6 +3456,8 @@ pub fn run_polymarket_live_signal(
     window_minutes: usize,
     decision_minute: Option<i64>,
     yes_token_price: f64,
+    no_token_price: f64,
+    price_mode: &str,
     kv_seed: &std::collections::HashMap<String, f64>,
 ) -> anyhow::Result<LiveSignalResult> {
     use rhai::{Engine, Scope};
@@ -3634,10 +3652,22 @@ pub fn run_polymarket_live_signal(
     let ast = engine.compile(&patched_script)
         .map_err(|e| anyhow::anyhow!("Script compile error (patched): {e}"))?;
 
+    // Candle just before this window opened (T-1:00 to T+0:00).
+    let prev_window_close = candles.iter()
+        .rev()
+        .find(|c| c.open_time_ms / 1000 < current_window)
+        .map(|c| c.close)
+        .unwrap_or(window_open);
+
     // Use the real CLOB price when available (matches slug backtest behaviour).
     // Fall back to the momentum model only if the caller couldn't fetch a price.
     let token_price_for_ctx = if yes_token_price > 0.0 && yes_token_price < 1.0 {
-        yes_token_price
+        if price_mode == "mid" && no_token_price > 0.0 && no_token_price < 1.0 {
+            let yes_sell = (1.0 - no_token_price).max(0.01);
+            ((yes_token_price + yes_sell) / 2.0).clamp(0.01, 0.99)
+        } else {
+            yes_token_price
+        }
     } else {
         let delta_abs = if window_open > 0.0 {
             ((dec.close - window_open) / window_open * 100.0).abs()
@@ -3657,7 +3687,8 @@ pub fn run_polymarket_live_signal(
     ctx_map.insert("entry_index".into(),     rhai::Dynamic::from(0i64));
     ctx_map.insert("balance".into(),         rhai::Dynamic::from(1000.0_f64));
     ctx_map.insert("open_positions".into(),  rhai::Dynamic::from(0i64));
-    ctx_map.insert("window_open".into(),      rhai::Dynamic::from(window_open));
+    ctx_map.insert("window_open".into(),         rhai::Dynamic::from(window_open));
+    ctx_map.insert("prev_window_close".into(),  rhai::Dynamic::from(prev_window_close));
     ctx_map.insert("window_minutes".into(),   rhai::Dynamic::from(window_minutes as i64));
     ctx_map.insert("token_price".into(),      rhai::Dynamic::from(token_price_for_ctx));
     ctx_map.insert("threshold".into(),        rhai::Dynamic::from(0.0_f64));
@@ -3711,6 +3742,9 @@ pub fn run_polymarket_bt_signal_preview(
     resolution_logic: &str,
     threshold: Option<f64>,
     initial_balance: f64,
+    price_mode: &str,
+    no_token_price: f64,
+    yes_token_price_param: f64,
 ) -> anyhow::Result<LiveSignalResult> {
     use rhai::{Engine, Scope};
     use std::sync::{Arc, Mutex};
@@ -3730,7 +3764,7 @@ pub fn run_polymarket_bt_signal_preview(
     let last_candle_ts = candles.last().unwrap().open_time_ms / 1000;
     let last_close_ts = last_candle_ts + 60;
     let current_window = last_close_ts - (last_close_ts % window_secs);
-    let dec_min = decision_minute.unwrap_or((window_minutes as i64) - 2);
+    let dec_min = decision_minute.unwrap_or((window_minutes as i64) - 1);
 
     let ts_to_idx: std::collections::HashMap<i64, usize> = candles.iter().enumerate()
         .map(|(idx, c)| (c.open_time_ms / 1000, idx))
@@ -3903,12 +3937,13 @@ pub fn run_polymarket_bt_signal_preview(
             ts_to_idx.get(&resolution_ts),
         ) else { continue; };
 
-        let window_open = candles[m0_idx].open;
+        let window_open       = candles[m0_idx].open;
+        let prev_window_close = if m0_idx > 0 { candles[m0_idx - 1].close } else { window_open };
         let dec         = &candles[dec_idx];
         let res_close   = candles[res_idx].close;
         let resolution_value = res_close;
         let thr_val = threshold.unwrap_or(0.0);
-        let yes_token_price = match resolution_logic {
+        let mut yes_token_price = match resolution_logic {
             "threshold_above" | "threshold_below" => 0.50_f64,
             _ => {
                 let delta_abs = if window_open > 0.0 {
@@ -3917,6 +3952,10 @@ pub fn run_polymarket_bt_signal_preview(
                 polymarket_token_price(delta_abs)
             }
         };
+        if price_mode == "mid" && no_token_price > 0.0 && no_token_price < 1.0 {
+            let yes_sell = (1.0 - no_token_price).max(0.01);
+            yes_token_price = ((yes_token_price + yes_sell) / 2.0).clamp(0.01, 0.99);
+        }
 
         {
             let mut s = state.lock().unwrap();
@@ -3937,7 +3976,8 @@ pub fn run_polymarket_bt_signal_preview(
         ctx_map.insert("entry_index".into(),      rhai::Dynamic::from(0i64));
         ctx_map.insert("balance".into(),          rhai::Dynamic::from(cur_balance));
         ctx_map.insert("open_positions".into(),   rhai::Dynamic::from(0i64));
-        ctx_map.insert("window_open".into(),      rhai::Dynamic::from(window_open));
+        ctx_map.insert("window_open".into(),        rhai::Dynamic::from(window_open));
+        ctx_map.insert("prev_window_close".into(), rhai::Dynamic::from(prev_window_close));
         ctx_map.insert("window_minutes".into(),   rhai::Dynamic::from(window_minutes as i64));
         ctx_map.insert("token_price".into(),      rhai::Dynamic::from(yes_token_price));
         ctx_map.insert("threshold".into(),        rhai::Dynamic::from(thr_val));
@@ -3972,16 +4012,28 @@ pub fn run_polymarket_bt_signal_preview(
     let window_open = cur_m0_idx
         .map(|i| candles[i].open)
         .unwrap_or(dec.open);
+    let prev_window_close = cur_m0_idx
+        .and_then(|i| if i > 0 { Some(candles[i - 1].close) } else { None })
+        .unwrap_or(window_open);
     let thr_val = threshold.unwrap_or(0.0);
-    let yes_token_price = match resolution_logic {
-        "threshold_above" | "threshold_below" => 0.50_f64,
-        _ => {
-            let delta_abs = if window_open > 0.0 {
-                ((dec.close - window_open) / window_open * 100.0).abs()
-            } else { 0.0 };
-            polymarket_token_price(delta_abs)
+    let mut yes_token_price = if yes_token_price_param > 0.0 && yes_token_price_param < 1.0 {
+        // Use real CLOB price when available so BT preview matches live signal.
+        yes_token_price_param
+    } else {
+        match resolution_logic {
+            "threshold_above" | "threshold_below" => 0.50_f64,
+            _ => {
+                let delta_abs = if window_open > 0.0 {
+                    ((dec.close - window_open) / window_open * 100.0).abs()
+                } else { 0.0 };
+                polymarket_token_price(delta_abs)
+            }
         }
     };
+    if price_mode == "mid" && no_token_price > 0.0 && no_token_price < 1.0 {
+        let yes_sell = (1.0 - no_token_price).max(0.01);
+        yes_token_price = ((yes_token_price + yes_sell) / 2.0).clamp(0.01, 0.99);
+    }
     // No future candle available — fall back to dec.close so the script can run.
     let resolution_value = dec.close;
 
@@ -4004,7 +4056,8 @@ pub fn run_polymarket_bt_signal_preview(
     ctx_map.insert("entry_index".into(),      rhai::Dynamic::from(0i64));
     ctx_map.insert("balance".into(),          rhai::Dynamic::from(cur_balance));
     ctx_map.insert("open_positions".into(),   rhai::Dynamic::from(0i64));
-    ctx_map.insert("window_open".into(),      rhai::Dynamic::from(window_open));
+    ctx_map.insert("window_open".into(),        rhai::Dynamic::from(window_open));
+    ctx_map.insert("prev_window_close".into(), rhai::Dynamic::from(prev_window_close));
     ctx_map.insert("window_minutes".into(),   rhai::Dynamic::from(window_minutes as i64));
     ctx_map.insert("token_price".into(),      rhai::Dynamic::from(yes_token_price));
     ctx_map.insert("threshold".into(),        rhai::Dynamic::from(thr_val));
@@ -4055,6 +4108,7 @@ pub fn run_polymarket_binary_on_candle_buffer(
         None,
         "percent",
         1.0,
+        "historical",
         None,
     )
     .unwrap_or_else(|e| BacktestMetrics {

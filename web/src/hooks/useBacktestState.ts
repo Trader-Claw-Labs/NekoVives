@@ -69,6 +69,9 @@ export interface BacktestConfig {
   sizing_mode?: 'fixed' | 'percent'
   // Sizing value: USD amount for fixed mode, or max fraction (0-1) for percent mode.
   sizing_value?: number
+  // Price mode for Polymarket binary entry: 'historical' = real scraped price,
+  // 'mid' = average of buy/sell (mid-price).
+  price_mode?: 'historical' | 'mid'
 }
 
 export interface TradeLog {
@@ -144,6 +147,7 @@ const DEFAULT_CONFIG: BacktestConfig = {
   max_position_usd: 500,
   sizing_mode: 'percent',
   sizing_value: 1.0,
+  price_mode: 'historical',
 }
 
 const DEFAULT_STATE: BacktestState = {

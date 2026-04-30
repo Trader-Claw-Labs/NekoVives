@@ -1742,6 +1742,28 @@ export default function Backtesting() {
             />
           </div>
 
+          {/* Price Mode (Polymarket binary only) */}
+          {config.market_type === 'polymarket_binary' && (
+            <div className="lg:col-span-2">
+              <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>
+                Entry Price Mode
+              </label>
+              <select
+                value={config.price_mode ?? 'historical'}
+                onChange={(e) => set('price_mode', e.target.value as 'historical' | 'mid')}
+                className="w-full rounded px-2 py-2 text-sm"
+                style={{
+                  backgroundColor: 'var(--color-surface-2)',
+                  border: '1px solid var(--color-border)',
+                  color: 'var(--color-text)',
+                }}
+              >
+                <option value="historical">Histórico real (CLOB)</option>
+                <option value="mid">Precio medio (bid/ask)</option>
+              </select>
+            </div>
+          )}
+
           {/* Sizing Mode */}
           <div className="lg:col-span-2">
             <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>

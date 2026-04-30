@@ -84,6 +84,10 @@ pub struct RunnerConfig {
     /// value, the trade/bet is skipped. Applies to live and paper modes.
     #[serde(default)]
     pub max_entry_price: Option<f64>,
+    /// Price mode for Polymarket binary entry: "historical" = buy price from CLOB,
+    /// "mid" = average of buy/sell (mid-price).
+    #[serde(default)]
+    pub price_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -229,6 +233,7 @@ impl StrategyRunnerStore {
         live_sizing_mode: Option<LiveSizingMode>,
         live_sizing_value: Option<f64>,
         max_entry_price: Option<f64>,
+        price_mode: Option<String>,
     ) -> Option<StoredRunner> {
         let mut map = self.runners.lock().unwrap();
         let updated = map.get_mut(id).map(|r| {
@@ -240,6 +245,9 @@ impl StrategyRunnerStore {
             }
             if let Some(val) = max_entry_price {
                 r.config.max_entry_price = Some(val);
+            }
+            if let Some(mode) = price_mode {
+                r.config.price_mode = Some(mode);
             }
             r.clone()
         });
@@ -693,7 +701,7 @@ async fn polymarket_runner_loop(
     // Pre-seed from a BT warmup run so avg_vol starts aligned with the backtester's historical value,
     // preventing score divergence on the first windows after runner start.
     let mut live_kv_state: std::collections::HashMap<String, f64> = {
-        let init_decision_minute = (window_minutes as i64) - 2;
+        let init_decision_minute = (window_minutes as i64) - 1;
         let res_logic = config.resolution_logic.as_deref().unwrap_or("price_up");
         match crate::tools::backtest::run_polymarket_bt_signal_preview(
             &script_content,
@@ -703,6 +711,9 @@ async fn polymarket_runner_loop(
             res_logic,
             config.threshold,
             config.initial_balance,
+            config.price_mode.as_deref().unwrap_or("historical"),
+            0.0,
+            0.0, // warmup: no real price, use momentum model
         ) {
             Ok(bt_seed) => {
                 let state: std::collections::HashMap<String, f64> = bt_seed.kv_state.iter()
@@ -727,9 +738,11 @@ async fn polymarket_runner_loop(
     let mut live_wins: u32 = 0;
     let mut live_total_trades: u32 = 0;
 
-    // Minute within the window to take the decision (0-based index).
-    // For a 5m window: decision at index 3 (the 4th candle, arriving at :34).
-    // This gives a full minute (:34-:35) for the order to execute before resolution.
+    // Minute within the window to take the decision (0-based open_time index).
+    // For a 5m window [T … T+300s]:
+    //   decision candle  = index 3, open=T+180s, close=T+240s  (fires at T+240s+~1s via WS)
+    //   This gives 60 seconds for the order to execute before window resolution at T+300s.
+    //   Note: backtest uses index 4 (last candle) since it doesn't need execution time.
     let decision_minute = (window_minutes as i64) - 2;
 
     // early_fire_secs: fire order N seconds before the decision candle closes.
@@ -892,7 +905,7 @@ async fn polymarket_runner_loop(
                         let outcome = if went_up { "UP" } else { "DOWN" };
 
                         // ── Backtest vs Live comparison for this window ──
-                        let decision_ts = prev_window + ((window_minutes as i64) - 2) * 60;
+                        let decision_ts = prev_window + ((window_minutes as i64) - 1) * 60;
                         let decision_dt = chrono::DateTime::from_timestamp(decision_ts, 0)
                             .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
                             .unwrap_or_default();
@@ -1077,12 +1090,15 @@ async fn polymarket_runner_loop(
 
             // Live signal: run script on the CURRENT (incomplete) window's decision candle.
             // This is NOT a backtest — it extracts buy/sell intent for the live market.
+            let price_mode = config.price_mode.as_deref().unwrap_or("historical");
             let live_result = match crate::tools::backtest::run_polymarket_live_signal(
                 &script_content,
                 buffer.iter().cloned().collect(),
                 window_minutes,
                 Some(decision_minute),
                 yes_token_price,
+                no_token_price,
+                price_mode,
                 &live_kv_state,
             ) {
                 Ok(res) => res,
@@ -1129,6 +1145,9 @@ async fn polymarket_runner_loop(
                 res_logic,
                 config.threshold,
                 config.initial_balance,
+                price_mode,
+                no_token_price,
+                yes_token_price, // real CLOB price so BT preview matches live signal
             ) {
                 Ok(bt_res) => {
                     append_runner_log(&store, &id, &format!("BT signal: {}", bt_res.signal));

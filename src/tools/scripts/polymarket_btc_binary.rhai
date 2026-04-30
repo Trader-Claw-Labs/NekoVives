@@ -30,8 +30,8 @@ fn on_candle(ctx) {
     if window_open <= 0.0 { return; }
 
     // Skip when token is too expensive (market already priced in the move)
-    if ctx.token_price > max_token_p { ctx.set("debug_reason", 1.0); return; }
-    if ctx.token_price < (1.0 - max_token_p) { ctx.set("debug_reason", 2.0); return; }
+    //if ctx.token_price > max_token_p { ctx.set("debug_reason", 1.0); return; }
+    //if ctx.token_price < (1.0 - max_token_p) { ctx.set("debug_reason", 2.0); return; }
 
     let close = ctx.close;
     let idx   = ctx.index;

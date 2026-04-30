@@ -176,6 +176,35 @@ pub fn has_historical_data(
 /// Internal helpers
 /// ---------------------------------------------------------------------------
 
+/// Fetch BTC open and close prices for a window from Binance klines.
+/// Returns (open_price, close_price) at the window boundaries.
+async fn fetch_btc_window_prices(
+    client: &reqwest::Client,
+    window_open_ts: i64,
+    window_close_ts: i64,
+) -> Option<(f64, f64)> {
+    let url = format!(
+        "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&startTime={}&endTime={}&limit=2",
+        window_open_ts * 1000,
+        window_close_ts * 1000,
+    );
+    let resp = client
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let klines: Vec<Vec<serde_json::Value>> = resp.json().await.ok()?;
+    // First kline open → window open price
+    let open = klines.first()?.get(1)?.as_str()?.parse::<f64>().ok()?;
+    // Last kline close → window close price
+    let close = klines.last()?.get(4)?.as_str()?.parse::<f64>().ok()?;
+    Some((open, close))
+}
+
 /// Fetch data for a single market window.
 async fn fetch_single_window(
     client: &reqwest::Client,
@@ -196,11 +225,21 @@ async fn fetch_single_window(
         None => return Ok(None),
     };
 
-    // 3. Fetch token prices at decision time
+    // 3. Fetch token prices at decision time (minute 4 of a 5m window)
     let yes_price = fetch_price_at_time(client, &yes_token_id, decision_ts).await.ok();
     let no_price = fetch_price_at_time(client, &no_token_id, decision_ts).await.ok();
 
-    // 4. Build record
+    // 4. Fetch BTC open/close to determine resolution (UP or DOWN)
+    let (btc_open, btc_close, resolution) =
+        match fetch_btc_window_prices(client, window_open_ts, window_close_ts).await {
+            Some((o, c)) => {
+                let res = if c > o { "up" } else { "down" };
+                (Some(o), Some(c), Some(res.to_string()))
+            }
+            None => (None, None, market.resolution),
+        };
+
+    // 5. Build record
     let record = HistoricalMarketWindow {
         window_open_ts,
         window_close_ts,
@@ -210,9 +249,9 @@ async fn fetch_single_window(
         no_token_id,
         yes_token_price: yes_price,
         no_token_price: no_price,
-        resolution: market.resolution,
-        btc_open: None,
-        btc_close: None,
+        resolution,
+        btc_open,
+        btc_close,
         slug: slug.to_string(),
         from_cache: false,
     };
@@ -435,7 +474,7 @@ fn generate_window_timestamps(
     let to_dt = Utc.from_utc_datetime(&to.and_hms_opt(23, 59, 59).unwrap());
 
     let window_secs = window_minutes * 60;
-    let decision_offset = (window_minutes - 2) * 60; // decision at minute N-2
+    let decision_offset = (window_minutes - 1) * 60; // decision at minute N-1 (last minute before resolution)
 
     // Align first window to the next boundary
     let first_ts = align_up_to(from_dt.timestamp(), window_secs);

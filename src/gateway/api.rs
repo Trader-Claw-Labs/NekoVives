@@ -3463,6 +3463,9 @@ pub struct BacktestRunBody {
     pub sizing_mode: Option<String>,
     /// Sizing value: USD amount for fixed mode, or max fraction (0.0-1.0) for percent mode.
     pub sizing_value: Option<f64>,
+    /// Price mode for Polymarket binary entry: 'historical' = real scraped price,
+    /// 'mid' = average of buy/sell (mid-price).
+    pub price_mode: Option<String>,
 }
 
 fn default_market_type() -> String {
@@ -3526,6 +3529,7 @@ pub async fn handle_api_backtest_run(
 
     let sizing_mode = body.sizing_mode.as_deref().unwrap_or("percent");
     let sizing_value = body.sizing_value.unwrap_or(1.0);
+    let price_mode = body.price_mode.as_deref().unwrap_or("historical");
 
     let metrics = crate::tools::backtest::run_backtest_engine(
         &script_path,
@@ -3542,6 +3546,7 @@ pub async fn handle_api_backtest_run(
         body.max_entry_price,
         sizing_mode,
         sizing_value,
+        price_mode,
         &workspace_dir,
     )
     .await;
@@ -3899,6 +3904,8 @@ pub struct CreateRunnerBody {
     pub early_fire_secs: Option<u32>,
     #[serde(default)]
     pub max_entry_price: Option<f64>,
+    #[serde(default)]
+    pub price_mode: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -3907,6 +3914,7 @@ pub struct PatchRunnerBody {
     pub live_sizing_mode: Option<String>,
     pub live_sizing_value: Option<f64>,
     pub max_entry_price: Option<f64>,
+    pub price_mode: Option<String>,
 }
 
 async fn hydrate_live_runtime_config(state: &AppState, config: &mut crate::strategy_runner::RunnerConfig) -> anyhow::Result<()> {
@@ -4043,12 +4051,12 @@ pub async fn handle_api_live_patch(
         }
     }
 
-    if body.live_sizing_mode.is_some() || body.live_sizing_value.is_some() || body.max_entry_price.is_some() {
+    if body.live_sizing_mode.is_some() || body.live_sizing_value.is_some() || body.max_entry_price.is_some() || body.price_mode.is_some() {
         let mode = body.live_sizing_mode.map(|m| match m.as_str() {
             "fixed" => crate::strategy_runner::LiveSizingMode::Fixed,
             _ => crate::strategy_runner::LiveSizingMode::Percent,
         });
-        match state.strategy_runner.update_runner_config(&id, mode, body.live_sizing_value, body.max_entry_price) {
+        match state.strategy_runner.update_runner_config(&id, mode, body.live_sizing_value, body.max_entry_price, body.price_mode) {
             Some(runner) => return Json(serde_json::json!({ "runner": runner })).into_response(),
             None => return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "runner not found" }))).into_response(),
         }
@@ -4143,6 +4151,7 @@ pub async fn handle_api_live_create(
             if v > 0 { Some(v) } else { None }
         }),
         max_entry_price: body.max_entry_price,
+        price_mode: body.price_mode,
     };
 
     if let Err(e) = hydrate_live_runtime_config(&state, &mut config).await {
