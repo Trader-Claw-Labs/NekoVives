@@ -3599,6 +3599,11 @@ pub async fn handle_api_backtest_run(
         "correct_direction_pct": metrics.correct_direction_pct,
         "break_even_win_rate": metrics.break_even_win_rate,
         "markets_tested": metrics.markets_tested,
+        "windows_with_real_price": metrics.windows_with_real_price,
+        "windows_with_estimated_price": metrics.windows_with_estimated_price,
+        "historical_data_coverage_pct": metrics.historical_data_coverage_pct,
+        "recommended_max_stake_usd": metrics.recommended_max_stake_usd,
+        "flat_debugs": metrics.flat_debugs,
         "final_balance": body.initial_balance * (1.0 + metrics.total_return_pct / 100.0),
     }))
     .into_response()

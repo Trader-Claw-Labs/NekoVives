@@ -2871,11 +2871,11 @@ fn run_polymarket_slug_backtest(
     let mut window_ts = first_window;
     while window_ts + window_secs <= last_ts {
         // For a 5m window starting at T:
-        //   decision candle  open=T+240s close=T+300s  (ctx.close = last candle)
-        //   resolution uses the same candle's close (res_close = decision close)
+        //   decision candle  open=T+240s close=T+300s  (ctx.close comes from this candle)
+        //   resolution uses the next 1m close at T+300s open / T+360s close
         let minute0_ts    = window_ts;
         let decision_ts   = window_ts + ((window_minutes as i64) - 1) * 60;
-        let resolution_ts = window_ts + ((window_minutes as i64) - 1) * 60;
+        let resolution_ts = window_ts + (window_minutes as i64) * 60;
         window_ts += window_secs;
 
         let (Some(&m0_idx), Some(&dec_idx), Some(&res_idx)) = (
@@ -2888,11 +2888,23 @@ fn run_polymarket_slug_backtest(
         let prev_window_close  = if m0_idx > 0 { candles[m0_idx - 1].close } else { window_open };
         let dec               = &candles[dec_idx];
         let res_close         = candles[res_idx].close;
-        // Resolution: use logic from the series definition
+        let hist_window       = historical.get(&minute0_ts);
+        // Resolution: prefer historical Polymarket outcome when available,
+        // otherwise fall back to the derived Binance resolution.
         let went_up = match resolution_logic {
             "threshold_above" => res_close > threshold.unwrap_or(f64::MAX),
             "threshold_below" => res_close < threshold.unwrap_or(f64::MIN),
-            _                 => res_close > window_open,   // default: price_up
+            _ => {
+                if let Some(hist) = hist_window {
+                    match hist.resolution.as_deref() {
+                        Some("up") => true,
+                        Some("down") => false,
+                        _ => res_close > window_open,
+                    }
+                } else {
+                    res_close > window_open
+                }
+            }
         };
         let resolution_value = res_close;
         let thr_val = threshold.unwrap_or(0.0);
@@ -3728,9 +3740,10 @@ pub fn run_polymarket_live_signal(
 ///  2. ctx fields (`threshold`, `token_price`, `resolution_value`, `balance`)
 ///     follow BT semantics (configured threshold, 0.50 for threshold markets,
 ///     etc.) instead of the live-mode placeholders.
-///  3. Completed windows use the FUTURE resolution candle as `ctx.resolution_value`
-///     (this is the BT lookahead). The current (incomplete) window falls back
-///     to `dec.close` as `resolution_value` so the comparison is visible.
+///  3. Completed windows keep `ctx.close` on the decision candle, but use the
+///     later resolution candle only for `ctx.resolution_value` / outcome math.
+///     The current (incomplete) window still falls back to `dec.close` as
+///     `resolution_value` because no future resolution candle exists yet.
 ///
 /// Use this at decision time to log "BT debug" alongside "LIVE debug" so the
 /// operator can spot script divergences between backtest and live execution.
@@ -3928,7 +3941,7 @@ pub fn run_polymarket_bt_signal_preview(
     while window_ts < current_window {
         let minute0_ts    = window_ts;
         let decision_ts   = window_ts + dec_min * 60;
-        let resolution_ts = window_ts + ((window_minutes as i64) - 1) * 60;
+        let resolution_ts = window_ts + (window_minutes as i64) * 60;
         window_ts += window_secs;
 
         let (Some(&m0_idx), Some(&dec_idx), Some(&res_idx)) = (

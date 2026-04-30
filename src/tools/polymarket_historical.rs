@@ -519,13 +519,13 @@ fn parse_cadence_to_minutes(cadence: &str) -> i64 {
 fn historical_cache_path(
     workspace_dir: &Path,
     series_id: &str,
-    from_date: &str,
-    to_date: &str,
+    _from_date: &str,
+    _to_date: &str,
 ) -> PathBuf {
     workspace_dir
         .join("data")
         .join("polymarket_historical")
-        .join(format!("{}_{}_{}.jsonl", series_id, from_date, to_date))
+        .join(format!("{}.jsonl", series_id))
 }
 
 fn load_existing_cache(path: &Path) -> Result<HashMap<i64, HistoricalMarketWindow>> {
