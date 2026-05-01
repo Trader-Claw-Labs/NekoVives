@@ -692,6 +692,11 @@ async fn polymarket_runner_loop(
 
     let mut last_window: i64 = -1;
     let mut last_decision_window: i64 = -1;
+    // Drift signal: YES token price captured at the candle BEFORE the decision
+    // candle closes (60s pre-decision). Reset to 0.0 after each decision so a
+    // stale value doesn't bleed into the next window. 0.0 = unavailable.
+    let mut prev_yes_token_price: f64 = 0.0;
+    let mut prev_yes_captured_window: i64 = -1;
     // (window_ts, live_signal, bt_preview_signal, debug)
     // bt_preview_signal is captured at decision time (stateless, no capital constraint)
     // and used for signal comparison so a depleted BT balance doesn't cause false DISCREPANCYs.
@@ -714,6 +719,7 @@ async fn polymarket_runner_loop(
             config.price_mode.as_deref().unwrap_or("historical"),
             0.0,
             0.0, // warmup: no real price, use momentum model
+            0.0, // warmup: no prev P3, drift = 0 (script must handle gracefully)
         ) {
             Ok(bt_seed) => {
                 let state: std::collections::HashMap<String, f64> = bt_seed.kv_state.iter()
@@ -791,6 +797,32 @@ async fn polymarket_runner_loop(
                         early_fire_armed_window = win;
                         tracing::info!("[RUNNER {id}] Early fire armed for window {} — fires in {:.1}s", win, delay_ms as f64 / 1000.0);
                         append_runner_log(&store, &id, &format!("Early fire armed: {}s before candle close", early_fire_secs));
+                    }
+                }
+
+                // ── Drift signal: capture YES token price 60s before the decision ──
+                // Fires exactly once per window when the candle preceding the decision
+                // arrives (min_in_win == decision_minute - 1). Result is consumed at
+                // the decision point as `ctx.token_price_prev` for `ctx.token_drift`.
+                if live.open_time_ms != 0 {
+                    let candle_ts = live.open_time_ms / 1000;
+                    let win = candle_ts - (candle_ts % window_secs as i64);
+                    let min_in_win = (candle_ts % window_secs as i64) / 60;
+                    if min_in_win == decision_minute - 1
+                        && win != prev_yes_captured_window
+                        && win != last_decision_window
+                    {
+                        if let (Some(yes), Some(no)) = (&config.poly_token_id, &config.poly_no_token_id) {
+                            let (p3_yes, _) = fetch_token_prices(yes, no).await;
+                            if p3_yes > 0.0 && p3_yes < 1.0 {
+                                prev_yes_token_price = p3_yes;
+                                prev_yes_captured_window = win;
+                                tracing::info!("[RUNNER {id}] P3 captured for window {}: yes={:.4}", win, p3_yes);
+                                append_runner_log(&store, &id, &format!("P3 captured: yes_token_price={:.4}", p3_yes));
+                            } else {
+                                tracing::warn!("[RUNNER {id}] P3 fetch returned invalid price ({}); drift signal unavailable", p3_yes);
+                            }
+                        }
                     }
                 }
 
@@ -1091,6 +1123,13 @@ async fn polymarket_runner_loop(
             // Live signal: run script on the CURRENT (incomplete) window's decision candle.
             // This is NOT a backtest — it extracts buy/sell intent for the live market.
             let price_mode = config.price_mode.as_deref().unwrap_or("historical");
+            // Use captured P3 only if it was fetched for THIS window (avoids stale
+            // value from a prior window leaking in if the prior decision was missed).
+            let drift_prev = if prev_yes_captured_window == current_window {
+                prev_yes_token_price
+            } else {
+                0.0
+            };
             let live_result = match crate::tools::backtest::run_polymarket_live_signal(
                 &script_content,
                 buffer.iter().cloned().collect(),
@@ -1100,6 +1139,7 @@ async fn polymarket_runner_loop(
                 no_token_price,
                 price_mode,
                 &live_kv_state,
+                drift_prev,
             ) {
                 Ok(res) => res,
                 Err(e) => {
@@ -1148,6 +1188,7 @@ async fn polymarket_runner_loop(
                 price_mode,
                 no_token_price,
                 yes_token_price, // real CLOB price so BT preview matches live signal
+                drift_prev,
             ) {
                 Ok(bt_res) => {
                     append_runner_log(&store, &id, &format!("BT signal: {}", bt_res.signal));

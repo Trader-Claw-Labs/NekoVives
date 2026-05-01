@@ -2652,6 +2652,7 @@ fn run_polymarket_slug_backtest(
     sizing_value: f64,
     price_mode: &str,
     historical_data: Option<HashMap<i64, HistoricalMarketWindow>>,
+    prev_historical_data: Option<HashMap<i64, HistoricalMarketWindow>>,
 ) -> anyhow::Result<BacktestMetrics> {
     use rhai::{Engine, Scope};
     use std::sync::{Arc, Mutex};
@@ -2761,6 +2762,7 @@ fn run_polymarket_slug_backtest(
     };
 
     let historical = historical_data.unwrap_or_default();
+    let prev_historical = prev_historical_data.unwrap_or_default();
 
     // ── Build engine ONCE — compile AST once, reuse across all windows ────────
     let cur_idx = Arc::new(Mutex::new(0usize));
@@ -2990,6 +2992,20 @@ fn run_polymarket_slug_backtest(
         ctx_map.insert("resolution_value".into(),  rhai::Dynamic::from(resolution_value));
         // ctx.value is an alias for ctx.close (more semantic for non-price markets)
         ctx_map.insert("value".into(),             rhai::Dynamic::from(dec.close));
+
+        // ── Earlier-decision (P3) token price + drift signal ────────────────────
+        // `token_price_prev` is the YES token price 60s before the decision candle
+        // (at minute_open + 180s). `token_drift = token_price - token_price_prev`.
+        // Both are 0.0 when no min3 historical data is available for this window.
+        let (prev_yes, drift) = match prev_historical.get(&minute0_ts) {
+            Some(prev) => {
+                let p = prev.yes_token_price.unwrap_or(0.0);
+                if p > 0.0 { (p, yes_token_price - p) } else { (0.0, 0.0) }
+            }
+            None => (0.0, 0.0),
+        };
+        ctx_map.insert("token_price_prev".into(), rhai::Dynamic::from(prev_yes));
+        ctx_map.insert("token_drift".into(),      rhai::Dynamic::from(drift));
 
         let mut scope = Scope::new();
         if let Err(e) = engine.call_fn::<()>(&mut scope, &ast, "on_candle", (rhai::Dynamic::from_map(ctx_map),)) {
@@ -3239,13 +3255,22 @@ pub async fn run_backtest_engine(
             tracing::info!("[BACKTEST] No historical on-chain data found for {}. Using momentum price model.", series_id);
         }
 
+        // Optional earlier-decision (P3) dataset for `ctx.token_drift` signal.
+        let prev_historical_data = super::polymarket_historical::load_prev_historical_data(
+            workspace_dir, &series_id
+        ).ok().filter(|m| !m.is_empty());
+        if let Some(ref m) = prev_historical_data {
+            tracing::info!("[BACKTEST] Loaded {} prev-decision (P3) records for drift signal on {}", m.len(), series_id);
+        }
+
         let script_for_log = script_content.clone();
         let sizing_mode_owned = sizing_mode.to_string();
         let price_mode_owned = price_mode.to_string();
         let hist_clone = historical_data.clone();
+        let prev_hist_clone = prev_historical_data.clone();
 
         return match tokio::task::spawn_blocking(move || {
-            run_polymarket_slug_backtest(script_content, candles, initial_balance, fee_pct, window_minutes, &rl, thr, max_position_usd, max_entry_price, &sizing_mode_owned, sizing_value, &price_mode_owned, hist_clone)
+            run_polymarket_slug_backtest(script_content, candles, initial_balance, fee_pct, window_minutes, &rl, thr, max_position_usd, max_entry_price, &sizing_mode_owned, sizing_value, &price_mode_owned, hist_clone, prev_hist_clone)
         })
         .await
         {
@@ -3471,6 +3496,7 @@ pub fn run_polymarket_live_signal(
     no_token_price: f64,
     price_mode: &str,
     kv_seed: &std::collections::HashMap<String, f64>,
+    prev_yes_token_price: f64,
 ) -> anyhow::Result<LiveSignalResult> {
     use rhai::{Engine, Scope};
     use std::sync::{Arc, Mutex};
@@ -3706,6 +3732,14 @@ pub fn run_polymarket_live_signal(
     ctx_map.insert("threshold".into(),        rhai::Dynamic::from(0.0_f64));
     ctx_map.insert("resolution_value".into(), rhai::Dynamic::from(dec.close));
     ctx_map.insert("value".into(),            rhai::Dynamic::from(dec.close));
+    // Earlier-decision (P3) token price + drift. 0.0 if not captured (graceful skip).
+    let token_drift = if prev_yes_token_price > 0.0 {
+        token_price_for_ctx - prev_yes_token_price
+    } else {
+        0.0
+    };
+    ctx_map.insert("token_price_prev".into(), rhai::Dynamic::from(prev_yes_token_price));
+    ctx_map.insert("token_drift".into(),      rhai::Dynamic::from(token_drift));
 
     let mut scope = Scope::new();
     engine.call_fn::<()>(&mut scope, &ast, "on_candle", (rhai::Dynamic::from_map(ctx_map),))
@@ -3758,6 +3792,7 @@ pub fn run_polymarket_bt_signal_preview(
     price_mode: &str,
     no_token_price: f64,
     yes_token_price_param: f64,
+    prev_yes_token_price: f64,
 ) -> anyhow::Result<LiveSignalResult> {
     use rhai::{Engine, Scope};
     use std::sync::{Arc, Mutex};
@@ -3996,6 +4031,9 @@ pub fn run_polymarket_bt_signal_preview(
         ctx_map.insert("threshold".into(),        rhai::Dynamic::from(thr_val));
         ctx_map.insert("resolution_value".into(), rhai::Dynamic::from(resolution_value));
         ctx_map.insert("value".into(),            rhai::Dynamic::from(dec.close));
+        // Drift signal — past windows have no real P3 data here, so 0.0 (script should treat as "unavailable").
+        ctx_map.insert("token_price_prev".into(), rhai::Dynamic::from(0.0_f64));
+        ctx_map.insert("token_drift".into(),      rhai::Dynamic::from(0.0_f64));
 
         let mut scope = Scope::new();
         let _ = engine.call_fn::<()>(&mut scope, &ast, "on_candle", (rhai::Dynamic::from_map(ctx_map),));
@@ -4076,6 +4114,13 @@ pub fn run_polymarket_bt_signal_preview(
     ctx_map.insert("threshold".into(),        rhai::Dynamic::from(thr_val));
     ctx_map.insert("resolution_value".into(), rhai::Dynamic::from(resolution_value));
     ctx_map.insert("value".into(),            rhai::Dynamic::from(dec.close));
+    let token_drift = if prev_yes_token_price > 0.0 {
+        yes_token_price - prev_yes_token_price
+    } else {
+        0.0
+    };
+    ctx_map.insert("token_price_prev".into(), rhai::Dynamic::from(prev_yes_token_price));
+    ctx_map.insert("token_drift".into(),      rhai::Dynamic::from(token_drift));
 
     let mut scope = Scope::new();
     engine.call_fn::<()>(&mut scope, &ast, "on_candle", (rhai::Dynamic::from_map(ctx_map),))
@@ -4122,6 +4167,7 @@ pub fn run_polymarket_binary_on_candle_buffer(
         "percent",
         1.0,
         "historical",
+        None,
         None,
     )
     .unwrap_or_else(|e| BacktestMetrics {
@@ -4234,5 +4280,248 @@ mod tests {
         let tool = BacktestRunTool::new(ws);
         let result = tool.execute(json!({})).await;
         assert!(result.is_err());
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    //  ctx.token_drift / ctx.token_price_prev regression
+    //
+    //  These tests pin the wiring from `min3_<series>.jsonl` →
+    //  `prev_historical_data` → ctx_map fields, so future refactors of the
+    //  binary slug engine cannot silently break the drift signal.
+    // ───────────────────────────────────────────────────────────────────
+
+    fn synth_candles_for_windows(num_windows: usize) -> Vec<Candle> {
+        // 5-min windows aligned to 2024-01-01 00:00:00 UTC
+        // Each window needs a candle at open + 4min (decision) + 5min (resolution).
+        // We emit one extra window of candles past the last decision so the
+        // engine's `while window_ts + window_secs <= last_ts` loop runs all
+        // intended windows and lookups for resolution_ts succeed.
+        let base_ms: i64 = 1704067200_000;
+        let total_minutes = (num_windows as i64) * 5 + 5;
+        (0..total_minutes)
+            .map(|i| Candle {
+                open_time_ms: base_ms + i * 60_000,
+                open: 42_000.0 + (i as f64) * 5.0,
+                high: 42_050.0 + (i as f64) * 5.0,
+                low:  41_950.0 + (i as f64) * 5.0,
+                close: 42_010.0 + (i as f64) * 5.0,
+                volume: 1.0,
+            })
+            .collect()
+    }
+
+    fn make_hist_window(open_ts: i64, yes: f64, condition_id: &str) -> HistoricalMarketWindow {
+        HistoricalMarketWindow {
+            window_open_ts: open_ts,
+            window_close_ts: open_ts + 300,
+            decision_ts: open_ts + 240,
+            condition_id: condition_id.to_string(),
+            yes_token_id: format!("yes-{}", condition_id),
+            no_token_id:  format!("no-{}",  condition_id),
+            yes_token_price: Some(yes),
+            no_token_price:  Some(1.0 - yes),
+            resolution: Some("up".to_string()),
+            btc_open: Some(42_000.0),
+            btc_close: Some(42_010.0),
+            slug: format!("test-slug-{}", open_ts),
+            from_cache: false,
+        }
+    }
+
+    /// Captures `ctx.token_price_prev` and `ctx.token_drift` in kv every window.
+    /// Forces a buy on every call so values surface in `Trade.debug` (not just
+    /// `flat_debugs`) — easier to assert against.
+    const PROBE_SCRIPT: &str = r#"
+        fn on_candle(ctx) {
+            ctx.set("debug_p4",     ctx.token_price);
+            ctx.set("debug_p3",     ctx.token_price_prev);
+            ctx.set("debug_drift",  ctx.token_drift);
+            ctx.buy(1.0);
+        }
+    "#;
+
+    /// Drift = P4 − P3 when both prices are present in their respective files.
+    #[test]
+    fn drift_computed_when_both_prices_present() {
+        let candles = synth_candles_for_windows(3);
+        let w0 = 1704067200_i64;
+        let w1 = w0 + 300;
+        let w2 = w1 + 300;
+
+        let mut p4 = HashMap::new();
+        p4.insert(w0, make_hist_window(w0, 0.40, "cond-w0"));
+        p4.insert(w1, make_hist_window(w1, 0.55, "cond-w1"));
+        p4.insert(w2, make_hist_window(w2, 0.30, "cond-w2"));
+
+        let mut p3 = HashMap::new();
+        p3.insert(w0, make_hist_window(w0, 0.50, "cond-w0")); // drift -0.10
+        p3.insert(w1, make_hist_window(w1, 0.50, "cond-w1")); // drift +0.05
+        p3.insert(w2, make_hist_window(w2, 0.40, "cond-w2")); // drift -0.10
+
+        let metrics = run_polymarket_slug_backtest(
+            PROBE_SCRIPT.to_string(),
+            candles, 1000.0, 0.0, 5,
+            "price_up", None, None, None,
+            "fixed", 10.0, "historical",
+            Some(p4), Some(p3),
+        ).expect("backtest must succeed");
+
+        assert!(metrics.total_trades >= 3, "expected ≥3 trades, got {}", metrics.total_trades);
+
+        // Sort trades chronologically so we can match by window order.
+        let mut trades = metrics.all_trades;
+        trades.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+
+        let trade_drifts: Vec<(f64, f64, f64)> = trades.iter()
+            .filter_map(|t| {
+                let dbg = t.debug.as_ref()?;
+                Some((
+                    *dbg.get("debug_p4").unwrap_or(&f64::NAN),
+                    *dbg.get("debug_p3").unwrap_or(&f64::NAN),
+                    *dbg.get("debug_drift").unwrap_or(&f64::NAN),
+                ))
+            })
+            .collect();
+
+        // Exactly 3 windows resolved with full P3+P4 data.
+        let resolved = trade_drifts.iter()
+            .filter(|(p4v, p3v, _)| *p4v > 0.0 && *p3v > 0.0)
+            .count();
+        assert_eq!(resolved, 3, "expected 3 windows with full drift data, got {}", resolved);
+
+        // Drift consistency: drift ≈ P4 − P3 every time
+        for (p4v, p3v, drift) in &trade_drifts {
+            if *p3v > 0.0 {
+                let expected = *p4v - *p3v;
+                assert!(
+                    (drift - expected).abs() < 1e-9,
+                    "drift mismatch: P4={p4v} P3={p3v} drift={drift} expected={expected}"
+                );
+            }
+        }
+    }
+
+    /// When the min3 dataset is absent (None), ctx.token_price_prev = 0 and
+    /// ctx.token_drift = 0 — strategies relying on drift must skip gracefully.
+    #[test]
+    fn drift_zero_when_min3_dataset_missing() {
+        let candles = synth_candles_for_windows(2);
+        let w0 = 1704067200_i64;
+        let w1 = w0 + 300;
+
+        let mut p4 = HashMap::new();
+        p4.insert(w0, make_hist_window(w0, 0.40, "cond-w0"));
+        p4.insert(w1, make_hist_window(w1, 0.60, "cond-w1"));
+
+        let metrics = run_polymarket_slug_backtest(
+            PROBE_SCRIPT.to_string(),
+            candles, 1000.0, 0.0, 5,
+            "price_up", None, None, None,
+            "fixed", 10.0, "historical",
+            Some(p4), None,
+        ).expect("backtest must succeed");
+
+        for trade in metrics.all_trades.iter() {
+            let dbg = trade.debug.as_ref().expect("debug map must be present");
+            assert_eq!(*dbg.get("debug_p3").unwrap_or(&-1.0), 0.0,
+                "P3 must be 0.0 when min3 dataset absent");
+            assert_eq!(*dbg.get("debug_drift").unwrap_or(&-1.0), 0.0,
+                "drift must be 0.0 when min3 dataset absent");
+        }
+    }
+
+    /// Per-window fallback: when SOME windows have a P3 record but others
+    /// don't, only the matched windows expose a non-zero drift.
+    #[test]
+    fn drift_falls_back_per_window_when_partial() {
+        let candles = synth_candles_for_windows(3);
+        let w0 = 1704067200_i64;
+        let w1 = w0 + 300;
+        let w2 = w1 + 300;
+
+        let mut p4 = HashMap::new();
+        p4.insert(w0, make_hist_window(w0, 0.40, "cond-w0"));
+        p4.insert(w1, make_hist_window(w1, 0.55, "cond-w1"));
+        p4.insert(w2, make_hist_window(w2, 0.30, "cond-w2"));
+
+        // Only w1 has a P3 record. w0 and w2 must report drift = 0.
+        let mut p3 = HashMap::new();
+        p3.insert(w1, make_hist_window(w1, 0.50, "cond-w1"));
+
+        let metrics = run_polymarket_slug_backtest(
+            PROBE_SCRIPT.to_string(),
+            candles, 1000.0, 0.0, 5,
+            "price_up", None, None, None,
+            "fixed", 10.0, "historical",
+            Some(p4), Some(p3),
+        ).expect("backtest must succeed");
+
+        let mut trades = metrics.all_trades;
+        trades.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+        assert_eq!(trades.len(), 3);
+
+        let with_drift = trades.iter().filter(|t| {
+            let dbg = t.debug.as_ref().unwrap();
+            *dbg.get("debug_p3").unwrap_or(&0.0) > 0.0
+        }).count();
+        assert_eq!(with_drift, 1, "exactly 1 window should have non-zero P3");
+
+        // The single matched window must have correct drift.
+        let matched = trades.iter().find(|t| {
+            let dbg = t.debug.as_ref().unwrap();
+            *dbg.get("debug_p3").unwrap_or(&0.0) > 0.0
+        }).unwrap();
+        let dbg = matched.debug.as_ref().unwrap();
+        let p4v = dbg["debug_p4"];
+        let p3v = dbg["debug_p3"];
+        let drift = dbg["debug_drift"];
+        assert!((p3v - 0.50).abs() < 1e-9, "P3 must be 0.50 for w1, got {p3v}");
+        assert!((drift - (p4v - p3v)).abs() < 1e-9, "drift must equal P4 − P3");
+    }
+
+    /// `load_prev_historical_data` reads the `min3_<series>.jsonl` file from
+    /// the same directory as the main historical cache, keyed by window_open_ts.
+    #[test]
+    fn load_prev_historical_data_reads_min3_file() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("data").join("polymarket_historical");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let w0 = 1704067200_i64;
+        let w1 = w0 + 300;
+
+        let rec0 = make_hist_window(w0 - 60, 0.42, "c-0"); // decision_ts = w0 + 180 (P3 timing)
+        let rec1 = make_hist_window(w1 - 60, 0.61, "c-1");
+
+        let mut content = String::new();
+        for r in [&rec0, &rec1] {
+            // Override window_open_ts to emulate real min3 file shape:
+            // window_open_ts matches main file (T), decision_ts = T + 180.
+            let mut r = r.clone();
+            r.window_open_ts = if r.condition_id == "c-0" { w0 } else { w1 };
+            r.decision_ts    = r.window_open_ts + 180;
+            content.push_str(&serde_json::to_string(&r).unwrap());
+            content.push('\n');
+        }
+        std::fs::write(dir.join("min3_btc_5m.jsonl"), &content).unwrap();
+
+        let map = super::super::polymarket_historical::load_prev_historical_data(
+            tmp.path(), "btc_5m"
+        ).expect("load must succeed");
+
+        assert_eq!(map.len(), 2);
+        assert!((map.get(&w0).unwrap().yes_token_price.unwrap() - 0.42).abs() < 1e-9);
+        assert!((map.get(&w1).unwrap().yes_token_price.unwrap() - 0.61).abs() < 1e-9);
+    }
+
+    /// Missing min3 file → empty map, not an error. Callers treat empty as
+    /// "drift signal unavailable" and proceed.
+    #[test]
+    fn load_prev_historical_data_returns_empty_when_file_missing() {
+        let tmp = TempDir::new().unwrap();
+        let map = super::super::polymarket_historical::load_prev_historical_data(
+            tmp.path(), "btc_5m"
+        ).expect("missing file must not be a hard error");
+        assert!(map.is_empty());
     }
 }

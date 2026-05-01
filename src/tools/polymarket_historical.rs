@@ -161,6 +161,26 @@ pub fn load_historical_data(
     load_existing_cache(&cache_path)
 }
 
+/// Load earlier-decision (P3) historical data for a series, if available.
+///
+/// Looks for `<workspace>/data/polymarket_historical/min3_<series_id>.jsonl`,
+/// which mirrors the main dataset but with `decision_ts = window_open + 180s`
+/// (60 seconds before the standard minute-4 decision). Used to compute the
+/// token-price drift signal `token_drift = P4 - P3` in the binary slug engine.
+///
+/// Returns `Ok(empty map)` if the file is absent — callers should treat the
+/// empty map as "drift signal unavailable" and fall back gracefully.
+pub fn load_prev_historical_data(
+    workspace_dir: &Path,
+    series_id: &str,
+) -> Result<HashMap<i64, HistoricalMarketWindow>> {
+    let cache_path = workspace_dir
+        .join("data")
+        .join("polymarket_historical")
+        .join(format!("min3_{}.jsonl", series_id));
+    load_existing_cache(&cache_path)
+}
+
 /// Check if historical data exists for a given series and date range.
 pub fn has_historical_data(
     workspace_dir: &Path,
