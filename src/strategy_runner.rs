@@ -88,6 +88,14 @@ pub struct RunnerConfig {
     /// "mid" = average of buy/sell (mid-price).
     #[serde(default)]
     pub price_mode: Option<String>,
+    /// Maximum tolerated deviation of `yes_mid + no_mid` from 1.0 before the
+    /// runner skips the decision window. 0.03 = 3% = ~6¢ of combined spread.
+    /// Rationale: BT assumes `no = 1 - yes`. When live books are wide (low
+    /// liquidity / high uncertainty), paper fills at mid are optimistic vs.
+    /// what real execution would cost. Default is 0.03; set to a large value
+    /// like 1.0 to disable the gate entirely.
+    #[serde(default)]
+    pub max_spread_pct: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -232,8 +240,11 @@ impl StrategyRunnerStore {
         id: &str,
         live_sizing_mode: Option<LiveSizingMode>,
         live_sizing_value: Option<f64>,
-        max_entry_price: Option<f64>,
+        // Option<Option<T>>: None = absent (skip), Some(None) = clear, Some(Some(v)) = set
+        max_entry_price: Option<Option<f64>>,
         price_mode: Option<String>,
+        max_spread_pct: Option<Option<f64>>,
+        early_fire_secs: Option<Option<u32>>,
     ) -> Option<StoredRunner> {
         let mut map = self.runners.lock().unwrap();
         let updated = map.get_mut(id).map(|r| {
@@ -243,11 +254,17 @@ impl StrategyRunnerStore {
             if let Some(val) = live_sizing_value {
                 r.config.live_sizing_value = val;
             }
-            if let Some(val) = max_entry_price {
-                r.config.max_entry_price = Some(val);
+            if let Some(maybe) = max_entry_price {
+                r.config.max_entry_price = maybe;
             }
             if let Some(mode) = price_mode {
                 r.config.price_mode = Some(mode);
+            }
+            if let Some(maybe) = max_spread_pct {
+                r.config.max_spread_pct = maybe;
+            }
+            if let Some(maybe) = early_fire_secs {
+                r.config.early_fire_secs = maybe;
             }
             r.clone()
         });
@@ -813,12 +830,18 @@ async fn polymarket_runner_loop(
                         && win != last_decision_window
                     {
                         if let (Some(yes), Some(no)) = (&config.poly_token_id, &config.poly_no_token_id) {
-                            let (p3_yes, _) = fetch_token_prices(yes, no).await;
+                            let (p3_yes, p3_no) = fetch_token_prices(yes, no).await;
                             if p3_yes > 0.0 && p3_yes < 1.0 {
                                 prev_yes_token_price = p3_yes;
                                 prev_yes_captured_window = win;
-                                tracing::info!("[RUNNER {id}] P3 captured for window {}: yes={:.4}", win, p3_yes);
-                                append_runner_log(&store, &id, &format!("P3 captured: yes_token_price={:.4}", p3_yes));
+                                tracing::info!(
+                                    "[RUNNER {id}] P3 captured for window {}: yes={:.4} no={:.4} sum={:.4}",
+                                    win, p3_yes, p3_no, p3_yes + p3_no
+                                );
+                                append_runner_log(
+                                    &store, &id,
+                                    &format!("P3 captured: yes={:.4} no={:.4} sum={:.4}", p3_yes, p3_no, p3_yes + p3_no)
+                                );
                             } else {
                                 tracing::warn!("[RUNNER {id}] P3 fetch returned invalid price ({}); drift signal unavailable", p3_yes);
                             }
@@ -1119,6 +1142,48 @@ async fn polymarket_runner_loop(
                     (Some(yes), Some(no)) => fetch_token_prices(yes, no).await,
                     _ => (0.0, 0.0),
                 };
+            // Diagnostic: P4 captured at decision. yes+no should ≈ 1.0. Surfaces
+            // spread/liquidity anomalies side-by-side with the captured P3 log.
+            if yes_token_price > 0.0 && no_token_price > 0.0 {
+                append_runner_log(
+                    &store, &id,
+                    &format!(
+                        "P4 captured: yes={:.4} no={:.4} sum={:.4}",
+                        yes_token_price, no_token_price, yes_token_price + no_token_price
+                    ),
+                );
+            }
+
+            // ── Spread gate ──
+            // When yes_mid + no_mid deviates materially from 1.0, the book is
+            // wide enough that paper fills at mid are optimistic vs. realistic
+            // execution. BT implicitly assumes no = 1 - yes, so these windows
+            // are semantically outside the backtest distribution. Force flat
+            // here instead of acting on an artificially favorable entry price.
+            // Default 3% ≈ 6¢ combined spread; set max_spread_pct to a large
+            // value (e.g. 1.0) in the runner config to disable.
+            let spread_pct = if yes_token_price > 0.0 && no_token_price > 0.0 {
+                (yes_token_price + no_token_price - 1.0).abs()
+            } else {
+                0.0
+            };
+            let spread_guard_threshold = config.max_spread_pct.unwrap_or(0.03);
+            let spread_guard_tripped = yes_token_price > 0.0
+                && no_token_price > 0.0
+                && spread_pct > spread_guard_threshold;
+            if spread_guard_tripped {
+                tracing::warn!(
+                    "[RUNNER {id}] Spread gate tripped for window {}: spread={:.4} > max={:.4}; forcing flat",
+                    current_window, spread_pct, spread_guard_threshold
+                );
+                append_runner_log(
+                    &store, &id,
+                    &format!(
+                        "Spread gate TRIPPED: forcing flat (spread={:.2}% > max={:.2}%)",
+                        spread_pct * 100.0, spread_guard_threshold * 100.0
+                    ),
+                );
+            }
 
             // Live signal: run script on the CURRENT (incomplete) window's decision candle.
             // This is NOT a backtest — it extracts buy/sell intent for the live market.
@@ -1161,7 +1226,14 @@ async fn polymarket_runner_loop(
                 .map(|(k, v)| (k.clone(), *v))
                 .collect();
 
-            let current_signal = live_result.signal.clone();
+            // If the spread gate tripped, override whatever the strategy said
+            // to "flat". The script's own debug values still surface below so
+            // we can see what it WOULD have done — useful for calibration.
+            let current_signal = if spread_guard_tripped {
+                "flat".to_string()
+            } else {
+                live_result.signal.clone()
+            };
             tracing::info!("[RUNNER {id}] Live signal for window {}: {}", current_window, current_signal);
             append_runner_log(&store, &id, &format!("Signal window {}: {}", current_window, current_signal));
 
@@ -1819,48 +1891,80 @@ async fn execute_live_polymarket_signal(
     }
 }
 
-/// Fetch Yes/No token prices from Polymarket CLOB API.
-/// Returns (yes_price, no_price) or (0.0, 0.0) on error.
+/// Fetch Yes/No token mid prices from Polymarket CLOB API.
+///
+/// Returns (yes_price, no_price) — both sampled via `/midpoint`, which is
+/// the SAME semantic the backtest scraper reads from `/prices-history`:
+/// the midpoint between best bid and best ask. Using this endpoint (rather
+/// than `/price?side=buy`, which returns the best bid and under-reports by
+/// half-spread) keeps live drift values comparable to the BT distribution
+/// the strategy was calibrated on.
+///
+/// Diagnostic logs: if the sum (yes_mid + no_mid) drifts more than 3% from
+/// 1.0, we log a warning — that's an early warning that either the book is
+/// exceptionally wide (low liquidity) or the midpoint endpoint returned
+/// stale data. Either case is useful to flag rather than silently bet on.
+///
+/// Returns (0.0, 0.0) on hard error.
 async fn fetch_token_prices(yes_token_id: &str, no_token_id: &str) -> (f64, f64) {
     let client = reqwest::Client::new();
 
-    let yes_url = format!("https://clob.polymarket.com/price?token_id={}&side=buy", yes_token_id);
-    let yes_price = match client.get(&yes_url).timeout(std::time::Duration::from_secs(5)).send().await {
-        Ok(resp) if resp.status().is_success() => {
-            resp.json::<serde_json::Value>().await
-                .ok()
-                .and_then(|v| v.get("price").and_then(|p| p.as_str()).map(|s| s.to_string()))
-                .and_then(|s| s.parse::<f64>().ok())
-                .unwrap_or(0.0)
+    async fn fetch_midpoint(client: &reqwest::Client, token_id: &str, label: &str) -> f64 {
+        // Primary: /midpoint — fair mid between best bid and best ask.
+        let url = format!("https://clob.polymarket.com/midpoint?token_id={}", token_id);
+        match client.get(&url).timeout(std::time::Duration::from_secs(5)).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                if let Ok(v) = resp.json::<serde_json::Value>().await {
+                    if let Some(p) = v.get("mid").and_then(|x| x.as_str())
+                        .and_then(|s| s.parse::<f64>().ok())
+                    {
+                        return p;
+                    }
+                    // Some deployments key by "midpoint" instead of "mid"
+                    if let Some(p) = v.get("midpoint").and_then(|x| x.as_str())
+                        .and_then(|s| s.parse::<f64>().ok())
+                    {
+                        return p;
+                    }
+                }
+                tracing::warn!("[PRICE] {} /midpoint returned unparseable body for {}", label, token_id);
+            }
+            Ok(resp) => {
+                tracing::warn!("[PRICE] {} /midpoint failed: {} for token {}", label, resp.status(), token_id);
+            }
+            Err(e) => {
+                tracing::warn!("[PRICE] {} /midpoint request error: {} for token {}", label, e, token_id);
+            }
         }
-        Ok(resp) => {
-            tracing::warn!("[PRICE] YES token /price failed: {} for token {}", resp.status(), yes_token_id);
-            0.0
-        }
-        Err(e) => {
-            tracing::warn!("[PRICE] YES token /price request error: {} for token {}", e, yes_token_id);
-            0.0
-        }
-    };
 
-    let no_url = format!("https://clob.polymarket.com/price?token_id={}&side=buy", no_token_id);
-    let no_price = match client.get(&no_url).timeout(std::time::Duration::from_secs(5)).send().await {
-        Ok(resp) if resp.status().is_success() => {
-            resp.json::<serde_json::Value>().await
+        // Fallback: /price?side=buy returns the best bid — under-reports by
+        // half-spread vs BT, but better than 0 (script stays flat if 0).
+        let url = format!("https://clob.polymarket.com/price?token_id={}&side=buy", token_id);
+        match client.get(&url).timeout(std::time::Duration::from_secs(5)).send().await {
+            Ok(resp) if resp.status().is_success() => resp.json::<serde_json::Value>().await
                 .ok()
                 .and_then(|v| v.get("price").and_then(|p| p.as_str()).map(|s| s.to_string()))
                 .and_then(|s| s.parse::<f64>().ok())
-                .unwrap_or(0.0)
+                .unwrap_or(0.0),
+            _ => 0.0,
         }
-        Ok(resp) => {
-            tracing::warn!("[PRICE] NO token /price failed: {} for token {}", resp.status(), no_token_id);
-            0.0
+    }
+
+    let yes_price = fetch_midpoint(&client, yes_token_id, "YES").await;
+    let no_price = fetch_midpoint(&client, no_token_id, "NO").await;
+
+    // Sanity check: yes_mid + no_mid should be ~= 1.0 for a well-priced
+    // binary market. >3% deviation suggests wide spread or stale price —
+    // surface it so the operator can correlate with losing streaks.
+    if yes_price > 0.0 && no_price > 0.0 {
+        let sum = yes_price + no_price;
+        if (sum - 1.0).abs() > 0.03 {
+            tracing::warn!(
+                "[PRICE] yes+no sum deviates from 1.0: yes={:.4} no={:.4} sum={:.4} (yes_tok={} no_tok={})",
+                yes_price, no_price, sum, yes_token_id, no_token_id
+            );
         }
-        Err(e) => {
-            tracing::warn!("[PRICE] NO token /price request error: {} for token {}", e, no_token_id);
-            0.0
-        }
-    };
+    }
 
     (yes_price, no_price)
 }

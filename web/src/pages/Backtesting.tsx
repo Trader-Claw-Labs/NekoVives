@@ -8,6 +8,7 @@ import {
   AlertCircle, ChevronDown, ChevronRight, RefreshCw, Trash2,
   Pencil, Save, X, FolderOpen, Activity, Check, Eye, Code2,
   Info, Zap, ArrowUpDown, ListChecks, Database, TrendingUp,
+  Download, CloudDownload,
 } from 'lucide-react'
 import clsx from 'clsx'
 
@@ -1396,6 +1397,12 @@ export default function Backtesting() {
         </div>
       </div>
 
+      {/* Polymarket historical data sync */}
+      <PolyHistoricalSyncPanel
+        seriesOptions={allSeries}
+        currentSeriesId={config.series_id ?? config.poly_binary_preset}
+      />
+
       {/* Configuration - Horizontal layout */}
       <div
         className="rounded-lg border p-4 mb-4"
@@ -2126,6 +2133,279 @@ export default function Backtesting() {
           onClose={() => setShowLiveModal(false)}
           onCreated={() => setShowLiveModal(false)}
         />
+      )}
+    </div>
+  )
+}
+
+// ── Polymarket historical data sync panel ─────────────────────────
+//
+// Downloads the last N days of real Polymarket token prices (P4 + P3) for
+// a chosen recurring series. Lets first-time users populate the
+// `data/polymarket_historical/` cache without touching the CLI, so their
+// backtests reflect real CLOB pricing instead of the momentum fallback.
+
+interface PolySyncProgress {
+  running: boolean
+  series_id: string
+  from_date: string
+  to_date: string
+  stage: string
+  windows_total: number
+  windows_fetched: number
+  min4_count: number
+  min3_count: number
+  error: string | null
+  started_at: string | null
+  completed_at: string | null
+}
+
+interface PolyDatasetSummary {
+  series_id: string
+  min4_count: number | null
+  min3_count: number | null
+  last_modified: string | null
+}
+
+interface PolySyncStatus {
+  progress: PolySyncProgress
+  datasets: PolyDatasetSummary[]
+}
+
+function fmtRelativeDate(iso: string | null): string {
+  if (!iso) return '—'
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return '—'
+  const mins = Math.round((Date.now() - d.getTime()) / 60000)
+  if (mins < 1) return 'just now'
+  if (mins < 60) return `${mins}m ago`
+  const hrs = Math.round(mins / 60)
+  if (hrs < 48) return `${hrs}h ago`
+  return d.toISOString().slice(0, 10)
+}
+
+export function PolyHistoricalSyncPanel({ seriesOptions, currentSeriesId }: {
+  seriesOptions: MarketSeries[]
+  currentSeriesId?: string
+}) {
+  const [seriesId, setSeriesId] = useState<string>(currentSeriesId ?? 'btc_5m')
+  const [daysBack, setDaysBack] = useState<number>(60)
+  const [expanded, setExpanded] = useState(false)
+
+  // Keep selector in sync when the Backtesting page switches series.
+  useEffect(() => {
+    if (currentSeriesId) setSeriesId(currentSeriesId)
+  }, [currentSeriesId])
+
+  const { data: status, refetch } = useQuery<PolySyncStatus>({
+    queryKey: ['poly-historical-status'],
+    queryFn: () => apiFetch('/api/backtest/polymarket-historical/status'),
+    refetchInterval: (query) => (query.state.data?.progress.running ? 1500 : false),
+  })
+
+  const syncMutation = useMutation({
+    mutationFn: () => apiPost('/api/backtest/polymarket-historical/sync', {
+      series_id: seriesId,
+      days_back: daysBack,
+    }),
+    onSuccess: () => refetch(),
+  })
+
+  const progress = status?.progress
+  const running = progress?.running ?? false
+  const dataset = (status?.datasets ?? []).find(d => d.series_id === seriesId)
+
+  const pct = progress && progress.windows_total > 0
+    ? Math.min(100, (progress.windows_fetched / progress.windows_total) * 100)
+    : 0
+
+  const stageLabel = (() => {
+    switch (progress?.stage) {
+      case 'min4': return 'Minute-4 prices (decision)'
+      case 'min3': return 'Minute-3 prices (drift signal)'
+      case 'done': return 'Completed'
+      case 'error': return 'Error'
+      default: return 'Idle'
+    }
+  })()
+
+  // Polymarket series only — weather and other data sources don't have CLOB token prices.
+  const pmSeries = seriesOptions.filter(s => s.data_source !== 'open_meteo')
+
+  return (
+    <div
+      className="rounded-lg border mb-4"
+      style={{ backgroundColor: 'var(--color-surface)', borderColor: 'var(--color-border)' }}
+    >
+      {/* Header */}
+      <button
+        onClick={() => setExpanded(!expanded)}
+        className="w-full flex items-center justify-between p-3 text-left"
+      >
+        <div className="flex items-center gap-2">
+          <CloudDownload size={16} style={{ color: 'var(--color-accent)' }} />
+          <span className="text-sm font-semibold" style={{ color: 'var(--color-text)' }}>
+            Historical Polymarket data (CLOB)
+          </span>
+          {dataset && (dataset.min4_count ?? 0) > 0 && (
+            <span
+              className="px-1.5 py-0.5 rounded text-[10px] font-bold uppercase"
+              style={{ backgroundColor: 'rgba(34, 197, 94, 0.15)', color: '#22c55e' }}
+            >
+              {(dataset.min4_count ?? 0).toLocaleString()} P4
+              {(dataset.min3_count ?? 0) > 0 && ` · ${(dataset.min3_count ?? 0).toLocaleString()} P3`}
+            </span>
+          )}
+          {running && (
+            <span
+              className="px-1.5 py-0.5 rounded text-[10px] font-bold uppercase animate-pulse"
+              style={{ backgroundColor: 'rgba(59, 130, 246, 0.15)', color: '#3b82f6' }}
+            >
+              Syncing…
+            </span>
+          )}
+        </div>
+        {expanded ? <ChevronDown size={16} style={{ color: 'var(--color-text-muted)' }} /> : <ChevronRight size={16} style={{ color: 'var(--color-text-muted)' }} />}
+      </button>
+
+      {expanded && (
+        <div className="px-3 pb-3 space-y-3">
+          <p className="text-xs" style={{ color: 'var(--color-text-muted)' }}>
+            Fetches the last N days of real Polymarket token prices from the CLOB API
+            for the selected recurring series. Captures both minute-4 (decision) and
+            minute-3 (drift signal) prices. Your backtests will use these prices instead
+            of the momentum-model fallback, giving you far more realistic results.
+          </p>
+
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 items-end">
+            <div>
+              <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>Series</label>
+              <select
+                value={seriesId}
+                onChange={(e) => setSeriesId(e.target.value)}
+                disabled={running}
+                className="w-full rounded px-2 py-2 text-sm"
+                style={{
+                  backgroundColor: 'var(--color-surface-2)',
+                  border: '1px solid var(--color-border)',
+                  color: 'var(--color-text)',
+                }}
+              >
+                {pmSeries.length === 0
+                  ? <option value="btc_5m">BTC 5m (default)</option>
+                  : pmSeries.map(s => <option key={s.id} value={s.id}>{s.label}</option>)
+                }
+              </select>
+            </div>
+            <div>
+              <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>Days back</label>
+              <input
+                type="number"
+                min={1}
+                max={365}
+                value={daysBack}
+                onChange={(e) => setDaysBack(Math.max(1, Math.min(365, parseInt(e.target.value || '60', 10))))}
+                disabled={running}
+                className="w-full rounded px-2 py-2 text-sm"
+                style={{
+                  backgroundColor: 'var(--color-surface-2)',
+                  border: '1px solid var(--color-border)',
+                  color: 'var(--color-text)',
+                }}
+              />
+            </div>
+            <div>
+              <button
+                onClick={() => syncMutation.mutate()}
+                disabled={running || syncMutation.isPending}
+                className="w-full flex items-center justify-center gap-2 rounded px-3 py-2 text-sm font-semibold transition-opacity disabled:opacity-50 disabled:cursor-not-allowed"
+                style={{
+                  backgroundColor: 'var(--color-accent)',
+                  color: 'var(--color-bg)',
+                }}
+              >
+                <Download size={14} />
+                {running ? 'Syncing…' : 'Cargar datos históricos de Polymarket (CLOB)'}
+              </button>
+            </div>
+          </div>
+
+          {/* Progress bar */}
+          {running && progress && (
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between text-xs" style={{ color: 'var(--color-text-muted)' }}>
+                <span>{stageLabel}</span>
+                <span>
+                  {progress.windows_fetched.toLocaleString()} / {progress.windows_total.toLocaleString()} windows
+                  {' · '}
+                  {pct.toFixed(1)}%
+                </span>
+              </div>
+              <div
+                className="w-full h-1.5 rounded overflow-hidden"
+                style={{ backgroundColor: 'var(--color-surface-2)' }}
+              >
+                <div
+                  className="h-full transition-all duration-300"
+                  style={{ width: `${pct}%`, backgroundColor: 'var(--color-accent)' }}
+                />
+              </div>
+              <p className="text-[10px]" style={{ color: 'var(--color-text-muted)' }}>
+                Window: {progress.from_date} → {progress.to_date}
+              </p>
+            </div>
+          )}
+
+          {/* Last result / error */}
+          {!running && progress?.stage === 'done' && (
+            <div
+              className="rounded border p-2 text-xs flex items-center gap-2"
+              style={{
+                backgroundColor: 'rgba(34, 197, 94, 0.08)',
+                borderColor: 'rgba(34, 197, 94, 0.35)',
+                color: '#22c55e',
+              }}
+            >
+              <Check size={14} />
+              Last sync: {progress.min4_count.toLocaleString()} P4 + {progress.min3_count.toLocaleString()} P3 records
+              {progress.completed_at && ` · ${fmtRelativeDate(progress.completed_at)}`}
+            </div>
+          )}
+          {!running && progress?.stage === 'error' && progress.error && (
+            <div
+              className="rounded border p-2 text-xs flex items-center gap-2"
+              style={{
+                backgroundColor: 'rgba(239, 68, 68, 0.08)',
+                borderColor: 'rgba(239, 68, 68, 0.35)',
+                color: '#ef4444',
+              }}
+            >
+              <AlertCircle size={14} />
+              Sync error: {progress.error}
+            </div>
+          )}
+
+          {/* Cached datasets summary */}
+          {(status?.datasets ?? []).length > 0 && (
+            <div className="text-xs" style={{ color: 'var(--color-text-muted)' }}>
+              <p className="font-semibold uppercase tracking-widest text-[10px] mb-1.5">Cached datasets</p>
+              <div className="space-y-1">
+                {(status?.datasets ?? []).map(d => (
+                  <div key={d.series_id} className="flex items-center justify-between gap-2">
+                    <span className="font-mono">{d.series_id}</span>
+                    <span>
+                      {(d.min4_count ?? 0).toLocaleString()} P4
+                      {' · '}
+                      {(d.min3_count ?? 0).toLocaleString()} P3
+                      {' · '}
+                      {fmtRelativeDate(d.last_modified)}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
       )}
     </div>
   )

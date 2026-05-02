@@ -30,6 +30,7 @@ interface RunnerConfig {
   stop_loss_pct?: number | null
   early_fire_secs?: number | null
   max_entry_price?: number | null
+  max_spread_pct?: number | null
 }
 
 interface RunnerStatus {
@@ -521,6 +522,7 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript }: Crea
     stop_loss_pct: null as number | null,
     early_fire_secs: null as number | null,
     max_entry_price: 0.65 as number | null,
+    max_spread_pct: 0.03 as number | null,
   })
   const [error, setError] = useState('')
   const [showMissingApiKeyModal, setShowMissingApiKeyModal] = useState(false)
@@ -861,6 +863,41 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript }: Crea
                 : 'Disabled — trades at any token price'}
             </p>
           </div>
+
+          {/* Max Spread (Polymarket Binary only) */}
+          {form.market_type === 'polymarket_binary' && (
+            <div>
+              <label className="block text-[11px] font-medium mb-1" style={{ color: 'var(--color-text-muted)' }}>
+                Max Spread
+              </label>
+              <div className="flex items-center gap-2">
+                <input
+                  type="number"
+                  className="w-20 rounded border px-2 py-1 text-xs"
+                  style={{ background: 'var(--color-surface-2)', borderColor: 'var(--color-border)', color: 'var(--color-text)' }}
+                  placeholder="3.00"
+                  min={0.01}
+                  max={50}
+                  step={0.01}
+                  value={form.max_spread_pct != null ? (form.max_spread_pct * 100).toFixed(2) : ''}
+                  onChange={e => set('max_spread_pct', e.target.value === '' ? null : Number(e.target.value) / 100)}
+                />
+                <span className="text-[11px]" style={{ color: 'var(--color-text-muted)' }}>%</span>
+                <SegmentedToggle
+                  value={form.max_spread_pct != null}
+                  onChange={(v) => set('max_spread_pct', v ? 0.03 : null)}
+                  leftLabel="Off"
+                  rightLabel="On"
+                  activeColor="#818cf8"
+                />
+              </div>
+              <p className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
+                {form.max_spread_pct != null
+                  ? `Skip windows when yes+no mids deviate >${(form.max_spread_pct * 100).toFixed(2)}% from 1.0 (type percentage: e.g. "2" = 2%) — avoids paper-fill optimism in wide books`
+                  : 'Disabled — trades regardless of spread width'}
+              </p>
+            </div>
+          )}
 
           {/* Live mode notice */}
           {form.mode === 'live' && (
@@ -1284,7 +1321,7 @@ interface RunnerCardProps {
   onStop: () => void
   onRestart: () => void
   onDelete: () => void
-  onUpdateConfig?: (updates: { live_sizing_mode?: string; live_sizing_value?: number; max_entry_price?: number | null }) => void
+  onUpdateConfig?: (updates: { live_sizing_mode?: string; live_sizing_value?: number; max_entry_price?: number | null; max_spread_pct?: number | null; early_fire_secs?: number | null }) => void
   isPatching?: boolean
 }
 
@@ -1472,6 +1509,76 @@ function RunnerCard({ runner, onStop, onRestart, onDelete, onUpdateConfig, isPat
             <SegmentedToggle
               value={config.max_entry_price != null}
               onChange={(v) => onUpdateConfig({ max_entry_price: v ? 0.65 : null })}
+              leftLabel="Off"
+              rightLabel="On"
+              activeColor="#818cf8"
+              disabled={isPatching}
+            />
+          </div>
+          {config.market_type === 'polymarket_binary' && (
+            <div className="flex items-center gap-3 text-xs mt-2">
+              <span style={{ color: 'var(--color-text-muted)' }} className="font-medium">Max Spread:</span>
+              <div className="flex items-center gap-1">
+                <input
+                  type="number"
+                  className="w-16 rounded border px-1.5 py-0.5 text-xs"
+                  style={{ background: 'var(--color-surface-2)', borderColor: 'var(--color-border)', color: 'var(--color-text)' }}
+                  min={0.01}
+                  max={50}
+                  step={0.01}
+                  placeholder="3.00"
+                  value={config.max_spread_pct != null ? (config.max_spread_pct * 100).toFixed(2) : ''}
+                  onChange={e => {
+                    const raw = e.target.value
+                    if (raw === '') {
+                      onUpdateConfig({ max_spread_pct: null })
+                    } else {
+                      const val = Number(raw) / 100
+                      if (!Number.isNaN(val)) onUpdateConfig({ max_spread_pct: val })
+                    }
+                  }}
+                  disabled={isPatching}
+                />
+                <span style={{ color: 'var(--color-text-muted)' }}>%</span>
+              </div>
+              <SegmentedToggle
+                value={config.max_spread_pct != null}
+                onChange={(v) => onUpdateConfig({ max_spread_pct: v ? 0.03 : null })}
+                leftLabel="Off"
+                rightLabel="On"
+                activeColor="#818cf8"
+                disabled={isPatching}
+              />
+            </div>
+          )}
+          <div className="flex items-center gap-3 text-xs mt-2">
+            <span style={{ color: 'var(--color-text-muted)' }} className="font-medium">Early Fire:</span>
+            <div className="flex items-center gap-1">
+              <input
+                type="number"
+                className="w-16 rounded border px-1.5 py-0.5 text-xs"
+                style={{ background: 'var(--color-surface-2)', borderColor: 'var(--color-border)', color: 'var(--color-text)' }}
+                min={1}
+                max={60}
+                step={1}
+                placeholder="10"
+                value={config.early_fire_secs != null ? config.early_fire_secs : ''}
+                onChange={e => {
+                  const raw = e.target.value
+                  if (raw === '') {
+                    onUpdateConfig({ early_fire_secs: null })
+                  } else {
+                    const val = parseInt(raw, 10)
+                    if (!Number.isNaN(val)) onUpdateConfig({ early_fire_secs: val })
+                  }
+                }}
+                disabled={isPatching}
+              />
+              <span style={{ color: 'var(--color-text-muted)' }}>s</span>
+            </div>
+            <SegmentedToggle
+              value={config.early_fire_secs != null}
+              onChange={(v) => onUpdateConfig({ early_fire_secs: v ? 10 : null })}
               leftLabel="Off"
               rightLabel="On"
               activeColor="#818cf8"

@@ -10,8 +10,27 @@ use axum::{
     response::{IntoResponse, Json},
 };
 use serde::Deserialize;
+use std::sync::Arc;
 
 const MASKED_SECRET: &str = "***MASKED***";
+
+// ── Nullable patch helper ────────────────────────────────────────────────
+// Distinguishes three JSON states for optional-but-clearable fields:
+//   - field absent    → Option<Option<T>> = None       (no update)
+//   - field = null    → Option<Option<T>> = Some(None) (clear/disable)
+//   - field = value   → Option<Option<T>> = Some(Some(v)) (set)
+//
+// Use with #[serde(default, deserialize_with = "nullable::deserialize")]
+mod nullable {
+    use serde::{Deserialize, Deserializer};
+    pub fn deserialize<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
+    where
+        D: Deserializer<'de>,
+        T: Deserialize<'de>,
+    {
+        Ok(Some(Option::<T>::deserialize(d)?))
+    }
+}
 
 // ── Bearer token auth extractor ─────────────────────────────────
 
@@ -3882,6 +3901,305 @@ pub async fn handle_api_backtest_scripts_content_post(
     }
 }
 
+// ── Polymarket historical dataset sync (dashboard) ────────────────────────
+
+#[derive(serde::Deserialize)]
+pub struct PolyHistSyncBody {
+    /// Series to sync. Defaults to "btc_5m".
+    #[serde(default)]
+    pub series_id: Option<String>,
+    /// Rolling window in days ending today (UTC). Defaults to 60.
+    #[serde(default)]
+    pub days_back: Option<u32>,
+}
+
+/// POST /api/backtest/polymarket-historical/sync
+///
+/// Starts a background scrape of the last `days_back` days of Polymarket
+/// data for the given series. Fetches both minute-4 (P4, main dataset) and
+/// minute-3 (P3, drift signal) token prices via CLOB `/prices-history`.
+///
+/// The request returns immediately. Progress is exposed at
+/// `GET /api/backtest/polymarket-historical/status`.
+///
+/// If a sync is already running, returns `started: false` plus the current
+/// progress snapshot — callers should just poll `/status` in that case.
+pub async fn handle_api_backtest_polymarket_historical_sync(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<PolyHistSyncBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let series_id = body.series_id.unwrap_or_else(|| "btc_5m".to_string());
+    let days_back = body.days_back.unwrap_or(60).clamp(1, 365) as i64;
+
+    // Reject unknown series early so the UI gets a clean error.
+    let series_known = crate::tools::series::builtin_series()
+        .into_iter()
+        .any(|s| s.id == series_id);
+    if !series_known {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("Unknown series_id: {}", series_id) })),
+        )
+            .into_response();
+    }
+
+    // Guard: at most one sync at a time.
+    {
+        let prog = state.poly_sync_progress.lock();
+        if prog.running {
+            return Json(serde_json::json!({
+                "started": false,
+                "progress": *prog,
+            }))
+            .into_response();
+        }
+    }
+
+    let to_dt = chrono::Utc::now();
+    let from_dt = to_dt - chrono::Duration::days(days_back);
+    let from_date = from_dt.format("%Y-%m-%d").to_string();
+    let to_date = to_dt.format("%Y-%m-%d").to_string();
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+
+    // Initialise progress.
+    {
+        let mut prog = state.poly_sync_progress.lock();
+        *prog = crate::tools::polymarket_historical::SyncProgress {
+            running: true,
+            series_id: series_id.clone(),
+            from_date: from_date.clone(),
+            to_date: to_date.clone(),
+            stage: "min4".to_string(),
+            windows_total: 0,
+            windows_fetched: 0,
+            min4_count: 0,
+            min3_count: 0,
+            error: None,
+            started_at: Some(chrono::Utc::now().to_rfc3339()),
+            completed_at: None,
+        };
+    }
+
+    // Spawn the scrape task. Minute-4 first (main dataset), then minute-3.
+    let progress = state.poly_sync_progress.clone();
+    tokio::spawn(async move {
+        use crate::tools::polymarket_historical::{scrape_series_with_options, ScrapeOptions};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // ── Stage 1: minute-4 (P4 decision) ──
+        let fetched = Arc::new(AtomicUsize::new(0));
+        let total = Arc::new(AtomicUsize::new(0));
+        let poll_fetched = fetched.clone();
+        let poll_total = total.clone();
+        let poll_progress = progress.clone();
+        let poll_handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+            loop {
+                interval.tick().await;
+                let mut p = poll_progress.lock();
+                if !p.running || p.stage == "error" || p.stage == "done" {
+                    break;
+                }
+                p.windows_fetched = poll_fetched.load(Ordering::SeqCst);
+                p.windows_total = poll_total.load(Ordering::SeqCst);
+            }
+        });
+
+        let min4_result = scrape_series_with_options(
+            &series_id,
+            &from_date,
+            &to_date,
+            &workspace_dir,
+            ScrapeOptions {
+                decision_offset_secs: None,     // default = minute 4 for 5m
+                file_prefix: None,              // main dataset
+                fetched_counter: Some(fetched.clone()),
+                total_counter: Some(total.clone()),
+            },
+        )
+        .await;
+
+        match min4_result {
+            Ok(n) => {
+                let mut p = progress.lock();
+                p.min4_count = n;
+                p.stage = "min3".to_string();
+                p.windows_fetched = 0;
+                p.windows_total = 0;
+            }
+            Err(e) => {
+                {
+                    let mut p = progress.lock();
+                    p.running = false;
+                    p.stage = "error".to_string();
+                    p.error = Some(format!("min4 scrape failed: {}", e));
+                    p.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                }
+                let _ = poll_handle.await;
+                return;
+            }
+        }
+
+        // ── Stage 2: minute-3 (P3 drift signal) ──
+        let fetched3 = Arc::new(AtomicUsize::new(0));
+        let total3 = Arc::new(AtomicUsize::new(0));
+        // Replace the progress-poll task to track stage 2 counters.
+        let _ = poll_handle.await;
+        let poll_fetched3 = fetched3.clone();
+        let poll_total3 = total3.clone();
+        let poll_progress3 = progress.clone();
+        let poll_handle3 = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+            loop {
+                interval.tick().await;
+                let mut p = poll_progress3.lock();
+                if !p.running || p.stage == "error" || p.stage == "done" {
+                    break;
+                }
+                p.windows_fetched = poll_fetched3.load(Ordering::SeqCst);
+                p.windows_total = poll_total3.load(Ordering::SeqCst);
+            }
+        });
+
+        // Decision offset for minute-3: (window_minutes - 2) * 60s.
+        // For the default 5m series, this is 180s. Derived from the series
+        // record so non-5m future series (e.g. 15m) also work.
+        let series = crate::tools::series::builtin_series()
+            .into_iter()
+            .find(|s| s.id == series_id);
+        let window_minutes: i64 = match series {
+            Some(s) => {
+                let c = &s.cadence;
+                if let Some(m) = c.strip_suffix('m') {
+                    m.parse().unwrap_or(5)
+                } else if let Some(h) = c.strip_suffix('h') {
+                    h.parse::<i64>().unwrap_or(1) * 60
+                } else {
+                    5
+                }
+            }
+            None => 5,
+        };
+        let min3_offset = (window_minutes - 2) * 60;
+
+        let min3_result = scrape_series_with_options(
+            &series_id,
+            &from_date,
+            &to_date,
+            &workspace_dir,
+            ScrapeOptions {
+                decision_offset_secs: Some(min3_offset),
+                file_prefix: Some("min3_".to_string()),
+                fetched_counter: Some(fetched3.clone()),
+                total_counter: Some(total3.clone()),
+            },
+        )
+        .await;
+
+        {
+            let mut p = progress.lock();
+            p.running = false;
+            p.completed_at = Some(chrono::Utc::now().to_rfc3339());
+            match min3_result {
+                Ok(n) => {
+                    p.min3_count = n;
+                    p.stage = "done".to_string();
+                }
+                Err(e) => {
+                    p.stage = "error".to_string();
+                    p.error = Some(format!("min3 scrape failed: {}", e));
+                }
+            }
+        }
+        let _ = poll_handle3.await;
+    });
+
+    let snapshot = state.poly_sync_progress.lock().clone();
+    Json(serde_json::json!({
+        "started": true,
+        "progress": snapshot,
+    }))
+    .into_response()
+}
+
+/// GET /api/backtest/polymarket-historical/status
+///
+/// Returns the current sync progress snapshot plus a lightweight summary of
+/// cached datasets on disk so the dashboard can render "last synced" info
+/// even across server restarts.
+pub async fn handle_api_backtest_polymarket_historical_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let progress = state.poly_sync_progress.lock().clone();
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let hist_dir = workspace_dir.join("data").join("polymarket_historical");
+
+    // Summarise available datasets (main + min3 pairs per series).
+    let mut datasets: Vec<serde_json::Value> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&hist_dir) {
+        use std::collections::BTreeMap;
+        let mut by_series: BTreeMap<String, (Option<u64>, Option<u64>, Option<std::time::SystemTime>)> = BTreeMap::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(n) if n.ends_with(".jsonl") => n.to_string(),
+                _ => continue,
+            };
+            let (series_key, is_min3) = if let Some(rest) = name.strip_prefix("min3_") {
+                (rest.trim_end_matches(".jsonl").to_string(), true)
+            } else {
+                (name.trim_end_matches(".jsonl").to_string(), false)
+            };
+            let meta = std::fs::metadata(&path).ok();
+            let modified = meta.as_ref().and_then(|m| m.modified().ok());
+            // Approx record count = line count. Cheap enough for small files.
+            let line_count = std::fs::read_to_string(&path)
+                .map(|c| c.lines().filter(|l| !l.trim().is_empty()).count() as u64)
+                .ok();
+            let slot = by_series.entry(series_key).or_default();
+            if is_min3 {
+                slot.1 = line_count;
+            } else {
+                slot.0 = line_count;
+            }
+            if let Some(m) = modified {
+                slot.2 = Some(match slot.2 {
+                    Some(prev) if prev > m => prev,
+                    _ => m,
+                });
+            }
+        }
+        for (series_key, (min4, min3, modified)) in by_series {
+            let modified_rfc = modified.and_then(|t| {
+                let dt: chrono::DateTime<chrono::Utc> = t.into();
+                Some(dt.to_rfc3339())
+            });
+            datasets.push(serde_json::json!({
+                "series_id": series_key,
+                "min4_count": min4,
+                "min3_count": min3,
+                "last_modified": modified_rfc,
+            }));
+        }
+    }
+
+    Json(serde_json::json!({
+        "progress": progress,
+        "datasets": datasets,
+    }))
+    .into_response()
+}
+
 // ── Live Strategy Runner API ──────────────────────────────────────────────
 
 #[derive(serde::Deserialize)]
@@ -3911,6 +4229,8 @@ pub struct CreateRunnerBody {
     pub max_entry_price: Option<f64>,
     #[serde(default)]
     pub price_mode: Option<String>,
+    #[serde(default)]
+    pub max_spread_pct: Option<f64>,
 }
 
 #[derive(serde::Deserialize)]
@@ -3918,8 +4238,15 @@ pub struct PatchRunnerBody {
     pub auto_restart: Option<bool>,
     pub live_sizing_mode: Option<String>,
     pub live_sizing_value: Option<f64>,
-    pub max_entry_price: Option<f64>,
+    // These three use Option<Option<T>> so we can distinguish:
+    //   absent → None (skip)   |   null → Some(None) (clear)   |   value → Some(Some(v)) (set)
+    #[serde(default, deserialize_with = "nullable::deserialize")]
+    pub max_entry_price: Option<Option<f64>>,
     pub price_mode: Option<String>,
+    #[serde(default, deserialize_with = "nullable::deserialize")]
+    pub max_spread_pct: Option<Option<f64>>,
+    #[serde(default, deserialize_with = "nullable::deserialize")]
+    pub early_fire_secs: Option<Option<u32>>,
 }
 
 async fn hydrate_live_runtime_config(state: &AppState, config: &mut crate::strategy_runner::RunnerConfig) -> anyhow::Result<()> {
@@ -4056,12 +4383,28 @@ pub async fn handle_api_live_patch(
         }
     }
 
-    if body.live_sizing_mode.is_some() || body.live_sizing_value.is_some() || body.max_entry_price.is_some() || body.price_mode.is_some() {
+    if body.live_sizing_mode.is_some()
+        || body.live_sizing_value.is_some()
+        || body.max_entry_price.is_some()
+        || body.price_mode.is_some()
+        || body.max_spread_pct.is_some()
+        || body.early_fire_secs.is_some()
+    {
         let mode = body.live_sizing_mode.map(|m| match m.as_str() {
             "fixed" => crate::strategy_runner::LiveSizingMode::Fixed,
             _ => crate::strategy_runner::LiveSizingMode::Percent,
         });
-        match state.strategy_runner.update_runner_config(&id, mode, body.live_sizing_value, body.max_entry_price, body.price_mode) {
+        // body.max_entry_price / max_spread_pct / early_fire_secs are
+        // Option<Option<T>>: Some(None) = clear the field, Some(Some(v)) = set it.
+        match state.strategy_runner.update_runner_config(
+            &id,
+            mode,
+            body.live_sizing_value,
+            body.max_entry_price,
+            body.price_mode,
+            body.max_spread_pct,
+            body.early_fire_secs,
+        ) {
             Some(runner) => return Json(serde_json::json!({ "runner": runner })).into_response(),
             None => return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "runner not found" }))).into_response(),
         }
@@ -4157,6 +4500,7 @@ pub async fn handle_api_live_create(
         }),
         max_entry_price: body.max_entry_price,
         price_mode: body.price_mode,
+        max_spread_pct: body.max_spread_pct,
     };
 
     if let Err(e) = hydrate_live_runtime_config(&state, &mut config).await {
