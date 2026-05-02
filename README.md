@@ -1,30 +1,20 @@
-```
-  $$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
+<div align="center">
+  <img src="landing/Neko.png" alt="Neko Vives" width="200"/>
 
-  |         |              ████████╗██████╗  █████╗ ██████╗ ███████╗██████╗
-  ▐▌    |   ▐▌   |    |    ╚══██╔══╝██╔══██╗██╔══██╗██╔══██╗██╔════╝██╔══██╗
-  ▐▌    ▐▌  ▐▌   ▐▌   |       ██║   ██████╔╝███████║██║  ██║█████╗  ██████╔╝
-  ▐▌    ▐▌  ▐▌   ▐▌   ▐▌      ██║   ██╔══██╗██╔══██║██║  ██║██╔══╝  ██╔══██╗
-  |     ▐▌  |    ▐▌   ▐▌      ██║   ██║  ██║██║  ██║██████╔╝███████╗██║  ██║
-        |        |    |        ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═╝╚═════╝ ╚══════╝╚═╝  ╚═╝
+  # NEKO VIVES
 
-  ▲ +420%              ██████╗██╗      █████╗ ██╗    ██╗
-  |                    ██╔════╝██║     ██╔══██╗██║    ██║
-  |    ___/            ██║     ██║     ███████║██║ █╗ ██║
-  |___/                ██║     ██║     ██╔══██║██║███╗██║
-  └──────────────>     ╚██████╗███████╗██║  ██║╚███╔███╔╝
-                        ╚═════╝╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝
+  **▲ VIVE TRADING CAT AGENT ▲**
 
-           Buy the dip. 100% Rust. EVM · Solana · TON · Polymarket.
+  *Rust crypto trading agent for degens on EVM, Solana, TON, and Polymarket.*
 
-  $$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
-```
+  [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
+  [![Rust](https://img.shields.io/badge/rust-1.86%2B-orange)](https://www.rust-lang.org/)
 
-**Rust crypto trading agent for degens on EVM, Solana, TON, and Polymarket.**
+</div>
 
 Control your trades via Telegram or the built-in web dashboard.
 
-![Trader Claw Dashboard](landing/screenshot.png)
+![Neko Vives Dashboard](landing/screenshot.png)
 
 ---
 
@@ -45,9 +35,9 @@ Control your trades via Telegram or the built-in web dashboard.
 ## Architecture
 
 ```
-trader-agent (binary)
+neko-vives (binary)
 ├── crates/wallet-manager    — EVM BIP44, Solana ED25519, TON v4R2
-├── crates/evm-trader        — Uniswap V3 via raw JSON-RPC
+├── crates/evm-trader        — Uniswap V2/V3/V4 via alloy
 ├── crates/solana-trader     — PumpFun, Raydium
 ├── crates/ton-trader        — STON.fi
 ├── crates/polymarket-trader — Gamma API + CLOB API, L1/L2 auth
@@ -108,10 +98,11 @@ winget install Rustlang.Rustup
 
 ```bash
 # Clone
-git clone https://github.com/Trader-Claw-Labs/Trader-Claw.git
-cd Trader-Claw
+git clone https://github.com/Neko-Vives-Labs/Neko-Vives.git
+cd Neko-Vives
 
-# Build (first build downloads ~200 deps, takes 2-5 min)
+# Build web dashboard first, then the binary
+cd web && npm run build && cd ..
 cargo build --release
 
 # First-time setup (creates ~/.config/trader-claw/config.toml)
@@ -133,12 +124,12 @@ cargo build --release
 
 ## Installation (pre-built binaries)
 
-No Rust required — grab a pre-built binary from [GitHub Releases](https://github.com/Trader-Claw-Labs/Trader-Claw/releases).
+No Rust required — grab a pre-built binary from [GitHub Releases](https://github.com/Neko-Vives-Labs/Neko-Vives/releases).
 
 ### One-liner (Linux / macOS)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Trader-Claw-Labs/Trader-Claw/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Neko-Vives-Labs/Neko-Vives/main/install.sh | sh
 ```
 
 Installs to `/usr/local/bin/trader-claw`. Detects OS and architecture automatically.
@@ -146,7 +137,7 @@ Installs to `/usr/local/bin/trader-claw`. Detects OS and architecture automatica
 ### One-liner (Windows PowerShell)
 
 ```powershell
-irm https://raw.githubusercontent.com/Trader-Claw-Labs/Trader-Claw/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/Neko-Vives-Labs/Neko-Vives/main/install.ps1 | iex
 ```
 
 Installs to `%LOCALAPPDATA%\trader-claw\` and adds it to your PATH.
@@ -154,37 +145,37 @@ Installs to `%LOCALAPPDATA%\trader-claw\` and adds it to your PATH.
 ### Homebrew (macOS / Linux)
 
 ```bash
-brew tap Trader-Claw-Labs/trader-claw
-brew install trader-claw
+brew tap Neko-Vives-Labs/neko-vives
+brew install neko-vives
 ```
 
 ### Scoop (Windows)
 
 ```powershell
-scoop bucket add trader-claw https://github.com/Trader-Claw-Labs/scoop-trader-claw
-scoop install trader-claw
+scoop bucket add neko-vives https://github.com/Neko-Vives-Labs/scoop-neko-vives
+scoop install neko-vives
 ```
 
 ### AUR (Arch Linux)
 
 ```bash
-yay -S trader-claw-bin
-# or: paru -S trader-claw-bin
+yay -S neko-vives-bin
+# or: paru -S neko-vives-bin
 ```
 
 ### MSI installer (Windows)
 
-Download `trader-claw-windows-x86_64.msi` from the latest [release](https://github.com/Trader-Claw-Labs/Trader-Claw/releases) — installs to `Program Files\Trader Claw\` and adds to system PATH.
+Download `neko-vives-windows-x86_64.msi` from the latest [release](https://github.com/Neko-Vives-Labs/Neko-Vives/releases) — installs to `Program Files\Neko Vives\` and adds to system PATH.
 
 ### DMG (macOS)
 
-Download `trader-claw-macos-arm64.dmg` (Apple Silicon) or `trader-claw-macos-x86_64.dmg` (Intel) from the latest [release](https://github.com/Trader-Claw-Labs/Trader-Claw/releases). Copy `trader-claw` to `/usr/local/bin/`.
+Download `neko-vives-macos-arm64.dmg` (Apple Silicon) or `neko-vives-macos-x86_64.dmg` (Intel) from the latest [release](https://github.com/Neko-Vives-Labs/Neko-Vives/releases). Copy `trader-claw` to `/usr/local/bin/`.
 
 > **Gatekeeper note:** macOS may block unsigned binaries. Right-click → Open → Open to allow.
 
 ### Self-update
 
-Once installed, keep `trader-claw` up to date with:
+Once installed, keep Neko Vives up to date with:
 
 ```bash
 trader-claw update
@@ -250,14 +241,15 @@ Dashboard → /backtesting
 Agent chat: "backtest polymarket_4min.rhai on BTCUSDT from 2024-01-01 to 2024-12-31"
 ```
 
-**Metrics reported:** Total Return %, Sharpe Ratio, Max Drawdown %, Win Rate, Trade Count, 5 Worst Trades, AI analysis.
+**Metrics reported:** Total Return %, Final Balance, Sharpe Ratio, Max Drawdown %, Win Rate, Trade Count, Avg Ticket, 5 Worst Trades, AI analysis.
 
 **Bundled strategies** (written to `~/.config/trader-claw/scripts/` on first run):
 
 | Script | Description |
 |--------|-------------|
 | `polymarket_4min.rhai` | Polymarket 4-minute momentum strategy — RSI + 4-candle momentum + volume confirmation (3-of-4), ATR-based stop loss and take profit |
-| `strategy_reference.rhai` | Reference implementation showing the array-based `on_candle(candle_data, capital)` API |
+| `weather_binary.rhai` | Weather threshold strategy (EMA/threshold scoring for YES/NO bets) |
+| `strategy_reference.rhai` | Reference implementation showing the legacy `on_candle(candle_data, capital)` API |
 
 **Writing your own strategy:**
 
@@ -307,9 +299,17 @@ fn on_candle(ctx) {
 ## Build & test
 
 ```bash
+# Rebuild web dashboard
+cd web && npm run build && cd ..
+
+# Build binary (both steps required after any frontend change)
 cargo build --release
+
+# Run tests and lints
 cargo test
 cargo clippy -- -D warnings
+
+# Docker
 docker compose up -d
 ```
 
@@ -318,4 +318,3 @@ docker compose up -d
 ## License
 
 MIT OR Apache-2.0
-
