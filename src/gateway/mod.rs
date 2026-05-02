@@ -370,6 +370,8 @@ pub struct AppState {
     pub wallets_path: Arc<std::path::PathBuf>,
     /// Live strategy runner store
     pub strategy_runner: Arc<crate::strategy_runner::StrategyRunnerStore>,
+    /// Polymarket historical sync progress (shared with background task)
+    pub poly_sync_progress: Arc<Mutex<crate::tools::polymarket_historical::SyncProgress>>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -618,6 +620,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         strategy_runner: Arc::new(crate::strategy_runner::StrategyRunnerStore::new(
             config.workspace_dir.clone(),
         )),
+        poly_sync_progress: Arc::new(Mutex::new(Default::default())),
     };
 
     // Restart any strategies that were running before the last shutdown
@@ -739,6 +742,14 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/backtest/scripts/description", post(api::handle_api_backtest_scripts_description))
         .route("/api/backtest/scripts/stats", post(api::handle_api_backtest_scripts_stats))
         .route("/api/backtest/scripts/content", get(api::handle_api_backtest_scripts_content_get).post(api::handle_api_backtest_scripts_content_post))
+        .route(
+            "/api/backtest/polymarket-historical/sync",
+            post(api::handle_api_backtest_polymarket_historical_sync),
+        )
+        .route(
+            "/api/backtest/polymarket-historical/status",
+            get(api::handle_api_backtest_polymarket_historical_status),
+        )
         .route(
             "/api/channels/telegram/configure",
             get(api::handle_api_telegram_get).post(api::handle_api_telegram_configure),
@@ -1238,6 +1249,7 @@ mod tests {
             wallets: Arc::new(Mutex::new(Vec::new())),
             wallets_path: Arc::new(std::env::temp_dir().join("traderclaw_test_wallets.json")),
             strategy_runner: Arc::new(crate::strategy_runner::StrategyRunnerStore::new(std::env::temp_dir())),
+            poly_sync_progress: Arc::new(Mutex::new(Default::default())),
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1282,6 +1294,7 @@ mod tests {
             wallets: Arc::new(Mutex::new(Vec::new())),
             wallets_path: Arc::new(std::env::temp_dir().join("traderclaw_test_wallets.json")),
             strategy_runner: Arc::new(crate::strategy_runner::StrategyRunnerStore::new(std::env::temp_dir())),
+            poly_sync_progress: Arc::new(Mutex::new(Default::default())),
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1627,6 +1640,7 @@ mod tests {
             wallets: Arc::new(Mutex::new(Vec::new())),
             wallets_path: Arc::new(std::env::temp_dir().join("traderclaw_test_wallets.json")),
             strategy_runner: Arc::new(crate::strategy_runner::StrategyRunnerStore::new(std::env::temp_dir())),
+            poly_sync_progress: Arc::new(Mutex::new(Default::default())),
         };
 
         let mut headers = HeaderMap::new();
@@ -1686,6 +1700,7 @@ mod tests {
             wallets: Arc::new(Mutex::new(Vec::new())),
             wallets_path: Arc::new(std::env::temp_dir().join("traderclaw_test_wallets.json")),
             strategy_runner: Arc::new(crate::strategy_runner::StrategyRunnerStore::new(std::env::temp_dir())),
+            poly_sync_progress: Arc::new(Mutex::new(Default::default())),
         };
 
         let headers = HeaderMap::new();
@@ -1757,6 +1772,7 @@ mod tests {
             wallets: Arc::new(Mutex::new(Vec::new())),
             wallets_path: Arc::new(std::env::temp_dir().join("traderclaw_test_wallets.json")),
             strategy_runner: Arc::new(crate::strategy_runner::StrategyRunnerStore::new(std::env::temp_dir())),
+            poly_sync_progress: Arc::new(Mutex::new(Default::default())),
         };
 
         let response = handle_webhook(
@@ -1800,6 +1816,7 @@ mod tests {
             wallets: Arc::new(Mutex::new(Vec::new())),
             wallets_path: Arc::new(std::env::temp_dir().join("traderclaw_test_wallets.json")),
             strategy_runner: Arc::new(crate::strategy_runner::StrategyRunnerStore::new(std::env::temp_dir())),
+            poly_sync_progress: Arc::new(Mutex::new(Default::default())),
         };
 
         let mut headers = HeaderMap::new();
@@ -1848,6 +1865,7 @@ mod tests {
             wallets: Arc::new(Mutex::new(Vec::new())),
             wallets_path: Arc::new(std::env::temp_dir().join("traderclaw_test_wallets.json")),
             strategy_runner: Arc::new(crate::strategy_runner::StrategyRunnerStore::new(std::env::temp_dir())),
+            poly_sync_progress: Arc::new(Mutex::new(Default::default())),
         };
 
         let mut headers = HeaderMap::new();

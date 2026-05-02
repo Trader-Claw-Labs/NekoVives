@@ -13,8 +13,60 @@ use chrono::{NaiveDate, TimeZone, Utc};
 use serde_json;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
+
+/// Live progress state for a dashboard-initiated historical sync.
+///
+/// Shared between the background task and the `/status` endpoint via
+/// `Arc<Mutex<SyncProgress>>`. All hot-path counters are `AtomicUsize` so
+/// the scrape task updates them lock-free; the mutex wraps only the slow
+/// metadata (stage, error, dates).
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct SyncProgress {
+    /// True while a scrape task is active.
+    pub running: bool,
+    /// Series currently being scraped (e.g. "btc_5m").
+    pub series_id: String,
+    pub from_date: String,
+    pub to_date: String,
+    /// One of "idle", "min4", "min3", "done", "error".
+    pub stage: String,
+    /// Total windows for the active stage (set once the stage starts).
+    pub windows_total: usize,
+    /// Windows fetched so far in the active stage.
+    pub windows_fetched: usize,
+    /// Cumulative counts written to the main (`<series>.jsonl`) and min3
+    /// (`min3_<series>.jsonl`) dataset files. Reflects the last completed
+    /// (or most-recently advanced) stage.
+    pub min4_count: usize,
+    pub min3_count: usize,
+    /// Non-empty when `stage == "error"`.
+    pub error: Option<String>,
+    /// RFC3339 timestamps.
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+}
+
+/// Optional overrides for a scrape. Backwards-compatible: `None` = defaults
+/// used by `scrape_series` (minute-4 decision, main `<series>.jsonl` file).
+#[derive(Default)]
+pub struct ScrapeOptions {
+    /// Override the seconds-from-window-open at which price is sampled.
+    /// Default: `(window_minutes - 1) * 60` (minute N-1, e.g. minute 4 for 5m).
+    /// Pass `Some((window_minutes - 2) * 60)` to capture minute-3 (P3) prices.
+    pub decision_offset_secs: Option<i64>,
+    /// Optional filename prefix for the output JSONL file. Default: empty.
+    /// Example: `Some("min3_")` writes to `min3_<series>.jsonl`.
+    pub file_prefix: Option<String>,
+    /// Atomic counter incremented once per successfully fetched window.
+    /// Used by the dashboard to poll progress without locks.
+    pub fetched_counter: Option<Arc<AtomicUsize>>,
+    /// Total window count (set once at start of scrape) so the UI can
+    /// compute a percentage without duplicating window generation logic.
+    pub total_counter: Option<Arc<AtomicUsize>>,
+}
 
 const GAMMA_API_BASE: &str = "https://gamma-api.polymarket.com";
 const CLOB_API_BASE: &str = "https://clob.polymarket.com";
@@ -43,6 +95,26 @@ pub async fn scrape_series(
     to_date: &str,
     workspace_dir: &Path,
 ) -> Result<usize> {
+    scrape_series_with_options(
+        series_id,
+        from_date,
+        to_date,
+        workspace_dir,
+        ScrapeOptions::default(),
+    )
+    .await
+}
+
+/// Extended scrape entry point. `scrape_series` is a thin wrapper with
+/// defaults. Pass `ScrapeOptions` to override the decision offset (for P3
+/// sampling) and redirect output to a prefixed filename (`min3_<series>.jsonl`).
+pub async fn scrape_series_with_options(
+    series_id: &str,
+    from_date: &str,
+    to_date: &str,
+    workspace_dir: &Path,
+    opts: ScrapeOptions,
+) -> Result<usize> {
     use crate::tools::series::builtin_series;
 
     let series = builtin_series()
@@ -52,20 +124,28 @@ pub async fn scrape_series(
 
     let slug_prefix = &series.slug_prefix;
     let window_minutes = parse_cadence_to_minutes(&series.cadence);
+    let file_prefix = opts.file_prefix.as_deref().unwrap_or("");
 
     tracing::info!(
-        "[POLY-HIST] Starting scrape for series={} (slug_prefix={}, window={}m) from {} to {}",
-        series_id, slug_prefix, window_minutes, from_date, to_date
+        "[POLY-HIST] Starting scrape for series={} (slug_prefix={}, window={}m, prefix=\"{}\") from {} to {}",
+        series_id, slug_prefix, window_minutes, file_prefix, from_date, to_date
     );
 
     // Generate expected window timestamps
-    let windows = generate_window_timestamps(from_date, to_date, window_minutes)?;
+    let windows = generate_window_timestamps(from_date, to_date, window_minutes, opts.decision_offset_secs)?;
     tracing::info!("[POLY-HIST] Generated {} windows to fetch", windows.len());
+    if let Some(ref c) = opts.total_counter {
+        c.store(windows.len(), Ordering::SeqCst);
+    }
 
     // Check existing cache to skip already-fetched windows
-    let cache_path = historical_cache_path(workspace_dir, series_id, from_date, to_date);
+    let cache_path = prefixed_historical_cache_path(workspace_dir, series_id, file_prefix);
     let mut existing: HashMap<i64, HistoricalMarketWindow> = load_existing_cache(&cache_path)?;
     tracing::info!("[POLY-HIST] Loaded {} existing cached windows", existing.len());
+    if let Some(ref c) = opts.fetched_counter {
+        // Pre-count already-cached windows so the progress bar starts partway.
+        c.store(existing.len(), Ordering::SeqCst);
+    }
 
     let client = reqwest::Client::new();
     let sem = Arc::new(Semaphore::new(MAX_CONCURRENT));
@@ -102,6 +182,9 @@ pub async fn scrape_series(
                 }
                 existing.insert(ts, window);
                 fetched += 1;
+                if let Some(ref c) = opts.fetched_counter {
+                    c.fetch_add(1, Ordering::SeqCst);
+                }
             }
             Ok((ts, Ok(None))) => {
                 tracing::warn!("[POLY-HIST] No market found for window {}", ts);
@@ -158,6 +241,26 @@ pub fn load_historical_data(
     to_date: &str,
 ) -> Result<HashMap<i64, HistoricalMarketWindow>> {
     let cache_path = historical_cache_path(workspace_dir, series_id, from_date, to_date);
+    load_existing_cache(&cache_path)
+}
+
+/// Load earlier-decision (P3) historical data for a series, if available.
+///
+/// Looks for `<workspace>/data/polymarket_historical/min3_<series_id>.jsonl`,
+/// which mirrors the main dataset but with `decision_ts = window_open + 180s`
+/// (60 seconds before the standard minute-4 decision). Used to compute the
+/// token-price drift signal `token_drift = P4 - P3` in the binary slug engine.
+///
+/// Returns `Ok(empty map)` if the file is absent — callers should treat the
+/// empty map as "drift signal unavailable" and fall back gracefully.
+pub fn load_prev_historical_data(
+    workspace_dir: &Path,
+    series_id: &str,
+) -> Result<HashMap<i64, HistoricalMarketWindow>> {
+    let cache_path = workspace_dir
+        .join("data")
+        .join("polymarket_historical")
+        .join(format!("min3_{}.jsonl", series_id));
     load_existing_cache(&cache_path)
 }
 
@@ -464,6 +567,7 @@ fn generate_window_timestamps(
     from_date: &str,
     to_date: &str,
     window_minutes: i64,
+    decision_offset_override: Option<i64>,
 ) -> Result<Vec<(i64, i64, i64)>> {
     let from = NaiveDate::parse_from_str(from_date, "%Y-%m-%d")
         .map_err(|e| anyhow!("Invalid from_date: {}", e))?;
@@ -474,7 +578,7 @@ fn generate_window_timestamps(
     let to_dt = Utc.from_utc_datetime(&to.and_hms_opt(23, 59, 59).unwrap());
 
     let window_secs = window_minutes * 60;
-    let decision_offset = (window_minutes - 1) * 60; // decision at minute N-1 (last minute before resolution)
+    let decision_offset = decision_offset_override.unwrap_or((window_minutes - 1) * 60);
 
     // Align first window to the next boundary
     let first_ts = align_up_to(from_dt.timestamp(), window_secs);
@@ -522,10 +626,18 @@ fn historical_cache_path(
     _from_date: &str,
     _to_date: &str,
 ) -> PathBuf {
+    prefixed_historical_cache_path(workspace_dir, series_id, "")
+}
+
+fn prefixed_historical_cache_path(
+    workspace_dir: &Path,
+    series_id: &str,
+    prefix: &str,
+) -> PathBuf {
     workspace_dir
         .join("data")
         .join("polymarket_historical")
-        .join(format!("{}.jsonl", series_id))
+        .join(format!("{}{}.jsonl", prefix, series_id))
 }
 
 fn load_existing_cache(path: &Path) -> Result<HashMap<i64, HistoricalMarketWindow>> {
