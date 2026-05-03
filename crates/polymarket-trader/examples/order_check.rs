@@ -26,6 +26,7 @@ async fn main() {
         private_key: Some(private_key.clone()),
         is_builder: false,
         proxy_address: None,
+        signature_type: None,
     };
 
     // Verificar que el private_key deriva la wallet_address

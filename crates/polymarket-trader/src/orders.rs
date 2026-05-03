@@ -11,11 +11,24 @@ use polymarket_client_sdk_v2::clob::{Client as SdkClient, Config as SdkConfig};
 use polymarket_client_sdk_v2::clob::types::request::BalanceAllowanceRequest;
 use polymarket_client_sdk_v2::derive_proxy_wallet;
 use polymarket_client_sdk_v2::derive_safe_wallet;
-use polymarket_client_sdk_v2::types::{Decimal, U256};
+use polymarket_client_sdk_v2::types::{B256, Decimal, U256};
 
 // V2 protocol is served at the same host. clob-v2.polymarket.com just 301-redirects
 // here, which breaks POST. The SDK queries /version to pick V1 vs V2 payload shape.
 const CLOB_BASE_URL: &str = "https://clob.polymarket.com";
+
+/// Trader-Claw Polymarket Builder Code.
+///
+/// Hard-coded so every order placed through this binary is attributed to the
+/// Trader-Claw builder, regardless of which user/wallet runs it.  This is the
+/// equivalent of the TS SDK `builderCode` argument on `createAndPostOrder`.
+///
+/// Do NOT make this user-configurable: end users running their own forks
+/// should change this constant if they need to point trades at a different
+/// builder identity.
+const TRADER_CLAW_BUILDER_CODE: B256 = polymarket_client_sdk_v2::types::b256!(
+    "0x81ede7d2e551e79016287430c4901461785f2823610ad3c545f6b2ebed8048a6"
+);
 
 /// Order side
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -91,6 +104,13 @@ impl ClobClient {
     /// Return the current credentials (cloned).  Used to persist renewed creds.
     pub fn credentials(&self) -> &PolyCredentials {
         &self.creds
+    }
+
+    /// Returns the hard-coded Trader-Claw [`TRADER_CLAW_BUILDER_CODE`].
+    /// Every order created via this client is tagged with this code so trades
+    /// are attributed to the Trader-Claw builder identity.
+    fn builder_code(&self) -> B256 {
+        TRADER_CLAW_BUILDER_CODE
     }
 
     /// Parse the stored private key into a LocalSigner.
@@ -259,6 +279,7 @@ impl ClobClient {
         let size_dec = Decimal::from_f64_retain(size)
             .ok_or_else(|| anyhow::anyhow!("Invalid size: {size}"))?;
 
+        let code = self.builder_code();
         let order = client
             .limit_order()
             .token_id(token_id_u256)
@@ -266,6 +287,7 @@ impl ClobClient {
             .size(size_dec)
             .side(side.to_sdk_side())
             .order_type(OrderType::GTC)
+            .builder_code(code)
             .build()
             .await?;
 
@@ -314,6 +336,9 @@ impl ClobClient {
         if worst_price >= 0.01 && worst_price <= 0.99 {
             builder = builder.price(price_dec);
         }
+
+        let code = self.builder_code();
+        builder = builder.builder_code(code);
 
         let order = builder.build().await?;
 
