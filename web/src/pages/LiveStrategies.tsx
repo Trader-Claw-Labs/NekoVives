@@ -6,6 +6,7 @@ import { useProfitCelebration } from '../hooks/useProfitCelebration'
 import {
   Bot, Plus, Trash2, RefreshCw, X, StopCircle, RotateCcw,
   TrendingUp, TrendingDown, Activity, ChevronDown, ChevronUp, AlertCircle, ExternalLink, Copy,
+  Eye, EyeOff,
 } from 'lucide-react'
 import clsx from 'clsx'
 
@@ -31,6 +32,8 @@ interface RunnerConfig {
   early_fire_secs?: number | null
   max_entry_price?: number | null
   max_spread_pct?: number | null
+  allowed_hours?: number[]
+  rv_min_btc?: number | null
 }
 
 interface RunnerStatus {
@@ -112,6 +115,7 @@ interface StoredRunner {
   config: RunnerConfig
   status: RunnerStatus
   result?: RunnerResult
+  hidden?: boolean
 }
 
 interface LiveListResponse {
@@ -523,6 +527,16 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript }: Crea
     early_fire_secs: null as number | null,
     max_entry_price: 0.65 as number | null,
     max_spread_pct: 0.03 as number | null,
+    wallet_password: '',
+    binance_api_key: '',
+    binance_api_secret: '',
+    funding_watchlist: 'BTC,ETH,SOL,AVAX',
+    min_apr_diff: 10,
+    force_close_diff: 2,
+    max_open_pairs: 4,
+    max_pos_pct: 15,
+    funding_poll_secs: 60,
+    fee_buffer_bps: 12,
   })
   const [error, setError] = useState('')
   const [showMissingApiKeyModal, setShowMissingApiKeyModal] = useState(false)
@@ -554,11 +568,32 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript }: Crea
       setShowMissingApiKeyModal(true)
       return ''
     }
+    if (m.includes('hyperliquid') || m.includes('wallet_label') || m.includes('signer')) {
+      return 'Live CEX trading requires a Hyperliquid wallet. Go to Wallets → create an EVM wallet, then set hyperliquid.wallet_label in Settings → Config.'
+    }
+    if (m.includes('password') || m.includes('decrypt') || m.includes('private key')) {
+      return 'Failed to decrypt wallet private key. Check your wallet password and try again.'
+    }
     return message
   }
 
   const mutation = useMutation({
-    mutationFn: () => apiPost('/api/live/strategies', form),
+    mutationFn: () => {
+      const payload: Record<string, unknown> = {
+        ...form,
+        funding_watchlist: form.funding_watchlist
+          ? form.funding_watchlist.split(',').map((s: string) => s.trim().toUpperCase()).filter(Boolean)
+          : undefined,
+        min_apr_diff: form.min_apr_diff != null ? form.min_apr_diff / 100 : undefined,
+        force_close_diff: form.force_close_diff != null ? form.force_close_diff / 100 : undefined,
+        max_pos_pct: form.max_pos_pct != null ? form.max_pos_pct / 100 : undefined,
+      }
+      // Remove undefined values so serde deserializes them as absent (triggering defaults)
+      Object.keys(payload).forEach((k) => {
+        if (payload[k] === undefined || payload[k] === '') delete payload[k]
+      })
+      return apiPost('/api/live/strategies', payload)
+    },
     onSuccess: () => { onCreated(); onClose() },
     onError: (e: Error) => setError(friendlyCreateError(e.message)),
   })
@@ -589,11 +624,21 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript }: Crea
         resolution_logic: rl,
         threshold: th,
       }))
+    } else if (mt === 'funding_arb') {
+      setForm(f => ({
+        ...f,
+        market_type: mt,
+        symbol: 'FUNDING_ARB',
+        interval: '1h',
+        fee_pct: 0.0,
+        series_id: '',
+        resolution_logic: 'price_up',
+        threshold: null,
+      }))
     } else {
       setForm(f => ({
         ...f,
         market_type: mt,
-        mode: 'paper', // crypto only supports paper for now
         symbol: 'BTCUSDT',
         interval: '5m',
         fee_pct: 0.1,
@@ -659,6 +704,7 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript }: Crea
               <select className="w-full rounded px-3 py-2 text-sm" value={form.market_type}
                 onChange={e => onMarketTypeChange(e.target.value)}>
                 <option value="crypto">Crypto</option>
+                <option value="funding_arb">Funding Arb</option>
                 <option value="polymarket_binary">Polymarket Binary</option>
               </select>
             </div>
@@ -670,7 +716,6 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript }: Crea
                 leftLabel="Dry Run"
                 rightLabel="Live"
                 activeColor={form.mode === 'live' ? 'var(--color-warning)' : 'var(--color-accent)'}
-                disabled={form.market_type !== 'polymarket_binary'}
               />
             </div>
           </div>
@@ -692,6 +737,16 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript }: Crea
                 {' · '}Window: {form.interval}
                 {' · '}Logic: <span className="font-mono">{form.resolution_logic}</span>
                 {form.threshold !== null ? <> {' · '}Threshold: <span className="font-mono">{form.threshold}</span></> : null}
+              </p>
+            </div>
+          ) : form.market_type === 'funding_arb' ? (
+            <div>
+              <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>Watchlist</label>
+              <input className="w-full rounded px-3 py-2 text-sm font-mono" value={form.funding_watchlist}
+                onChange={e => set('funding_watchlist', e.target.value)}
+                placeholder="BTC,ETH,SOL,AVAX" />
+              <p className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
+                Comma-separated list of coins to monitor for funding rate divergences
               </p>
             </div>
           ) : (
@@ -733,42 +788,150 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript }: Crea
             </div>
           )}
 
-          {/* Live sizing config — polymarket_binary supports these in both paper and live */}
-          {form.market_type === 'polymarket_binary' && (
-            <div className="grid grid-cols-2 gap-3">
-              <div>
-                <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>Sizing Mode</label>
-                <select
-                  className="w-full rounded px-3 py-2 text-sm"
-                  value={form.live_sizing_mode}
-                  onChange={e => set('live_sizing_mode', e.target.value as 'fixed' | 'percent')}
-                >
-                  <option value="percent">% of Balance</option>
-                  <option value="fixed">Fixed USD</option>
-                </select>
-              </div>
-              <div>
+          {/* Live sizing config — shown for all market types */}
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>Sizing Mode</label>
+              <select
+                className="w-full rounded px-3 py-2 text-sm"
+                value={form.live_sizing_mode}
+                onChange={e => set('live_sizing_mode', e.target.value as 'fixed' | 'percent')}
+              >
+                <option value="percent">% of Balance</option>
+                <option value="fixed">Fixed USD</option>
+              </select>
+            </div>
+            <div>
+              <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>
+                {form.live_sizing_mode === 'fixed' ? 'Amount (USD)' : 'Max % of Balance'}
+              </label>
+              <input
+                type="number"
+                step={form.live_sizing_mode === 'fixed' ? 1 : 0.1}
+                min={form.live_sizing_mode === 'fixed' ? 5 : 0.1}
+                max={form.live_sizing_mode === 'fixed' ? undefined : 100}
+                className="w-full rounded px-3 py-2 text-sm"
+                value={form.live_sizing_value}
+                onChange={e => set('live_sizing_value', Number(e.target.value))}
+              />
+              <p className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
+                {form.live_sizing_mode === 'fixed'
+                  ? 'Fixed USD amount per order (min $5)'
+                  : 'Script fraction is capped at this %'}
+              </p>
+            </div>
+
+            {/* Wallet password for crypto/funding_arb live mode */}
+            {form.mode === 'live' && (form.market_type === 'crypto' || form.market_type === 'funding_arb') && (
+              <div className="col-span-2">
                 <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>
-                  {form.live_sizing_mode === 'fixed' ? 'Amount (USD)' : 'Max % of Balance'}
+                  Wallet Password
                 </label>
                 <input
-                  type="number"
-                  step={form.live_sizing_mode === 'fixed' ? 1 : 0.1}
-                  min={form.live_sizing_mode === 'fixed' ? 5 : 0.1}
-                  max={form.live_sizing_mode === 'fixed' ? undefined : 100}
+                  type="password"
                   className="w-full rounded px-3 py-2 text-sm"
-                  value={form.live_sizing_value}
-                  onChange={e => set('live_sizing_value', Number(e.target.value))}
+                  placeholder="Enter password to decrypt Hyperliquid wallet"
+                  value={form.wallet_password}
+                  onChange={e => set('wallet_password', e.target.value)}
                 />
                 <p className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
-                  {form.live_sizing_mode === 'fixed'
-                    ? 'Fixed USDC amount per order (min $5)'
-                    : 'Script fraction is capped at this %'}
+                  Required to decrypt your EVM wallet private key for Hyperliquid signing. The password is never stored.
                 </p>
               </div>
+            )}
 
-              {/* Stop-loss */}
-              <div>
+            {/* Binance API credentials for crypto/funding_arb live mode */}
+            {form.mode === 'live' && (form.market_type === 'crypto' || form.market_type === 'funding_arb') && (
+              <>
+                <div>
+                  <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>
+                    Binance API Key
+                  </label>
+                  <input
+                    type="password"
+                    className="w-full rounded px-3 py-2 text-sm font-mono"
+                    placeholder={form.market_type === 'funding_arb' ? 'Required for funding arb' : 'Optional — uses Binance instead of Hyperliquid'}
+                    value={form.binance_api_key}
+                    onChange={e => set('binance_api_key', e.target.value)}
+                  />
+                </div>
+                <div>
+                  <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>
+                    Binance API Secret
+                  </label>
+                  <input
+                    type="password"
+                    className="w-full rounded px-3 py-2 text-sm font-mono"
+                    placeholder={form.market_type === 'funding_arb' ? 'Required for funding arb' : 'Required with API key for Binance'}
+                    value={form.binance_api_secret}
+                    onChange={e => set('binance_api_secret', e.target.value)}
+                  />
+                </div>
+                <p className="col-span-2 text-[10px]" style={{ color: 'var(--color-text-muted)' }}>
+                  {form.market_type === 'funding_arb'
+                    ? 'Both Hyperliquid wallet AND Binance credentials are required for funding rate arbitrage.'
+                    : 'Leave empty to use Hyperliquid (wallet password required). Fill both to trade on Binance Futures instead.'}
+                </p>
+              </>
+            )}
+
+            {/* Funding arb configuration fields */}
+            {form.market_type === 'funding_arb' && (
+              <>
+                <div className="grid grid-cols-3 gap-3">
+                  <div>
+                    <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>Min APR Diff (%)</label>
+                    <input type="number" step="0.5" min="0.5" max="50"
+                      className="w-full rounded px-3 py-2 text-sm"
+                      value={form.min_apr_diff}
+                      onChange={e => set('min_apr_diff', Number(e.target.value))} />
+                  </div>
+                  <div>
+                    <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>Close Below (%)</label>
+                    <input type="number" step="0.5" min="0.5" max="20"
+                      className="w-full rounded px-3 py-2 text-sm"
+                      value={form.force_close_diff}
+                      onChange={e => set('force_close_diff', Number(e.target.value))} />
+                  </div>
+                  <div>
+                    <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>Max Pairs</label>
+                    <input type="number" step="1" min="1" max="10"
+                      className="w-full rounded px-3 py-2 text-sm"
+                      value={form.max_open_pairs}
+                      onChange={e => set('max_open_pairs', Number(e.target.value))} />
+                  </div>
+                </div>
+                <div className="grid grid-cols-3 gap-3">
+                  <div>
+                    <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>Max Position %</label>
+                    <input type="number" step="1" min="1" max="50"
+                      className="w-full rounded px-3 py-2 text-sm"
+                      value={form.max_pos_pct}
+                      onChange={e => set('max_pos_pct', Number(e.target.value))} />
+                  </div>
+                  <div>
+                    <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>Poll Interval (s)</label>
+                    <input type="number" step="10" min="10" max="300"
+                      className="w-full rounded px-3 py-2 text-sm"
+                      value={form.funding_poll_secs}
+                      onChange={e => set('funding_poll_secs', Number(e.target.value))} />
+                  </div>
+                  <div>
+                    <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>Fee Buffer (bps)</label>
+                    <input type="number" step="1" min="1" max="50"
+                      className="w-full rounded px-3 py-2 text-sm"
+                      value={form.fee_buffer_bps}
+                      onChange={e => set('fee_buffer_bps', Number(e.target.value))} />
+                  </div>
+                </div>
+              </>
+            )}
+
+            {/* Polymarket-specific fields */}
+            {form.market_type === 'polymarket_binary' && (
+              <>
+                {/* Stop-loss */}
+                <div>
                 <label className="block text-xs font-medium mb-1" style={{ color: 'var(--color-text-muted)' }}>
                   Stop-Loss (% drop from entry)
                 </label>
@@ -829,8 +992,9 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript }: Crea
                     : 'Disabled — order placed at candle close'}
                 </p>
               </div>
-            </div>
+            </>
           )}
+          </div>
 
           {/* Max Entry Price */}
           <div>
@@ -913,8 +1077,8 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript }: Crea
                 This will send <strong>real orders</strong> to Polymarket via the CLOB API using your configured wallet.
                 Ensure your Polymarket API key, secret, and passphrase are set in <strong>Settings → Config</strong> before starting.
               </p>
-              {form.market_type !== 'polymarket_binary' && (
-                <p className="font-medium">Live mode is only supported for Polymarket Binary markets.</p>
+              {form.market_type !== 'polymarket_binary' && form.market_type !== 'funding_arb' && (
+                <p className="font-medium">Live mode is only supported for Polymarket Binary and Funding Arbitrage markets.</p>
               )}
             </div>
           )}
@@ -927,7 +1091,7 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript }: Crea
             onClick={() => mutation.mutate()}
             disabled={
               !form.script || !form.symbol || mutation.isPending ||
-              (form.mode === 'live' && form.market_type !== 'polymarket_binary')
+              (form.mode === 'live' && form.market_type !== 'polymarket_binary' && form.market_type !== 'funding_arb')
             }
             className="flex-1 py-2 rounded text-sm font-medium disabled:opacity-50"
             style={{ backgroundColor: 'var(--color-accent)', color: '#000' }}
@@ -1144,6 +1308,20 @@ function statusDot(s: string): 'online' | 'warning' | 'offline' {
   return 'offline'
 }
 
+function formatUptime(startedAt?: string): string {
+  if (!startedAt) return ''
+  const start = new Date(startedAt).getTime()
+  if (Number.isNaN(start)) return ''
+  const elapsed = Math.max(0, Date.now() - start)
+  const totalMin = Math.floor(elapsed / 60_000)
+  const days = Math.floor(totalMin / 1440)
+  const hours = Math.floor((totalMin % 1440) / 60)
+  const mins = totalMin % 60
+  if (days > 0) return `${days}d ${hours}h ${mins}m`
+  if (hours > 0) return `${hours}h ${mins}m`
+  return `${mins}m`
+}
+
 function maskAddress(addr?: string): string {
   if (!addr) return '—'
   if (addr.length <= 12) return addr
@@ -1321,11 +1499,12 @@ interface RunnerCardProps {
   onStop: () => void
   onRestart: () => void
   onDelete: () => void
-  onUpdateConfig?: (updates: { live_sizing_mode?: string; live_sizing_value?: number; max_entry_price?: number | null; max_spread_pct?: number | null; early_fire_secs?: number | null }) => void
+  onToggleHidden: () => void
+  onUpdateConfig?: (updates: { live_sizing_mode?: string; live_sizing_value?: number; max_entry_price?: number | null; max_spread_pct?: number | null; early_fire_secs?: number | null; allowed_hours?: number[]; rv_min_btc?: number | null }) => void
   isPatching?: boolean
 }
 
-function RunnerCard({ runner, onStop, onRestart, onDelete, onUpdateConfig, isPatching }: RunnerCardProps) {
+function RunnerCard({ runner, onStop, onRestart, onDelete, onToggleHidden, onUpdateConfig, isPatching }: RunnerCardProps) {
   const [expanded, setExpanded] = useState(() => {
     try {
       const stored = localStorage.getItem(`runner-expanded-${runner.config.id}`)
@@ -1351,9 +1530,22 @@ function RunnerCard({ runner, onStop, onRestart, onDelete, onUpdateConfig, isPat
     }
   })
   const { celebrate } = useProfitCelebration()
-  const prevTradesRef = useRef<number>(0)
+  // Sentinel -1 = "not yet seeded". On the first effect run we record the
+  // current trade count without firing confetti, so reloading the page does
+  // not celebrate historical wins. Subsequent runs fire only on NEW wins.
+  const prevTradesRef = useRef<number>(-1)
   const { config, status, result } = runner
   const isRunning = status.status === 'running' || status.status === 'starting'
+
+  // Tick every 30s so the uptime label refreshes without waiting for the
+  // outer 5s polling cycle to swap status props.
+  const [, setUptimeTick] = useState(0)
+  useEffect(() => {
+    if (!isRunning) return
+    const t = setInterval(() => setUptimeTick(v => v + 1), 30_000)
+    return () => clearInterval(t)
+  }, [isRunning])
+  const uptime = isRunning ? formatUptime(status.started_at) : ''
 
   useEffect(() => {
     if (
@@ -1372,14 +1564,27 @@ function RunnerCard({ runner, onStop, onRestart, onDelete, onUpdateConfig, isPat
     }
   }, [config.mode, config.id, result?.wallet_balance_usdc, lowBalanceShownOnce])
 
-  // Trigger celebration on profitable trades (paper mode only — live trades are real orders)
+  // Trigger celebration on profitable trades (paper mode only — live trades are real orders).
+  // Only NEW wins that arrive AFTER this component mounts fire confetti. On the
+  // first pass we just record the trade count so a page refresh doesn't replay
+  // historical celebrations.
   useEffect(() => {
     if (config.mode === 'live') return
     const trades = config.market_type === 'polymarket_binary' ? result?.live_orders : result?.all_trades
     if (!trades) return
+    if (prevTradesRef.current < 0) {
+      // First observation — seed and skip.
+      prevTradesRef.current = trades.length
+      return
+    }
+    if (trades.length <= prevTradesRef.current) {
+      // Trades list may shrink (reset / re-fetch ordering quirk). Resync.
+      prevTradesRef.current = trades.length
+      return
+    }
     const newTrades = trades.slice(prevTradesRef.current)
-    const profitTrades = newTrades.filter((t: any) => t.pnl && t.pnl > 0)
-    if (profitTrades.length > 0) {
+    const hasWin = newTrades.some((t: any) => t.pnl && t.pnl > 0)
+    if (hasWin) {
       celebrate()
     }
     prevTradesRef.current = trades.length
@@ -1402,6 +1607,15 @@ function RunnerCard({ runner, onStop, onRestart, onDelete, onUpdateConfig, isPat
             >
               {status.status}
             </span>
+            {uptime && (
+              <span
+                className="text-[10px] px-1.5 py-0.5 rounded flex-shrink-0 font-mono"
+                style={{ backgroundColor: 'var(--color-base)', color: 'var(--color-text-muted)' }}
+                title={`Started ${fmt(status.started_at)}`}
+              >
+                {uptime}
+              </span>
+            )}
             {config.mode === 'live' && (
               <span
                 className="text-xs px-1.5 py-0.5 rounded flex-shrink-0 font-semibold"
@@ -1413,12 +1627,19 @@ function RunnerCard({ runner, onStop, onRestart, onDelete, onUpdateConfig, isPat
           </div>
           <p className="text-xs font-mono truncate" style={{ color: 'var(--color-text-muted)' }}>
             {config.script.split('/').pop()} · {config.symbol} · {config.interval} · {config.mode === 'paper' ? 'dry run' : config.mode}
+            {config.market_type === 'funding_arb' ? ' · funding arb' : ''}
             {config.market_type === 'polymarket_binary' ? ` · ${config.resolution_logic ?? 'price_up'}${config.threshold !== undefined && config.threshold !== null ? `(${config.threshold})` : ''}` : ''}
             {config.market_type === 'polymarket_binary' && config.live_sizing_mode
               ? ` · ${config.live_sizing_mode === 'percent' ? `${config.live_sizing_value}%` : `$${config.live_sizing_value}`}`
               : ''}
             {config.market_type === 'polymarket_binary' && config.max_entry_price != null
               ? ` · max≤$${config.max_entry_price.toFixed(2)}`
+              : ''}
+            {config.market_type === 'polymarket_binary' && config.max_spread_pct != null
+              ? ` · spread≤${(config.max_spread_pct * 100).toFixed(2)}%`
+              : ''}
+            {config.market_type === 'polymarket_binary' && config.early_fire_secs != null && config.early_fire_secs > 0
+              ? ` · early ${config.early_fire_secs}s`
               : ''}
           </p>
         </div>
@@ -1432,6 +1653,12 @@ function RunnerCard({ runner, onStop, onRestart, onDelete, onUpdateConfig, isPat
             <button onClick={onRestart} title="Restart"
               className="p-1.5 rounded hover:bg-white/5" style={{ color: 'var(--color-accent)' }}>
               <RotateCcw size={14} />
+            </button>
+          )}
+          {!isRunning && (
+            <button onClick={onToggleHidden} title={runner.hidden ? 'Show' : 'Hide'}
+              className="p-1.5 rounded hover:bg-white/5" style={{ color: 'var(--color-text-muted)' }}>
+              {runner.hidden ? <Eye size={14} /> : <EyeOff size={14} />}
             </button>
           )}
           <button onClick={onDelete} title="Delete"
@@ -1585,11 +1812,95 @@ function RunnerCard({ runner, onStop, onRestart, onDelete, onUpdateConfig, isPat
               disabled={isPatching}
             />
           </div>
+          {/* Allowed Hours */}
+          {config.market_type === 'polymarket_binary' && (
+            <div className="flex items-start gap-3 text-xs mt-2">
+              <span style={{ color: 'var(--color-text-muted)' }} className="font-medium pt-0.5 whitespace-nowrap">Hour Gate:</span>
+              <div className="flex flex-col gap-1 flex-1">
+                <div className="flex items-center gap-1">
+                  <SegmentedToggle
+                    value={(config.allowed_hours ?? []).length > 0}
+                    onChange={(v) => onUpdateConfig({ allowed_hours: v ? [0, 9, 11, 18, 21] : [] })}
+                    leftLabel="Off"
+                    rightLabel="On"
+                    activeColor="#34d399"
+                    disabled={isPatching}
+                  />
+                  <span style={{ color: 'var(--color-text-muted)' }} className="ml-1">Hot hours only</span>
+                </div>
+                {(config.allowed_hours ?? []).length > 0 && (
+                  <div className="flex flex-wrap gap-1 mt-1">
+                    {Array.from({length: 24}, (_, h) => {
+                      const active = (config.allowed_hours ?? []).includes(h)
+                      return (
+                        <button
+                          key={h}
+                          disabled={isPatching}
+                          onClick={() => {
+                            const cur = config.allowed_hours ?? []
+                            const next = active ? cur.filter(x => x !== h) : [...cur, h].sort((a,b) => a-b)
+                            onUpdateConfig({ allowed_hours: next })
+                          }}
+                          className={clsx('w-7 h-6 rounded text-[10px] font-mono transition-colors',
+                            active
+                              ? 'bg-emerald-600 text-white'
+                              : 'bg-transparent border'
+                          )}
+                          style={!active ? { borderColor: 'var(--color-border)', color: 'var(--color-text-muted)' } : undefined}
+                        >{String(h).padStart(2, '0')}</button>
+                      )
+                    })}
+                  </div>
+                )}
+                <span style={{ color: 'var(--color-text-muted)' }} className="text-[10px]">
+                  {(config.allowed_hours ?? []).length > 0
+                    ? `Trading only in UTC hours: ${(config.allowed_hours ?? []).join(', ')} — dead hours skip silently`
+                    : 'No hour restriction (trades 24/7)'}
+                </span>
+              </div>
+            </div>
+          )}
+          {/* RV Min */}
+          {config.market_type === 'polymarket_binary' && (
+            <div className="flex items-center gap-3 text-xs mt-2">
+              <span style={{ color: 'var(--color-text-muted)' }} className="font-medium whitespace-nowrap">RV Floor:</span>
+              <div className="flex items-center gap-1">
+                <input
+                  type="number"
+                  className="w-20 rounded border px-1.5 py-0.5 text-xs font-mono"
+                  style={{ background: 'var(--color-surface-2)', borderColor: 'var(--color-border)', color: 'var(--color-text)' }}
+                  min={0}
+                  step={0.000005}
+                  placeholder="0.00015"
+                  value={config.rv_min_btc != null ? config.rv_min_btc : ''}
+                  onChange={e => {
+                    const raw = e.target.value
+                    if (raw === '') { onUpdateConfig({ rv_min_btc: null }) }
+                    else { const val = Number(raw); if (!Number.isNaN(val)) onUpdateConfig({ rv_min_btc: val }) }
+                  }}
+                  disabled={isPatching}
+                />
+              </div>
+              <SegmentedToggle
+                value={config.rv_min_btc != null && config.rv_min_btc > 0}
+                onChange={(v) => onUpdateConfig({ rv_min_btc: v ? 0.00015 : null })}
+                leftLabel="Off"
+                rightLabel="On"
+                activeColor="#34d399"
+                disabled={isPatching}
+              />
+              <span style={{ color: 'var(--color-text-muted)' }}>
+                {config.rv_min_btc != null && config.rv_min_btc > 0
+                  ? `Skip when BTC 1h RV < ${config.rv_min_btc.toFixed(5)} (flat market filter)`
+                  : 'No RV filter'}
+              </span>
+            </div>
+          )}
         </div>
       )}
 
-      {/* P&L summary — paper mode only (non-polymarket) */}
-      {result && config.mode === 'paper' && config.market_type !== 'polymarket_binary' && (
+      {/* P&L summary — paper mode only (crypto only, not funding_arb) */}
+      {result && config.mode === 'paper' && config.market_type === 'crypto' && (
         <div className="grid grid-cols-4 gap-2 px-4 pb-3 text-xs">
           <div>
             <div style={{ color: 'var(--color-text-muted)' }}>Return</div>
@@ -1608,6 +1919,28 @@ function RunnerCard({ runner, onStop, onRestart, onDelete, onUpdateConfig, isPat
             <div className="font-semibold truncate"
               style={{ color: result.last_signal === 'buy' ? 'var(--color-accent)' : result.last_signal === 'sell' ? 'var(--color-danger)' : 'var(--color-text-muted)' }}>
               {result.last_signal || '—'}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Funding arb summary */}
+      {config.market_type === 'funding_arb' && result && (
+        <div className="px-4 pb-3 text-xs">
+          <div className="grid grid-cols-3 gap-2">
+            <div>
+              <div style={{ color: 'var(--color-text-muted)' }}>Open Pairs</div>
+              <div className="font-semibold">{result.position ?? 0}</div>
+            </div>
+            <div>
+              <div style={{ color: 'var(--color-text-muted)' }}>Orders</div>
+              <div className="font-semibold">{result.live_orders?.length ?? 0}</div>
+            </div>
+            <div>
+              <div style={{ color: 'var(--color-text-muted)' }}>Status</div>
+              <div className="font-semibold truncate" style={{ color: 'var(--color-text-muted)' }}>
+                {result.last_signal || '—'}
+              </div>
             </div>
           </div>
         </div>
@@ -1661,8 +1994,8 @@ function RunnerCard({ runner, onStop, onRestart, onDelete, onUpdateConfig, isPat
       {expanded && (
         <>
 
-      {/* Equity Chart — paper mode (crypto) or polymarket_binary (any mode) */}
-      {config.mode === 'paper' && config.market_type !== 'polymarket_binary' && result && result.all_trades?.length > 0 && (
+      {/* Equity Chart — paper mode (crypto only) */}
+      {config.mode === 'paper' && config.market_type === 'crypto' && result && result.all_trades?.length > 0 && (
         <div className="px-4 pb-2 border-t pt-3" style={{ borderColor: 'var(--color-border)' }}>
           <div className="flex items-center justify-between mb-1.5">
             <span className="text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>
@@ -1676,20 +2009,34 @@ function RunnerCard({ runner, onStop, onRestart, onDelete, onUpdateConfig, isPat
         </div>
       )}
 
-      {/* Equity Chart for polymarket_binary live_orders */}
-      {config.market_type === 'polymarket_binary' && result?.live_orders && result.live_orders.length > 0 && (
-        <div className="px-4 pb-2 border-t pt-3" style={{ borderColor: 'var(--color-border)' }}>
-          <div className="flex items-center justify-between mb-1.5">
-            <span className="text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>
-              Equity Curve
-            </span>
-            <span className="text-xs" style={{ color: 'var(--color-text-muted)' }}>
-              {result.live_orders.filter(o => o.pnl != null).length} trades · ${fmtUSD(config.initial_balance + runnerPnlUSD(runner))}
-            </span>
+      {/* Equity Chart for polymarket_binary live_orders.
+          In live mode, anchor the curve to the real Polymarket wallet balance
+          instead of the (paper) config.initial_balance, so the displayed
+          balance matches the wallet. */}
+      {config.market_type === 'polymarket_binary' && result?.live_orders && result.live_orders.length > 0 && (() => {
+        const cumPnl = runnerPnlUSD(runner)
+        const isLive = config.mode === 'live'
+        const liveWallet = result.wallet_balance_usdc
+        const startBalance = isLive && typeof liveWallet === 'number'
+          ? Math.max(0, liveWallet - cumPnl)
+          : config.initial_balance
+        const currentBalance = isLive && typeof liveWallet === 'number'
+          ? liveWallet
+          : config.initial_balance + cumPnl
+        return (
+          <div className="px-4 pb-2 border-t pt-3" style={{ borderColor: 'var(--color-border)' }}>
+            <div className="flex items-center justify-between mb-1.5">
+              <span className="text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>
+                Equity Curve
+              </span>
+              <span className="text-xs" style={{ color: 'var(--color-text-muted)' }}>
+                {result.live_orders.filter(o => o.pnl != null).length} trades · ${fmtUSD(currentBalance)}
+              </span>
+            </div>
+            <LiveEquityChart trades={liveOrdersToTrades(result.live_orders, startBalance)} initialBalance={startBalance} />
           </div>
-          <LiveEquityChart trades={liveOrdersToTrades(result.live_orders, config.initial_balance)} initialBalance={config.initial_balance} />
-        </div>
-      )}
+        )
+      })()}
 
       {/* Live order/activity log */}
       {config.market_type === 'polymarket_binary' && status.error && (
@@ -1719,7 +2066,7 @@ function RunnerCard({ runner, onStop, onRestart, onDelete, onUpdateConfig, isPat
       )}
 
       {/* Live order history */}
-      {config.market_type === 'polymarket_binary' && result?.live_orders && result.live_orders.length > 0 && (
+      {(config.market_type === 'polymarket_binary' || config.market_type === 'funding_arb') && result?.live_orders && result.live_orders.length > 0 && (
         <div className="mx-4 mb-3 rounded border overflow-hidden" style={{ borderColor: 'var(--color-border)' }}>
           <div className="px-3 py-2 text-xs font-semibold border-b flex items-center gap-2" style={{ borderColor: 'var(--color-border)', backgroundColor: 'var(--color-base)' }}>
             <TrendingUp size={12} style={{ color: 'var(--color-accent)' }} />
@@ -1936,7 +2283,7 @@ export default function LiveStrategies() {
   })
 
   const patchMutation = useMutation({
-    mutationFn: ({ id, body }: { id: string; body: { live_sizing_mode?: string; live_sizing_value?: number } }) =>
+    mutationFn: ({ id, body }: { id: string; body: Record<string, unknown> }) =>
       apiPatch(`/api/live/strategies/${id}`, body),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['live-strategies'] }),
   })
@@ -1952,6 +2299,75 @@ export default function LiveStrategies() {
   const { pnlDisplay: totalPnl, tradesDisplay: totalTradesDelta, winsDisplay: totalWinsDelta, reset: resetStats } = useResettableStats(runners)
   const [deleteTarget, setDeleteTarget] = useState<StoredRunner | null>(null)
 
+  // Sort the strategy cards. Persisted in localStorage so the user's last
+  // pick survives reloads. Default is 'default' (creation order, what the
+  // backend returns) to preserve the existing UX for new users.
+  type SortKey = 'default' | 'pnl_desc' | 'wr_desc'
+  const [sortKey, setSortKey] = useState<SortKey>(() => {
+    try {
+      const saved = localStorage.getItem('live-strategies-sort') as SortKey | null
+      return saved && ['default', 'pnl_desc', 'wr_desc'].includes(saved) ? saved : 'default'
+    } catch { return 'default' }
+  })
+  const setSortKeyPersisted = (k: SortKey) => {
+    setSortKey(k)
+    try { localStorage.setItem('live-strategies-sort', k) } catch {}
+  }
+  const [showHidden, setShowHidden] = useState(false)
+
+  const visibleRunners = runners.filter(r => !r.hidden)
+  const hiddenRunners = runners.filter(r => r.hidden)
+
+  const sortedRunners = (list: StoredRunner[]) => {
+    if (sortKey === 'default') return list
+    const copy = [...list]
+    if (sortKey === 'pnl_desc') {
+      copy.sort((a, b) => runnerPnlUSD(b) - runnerPnlUSD(a))
+    } else if (sortKey === 'wr_desc') {
+      const wr = (r: StoredRunner) => {
+        const t = r.config.mode === 'live'
+          ? (r.result?.live_total_trades ?? 0)
+          : (r.result?.live_total_trades ?? r.result?.total_trades ?? 0)
+        if (t === 0) return -1   // no-trade runners sink to the bottom
+        const w = r.config.mode === 'live'
+          ? (r.result?.live_wins ?? 0)
+          : (r.result?.live_wins ?? Math.round((r.result?.win_rate_pct ?? 0) / 100 * (r.result?.total_trades ?? 0)))
+        return (w / t) * 100
+      }
+      copy.sort((a, b) => wr(b) - wr(a))
+    }
+    return copy
+  }
+  const sortedVisible = sortedRunners(visibleRunners)
+  const sortedHidden = sortedRunners(hiddenRunners)
+
+  // Per-mode breakdown for the KPIs section. Split runners by live vs paper
+  // (dry run) so the stats row shows each mode separately. Deleted runners
+  // drop out of these totals automatically because we derive from the live
+  // `runners` array each render — there's no separate baseline to keep in
+  // sync, so deleting a strategy correctly subtracts from all totals.
+  const liveRunners = runners.filter(r => r.config.mode === 'live')
+  const paperRunners = runners.filter(r => r.config.mode !== 'live')
+  const liveRunning = liveRunners.filter(r => r.status.status === 'running').length
+  const paperRunning = paperRunners.filter(r => r.status.status === 'running').length
+  const liveTotalTrades = liveRunners.reduce((s, r) => s + (r.result?.live_total_trades ?? 0), 0)
+  const paperTotalTrades = paperRunners.reduce((s, r) => s + (r.result?.live_total_trades ?? r.result?.total_trades ?? 0), 0)
+  const liveTotalWins = liveRunners.reduce((s, r) => s + (r.result?.live_wins ?? 0), 0)
+  const paperTotalWins = paperRunners.reduce((s, r) => {
+    // Paper runners also populate live_wins when the runner fires, but fall
+    // back to win_rate_pct × total_trades so legacy runs still aggregate.
+    const liveWins = r.result?.live_wins
+    if (liveWins != null) return s + liveWins
+    return s + Math.round((r.result?.win_rate_pct ?? 0) / 100 * (r.result?.total_trades ?? 0))
+  }, 0)
+  const liveWr = liveTotalTrades > 0 ? (liveTotalWins / liveTotalTrades) * 100 : null
+  const paperWr = paperTotalTrades > 0 ? (paperTotalWins / paperTotalTrades) * 100 : null
+  // Per-mode P&L. Computed directly from the current `runners` array so a
+  // deleted strategy is automatically excluded.
+  const livePnl = liveRunners.reduce((s, r) => s + runnerPnlUSD(r), 0)
+  const paperPnl = paperRunners.reduce((s, r) => s + runnerPnlUSD(r), 0)
+  const _unusedTotals = { totalPnl, totalTradesDelta, totalWinsDelta } // legacy hook return
+
   return (
     <div className="p-6 max-w-5xl mx-auto">
       {/* Header */}
@@ -1965,18 +2381,33 @@ export default function LiveStrategies() {
               {running} running
             </span>
           )}
-          <span className="text-xs px-2 py-0.5 rounded font-semibold"
-            style={{
-              backgroundColor: totalPnl >= 0 ? 'rgba(74,222,128,0.15)' : 'rgba(239,68,68,0.15)',
-              color: totalPnl >= 0 ? 'var(--color-accent)' : 'var(--color-danger)',
-            }}>
-            Total P&L: {totalPnl >= 0 ? '+' : ''}${fmtUSD(totalPnl)}
-          </span>
+          {paperRunners.length > 0 && (
+            <span className="text-xs px-2 py-0.5 rounded font-semibold"
+              style={{
+                backgroundColor: paperPnl >= 0 ? 'rgba(129,140,248,0.15)' : 'rgba(239,68,68,0.15)',
+                color: paperPnl >= 0 ? '#818cf8' : 'var(--color-danger)',
+              }}
+              title="Sum of P&L across Dry Run strategies (auto-updates when you delete one)"
+            >
+              Dry Run P&L: {paperPnl >= 0 ? '+' : ''}${fmtUSD(paperPnl)}
+            </span>
+          )}
+          {liveRunners.length > 0 && (
+            <span className="text-xs px-2 py-0.5 rounded font-semibold"
+              style={{
+                backgroundColor: livePnl >= 0 ? 'rgba(74,222,128,0.15)' : 'rgba(239,68,68,0.15)',
+                color: livePnl >= 0 ? 'var(--color-accent)' : 'var(--color-danger)',
+              }}
+              title="Sum of P&L across Live strategies (auto-updates when you delete one)"
+            >
+              Live P&L: {livePnl >= 0 ? '+' : ''}${fmtUSD(livePnl)}
+            </span>
+          )}
           <button
             onClick={resetStats}
             className="text-[10px] px-2 py-0.5 rounded border hover:bg-white/5"
             style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-muted)' }}
-            title="Reset Stats"
+            title="Reset stats baseline (legacy)"
           >
             Reset
           </button>
@@ -2032,26 +2463,47 @@ export default function LiveStrategies() {
         </div>
       </div>
 
-      {/* Stats row */}
-      {runners.length > 0 && (
-        <div className="grid grid-cols-4 gap-3 mb-6">
-          {[
-            { label: 'Runners', value: runners.length, icon: <Activity size={14} /> },
-            { label: 'Running', value: running, icon: <Bot size={14} /> },
-            { label: 'Total Trades', value: totalTradesDelta, icon: <TrendingUp size={14} /> },
-            { label: 'Avg Win Rate', value: totalTradesDelta > 0 ? `${((totalWinsDelta / totalTradesDelta) * 100).toFixed(1)}%` : '—', icon: <TrendingDown size={14} /> },
-          ].map(stat => (
-            <div key={stat.label} className="rounded-lg border p-3"
-              style={{ backgroundColor: 'var(--color-surface)', borderColor: 'var(--color-border)' }}>
-              <div className="flex items-center gap-1.5 mb-1" style={{ color: 'var(--color-text-muted)' }}>
-                {stat.icon}
-                <span className="text-xs">{stat.label}</span>
+      {/* Stats row — split Live vs Dry Run with colour coding.
+          Dry Run uses indigo (#818cf8) to signal paper/preview context.
+          Live uses the accent green to signal real money. */}
+      {runners.length > 0 && (() => {
+        const DRY = '#818cf8'
+        const LIVE_COLOR = 'var(--color-accent)'
+        const kpis: Array<{ label: string; icon: React.ReactElement; dry: React.ReactNode; live: React.ReactNode }> = [
+          { label: 'Scripts', icon: <Activity size={14} />, dry: paperRunners.length, live: liveRunners.length },
+          { label: 'Running', icon: <Bot size={14} />, dry: paperRunning, live: liveRunning },
+          { label: 'Total Trades', icon: <TrendingUp size={14} />, dry: paperTotalTrades, live: liveTotalTrades },
+          {
+            label: 'Avg Win Rate',
+            icon: <TrendingDown size={14} />,
+            dry: paperWr != null ? `${paperWr.toFixed(1)}%` : '—',
+            live: liveWr != null ? `${liveWr.toFixed(1)}%` : '—',
+          },
+        ]
+        return (
+          <div className="grid grid-cols-4 gap-3 mb-6">
+            {kpis.map(stat => (
+              <div key={stat.label} className="rounded-lg border p-3"
+                style={{ backgroundColor: 'var(--color-surface)', borderColor: 'var(--color-border)' }}>
+                <div className="flex items-center gap-1.5 mb-2" style={{ color: 'var(--color-text-muted)' }}>
+                  {stat.icon}
+                  <span className="text-xs">{stat.label}</span>
+                </div>
+                <div className="grid grid-cols-2 gap-2 items-end">
+                  <div>
+                    <div className="text-[9px] uppercase font-bold tracking-widest" style={{ color: DRY }}>Dry Run</div>
+                    <div className="text-base font-bold" style={{ color: DRY }}>{stat.dry}</div>
+                  </div>
+                  <div className="text-right">
+                    <div className="text-[9px] uppercase font-bold tracking-widest" style={{ color: LIVE_COLOR }}>Live</div>
+                    <div className="text-base font-bold" style={{ color: LIVE_COLOR }}>{stat.live}</div>
+                  </div>
+                </div>
               </div>
-              <div className="text-lg font-bold">{stat.value}</div>
-            </div>
-          ))}
-        </div>
-      )}
+            ))}
+          </div>
+        )
+      })()}
 
       {/* Runners grid */}
       {isLoading ? (
@@ -2071,21 +2523,78 @@ export default function LiveStrategies() {
           </button>
         </div>
       ) : (
-        <div className="grid grid-cols-1 gap-4">
-          {runners.map(runner => (
-            <RunnerCard
-              key={runner.config.id}
-              runner={runner}
-              onStop={() => stopMutation.mutate(runner.config.id)}
-              onRestart={() => restartMutation.mutate(runner.config.id)}
-              onDelete={() => setDeleteTarget(runner)}
-              onUpdateConfig={(updates) =>
-                patchMutation.mutate({ id: runner.config.id, body: updates })
-              }
-              isPatching={patchMutation.isPending}
-            />
-          ))}
-        </div>
+        <>
+          {/* Sort selector — placed just above the cards. Only renders when
+              there's >1 visible runner; with a single card sorting is meaningless. */}
+          {visibleRunners.length > 1 && (
+            <div className="flex items-center justify-end gap-2 mb-3 text-xs">
+              <span style={{ color: 'var(--color-text-muted)' }}>Sort:</span>
+              <select
+                value={sortKey}
+                onChange={e => setSortKeyPersisted(e.target.value as SortKey)}
+                className="rounded border px-2 py-1"
+                style={{
+                  backgroundColor: 'var(--color-surface-2)',
+                  borderColor: 'var(--color-border)',
+                  color: 'var(--color-text)',
+                }}
+              >
+                <option value="default">Default (creation order)</option>
+                <option value="pnl_desc">P&amp;L ↓ (highest first)</option>
+                <option value="wr_desc">Win Rate ↓ (highest first)</option>
+              </select>
+            </div>
+          )}
+          <div className="grid grid-cols-1 gap-4">
+            {sortedVisible.map(runner => (
+              <RunnerCard
+                key={runner.config.id}
+                runner={runner}
+                onStop={() => stopMutation.mutate(runner.config.id)}
+                onRestart={() => restartMutation.mutate(runner.config.id)}
+                onDelete={() => setDeleteTarget(runner)}
+                onToggleHidden={() => patchMutation.mutate({ id: runner.config.id, body: { hidden: true } })}
+                onUpdateConfig={(updates) =>
+                  patchMutation.mutate({ id: runner.config.id, body: updates })
+                }
+                isPatching={patchMutation.isPending}
+              />
+            ))}
+          </div>
+
+          {/* Hidden strategies section */}
+          {hiddenRunners.length > 0 && (
+            <div className="mt-6">
+              <button
+                onClick={() => setShowHidden(v => !v)}
+                className="flex items-center gap-2 text-xs font-medium mb-3 px-3 py-1.5 rounded border"
+                style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-muted)' }}
+              >
+                {showHidden ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+                <EyeOff size={14} />
+                <span>Hidden strategies ({hiddenRunners.length})</span>
+              </button>
+              {showHidden && (
+                <div className="grid grid-cols-1 gap-4">
+                  {sortedHidden.map(runner => (
+                    <RunnerCard
+                      key={runner.config.id}
+                      runner={runner}
+                      onStop={() => stopMutation.mutate(runner.config.id)}
+                      onRestart={() => restartMutation.mutate(runner.config.id)}
+                      onDelete={() => setDeleteTarget(runner)}
+                      onToggleHidden={() => patchMutation.mutate({ id: runner.config.id, body: { hidden: false } })}
+                      onUpdateConfig={(updates) =>
+                        patchMutation.mutate({ id: runner.config.id, body: updates })
+                      }
+                      isPatching={patchMutation.isPending}
+                    />
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+        </>
       )}
 
       {showCreate && (

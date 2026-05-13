@@ -1771,6 +1771,95 @@ export default function Backtesting() {
             </div>
           )}
 
+          {/* Hour Gate (Polymarket binary only) */}
+          {config.market_type === 'polymarket_binary' && (
+            <div className="lg:col-span-4">
+              <label className="block text-xs mb-1.5 flex items-center gap-1.5" style={{ color: 'var(--color-text-muted)' }}>
+                Hour Gate (UTC)
+                <span
+                  className="px-1 rounded text-[9px]"
+                  style={{ backgroundColor: 'var(--color-surface-2)', color: 'var(--color-text-muted)' }}
+                  title="Skip windows outside these UTC hours. Empirically, hours 01/03/04/07/08/14/17/20 show ~34% WR."
+                >hot hours only</span>
+              </label>
+              <div className="flex flex-wrap gap-1 mb-1.5">
+                {Array.from({ length: 24 }, (_, h) => {
+                  const active = (config.allowed_hours ?? []).includes(h)
+                  return (
+                    <button
+                      key={h}
+                      type="button"
+                      onClick={() => {
+                        const cur = config.allowed_hours ?? []
+                        const next = active ? cur.filter(x => x !== h) : [...cur, h].sort((a, b) => a - b)
+                        set('allowed_hours', next)
+                      }}
+                      className="w-8 h-7 rounded text-[11px] font-mono transition-colors"
+                      style={{
+                        background: active ? '#059669' : 'var(--color-surface-2)',
+                        color: active ? '#fff' : 'var(--color-text-muted)',
+                        border: `1px solid ${active ? '#059669' : 'var(--color-border)'}`,
+                      }}
+                    >{String(h).padStart(2, '0')}</button>
+                  )
+                })}
+              </div>
+              <div className="flex gap-2 text-[11px]" style={{ color: 'var(--color-text-muted)' }}>
+                <button
+                  type="button"
+                  className="underline"
+                  onClick={() => set('allowed_hours', [0, 9, 11, 18, 21])}
+                >Preset: hot hours</button>
+                <button
+                  type="button"
+                  className="underline"
+                  onClick={() => set('allowed_hours', [])}
+                >Clear (24/7)</button>
+                <span>
+                  {(config.allowed_hours ?? []).length > 0
+                    ? `Active: ${(config.allowed_hours ?? []).join(', ')} UTC — ${(config.allowed_hours ?? []).length * (60 / 5)} windows/day max`
+                    : 'No restriction — trades all 24 hours'}
+                </span>
+              </div>
+            </div>
+          )}
+
+          {/* RV Floor (Polymarket binary only) */}
+          {config.market_type === 'polymarket_binary' && (
+            <div className="lg:col-span-2">
+              <label className="block text-xs mb-1.5 flex items-center gap-1.5" style={{ color: 'var(--color-text-muted)' }}>
+                BTC RV Floor
+                <span
+                  className="px-1 rounded text-[9px]"
+                  style={{ backgroundColor: 'var(--color-surface-2)', color: 'var(--color-text-muted)' }}
+                  title="Skip windows when BTC 60-period realized vol is below this value. Flat markets degrade drift signal."
+                >flat-mkt filter</span>
+              </label>
+              <input
+                type="number"
+                min={0}
+                step={0.000005}
+                value={config.rv_min_btc ?? ''}
+                onChange={(e) => {
+                  const val = e.target.value
+                  set('rv_min_btc', val === '' ? undefined : Number(val))
+                }}
+                placeholder="0.00015 (empirical)"
+                className="w-full rounded px-2 py-2 text-sm font-mono"
+                style={{
+                  backgroundColor: 'var(--color-surface-2)',
+                  border: '1px solid var(--color-border)',
+                  color: 'var(--color-text)',
+                }}
+              />
+              <div className="text-[11px] mt-1" style={{ color: 'var(--color-text-muted)' }}>
+                {config.rv_min_btc
+                  ? `Skip when RV < ${config.rv_min_btc.toFixed(5)} — filters flat consolidation`
+                  : 'Disabled — no RV filter applied'}
+              </div>
+            </div>
+          )}
+
           {/* Sizing Mode */}
           <div className="lg:col-span-2">
             <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>
@@ -2211,6 +2300,11 @@ export function PolyHistoricalSyncPanel({ seriesOptions, currentSeriesId }: {
     onSuccess: () => refetch(),
   })
 
+  const cancelMutation = useMutation({
+    mutationFn: () => apiPost('/api/backtest/polymarket-historical/cancel', {}),
+    onSuccess: () => refetch(),
+  })
+
   const progress = status?.progress
   const running = progress?.running ?? false
   const dataset = (status?.datasets ?? []).find(d => d.series_id === seriesId)
@@ -2225,6 +2319,7 @@ export function PolyHistoricalSyncPanel({ seriesOptions, currentSeriesId }: {
       case 'min3': return 'Minute-3 prices (drift signal)'
       case 'done': return 'Completed'
       case 'error': return 'Error'
+      case 'cancelled': return 'Cancelled'
       default: return 'Idle'
     }
   })()
@@ -2315,18 +2410,34 @@ export function PolyHistoricalSyncPanel({ seriesOptions, currentSeriesId }: {
               />
             </div>
             <div>
-              <button
-                onClick={() => syncMutation.mutate()}
-                disabled={running || syncMutation.isPending}
-                className="w-full flex items-center justify-center gap-2 rounded px-3 py-2 text-sm font-semibold transition-opacity disabled:opacity-50 disabled:cursor-not-allowed"
-                style={{
-                  backgroundColor: 'var(--color-accent)',
-                  color: 'var(--color-bg)',
-                }}
-              >
-                <Download size={14} />
-                {running ? 'Syncing…' : 'Cargar datos históricos de Polymarket (CLOB)'}
-              </button>
+              {running ? (
+                <button
+                  onClick={() => cancelMutation.mutate()}
+                  disabled={cancelMutation.isPending}
+                  className="w-full flex items-center justify-center gap-2 rounded px-3 py-2 text-sm font-semibold transition-opacity disabled:opacity-50 disabled:cursor-not-allowed"
+                  style={{
+                    backgroundColor: 'var(--color-danger, #ef4444)',
+                    color: '#fff',
+                  }}
+                  title="Cancel sync — partial data will still be saved"
+                >
+                  <X size={14} />
+                  {cancelMutation.isPending ? 'Cancelling…' : 'Stop sync'}
+                </button>
+              ) : (
+                <button
+                  onClick={() => syncMutation.mutate()}
+                  disabled={syncMutation.isPending}
+                  className="w-full flex items-center justify-center gap-2 rounded px-3 py-2 text-sm font-semibold transition-opacity disabled:opacity-50 disabled:cursor-not-allowed"
+                  style={{
+                    backgroundColor: 'var(--color-accent)',
+                    color: 'var(--color-bg)',
+                  }}
+                >
+                  <Download size={14} />
+                  Cargar datos históricos de Polymarket (CLOB)
+                </button>
+              )}
             </div>
           </div>
 
@@ -2368,6 +2479,20 @@ export function PolyHistoricalSyncPanel({ seriesOptions, currentSeriesId }: {
             >
               <Check size={14} />
               Last sync: {progress.min4_count.toLocaleString()} P4 + {progress.min3_count.toLocaleString()} P3 records
+              {progress.completed_at && ` · ${fmtRelativeDate(progress.completed_at)}`}
+            </div>
+          )}
+          {!running && progress?.stage === 'cancelled' && (
+            <div
+              className="rounded border p-2 text-xs flex items-center gap-2"
+              style={{
+                backgroundColor: 'rgba(245, 158, 11, 0.08)',
+                borderColor: 'rgba(245, 158, 11, 0.35)',
+                color: '#f59e0b',
+              }}
+            >
+              <X size={14} />
+              Cancelled — saved {progress.min4_count.toLocaleString()} P4 + {progress.min3_count.toLocaleString()} P3 records before stopping
               {progress.completed_at && ` · ${fmtRelativeDate(progress.completed_at)}`}
             </div>
           )}

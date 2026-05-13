@@ -170,6 +170,18 @@ pub struct Config {
     #[serde(default)]
     pub chainlink: ChainlinkConfig,
 
+    /// Copy Trading configuration (`[copy_trading]`).
+    #[serde(default)]
+    pub copy_trading: CopyTradingConfig,
+
+    /// Hyperliquid connector configuration (`[hyperliquid]`).
+    #[serde(default)]
+    pub hyperliquid: HyperliquidConfig,
+
+    /// General trading risk configuration (`[risk_trading]`).
+    #[serde(default)]
+    pub risk_trading: RiskTradingConfig,
+
     /// Live strategy global defaults (`[live_strategy]`).
     #[serde(default)]
     pub live_strategy: LiveStrategyConfig,
@@ -956,6 +968,183 @@ pub struct PolymarketConfig {
     #[serde(default)]
     pub signature_type: Option<String>,
 }
+
+// ── Copy Trading ─────────────────────────────────────────────────
+
+/// Copy Trading configuration (`[copy_trading]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CopyTradingConfig {
+    /// Enable copy trading infrastructure.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Default mode: discovery | consensus | mirror.
+    #[serde(default = "default_copy_mode")]
+    pub default_mode: String,
+    /// Polymarket Polygon RPC WebSocket URL.
+    #[serde(default = "default_poly_rpc_ws")]
+    pub polymarket_rpc_ws: String,
+    /// Cron schedule for the nightly indexer (default: 2 AM).
+    #[serde(default = "default_indexer_schedule")]
+    pub indexer_schedule: String,
+    /// Minimum wallet score to allow mirror mode.
+    #[serde(default = "default_min_mirror_score")]
+    pub min_leader_score_mirror: f64,
+    /// Minimum wallet score to allow consensus mode.
+    #[serde(default = "default_min_consensus_score")]
+    pub min_leader_score_consensus: f64,
+    /// Max exposure to a single leader (% of capital).
+    #[serde(default = "default_max_single_leader_pct")]
+    pub max_single_leader_exposure_pct: f64,
+    /// Max copy exposure per venue (% of capital).
+    #[serde(default = "default_max_venue_copy_pct")]
+    pub max_per_venue_copy_exposure_pct: f64,
+    /// Max aggregate memecoin copy exposure (% of capital).
+    #[serde(default = "default_max_memecoin_pct")]
+    pub max_aggregate_memecoin_copy_pct: f64,
+    /// Max follow lag in seconds before auto-closing a position.
+    #[serde(default = "default_max_follow_lag")]
+    pub max_follow_lag_seconds: f64,
+    /// Consensus N: minimum leaders agreeing.
+    #[serde(default = "default_consensus_n")]
+    pub consensus_n: usize,
+    /// Consensus M: pool of leaders watched.
+    #[serde(default = "default_consensus_m")]
+    pub consensus_m: usize,
+    /// Consensus window in seconds.
+    #[serde(default = "default_consensus_window")]
+    pub consensus_window_seconds: i64,
+}
+
+impl Default for CopyTradingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            default_mode: default_copy_mode(),
+            polymarket_rpc_ws: default_poly_rpc_ws(),
+            indexer_schedule: default_indexer_schedule(),
+            min_leader_score_mirror: default_min_mirror_score(),
+            min_leader_score_consensus: default_min_consensus_score(),
+            max_single_leader_exposure_pct: default_max_single_leader_pct(),
+            max_per_venue_copy_exposure_pct: default_max_venue_copy_pct(),
+            max_aggregate_memecoin_copy_pct: default_max_memecoin_pct(),
+            max_follow_lag_seconds: default_max_follow_lag(),
+            consensus_n: default_consensus_n(),
+            consensus_m: default_consensus_m(),
+            consensus_window_seconds: default_consensus_window(),
+        }
+    }
+}
+
+fn default_copy_mode() -> String { "discovery".into() }
+fn default_poly_rpc_ws() -> String { "wss://polygon.publicnode.com".into() }
+fn default_indexer_schedule() -> String { "0 2 * * *".into() }
+fn default_min_mirror_score() -> f64 { 80.0 }
+fn default_min_consensus_score() -> f64 { 65.0 }
+fn default_max_single_leader_pct() -> f64 { 0.10 }
+fn default_max_venue_copy_pct() -> f64 { 0.30 }
+fn default_max_memecoin_pct() -> f64 { 0.15 }
+fn default_max_follow_lag() -> f64 { 5.0 }
+fn default_consensus_n() -> usize { 3 }
+
+// ── Hyperliquid ──────────────────────────────────────────────────
+
+/// Hyperliquid connector configuration (`[hyperliquid]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct HyperliquidConfig {
+    /// Enable Hyperliquid trading infrastructure.
+    #[serde(default)]
+    pub enabled: bool,
+    /// REST API URL.
+    #[serde(default = "default_hl_api_url")]
+    pub api_url: String,
+    /// WebSocket URL.
+    #[serde(default = "default_hl_ws_url")]
+    pub ws_url: String,
+    /// Use testnet instead of mainnet.
+    #[serde(default)]
+    pub use_testnet: bool,
+    /// Label of the EVM wallet to use for Hyperliquid trading.
+    /// The wallet must exist in the wallets store and have a valid private key.
+    #[serde(default)]
+    pub wallet_label: Option<String>,
+}
+
+impl Default for HyperliquidConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_url: default_hl_api_url(),
+            ws_url: default_hl_ws_url(),
+            use_testnet: false,
+            wallet_label: None,
+        }
+    }
+}
+
+fn default_hl_api_url() -> String { "https://api.hyperliquid.xyz".into() }
+fn default_hl_ws_url() -> String { "wss://api.hyperliquid.xyz/ws".into() }
+
+// ── Risk Trading ─────────────────────────────────────────────────
+
+/// General trading risk configuration (`[risk_trading]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct RiskTradingConfig {
+    /// Daily loss limit (% of capital). Default: 4%.
+    #[serde(default = "default_daily_loss_limit")]
+    pub daily_loss_limit_pct: f64,
+    /// Hard drawdown limit (% of capital). Default: 20%.
+    #[serde(default = "default_drawdown_hard_limit")]
+    pub drawdown_hard_limit_pct: f64,
+    /// Soft drawdown limit (% of capital). Default: 15%.
+    #[serde(default = "default_drawdown_soft_limit")]
+    pub drawdown_soft_limit_pct: f64,
+    /// Risk per trade (% of capital). Default: 1%.
+    #[serde(default = "default_risk_per_trade")]
+    pub risk_per_trade_pct: f64,
+    /// Correlation threshold for grouping assets. Default: 0.80.
+    #[serde(default = "default_correlation_threshold")]
+    pub correlation_threshold: f64,
+    /// Max exposure to correlated assets (% of capital). Default: 40%.
+    #[serde(default = "default_max_correlated_exposure")]
+    pub max_correlated_exposure_pct: f64,
+    /// Max exposure per strategy (% of capital). Default: 25%.
+    #[serde(default = "default_max_strategy_exposure")]
+    pub max_strategy_exposure_pct: f64,
+    /// Max aggregate memecoin exposure (% of capital). Default: 15%.
+    #[serde(default = "default_max_memecoin_exposure")]
+    pub max_memecoin_exposure_pct: f64,
+    /// Minimum notional per trade (USD). Default: 10.0.
+    #[serde(default = "default_min_notional")]
+    pub min_notional_usd: f64,
+}
+
+impl Default for RiskTradingConfig {
+    fn default() -> Self {
+        Self {
+            daily_loss_limit_pct: default_daily_loss_limit(),
+            drawdown_hard_limit_pct: default_drawdown_hard_limit(),
+            drawdown_soft_limit_pct: default_drawdown_soft_limit(),
+            risk_per_trade_pct: default_risk_per_trade(),
+            correlation_threshold: default_correlation_threshold(),
+            max_correlated_exposure_pct: default_max_correlated_exposure(),
+            max_strategy_exposure_pct: default_max_strategy_exposure(),
+            max_memecoin_exposure_pct: default_max_memecoin_exposure(),
+            min_notional_usd: default_min_notional(),
+        }
+    }
+}
+
+fn default_daily_loss_limit() -> f64 { 0.04 }
+fn default_drawdown_hard_limit() -> f64 { 0.20 }
+fn default_drawdown_soft_limit() -> f64 { 0.15 }
+fn default_risk_per_trade() -> f64 { 0.01 }
+fn default_correlation_threshold() -> f64 { 0.80 }
+fn default_max_correlated_exposure() -> f64 { 0.40 }
+fn default_max_strategy_exposure() -> f64 { 0.25 }
+fn default_max_memecoin_exposure() -> f64 { 0.15 }
+fn default_min_notional() -> f64 { 10.0 }
+fn default_consensus_m() -> usize { 10 }
+fn default_consensus_window() -> i64 { 1800 }
 
 // ── Chainlink Data Streams ──────────────────────────────────────
 
@@ -3789,6 +3978,9 @@ impl Default for Config {
             polymarket: PolymarketConfig::default(),
             chainlink: ChainlinkConfig::default(),
             live_strategy: LiveStrategyConfig::default(),
+            copy_trading: CopyTradingConfig::default(),
+            hyperliquid: HyperliquidConfig::default(),
+            risk_trading: RiskTradingConfig::default(),
         }
     }
 }

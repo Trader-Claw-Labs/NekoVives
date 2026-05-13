@@ -5,7 +5,7 @@
 //!  2. Connects to the Binance WebSocket kline stream for real-time closed candles.
 //!  3. Runs the Rhai strategy on a rolling buffer after every new closed candle.
 //!  4. In paper mode: tracks simulated P&L and updates the store.
-//!     In live mode (polymarket_binary only): sends real orders via Polymarket CLOB API.
+//!     In live mode: sends real orders via Polymarket CLOB API or Hyperliquid CEX.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -23,7 +23,7 @@ pub enum LiveSizingMode {
     Fixed,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RunnerConfig {
     pub id: String,
     pub name: String,
@@ -96,6 +96,50 @@ pub struct RunnerConfig {
     /// like 1.0 to disable the gate entirely.
     #[serde(default)]
     pub max_spread_pct: Option<f64>,
+    /// Allowed UTC hours (0-23). When set, the runner skips decision windows
+    /// whose hour is NOT in this list. Empirically, hours 01/03/04/07/08/14/17/20
+    /// (UTC) show ~34% WR vs 56% for the best hours. Empty vec = no restriction.
+    #[serde(default)]
+    pub allowed_hours: Vec<u8>,
+    /// Minimum BTC realized-vol (60-period stdev of 1m log-returns) required
+    /// before the runner will place a bet. Flat markets degrade drift signal
+    /// to noise. Empirical threshold: 0.00015 (half of normal baseline).
+    /// 0.0 / None = disabled.
+    #[serde(default)]
+    pub rv_min_btc: Option<f64>,
+    /// Hyperliquid signer for live CEX trading. Created at runner start from
+    /// wallet-manager decrypted key. Never serialized to disk.
+    #[serde(skip)]
+    pub hl_signer: Option<hyperliquid_trader::exchange::Signer>,
+    /// Trading risk gate reference for live mode. Passed from AppState.
+    #[serde(skip)]
+    pub risk_gate: Option<Arc<risk_manager::general::TradingRiskGate>>,
+    /// Binance Futures credentials for live CEX trading.
+    /// If present and hl_signer is None, the runner trades on Binance instead of Hyperliquid.
+    #[serde(skip)]
+    pub binance_creds: Option<crate::tools::binance_perps::BinanceCredentials>,
+    // ── Funding arbitrage configuration ───────────────────────────────────────
+    /// Watchlist of coins to monitor for funding rate arbitrage.
+    #[serde(default = "default_funding_watchlist")]
+    pub funding_watchlist: Vec<String>,
+    /// Minimum APR difference required to open a funding arb position.
+    #[serde(default = "default_min_apr_diff")]
+    pub min_apr_diff: f64,
+    /// APR diff threshold below which an open position is force-closed.
+    #[serde(default = "default_force_close_diff")]
+    pub force_close_diff: f64,
+    /// Maximum number of concurrent funding arb pairs.
+    #[serde(default = "default_max_open_pairs")]
+    pub max_open_pairs: usize,
+    /// Max % of capital allocated per pair (split across both legs).
+    #[serde(default = "default_max_pos_pct")]
+    pub max_pos_pct: f64,
+    /// Polling interval in seconds for funding rate checks.
+    #[serde(default = "default_funding_poll_secs")]
+    pub funding_poll_secs: u64,
+    /// Estimated taker fee + slippage in basis points per leg per cycle.
+    #[serde(default = "default_fee_buffer_bps")]
+    pub fee_buffer_bps: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,6 +190,11 @@ pub struct RunnerResult {
     pub live_wins: u32,
     /// Live-mode total trades count
     pub live_total_trades: u32,
+    /// Persistent script kv_state across pause/restart cycles. Mirrors
+    /// `ctx.set(...)` values that the Rhai script carries between windows
+    /// (avg_vol, loss_streak, pause_until, etc.). Empty `{}` on fresh runner.
+    #[serde(default)]
+    pub live_kv_state: std::collections::HashMap<String, f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -166,6 +215,8 @@ pub struct StoredRunner {
     pub config: RunnerConfig,
     pub status: RunnerStatus,
     pub result: Option<RunnerResult>,
+    #[serde(default)]
+    pub hidden: bool,
 }
 
 pub struct StrategyRunnerStore {
@@ -176,6 +227,16 @@ pub struct StrategyRunnerStore {
 
 fn default_auto_restart() -> bool { true }
 fn default_chainlink_interval() -> u64 { 5 }
+
+fn default_funding_watchlist() -> Vec<String> {
+    vec!["BTC".into(), "ETH".into(), "SOL".into(), "AVAX".into()]
+}
+fn default_min_apr_diff() -> f64 { 0.10 }
+fn default_force_close_diff() -> f64 { 0.02 }
+fn default_max_open_pairs() -> usize { 4 }
+fn default_max_pos_pct() -> f64 { 0.15 }
+fn default_funding_poll_secs() -> u64 { 60 }
+fn default_fee_buffer_bps() -> f64 { 12.0 }
 
 // ── Store impl ───────────────────────────────────────────────────────────────
 
@@ -235,6 +296,19 @@ impl StrategyRunnerStore {
         updated
     }
 
+    pub fn set_hidden(&self, id: &str, hidden: bool) -> Option<StoredRunner> {
+        let mut map = self.runners.lock().unwrap();
+        let updated = map.get_mut(id).map(|r| {
+            r.hidden = hidden;
+            r.clone()
+        });
+        drop(map);
+        if updated.is_some() {
+            self.persist();
+        }
+        updated
+    }
+
     pub fn update_runner_config(
         &self,
         id: &str,
@@ -242,6 +316,8 @@ impl StrategyRunnerStore {
         live_sizing_value: Option<f64>,
         // Option<Option<T>>: None = absent (skip), Some(None) = clear, Some(Some(v)) = set
         max_entry_price: Option<Option<f64>>,
+        allowed_hours: Option<Vec<u8>>,
+        rv_min_btc: Option<Option<f64>>,
         price_mode: Option<String>,
         max_spread_pct: Option<Option<f64>>,
         early_fire_secs: Option<Option<u32>>,
@@ -265,6 +341,12 @@ impl StrategyRunnerStore {
             }
             if let Some(maybe) = early_fire_secs {
                 r.config.early_fire_secs = maybe;
+            }
+            if let Some(hours) = allowed_hours {
+                r.config.allowed_hours = hours;
+            }
+            if let Some(maybe) = rv_min_btc {
+                r.config.rv_min_btc = maybe;
             }
             r.clone()
         });
@@ -413,6 +495,11 @@ pub fn start_runner(
     let id = config.id.clone();
     let now = chrono::Utc::now().to_rfc3339();
 
+    // Preserve any existing result (live_orders, live_wins, live_kv_state, ...)
+    // so manual restart / auto-restart on error / restart_previously_running
+    // do NOT wipe accumulated stats. The runner loop will rehydrate from this.
+    let existing_result = store.get(&id).and_then(|r| r.result);
+
     let status = RunnerStatus {
         id: id.clone(),
         status: "starting".to_string(),
@@ -422,13 +509,71 @@ pub fn start_runner(
         error: None,
     };
 
-    let runner = StoredRunner { config: config.clone(), status: status.clone(), result: None };
+    let runner = StoredRunner {
+        config: config.clone(),
+        status: status.clone(),
+        result: existing_result,
+        hidden: false,
+    };
     store.upsert(runner.clone());
 
     let store_clone = store.clone();
     let ws_dir = workspace_dir.clone();
     let task = tokio::spawn(async move {
-        runner_loop(store_clone, config, ws_dir, config_path).await;
+        // Auto-restart wrapper. If `runner_loop` exits with status="error" and
+        // the runner has auto_restart=true, wait and restart up to 5 times.
+        // Trades and KV state survive because start_runner preserves the
+        // result on each upsert.
+        const MAX_AUTO_RESTARTS: u32 = 5;
+        const RESTART_DELAY_SECS: u64 = 30;
+        let mut attempt: u32 = 0;
+        loop {
+            let cfg = config.clone();
+            let cfg_path = config_path.clone();
+            let ws = ws_dir.clone();
+            let store_inner = store_clone.clone();
+            runner_loop(store_inner, cfg, ws, cfg_path).await;
+
+            let should_restart = {
+                let map = store_clone.runners.lock().unwrap();
+                map.get(&config.id).map(|r| {
+                    r.status.status == "error" && r.config.auto_restart
+                }).unwrap_or(false)
+            };
+            if !should_restart {
+                break;
+            }
+            attempt += 1;
+            if attempt > MAX_AUTO_RESTARTS {
+                tracing::error!(
+                    "[RUNNER {}] Auto-restart exhausted ({}/{}). Manual restart required.",
+                    config.id, MAX_AUTO_RESTARTS, MAX_AUTO_RESTARTS
+                );
+                break;
+            }
+            tracing::info!(
+                "[RUNNER {}] Auto-restart attempt {}/{} in {}s",
+                config.id, attempt, MAX_AUTO_RESTARTS, RESTART_DELAY_SECS
+            );
+            // Mark as 'starting' with note so dashboard shows progress.
+            {
+                let mut map = store_clone.runners.lock().unwrap();
+                if let Some(r) = map.get_mut(&config.id) {
+                    r.status.status = "starting".to_string();
+                    r.status.error = Some(format!(
+                        "Auto-restart {}/{} after error", attempt, MAX_AUTO_RESTARTS
+                    ));
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(RESTART_DELAY_SECS)).await;
+            // Clear error message before re-entering loop.
+            {
+                let mut map = store_clone.runners.lock().unwrap();
+                if let Some(r) = map.get_mut(&config.id) {
+                    r.status.error = None;
+                }
+            }
+        }
     });
     store.register_handle(id, task.abort_handle());
 
@@ -446,8 +591,761 @@ async fn runner_loop(
     // Dispatch to the correct loop based on market type
     if config.market_type == "polymarket_binary" {
         polymarket_runner_loop(store, config, workspace_dir, config_path).await;
+    } else if config.market_type == "funding_arb" {
+        funding_arb_runner_loop(store, config, workspace_dir).await;
     } else {
         crypto_runner_loop(store, config, workspace_dir).await;
+    }
+}
+
+/// Compute simple ATR over the last `period` candles.
+fn compute_atr_simple(candles: &[crate::tools::backtest::Candle], period: usize) -> f64 {
+    if candles.len() < period + 1 {
+        return 0.0;
+    }
+    let mut tr_sum = 0.0;
+    for i in (candles.len() - period)..candles.len() {
+        let prev_close = candles[i - 1].close;
+        let high = candles[i].high;
+        let low = candles[i].low;
+        let tr = (high - low)
+            .max((high - prev_close).abs())
+            .max((low - prev_close).abs());
+        tr_sum += tr;
+    }
+    tr_sum / period as f64
+}
+
+/// Convert a Binance-style symbol (e.g. "BTCUSDT") to a Hyperliquid coin ("BTC").
+fn binance_symbol_to_hl_coin(symbol: &str) -> String {
+    symbol
+        .trim_end_matches("USDT")
+        .trim_end_matches("USDC")
+        .trim_end_matches("USD")
+        .to_string()
+}
+
+/// Execute a CEX position change via Hyperliquid.
+/// `prev_pos` and `new_pos` are the strategy-engine position states.
+/// Positive = long, negative = short, zero = flat.
+async fn execute_hl_position_change(
+    client: &hyperliquid_trader::HyperliquidClient,
+    gate: &risk_manager::general::TradingRiskGate,
+    config: &RunnerConfig,
+    coin: &str,
+    price: f64,
+    prev_pos: f64,
+    new_pos: f64,
+    atr14: f64,
+    live_orders: &mut Vec<LiveOrder>,
+) {
+    if (new_pos - prev_pos).abs() < f64::EPSILON {
+        return;
+    }
+
+    let side_str;
+    let order_result: Result<hyperliquid_trader::types::OrderResponse, String>;
+    let size_usd: f64;
+
+    // Determine sizing
+    let capital = gate.status().total_capital.max(config.initial_balance);
+    size_usd = match config.live_sizing_mode {
+        LiveSizingMode::Fixed => config.live_sizing_value,
+        LiveSizingMode::Percent => capital * config.live_sizing_value,
+    };
+
+    if size_usd <= 0.0 {
+        tracing::warn!("[HL LIVE] Sizing produced zero or negative size; skipping");
+        return;
+    }
+
+    // Risk gate approval
+    let order_req = risk_manager::general::OrderRequest {
+        symbol: coin.to_string(),
+        strategy_id: config.id.clone(),
+        side: if new_pos > 0.0 { "buy".into() } else { "sell".into() },
+        proposed_size_usd: size_usd,
+        stop_distance_atr: 2.0,
+        atr14,
+        is_memecoin: false,
+    };
+    let ctx = risk_manager::general::OrderContext { current_price: price };
+
+    let approved = match gate.approve_order(&order_req, &ctx) {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!("[HL LIVE] Risk gate rejected order: {e}");
+            live_orders.push(LiveOrder {
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                window_ts: 0,
+                side: order_req.side.clone(),
+                token_id: coin.to_string(),
+                amount_usdc: size_usd,
+                order_id: "REJECTED".to_string(),
+                status: format!("rejected: {e}"),
+                entry_price: Some(price),
+                result: None,
+                pnl: None,
+                stop_loss_triggered: false,
+            });
+            return;
+        }
+    };
+
+    let exec_size_usd = approved.approved_size_usd;
+    let sz_coins = exec_size_usd / price;
+
+    // Handle transitions
+    let prev_side = if prev_pos > 0.0 { "long" } else if prev_pos < 0.0 { "short" } else { "flat" };
+    let new_side = if new_pos > 0.0 { "long" } else if new_pos < 0.0 { "short" } else { "flat" };
+
+    if new_side == "flat" {
+        // Close existing position
+        side_str = "close".to_string();
+        tracing::info!("[HL LIVE] Closing position for {coin} (was {prev_side})");
+        order_result = client
+            .close_position(coin)
+            .await
+            .map_err(|e| e.to_string());
+    } else if prev_side == "flat" {
+        // Open new position
+        side_str = if new_side == "long" { "buy" } else { "sell" }.to_string();
+        let order = if new_side == "long" {
+            hyperliquid_trader::types::Order::market_buy(coin, sz_coins)
+        } else {
+            hyperliquid_trader::types::Order::market_sell(coin, sz_coins)
+        };
+        tracing::info!("[HL LIVE] Opening {new_side} {coin} @ ~{price:.2} | {exec_size_usd:.2} USD ({sz_coins:.6} coins)");
+        order_result = client.place_order(&order).await.map_err(|e| e.to_string());
+    } else if prev_side != new_side {
+        // Reverse: close then open
+        side_str = format!("reverse_{}_to_{}", prev_side, new_side);
+        tracing::info!("[HL LIVE] Reversing {prev_side} → {new_side} for {coin}");
+        let _ = client.close_position(coin).await;
+        let order = if new_side == "long" {
+            hyperliquid_trader::types::Order::market_buy(coin, sz_coins)
+        } else {
+            hyperliquid_trader::types::Order::market_sell(coin, sz_coins)
+        };
+        order_result = client.place_order(&order).await.map_err(|e| e.to_string());
+    } else {
+        // Same direction but size might have changed — for simplicity, skip
+        return;
+    }
+
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    match order_result {
+        Ok(resp) => {
+            let oid = resp.order_id.map(|id| id.to_string()).unwrap_or_else(|| "ok".to_string());
+            tracing::info!("[HL LIVE] Order placed: {oid}");
+            gate.record_fill(&risk_manager::general::FillRecord {
+                symbol: coin.to_string(),
+                strategy_id: config.id.clone(),
+                side: side_str.clone(),
+                size_usd: exec_size_usd,
+                price,
+                pnl_realized: 0.0,
+                is_memecoin: false,
+                timestamp: chrono::Utc::now(),
+            });
+            live_orders.push(LiveOrder {
+                timestamp,
+                window_ts: 0,
+                side: side_str,
+                token_id: coin.to_string(),
+                amount_usdc: exec_size_usd,
+                order_id: oid,
+                status: "filled".to_string(),
+                entry_price: Some(price),
+                result: None,
+                pnl: None,
+                stop_loss_triggered: false,
+            });
+        }
+        Err(e) => {
+            tracing::error!("[HL LIVE] Order failed: {e}");
+            live_orders.push(LiveOrder {
+                timestamp,
+                window_ts: 0,
+                side: side_str,
+                token_id: coin.to_string(),
+                amount_usdc: exec_size_usd,
+                order_id: "FAILED".to_string(),
+                status: format!("error: {e}"),
+                entry_price: Some(price),
+                result: None,
+                pnl: None,
+                stop_loss_triggered: false,
+            });
+        }
+    }
+}
+
+/// Execute a CEX position change via Binance Futures.
+async fn execute_binance_position_change(
+    creds: &crate::tools::binance_perps::BinanceCredentials,
+    gate: &risk_manager::general::TradingRiskGate,
+    config: &RunnerConfig,
+    symbol: &str,
+    price: f64,
+    prev_pos: f64,
+    new_pos: f64,
+    atr14: f64,
+    live_orders: &mut Vec<LiveOrder>,
+) {
+    if (new_pos - prev_pos).abs() < f64::EPSILON {
+        return;
+    }
+
+    let side_str;
+    let order_result: Result<serde_json::Value, String>;
+    let size_usd: f64;
+
+    let capital = gate.status().total_capital.max(config.initial_balance);
+    size_usd = match config.live_sizing_mode {
+        LiveSizingMode::Fixed => config.live_sizing_value,
+        LiveSizingMode::Percent => capital * config.live_sizing_value,
+    };
+
+    if size_usd <= 0.0 {
+        tracing::warn!("[BN LIVE] Sizing produced zero or negative size; skipping");
+        return;
+    }
+
+    let order_req = risk_manager::general::OrderRequest {
+        symbol: symbol.to_string(),
+        strategy_id: config.id.clone(),
+        side: if new_pos > 0.0 { "buy".into() } else { "sell".into() },
+        proposed_size_usd: size_usd,
+        stop_distance_atr: 2.0,
+        atr14,
+        is_memecoin: false,
+    };
+    let ctx = risk_manager::general::OrderContext { current_price: price };
+
+    let approved = match gate.approve_order(&order_req, &ctx) {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!("[BN LIVE] Risk gate rejected order: {e}");
+            live_orders.push(LiveOrder {
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                window_ts: 0,
+                side: order_req.side.clone(),
+                token_id: symbol.to_string(),
+                amount_usdc: size_usd,
+                order_id: "REJECTED".to_string(),
+                status: format!("rejected: {e}"),
+                entry_price: Some(price),
+                result: None,
+                pnl: None,
+                stop_loss_triggered: false,
+            });
+            return;
+        }
+    };
+
+    let exec_size_usd = approved.approved_size_usd;
+    let qty = exec_size_usd / price;
+
+    let prev_side = if prev_pos > 0.0 { "long" } else if prev_pos < 0.0 { "short" } else { "flat" };
+    let new_side = if new_pos > 0.0 { "long" } else if new_pos < 0.0 { "short" } else { "flat" };
+
+    if new_side == "flat" {
+        side_str = "close".to_string();
+        tracing::info!("[BN LIVE] Closing position for {symbol} (was {prev_side})");
+        order_result = crate::tools::binance_perps::close_position(creds, symbol)
+            .await
+            .map_err(|e| e.to_string());
+    } else if prev_side == "flat" {
+        let side = if new_side == "long" { "BUY" } else { "SELL" };
+        side_str = side.to_lowercase();
+        tracing::info!("[BN LIVE] Opening {new_side} {symbol} @ ~{price:.2} | {exec_size_usd:.2} USD ({qty:.6})");
+        order_result = crate::tools::binance_perps::place_market_order(creds, symbol, side, qty, false)
+            .await
+            .map_err(|e| e.to_string());
+    } else if prev_side != new_side {
+        side_str = format!("reverse_{}_to_{}", prev_side, new_side);
+        tracing::info!("[BN LIVE] Reversing {prev_side} → {new_side} for {symbol}");
+        let _ = crate::tools::binance_perps::close_position(creds, symbol).await;
+        let side = if new_side == "long" { "BUY" } else { "SELL" };
+        order_result = crate::tools::binance_perps::place_market_order(creds, symbol, side, qty, false)
+            .await
+            .map_err(|e| e.to_string());
+    } else {
+        return;
+    }
+
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    match order_result {
+        Ok(resp) => {
+            let oid = resp.get("orderId").and_then(|v| v.as_u64()).map(|id| id.to_string()).unwrap_or_else(|| "ok".to_string());
+            tracing::info!("[BN LIVE] Order placed: {oid}");
+            gate.record_fill(&risk_manager::general::FillRecord {
+                symbol: symbol.to_string(),
+                strategy_id: config.id.clone(),
+                side: side_str.clone(),
+                size_usd: exec_size_usd,
+                price,
+                pnl_realized: 0.0,
+                is_memecoin: false,
+                timestamp: chrono::Utc::now(),
+            });
+            live_orders.push(LiveOrder {
+                timestamp,
+                window_ts: 0,
+                side: side_str,
+                token_id: symbol.to_string(),
+                amount_usdc: exec_size_usd,
+                order_id: oid,
+                status: "filled".to_string(),
+                entry_price: Some(price),
+                result: None,
+                pnl: None,
+                stop_loss_triggered: false,
+            });
+        }
+        Err(e) => {
+            tracing::error!("[BN LIVE] Order failed: {e}");
+            live_orders.push(LiveOrder {
+                timestamp,
+                window_ts: 0,
+                side: side_str,
+                token_id: symbol.to_string(),
+                amount_usdc: exec_size_usd,
+                order_id: "FAILED".to_string(),
+                status: format!("error: {e}"),
+                entry_price: Some(price),
+                result: None,
+                pnl: None,
+                stop_loss_triggered: false,
+            });
+        }
+    }
+}
+
+// ── Forced open/close helpers (funding arb) ──────────────────────────────────
+
+async fn open_hl_long(
+    client: &hyperliquid_trader::HyperliquidClient,
+    gate: &risk_manager::general::TradingRiskGate,
+    coin: &str,
+    size_usd: f64,
+    price: f64,
+    config: &RunnerConfig,
+    live_orders: &mut Vec<LiveOrder>,
+) {
+    if size_usd <= 0.0 {
+        return;
+    }
+    let order_req = risk_manager::general::OrderRequest {
+        symbol: coin.to_string(),
+        strategy_id: config.id.clone(),
+        side: "buy".into(),
+        proposed_size_usd: size_usd,
+        stop_distance_atr: 2.0,
+        atr14: 0.0,
+        is_memecoin: false,
+    };
+    let ctx = risk_manager::general::OrderContext { current_price: price };
+    let approved = match gate.approve_order(&order_req, &ctx) {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!("[HL_ARB] Risk gate rejected long: {e}");
+            return;
+        }
+    };
+    let sz = approved.approved_size_usd / price;
+    let order = hyperliquid_trader::types::Order::market_buy(coin, sz);
+    let ts = chrono::Utc::now().to_rfc3339();
+    match client.place_order(&order).await {
+        Ok(resp) => {
+            let oid = resp.order_id.map(|id| id.to_string()).unwrap_or_else(|| "ok".to_string());
+            tracing::info!("[HL_ARB] Long {coin} @ ~{price:.2} | {sz:.6} coins");
+            gate.record_fill(&risk_manager::general::FillRecord {
+                symbol: coin.to_string(),
+                strategy_id: config.id.clone(),
+                side: "buy".into(),
+                size_usd: approved.approved_size_usd,
+                price,
+                pnl_realized: 0.0,
+                is_memecoin: false,
+                timestamp: chrono::Utc::now(),
+            });
+            live_orders.push(LiveOrder {
+                timestamp: ts,
+                window_ts: 0,
+                side: "buy".to_string(),
+                token_id: coin.to_string(),
+                amount_usdc: approved.approved_size_usd,
+                order_id: oid,
+                status: "filled".to_string(),
+                entry_price: Some(price),
+                result: None,
+                pnl: None,
+                stop_loss_triggered: false,
+            });
+        }
+        Err(e) => {
+            tracing::error!("[HL_ARB] Long failed: {e}");
+            live_orders.push(LiveOrder {
+                timestamp: ts,
+                window_ts: 0,
+                side: "buy".to_string(),
+                token_id: coin.to_string(),
+                amount_usdc: size_usd,
+                order_id: "FAILED".to_string(),
+                status: format!("error: {e}"),
+                entry_price: Some(price),
+                result: None,
+                pnl: None,
+                stop_loss_triggered: false,
+            });
+        }
+    }
+}
+
+async fn open_hl_short(
+    client: &hyperliquid_trader::HyperliquidClient,
+    gate: &risk_manager::general::TradingRiskGate,
+    coin: &str,
+    size_usd: f64,
+    price: f64,
+    config: &RunnerConfig,
+    live_orders: &mut Vec<LiveOrder>,
+) {
+    if size_usd <= 0.0 {
+        return;
+    }
+    let order_req = risk_manager::general::OrderRequest {
+        symbol: coin.to_string(),
+        strategy_id: config.id.clone(),
+        side: "sell".into(),
+        proposed_size_usd: size_usd,
+        stop_distance_atr: 2.0,
+        atr14: 0.0,
+        is_memecoin: false,
+    };
+    let ctx = risk_manager::general::OrderContext { current_price: price };
+    let approved = match gate.approve_order(&order_req, &ctx) {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!("[HL_ARB] Risk gate rejected short: {e}");
+            return;
+        }
+    };
+    let sz = approved.approved_size_usd / price;
+    let order = hyperliquid_trader::types::Order::market_sell(coin, sz);
+    let ts = chrono::Utc::now().to_rfc3339();
+    match client.place_order(&order).await {
+        Ok(resp) => {
+            let oid = resp.order_id.map(|id| id.to_string()).unwrap_or_else(|| "ok".to_string());
+            tracing::info!("[HL_ARB] Short {coin} @ ~{price:.2} | {sz:.6} coins");
+            gate.record_fill(&risk_manager::general::FillRecord {
+                symbol: coin.to_string(),
+                strategy_id: config.id.clone(),
+                side: "sell".into(),
+                size_usd: approved.approved_size_usd,
+                price,
+                pnl_realized: 0.0,
+                is_memecoin: false,
+                timestamp: chrono::Utc::now(),
+            });
+            live_orders.push(LiveOrder {
+                timestamp: ts,
+                window_ts: 0,
+                side: "sell".to_string(),
+                token_id: coin.to_string(),
+                amount_usdc: approved.approved_size_usd,
+                order_id: oid,
+                status: "filled".to_string(),
+                entry_price: Some(price),
+                result: None,
+                pnl: None,
+                stop_loss_triggered: false,
+            });
+        }
+        Err(e) => {
+            tracing::error!("[HL_ARB] Short failed: {e}");
+            live_orders.push(LiveOrder {
+                timestamp: ts,
+                window_ts: 0,
+                side: "sell".to_string(),
+                token_id: coin.to_string(),
+                amount_usdc: size_usd,
+                order_id: "FAILED".to_string(),
+                status: format!("error: {e}"),
+                entry_price: Some(price),
+                result: None,
+                pnl: None,
+                stop_loss_triggered: false,
+            });
+        }
+    }
+}
+
+async fn close_hl_position(
+    client: &hyperliquid_trader::HyperliquidClient,
+    gate: &risk_manager::general::TradingRiskGate,
+    coin: &str,
+    config: &RunnerConfig,
+    live_orders: &mut Vec<LiveOrder>,
+) {
+    let ts = chrono::Utc::now().to_rfc3339();
+    match client.close_position(coin).await {
+        Ok(resp) => {
+            let oid = resp.order_id.map(|id| id.to_string()).unwrap_or_else(|| "ok".to_string());
+            tracing::info!("[HL_ARB] Closed {coin}");
+            gate.record_fill(&risk_manager::general::FillRecord {
+                symbol: coin.to_string(),
+                strategy_id: config.id.clone(),
+                side: "close".into(),
+                size_usd: 0.0,
+                price: 0.0,
+                pnl_realized: 0.0,
+                is_memecoin: false,
+                timestamp: chrono::Utc::now(),
+            });
+            live_orders.push(LiveOrder {
+                timestamp: ts,
+                window_ts: 0,
+                side: "close".to_string(),
+                token_id: coin.to_string(),
+                amount_usdc: 0.0,
+                order_id: oid,
+                status: "filled".to_string(),
+                entry_price: None,
+                result: None,
+                pnl: None,
+                stop_loss_triggered: false,
+            });
+        }
+        Err(e) => {
+            tracing::error!("[HL_ARB] Close failed: {e}");
+            live_orders.push(LiveOrder {
+                timestamp: ts,
+                window_ts: 0,
+                side: "close".to_string(),
+                token_id: coin.to_string(),
+                amount_usdc: 0.0,
+                order_id: "FAILED".to_string(),
+                status: format!("error: {e}"),
+                entry_price: None,
+                result: None,
+                pnl: None,
+                stop_loss_triggered: false,
+            });
+        }
+    }
+}
+
+async fn open_binance_long(
+    creds: &crate::tools::binance_perps::BinanceCredentials,
+    gate: &risk_manager::general::TradingRiskGate,
+    symbol: &str,
+    size_usd: f64,
+    price: f64,
+    config: &RunnerConfig,
+    live_orders: &mut Vec<LiveOrder>,
+) {
+    if size_usd <= 0.0 {
+        return;
+    }
+    let order_req = risk_manager::general::OrderRequest {
+        symbol: symbol.to_string(),
+        strategy_id: config.id.clone(),
+        side: "buy".into(),
+        proposed_size_usd: size_usd,
+        stop_distance_atr: 2.0,
+        atr14: 0.0,
+        is_memecoin: false,
+    };
+    let ctx = risk_manager::general::OrderContext { current_price: price };
+    let approved = match gate.approve_order(&order_req, &ctx) {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!("[BN_ARB] Risk gate rejected long: {e}");
+            return;
+        }
+    };
+    let qty = approved.approved_size_usd / price;
+    let ts = chrono::Utc::now().to_rfc3339();
+    match crate::tools::binance_perps::place_market_order(creds, symbol, "BUY", qty, false).await {
+        Ok(resp) => {
+            let oid = resp.get("orderId").and_then(|v| v.as_u64()).map(|id| id.to_string()).unwrap_or_else(|| "ok".to_string());
+            tracing::info!("[BN_ARB] Long {symbol} @ ~{price:.2} | {qty:.6}");
+            gate.record_fill(&risk_manager::general::FillRecord {
+                symbol: symbol.to_string(),
+                strategy_id: config.id.clone(),
+                side: "buy".into(),
+                size_usd: approved.approved_size_usd,
+                price,
+                pnl_realized: 0.0,
+                is_memecoin: false,
+                timestamp: chrono::Utc::now(),
+            });
+            live_orders.push(LiveOrder {
+                timestamp: ts,
+                window_ts: 0,
+                side: "buy".to_string(),
+                token_id: symbol.to_string(),
+                amount_usdc: approved.approved_size_usd,
+                order_id: oid,
+                status: "filled".to_string(),
+                entry_price: Some(price),
+                result: None,
+                pnl: None,
+                stop_loss_triggered: false,
+            });
+        }
+        Err(e) => {
+            tracing::error!("[BN_ARB] Long failed: {e}");
+            live_orders.push(LiveOrder {
+                timestamp: ts,
+                window_ts: 0,
+                side: "buy".to_string(),
+                token_id: symbol.to_string(),
+                amount_usdc: size_usd,
+                order_id: "FAILED".to_string(),
+                status: format!("error: {e}"),
+                entry_price: Some(price),
+                result: None,
+                pnl: None,
+                stop_loss_triggered: false,
+            });
+        }
+    }
+}
+
+async fn open_binance_short(
+    creds: &crate::tools::binance_perps::BinanceCredentials,
+    gate: &risk_manager::general::TradingRiskGate,
+    symbol: &str,
+    size_usd: f64,
+    price: f64,
+    config: &RunnerConfig,
+    live_orders: &mut Vec<LiveOrder>,
+) {
+    if size_usd <= 0.0 {
+        return;
+    }
+    let order_req = risk_manager::general::OrderRequest {
+        symbol: symbol.to_string(),
+        strategy_id: config.id.clone(),
+        side: "sell".into(),
+        proposed_size_usd: size_usd,
+        stop_distance_atr: 2.0,
+        atr14: 0.0,
+        is_memecoin: false,
+    };
+    let ctx = risk_manager::general::OrderContext { current_price: price };
+    let approved = match gate.approve_order(&order_req, &ctx) {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!("[BN_ARB] Risk gate rejected short: {e}");
+            return;
+        }
+    };
+    let qty = approved.approved_size_usd / price;
+    let ts = chrono::Utc::now().to_rfc3339();
+    match crate::tools::binance_perps::place_market_order(creds, symbol, "SELL", qty, false).await {
+        Ok(resp) => {
+            let oid = resp.get("orderId").and_then(|v| v.as_u64()).map(|id| id.to_string()).unwrap_or_else(|| "ok".to_string());
+            tracing::info!("[BN_ARB] Short {symbol} @ ~{price:.2} | {qty:.6}");
+            gate.record_fill(&risk_manager::general::FillRecord {
+                symbol: symbol.to_string(),
+                strategy_id: config.id.clone(),
+                side: "sell".into(),
+                size_usd: approved.approved_size_usd,
+                price,
+                pnl_realized: 0.0,
+                is_memecoin: false,
+                timestamp: chrono::Utc::now(),
+            });
+            live_orders.push(LiveOrder {
+                timestamp: ts,
+                window_ts: 0,
+                side: "sell".to_string(),
+                token_id: symbol.to_string(),
+                amount_usdc: approved.approved_size_usd,
+                order_id: oid,
+                status: "filled".to_string(),
+                entry_price: Some(price),
+                result: None,
+                pnl: None,
+                stop_loss_triggered: false,
+            });
+        }
+        Err(e) => {
+            tracing::error!("[BN_ARB] Short failed: {e}");
+            live_orders.push(LiveOrder {
+                timestamp: ts,
+                window_ts: 0,
+                side: "sell".to_string(),
+                token_id: symbol.to_string(),
+                amount_usdc: size_usd,
+                order_id: "FAILED".to_string(),
+                status: format!("error: {e}"),
+                entry_price: Some(price),
+                result: None,
+                pnl: None,
+                stop_loss_triggered: false,
+            });
+        }
+    }
+}
+
+async fn close_binance_position(
+    creds: &crate::tools::binance_perps::BinanceCredentials,
+    gate: &risk_manager::general::TradingRiskGate,
+    symbol: &str,
+    config: &RunnerConfig,
+    live_orders: &mut Vec<LiveOrder>,
+) {
+    let ts = chrono::Utc::now().to_rfc3339();
+    match crate::tools::binance_perps::close_position(creds, symbol).await {
+        Ok(resp) => {
+            let oid = resp.get("orderId").and_then(|v| v.as_u64()).map(|id| id.to_string()).unwrap_or_else(|| "ok".to_string());
+            tracing::info!("[BN_ARB] Closed {symbol}");
+            gate.record_fill(&risk_manager::general::FillRecord {
+                symbol: symbol.to_string(),
+                strategy_id: config.id.clone(),
+                side: "close".into(),
+                size_usd: 0.0,
+                price: 0.0,
+                pnl_realized: 0.0,
+                is_memecoin: false,
+                timestamp: chrono::Utc::now(),
+            });
+            live_orders.push(LiveOrder {
+                timestamp: ts,
+                window_ts: 0,
+                side: "close".to_string(),
+                token_id: symbol.to_string(),
+                amount_usdc: 0.0,
+                order_id: oid,
+                status: "filled".to_string(),
+                entry_price: None,
+                result: None,
+                pnl: None,
+                stop_loss_triggered: false,
+            });
+        }
+        Err(e) => {
+            tracing::error!("[BN_ARB] Close failed: {e}");
+            live_orders.push(LiveOrder {
+                timestamp: ts,
+                window_ts: 0,
+                side: "close".to_string(),
+                token_id: symbol.to_string(),
+                amount_usdc: 0.0,
+                order_id: "FAILED".to_string(),
+                status: format!("error: {e}"),
+                entry_price: None,
+                result: None,
+                pnl: None,
+                stop_loss_triggered: false,
+            });
+        }
     }
 }
 
@@ -457,6 +1355,30 @@ async fn crypto_runner_loop(
     workspace_dir: PathBuf,
 ) {
     let id = config.id.clone();
+    let is_live = config.mode == "live";
+
+    // ─ Live trading setup ──────────────────────────────────────────────────────
+    let hl_client: Option<hyperliquid_trader::HyperliquidClient> = if is_live {
+        if let Some(ref signer) = config.hl_signer {
+            let client = hyperliquid_trader::HyperliquidClient::new_mainnet_with_signer(signer.clone());
+            tracing::info!("[RUNNER {id}] Live trading enabled on Hyperliquid (addr={})", signer.address());
+            Some(client)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let use_binance = is_live && config.binance_creds.is_some() && config.hl_signer.is_none();
+    if use_binance {
+        tracing::info!("[RUNNER {id}] Live trading enabled on Binance Futures");
+    } else if is_live && hl_client.is_none() && config.hl_signer.is_none() {
+        tracing::warn!("[RUNNER {id}] Live mode requested but no trading venue configured; running paper");
+    }
+
+    let risk_gate = config.risk_gate.clone();
+    let coin = binance_symbol_to_hl_coin(&config.symbol);
 
     // ─ Resolve script (read from disk or fall back to bundled default)
     let script_content = match crate::tools::backtest::read_script_or_default(
@@ -498,7 +1420,9 @@ async fn crypto_runner_loop(
         config.initial_balance,
         config.fee_pct,
     );
-    update_runner_result(&store, &id, &config, &initial_metrics, None, None, None, None, None, None, None).await;
+    let mut last_position = initial_metrics.position;
+    let mut live_orders: Vec<LiveOrder> = Vec::new();
+    update_runner_result(&store, &id, &config, &initial_metrics, None, None, None, Some(live_orders.clone()), None, None, None).await;
     set_runner_status(&store, &id, "running");
 
     // ─ Connect Binance WebSocket for real-time closed candles ──────────────────
@@ -520,8 +1444,25 @@ async fn crypto_runner_loop(
         };
         tracing::debug!("[RUNNER {id}] New closed candle: close={}", candle.close);
 
-        buffer.push_back(candle);
+        buffer.push_back(candle.clone());
         if buffer.len() > MAX_BUFFER { buffer.pop_front(); }
+
+        // Pre-flight risk gate check (live only)
+        if is_live {
+            if let Some(ref gate) = risk_gate {
+                if gate.is_halted() {
+                    tracing::warn!("[RUNNER {id}] Risk gate is HALTED — skipping tick");
+                    let now = chrono::Utc::now().to_rfc3339();
+                    {
+                        let mut map = store.runners.lock().unwrap();
+                        if let Some(r) = map.get_mut(&id) {
+                            r.status.last_tick_at = Some(now);
+                        }
+                    }
+                    continue;
+                }
+            }
+        }
 
         // Run strategy on the current rolling window
         let metrics = crate::tools::backtest::run_rhai_on_candle_buffer(
@@ -530,6 +1471,27 @@ async fn crypto_runner_loop(
             config.initial_balance,
             config.fee_pct,
         );
+
+        // Live order execution (CEX)
+        if is_live {
+            let atr14 = compute_atr_simple(&buffer.iter().cloned().collect::<Vec<_>>(), 14);
+            if let Some(ref gate) = risk_gate {
+                if let Some(ref client) = hl_client {
+                    execute_hl_position_change(
+                        client, gate, &config, &coin, candle.close,
+                        last_position, metrics.position, atr14,
+                        &mut live_orders,
+                    ).await;
+                } else if let Some(ref creds) = config.binance_creds {
+                    execute_binance_position_change(
+                        creds, gate, &config, &config.symbol, candle.close,
+                        last_position, metrics.position, atr14,
+                        &mut live_orders,
+                    ).await;
+                }
+            }
+            last_position = metrics.position;
+        }
 
         // Update status timestamps
         let now = chrono::Utc::now().to_rfc3339();
@@ -540,12 +1502,285 @@ async fn crypto_runner_loop(
                 r.status.next_tick_at = None; // event-driven; no fixed next tick
             }
         }
-        update_runner_result(&store, &id, &config, &metrics, None, None, None, None, None, None, None).await;
+        update_runner_result(&store, &id, &config, &metrics, None, None, None, Some(live_orders.clone()), None, None, None).await;
         store.persist();
     }
 
     // Channel closed means the feed task was dropped (runner stopped)
     tracing::info!("[RUNNER {id}] Feed channel closed, exiting");
+}
+
+// ── Funding rate arbitrage runner ─────────────────────────────────────────────
+
+/// Per-pair position tracking for funding arbitrage.
+#[derive(Debug, Clone)]
+struct FundingArbPosition {
+    pub symbol: String,
+    pub hl_side: String,      // "long" | "short" | "flat"
+    pub bin_side: String,     // "long" | "short" | "flat"
+    pub leg_size_usd: f64,
+    pub entry_diff_apr: f64,
+    pub opened_at: chrono::DateTime<chrono::Utc>,
+}
+
+async fn funding_arb_runner_loop(
+    store: Arc<StrategyRunnerStore>,
+    config: RunnerConfig,
+    _workspace_dir: PathBuf,
+) {
+    let id = config.id.clone();
+    let is_live = config.mode == "live";
+
+    // ─ Live trading setup ──────────────────────────────────────────────────────
+    let hl_client: Option<hyperliquid_trader::HyperliquidClient> = if is_live {
+        config.hl_signer.as_ref().map(|s| {
+            hyperliquid_trader::HyperliquidClient::new_mainnet_with_signer(s.clone())
+        })
+    } else {
+        None
+    };
+
+    let binance_creds = config.binance_creds.clone();
+
+    if is_live {
+        if hl_client.is_none() {
+            set_runner_error(&store, &id, "Live funding arb requires Hyperliquid wallet (hl_signer).");
+            return;
+        }
+        if binance_creds.is_none() {
+            set_runner_error(&store, &id, "Live funding arb requires Binance Futures credentials.");
+            return;
+        }
+        tracing::info!("[RUNNER {id}] Live funding arb enabled on HL + Binance");
+    } else {
+        tracing::info!("[RUNNER {id}] Paper funding arb mode");
+    }
+
+    let risk_gate = config.risk_gate.clone();
+    let watchlist = config.funding_watchlist.clone();
+    let min_apr_diff = config.min_apr_diff;
+    let force_close_diff = config.force_close_diff;
+    let max_open_pairs = config.max_open_pairs;
+    let max_pos_pct = config.max_pos_pct;
+    let poll_secs = config.funding_poll_secs;
+    let fee_buffer_bps = config.fee_buffer_bps;
+    let fee_buffer_apr = (fee_buffer_bps / 10000.0) * 24.0 * 365.0 / 8.0;
+
+    let mut open_positions: Vec<FundingArbPosition> = Vec::new();
+    let mut live_orders: Vec<LiveOrder> = Vec::new();
+
+    set_runner_status(&store, &id, "running");
+
+    // ─ Main loop ───────────────────────────────────────────────────────────────
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(poll_secs));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        interval.tick().await;
+
+        // Pre-flight risk gate check
+        if is_live {
+            if let Some(ref gate) = risk_gate {
+                if gate.is_halted() {
+                    tracing::warn!("[RUNNER {id}] Risk gate HALTED — skipping funding check");
+                    let now = chrono::Utc::now().to_rfc3339();
+                    {
+                        let mut map = store.runners.lock().unwrap();
+                        if let Some(r) = map.get_mut(&id) {
+                            r.status.last_tick_at = Some(now);
+                        }
+                    }
+                    continue;
+                }
+            }
+        }
+
+        // ─ Fetch Hyperliquid predicted funding ─────────────────────────────────
+        let hl_rates: std::collections::HashMap<String, f64> = if let Some(ref client) = hl_client {
+            match client.predicted_funding().await {
+                Ok(rates) => rates,
+                Err(e) => {
+                    tracing::warn!("[RUNNER {id}] HL predicted funding failed: {e}");
+                    std::collections::HashMap::new()
+                }
+            }
+        } else {
+            // Paper mode: simulate random funding rates for testing
+            let mut sim = std::collections::HashMap::new();
+            for coin in &watchlist {
+                sim.insert(coin.clone(), (rand::random::<f64>() - 0.5) * 0.002);
+            }
+            sim
+        };
+
+        // ─ Fetch Binance funding rates ─────────────────────────────────────────
+        let binance_rates: std::collections::HashMap<String, f64> =
+            if let Some(ref creds) = binance_creds {
+                match fetch_binance_funding_rates(creds, &watchlist).await {
+                    Ok(rates) => rates,
+                    Err(e) => {
+                        tracing::warn!("[RUNNER {id}] Binance funding fetch failed: {e}");
+                        std::collections::HashMap::new()
+                    }
+                }
+            } else {
+                let mut sim = std::collections::HashMap::new();
+                for coin in &watchlist {
+                    sim.insert(format!("{}USDT", coin), (rand::random::<f64>() - 0.5) * 0.001);
+                }
+                sim
+            };
+
+        // ─ Evaluate each symbol ────────────────────────────────────────────────
+        let mut decisions: Vec<String> = Vec::new();
+        for coin in &watchlist {
+            let hl_raw = hl_rates.get(coin).copied().unwrap_or(0.0);
+            let bin_raw = binance_rates.get(&format!("{}USDT", coin)).copied().unwrap_or(0.0);
+
+            // HL is 1h funding, Binance is 8h funding
+            let hl_apr = hl_raw * 24.0 * 365.0;
+            let bin_apr = bin_raw * 3.0 * 365.0;
+            let raw_diff = (hl_apr - bin_apr).abs();
+            let net_diff = raw_diff - fee_buffer_apr;
+
+            let pos_idx = open_positions.iter().position(|p| p.symbol == *coin);
+            let in_pair = pos_idx.is_some();
+
+            if !in_pair && net_diff > min_apr_diff && open_positions.len() < max_open_pairs {
+                let capital = risk_gate.as_ref().map(|g| g.status().total_capital).unwrap_or(config.initial_balance);
+                let leg_size_usd = capital * max_pos_pct * 0.5;
+
+                let (hl_side, bin_side) = if hl_apr > bin_apr {
+                    ("short", "long")
+                } else {
+                    ("long", "short")
+                };
+
+                if is_live {
+                    if let (Some(ref client), Some(ref gate), Some(ref creds)) = (&hl_client, &risk_gate, &binance_creds) {
+                        // Fetch reference price from Binance spot for sizing
+                        let price = fetch_binance_price(coin).await.unwrap_or(0.0);
+                        if price > 0.0 {
+                            if hl_side == "long" {
+                                open_hl_long(client, gate, coin, leg_size_usd, price, &config, &mut live_orders).await;
+                            } else {
+                                open_hl_short(client, gate, coin, leg_size_usd, price, &config, &mut live_orders).await;
+                            }
+                            let symbol = format!("{}USDT", coin);
+                            if bin_side == "long" {
+                                open_binance_long(creds, gate, &symbol, leg_size_usd, price, &config, &mut live_orders).await;
+                            } else {
+                                open_binance_short(creds, gate, &symbol, leg_size_usd, price, &config, &mut live_orders).await;
+                            }
+                        }
+                    }
+                } else {
+                    tracing::info!("[RUNNER {id}] PAPER: Would open {coin} arb | HL={hl_side} BIN={bin_side} | net_diff={net_diff:.2}%");
+                }
+
+                open_positions.push(FundingArbPosition {
+                    symbol: coin.clone(),
+                    hl_side: hl_side.to_string(),
+                    bin_side: bin_side.to_string(),
+                    leg_size_usd,
+                    entry_diff_apr: net_diff,
+                    opened_at: chrono::Utc::now(),
+                });
+                decisions.push(format!("OPEN {coin} {hl_side}/{bin_side} @ {net_diff:.2}% APR"));
+
+            } else if in_pair && raw_diff < force_close_diff {
+                if let Some(idx) = pos_idx {
+                    let pos = open_positions.remove(idx);
+                    if is_live {
+                        if let (Some(ref client), Some(ref gate), Some(ref creds)) = (&hl_client, &risk_gate, &binance_creds) {
+                            close_hl_position(client, gate, coin, &config, &mut live_orders).await;
+                            let symbol = format!("{}USDT", coin);
+                            close_binance_position(creds, gate, &symbol, &config, &mut live_orders).await;
+                        }
+                    } else {
+                        tracing::info!("[RUNNER {id}] PAPER: Would close {coin} arb | diff collapsed to {raw_diff:.2}%");
+                    }
+                    decisions.push(format!("CLOSE {coin} @ {raw_diff:.2}% APR"));
+                }
+            }
+        }
+
+        // ─ Update runner status ────────────────────────────────────────────────
+        let now = chrono::Utc::now().to_rfc3339();
+        let analysis = if decisions.is_empty() {
+            "No funding arb signals this cycle".to_string()
+        } else {
+            decisions.join("; ")
+        };
+
+        // Build a minimal RunnerResult for funding arb
+        let result = RunnerResult {
+            total_return_pct: 0.0,
+            balance: config.initial_balance,
+            position: open_positions.len() as f64,
+            total_trades: live_orders.len() as u32,
+            win_rate_pct: 0.0,
+            sharpe_ratio: 0.0,
+            max_drawdown_pct: 0.0,
+            all_trades: Vec::new(),
+            last_signal: analysis.clone(),
+            analysis,
+            live_feed: None,
+            wallet_address: config.wallet_address.clone(),
+            wallet_balance_usdc: None,
+            live_orders: live_orders.clone(),
+            live_wins: 0,
+            live_total_trades: live_orders.len() as u32,
+            live_kv_state: std::collections::HashMap::new(),
+        };
+
+        {
+            let mut map = store.runners.lock().unwrap();
+            if let Some(r) = map.get_mut(&id) {
+                r.result = Some(result);
+                r.status.last_tick_at = Some(now);
+                r.status.status = "running".to_string();
+            }
+        }
+        store.persist();
+    }
+}
+
+/// Fetch Binance funding rates for a list of coins via REST.
+async fn fetch_binance_funding_rates(
+    _creds: &crate::tools::binance_perps::BinanceCredentials,
+    watchlist: &[String],
+) -> anyhow::Result<std::collections::HashMap<String, f64>> {
+    let client = reqwest::Client::new();
+    let url = "https://fapi.binance.com/fapi/v1/premiumIndex";
+    let resp = client.get(url).send().await?;
+    let arr: Vec<serde_json::Value> = resp.json().await?;
+
+    let mut rates: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    for item in &arr {
+        let symbol = item["symbol"].as_str().unwrap_or("");
+        let rate_str = item["lastFundingRate"].as_str().unwrap_or("0");
+        let rate: f64 = rate_str.parse().unwrap_or(0.0);
+        for coin in watchlist {
+            if symbol == format!("{}USDT", coin) {
+                rates.insert(symbol.to_string(), rate);
+            }
+        }
+    }
+    Ok(rates)
+}
+
+/// Fetch current Binance spot price for a coin.
+async fn fetch_binance_price(coin: &str) -> Option<f64> {
+    let client = reqwest::Client::new();
+    let url = format!("https://api.binance.com/api/v3/ticker/price?symbol={}USDT", coin);
+    match client.get(&url).send().await {
+        Ok(resp) => match resp.json::<serde_json::Value>().await {
+            Ok(json) => json["price"].as_str().and_then(|s| s.parse().ok()),
+            Err(_) => None,
+        },
+        Err(_) => None,
+    }
 }
 
 // ── Polymarket binary live runner ─────────────────────────────────────────────
@@ -720,46 +1955,96 @@ async fn polymarket_runner_loop(
     let mut prev_live_position: Option<(i64, String, String, std::collections::HashMap<String, f64>)> = None;
     let mut price_history: std::collections::VecDeque<(i64, f64)> = std::collections::VecDeque::with_capacity(60);
     // Persistent kv state for live signal — carries avg_vol and other ctx.set() values across windows.
-    // Pre-seed from a BT warmup run so avg_vol starts aligned with the backtester's historical value,
-    // preventing score divergence on the first windows after runner start.
+    //
+    // On restart, we prefer the previously persisted kv_state from the store
+    // so script state (loss_streak, pause_until, avg_vol, ...) survives a
+    // pause/restart cycle. If there's no prior state (fresh runner), we seed
+    // from a BT warmup run so avg_vol starts aligned with the backtester's
+    // historical value, preventing score divergence on the first windows.
     let mut live_kv_state: std::collections::HashMap<String, f64> = {
-        let init_decision_minute = (window_minutes as i64) - 1;
-        let res_logic = config.resolution_logic.as_deref().unwrap_or("price_up");
-        match crate::tools::backtest::run_polymarket_bt_signal_preview(
-            &script_content,
-            buffer.iter().cloned().collect(),
-            window_minutes,
-            Some(init_decision_minute),
-            res_logic,
-            config.threshold,
-            config.initial_balance,
-            config.price_mode.as_deref().unwrap_or("historical"),
-            0.0,
-            0.0, // warmup: no real price, use momentum model
-            0.0, // warmup: no prev P3, drift = 0 (script must handle gracefully)
-        ) {
-            Ok(bt_seed) => {
-                let state: std::collections::HashMap<String, f64> = bt_seed.kv_state.iter()
-                    .filter(|(k, _)| !k.starts_with("debug_"))
-                    .map(|(k, v)| (k.clone(), *v))
-                    .collect();
-                tracing::info!("[RUNNER {id}] KV pre-seeded from BT warmup: {} state keys", state.len());
-                append_runner_log(&store, &id, &format!(
-                    "KV warmup: avg_vol={:.4}",
-                    state.get("avg_vol").copied().unwrap_or(0.0)
-                ));
-                state
-            }
-            Err(e) => {
-                tracing::warn!("[RUNNER {id}] BT warmup seed failed ({}), starting with empty kv", e);
-                std::collections::HashMap::new()
+        let restored = {
+            let map = store.runners.lock().unwrap();
+            map.get(&id)
+                .and_then(|r| r.result.as_ref())
+                .map(|res| res.live_kv_state.clone())
+                .unwrap_or_default()
+        };
+        if !restored.is_empty() {
+            tracing::info!(
+                "[RUNNER {id}] KV restored from persisted state: {} keys",
+                restored.len()
+            );
+            append_runner_log(&store, &id, &format!(
+                "KV restored: {} state keys (avg_vol={:.4}, loss_streak={:.0})",
+                restored.len(),
+                restored.get("avg_vol").copied().unwrap_or(0.0),
+                restored.get("loss_streak").copied().unwrap_or(0.0),
+            ));
+            restored
+        } else {
+            let init_decision_minute = (window_minutes as i64) - 1;
+            let res_logic = config.resolution_logic.as_deref().unwrap_or("price_up");
+            match crate::tools::backtest::run_polymarket_bt_signal_preview(
+                &script_content,
+                buffer.iter().cloned().collect(),
+                window_minutes,
+                Some(init_decision_minute),
+                res_logic,
+                config.threshold,
+                config.initial_balance,
+                config.price_mode.as_deref().unwrap_or("historical"),
+                0.0,
+                0.0, // warmup: no real price, use momentum model
+                0.0, // warmup: no prev P3, drift = 0 (script must handle gracefully)
+            ) {
+                Ok(bt_seed) => {
+                    let state: std::collections::HashMap<String, f64> = bt_seed.kv_state.iter()
+                        .filter(|(k, _)| !k.starts_with("debug_"))
+                        .map(|(k, v)| (k.clone(), *v))
+                        .collect();
+                    tracing::info!("[RUNNER {id}] KV pre-seeded from BT warmup: {} state keys", state.len());
+                    append_runner_log(&store, &id, &format!(
+                        "KV warmup: avg_vol={:.4}",
+                        state.get("avg_vol").copied().unwrap_or(0.0)
+                    ));
+                    state
+                }
+                Err(e) => {
+                    tracing::warn!("[RUNNER {id}] BT warmup seed failed ({}), starting with empty kv", e);
+                    std::collections::HashMap::new()
+                }
             }
         }
     };
-    // Live-mode counters (reset on runner start)
-    let mut live_orders: Vec<LiveOrder> = Vec::new();
-    let mut live_wins: u32 = 0;
-    let mut live_total_trades: u32 = 0;
+    // Live-mode counters. Restored from the previously persisted result so
+    // KPIs survive a pause/restart cycle. If no prior result exists (fresh
+    // runner), these start at zero.
+    let (mut live_orders, mut live_wins, mut live_total_trades): (Vec<LiveOrder>, u32, u32) = {
+        let map = store.runners.lock().unwrap();
+        if let Some(r) = map.get(&id) {
+            if let Some(ref prev) = r.result {
+                (prev.live_orders.clone(), prev.live_wins, prev.live_total_trades)
+            } else {
+                (Vec::new(), 0, 0)
+            }
+        } else {
+            (Vec::new(), 0, 0)
+        }
+    };
+    if !live_orders.is_empty() {
+        tracing::info!(
+            "[RUNNER {id}] Restored state on start: {} orders, {} wins, {} total trades",
+            live_orders.len(), live_wins, live_total_trades
+        );
+        append_runner_log(
+            &store, &id,
+            &format!(
+                "Restored on restart: {} trades ({} wins, {:.1}% WR)",
+                live_total_trades, live_wins,
+                if live_total_trades > 0 { (live_wins as f64 / live_total_trades as f64) * 100.0 } else { 0.0 }
+            ),
+        );
+    }
 
     // Minute within the window to take the decision (0-based open_time index).
     // For a 5m window [T … T+300s]:
@@ -779,13 +2064,33 @@ async fn polymarket_runner_loop(
     tokio::pin!(early_sleep);
     let mut early_fire_armed_window: i64 = -1; // window_ts that the timer is armed for
 
+    // ── Watchdog ──────────────────────────────────────────────────────────
+    // Defensive: if no candle arrives for >WATCHDOG_STALL_SECS, the WS feed
+    // is stuck (network partition, Binance restart, etc.). We break out of
+    // the runner loop so the caller (spawn site) can decide whether to
+    // auto-restart. Binance normally sends a candle every minute; >5 min
+    // silence is already unusual, >10 min is almost certainly a stuck
+    // connection not recovering on its own.
+    const WATCHDOG_STALL_SECS: u64 = 600;        // 10 min → break & exit runner
+    const WATCHDOG_WARN_SECS: u64 = 300;         // 5 min → log warning
+    const WATCHDOG_POLL_SECS: u64 = 60;          // how often to check
+    let mut last_candle_at = tokio::time::Instant::now();
+    let mut watchdog_warned = false;
+    let watchdog_sleep = tokio::time::sleep(std::time::Duration::from_secs(WATCHDOG_POLL_SECS));
+    tokio::pin!(watchdog_sleep);
+
+    let mut watchdog_tripped = false;
     loop {
-        // Either a new closed candle arrives, or the early-fire timer fires.
+        // Either a new closed candle arrives, the early-fire timer fires,
+        // or the watchdog wakes up to check feed health.
         let early_fired = tokio::select! {
             candle_opt = candle_rx.recv() => {
                 let live_inner = match candle_opt { Some(c) => c, None => break };
                 // Shadow `live` for the rest of the block
                 let live = live_inner;
+                // Reset watchdog — a candle arrived so the feed is healthy.
+                last_candle_at = tokio::time::Instant::now();
+                watchdog_warned = false;
 
                 let candle = crate::tools::backtest::Candle {
                     open_time_ms: live.open_time_ms,
@@ -858,6 +2163,41 @@ async fn polymarket_runner_loop(
                 append_runner_log(&store, &id, "Early fire: placing order before candle close");
                 true // signal that this is an early-fire tick
             }
+            _ = &mut watchdog_sleep => {
+                // Wake up every WATCHDOG_POLL_SECS to check feed health.
+                // Re-arm the timer so we poll again.
+                watchdog_sleep.as_mut().reset(
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(WATCHDOG_POLL_SECS)
+                );
+                let stale_secs = last_candle_at.elapsed().as_secs();
+                if stale_secs >= WATCHDOG_STALL_SECS {
+                    tracing::error!(
+                        "[RUNNER {id}] WATCHDOG: no candle for {}s (>{}s limit) — exiting runner loop",
+                        stale_secs, WATCHDOG_STALL_SECS
+                    );
+                    append_runner_log(
+                        &store, &id,
+                        &format!(
+                            "WATCHDOG tripped: no WS candle for {}s. Runner will stop. auto_restart will relaunch if enabled.",
+                            stale_secs
+                        ),
+                    );
+                    watchdog_tripped = true;
+                    break; // exits the select, then exits the outer loop below
+                } else if stale_secs >= WATCHDOG_WARN_SECS && !watchdog_warned {
+                    tracing::warn!(
+                        "[RUNNER {id}] WATCHDOG: no candle for {}s (warn threshold {}s)",
+                        stale_secs, WATCHDOG_WARN_SECS
+                    );
+                    append_runner_log(
+                        &store, &id,
+                        &format!("WATCHDOG warning: no WS candle for {}s. Will stop at {}s.", stale_secs, WATCHDOG_STALL_SECS),
+                    );
+                    watchdog_warned = true;
+                }
+                // Not an early-fire event. Skip the rest of the iteration.
+                continue;
+            }
         };
 
         // When early fire triggers, synthesize window/candle timing from wall-clock.
@@ -897,8 +2237,13 @@ async fn polymarket_runner_loop(
         let window_seconds_left = next_window - (live.open_time_ms / 1000);
 
         // ── New window boundary: resolve previous window, prepare tokens ──
+        //
+        // IMPORTANT: do NOT advance `last_window` until we have successfully
+        // resolved the tokens for this window. If we advance eagerly and the
+        // resolve fails (network blip), we would silently bet against stale
+        // tokens from the previous window — which is a near-resolution market
+        // with extreme prices and thin books.
         if current_window != last_window {
-            last_window = current_window;
             tracing::info!(
                 "[RUNNER {id}] New {}-min window @ {} UTC",
                 window_minutes,
@@ -907,45 +2252,86 @@ async fn polymarket_runner_loop(
                     .unwrap_or_default()
             );
 
-            // Resolve tokens for the new window
-            if let Some(ref series_id) = config.series_id {
-                    match resolve_token_for_window(series_id, current_window as u64).await {
-                        Ok((yes_id, no_id, condition_id)) => {
-                            tracing::info!(
-                                "[RUNNER {id}] Resolved tokens for window {}: YES={} NO={} condition_id={}",
-                                current_window, yes_id, no_id, condition_id
-                            );
-                            // Update BOTH the store and the local config so that
-                            // order placement and live-feed price checks use the
-                            // current window's tokens, not stale ones.
-                            config.poly_token_id = Some(yes_id.clone());
-                            config.poly_no_token_id = Some(no_id.clone());
-                            config.poly_condition_id = Some(condition_id.clone());
-                            let mut map = store.runners.lock().unwrap();
-                            if let Some(r) = map.get_mut(&id) {
-                                r.config.poly_token_id = Some(yes_id);
-                                r.config.poly_no_token_id = Some(no_id);
-                                r.config.poly_condition_id = Some(condition_id.clone());
-                            }
-                            // Fetch and cache historical trades for this market window
-                            let ws = workspace_dir.clone();
-                            let cond = condition_id.clone();
-                            tokio::spawn(async move {
-                                update_trade_cache(&cond, &ws).await;
-                            });
+            // Resolve tokens for the new window. `resolve_token_for_window`
+            // internally retries with backoff (3 attempts over ~10s).
+            let resolve_ok = if let Some(ref series_id) = config.series_id {
+                match resolve_token_for_window(series_id, current_window as u64).await {
+                    Ok((yes_id, no_id, condition_id)) => {
+                        tracing::info!(
+                            "[RUNNER {id}] Resolved tokens for window {}: YES={} NO={} condition_id={}",
+                            current_window, yes_id, no_id, condition_id
+                        );
+                        // Update BOTH the store and the local config so that
+                        // order placement and live-feed price checks use the
+                        // current window's tokens, not stale ones.
+                        config.poly_token_id = Some(yes_id.clone());
+                        config.poly_no_token_id = Some(no_id.clone());
+                        config.poly_condition_id = Some(condition_id.clone());
+                        let mut map = store.runners.lock().unwrap();
+                        if let Some(r) = map.get_mut(&id) {
+                            r.config.poly_token_id = Some(yes_id);
+                            r.config.poly_no_token_id = Some(no_id);
+                            r.config.poly_condition_id = Some(condition_id.clone());
                         }
-                        Err(e) => {
-                            tracing::error!(
-                                "[RUNNER {id}] Failed to resolve token_id for window {}: {}",
+                        drop(map);
+                        // Fetch and cache historical trades for this market window
+                        let ws = workspace_dir.clone();
+                        let cond = condition_id.clone();
+                        tokio::spawn(async move {
+                            update_trade_cache(&cond, &ws).await;
+                        });
+                        true
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "[RUNNER {id}] Failed to resolve token_id for window {} after retries: {}",
+                            current_window, e
+                        );
+                        append_runner_log(
+                            &store, &id,
+                            &format!(
+                                "Token resolution failed for window {} after 3 retries: {} — clearing stale tokens, will retry on next candle",
                                 current_window, e
-                            );
-                            append_runner_log(
-                                &store, &id,
-                                &format!("Token resolution failed for window {}: {}", current_window, e),
-                            );
+                            ),
+                        );
+                        // Clear stale tokens so subsequent price fetches don't
+                        // accidentally read from the previous window's market.
+                        config.poly_token_id = None;
+                        config.poly_no_token_id = None;
+                        config.poly_condition_id = None;
+                        let mut map = store.runners.lock().unwrap();
+                        if let Some(r) = map.get_mut(&id) {
+                            r.config.poly_token_id = None;
+                            r.config.poly_no_token_id = None;
+                            r.config.poly_condition_id = None;
                         }
+                        false
                     }
                 }
+            } else {
+                // No series configured = manual market selection; consider "ok"
+                true
+            };
+
+            if resolve_ok {
+                last_window = current_window;
+            } else {
+                // If resolve failed, `last_window` stays at its previous value
+                // so the very next candle (~60s) will retry the whole block.
+                // Skip the rest of the window-transition work (backtest eval,
+                // previous-window resolution, tick update, balance fetch) because
+                // it all depends on valid tokens. We still proceed to the normal
+                // candle processing below.
+                //
+                // Advance the `last_tick_at` heartbeat anyway so the dashboard
+                // knows the runner is alive, just stalled on token resolution.
+                let now = chrono::Utc::now().to_rfc3339();
+                let mut map = store.runners.lock().unwrap();
+                if let Some(r) = map.get_mut(&id) {
+                    r.status.last_tick_at = Some(now);
+                }
+                continue;
+            }
 
             // Run backtest on the full buffer so we can compare backtest vs live
             // for the window that just completed.
@@ -1081,9 +2467,15 @@ async fn polymarket_runner_loop(
                 }
             }
             let wallet_balance = if let Some(ref client) = clob_client {
+                // Live mode: read real USDC balance from the CLOB/exchange
                 fetch_usdc_balance_clob(client).await
             } else {
-                Some(config.initial_balance)
+                // Paper mode: running balance = initial + sum of all settled pnl.
+                // Previously this returned `initial_balance` verbatim, so the UI
+                // showed a stuck $1000. Now it reflects the paper P&L so the
+                // user sees their strategy's realized P&L in the Wallet widget.
+                let settled_pnl: f64 = live_orders.iter().filter_map(|o| o.pnl).sum();
+                Some(config.initial_balance + settled_pnl)
             };
             update_runner_result(
                 &store, &id, &config, &metrics, None,
@@ -1185,6 +2577,46 @@ async fn polymarket_runner_loop(
                 );
             }
 
+            // ── Allowed-hours gate ──
+            // Skip decision windows in UTC hours that historically show poor WR.
+            // Only active when `allowed_hours` is non-empty.
+            let hour_gate_tripped = if !config.allowed_hours.is_empty() {
+                let window_hour = (current_window % 86400) / 3600;
+                let window_hour_u8 = window_hour as u8;
+                !config.allowed_hours.contains(&window_hour_u8)
+            } else {
+                false
+            };
+            if hour_gate_tripped {
+                let window_hour = (current_window % 86400) / 3600;
+                append_runner_log(
+                    &store, &id,
+                    &format!("Hour gate: skipping window (UTC {:02}:00 not in allowed_hours)", window_hour),
+                );
+            }
+
+            // ── RV floor gate ──
+            // Skip when BTC realized-vol is below the minimum threshold.
+            // Flat-market conditions degrade the drift signal to noise.
+            let rv_gate_tripped = if let Some(rv_min) = config.rv_min_btc {
+                if rv_min > 0.0 {
+                    let rv_now = compute_btc_rv_1h(&buffer);
+                    let rv_str = rv_now.map(|v| format!("{:.6}", v)).unwrap_or_else(|| "n/a".to_string());
+                    let tripped = rv_now.map(|v| v < rv_min).unwrap_or(false);
+                    if tripped {
+                        append_runner_log(
+                            &store, &id,
+                            &format!("RV gate: skipping window (rv_btc={} < min={})", rv_str, rv_min),
+                        );
+                    }
+                    tripped
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
             // Live signal: run script on the CURRENT (incomplete) window's decision candle.
             // This is NOT a backtest — it extracts buy/sell intent for the live market.
             let price_mode = config.price_mode.as_deref().unwrap_or("historical");
@@ -1225,11 +2657,20 @@ async fn polymarket_runner_loop(
                 .filter(|(k, _)| !k.starts_with("debug_"))
                 .map(|(k, v)| (k.clone(), *v))
                 .collect();
+            // Also mirror it into the store so it persists across pause/restart.
+            // Cheap: HashMap<String, f64> with typically <10 keys.
+            {
+                let mut map = store.runners.lock().unwrap();
+                if let Some(r) = map.get_mut(&id) {
+                    if let Some(ref mut res) = r.result {
+                        res.live_kv_state = live_kv_state.clone();
+                    }
+                }
+            }
 
-            // If the spread gate tripped, override whatever the strategy said
-            // to "flat". The script's own debug values still surface below so
-            // we can see what it WOULD have done — useful for calibration.
-            let current_signal = if spread_guard_tripped {
+            // If any gate tripped, override to "flat". The script's debug values
+            // still surface below so we can see what it WOULD have done.
+            let current_signal = if spread_guard_tripped || hour_gate_tripped || rv_gate_tripped {
                 "flat".to_string()
             } else {
                 live_result.signal.clone()
@@ -1281,9 +2722,23 @@ async fn polymarket_runner_loop(
             prev_live_position = Some((current_window, current_signal.clone(), bt_preview_signal, live_result.debug.clone()));
 
             if !current_signal.starts_with("flat") {
+                // Confidence-weighted sizing: scripts can emit a `kelly_size`
+                // value in their kv_state. The runner reads it here and passes
+                // as a multiplier (clamped to [0.1, 2.0]) on the base stake.
+                // Default 1.0 if the script doesn't set it.
+                let kelly_mult = live_result.kv_state.get("kelly_size")
+                    .copied()
+                    .map(|v| v.clamp(0.1, 2.0))
+                    .unwrap_or(1.0);
+                if (kelly_mult - 1.0).abs() > 0.001 {
+                    append_runner_log(
+                        &store, &id,
+                        &format!("Confidence sizing: kelly_size={:.2}x", kelly_mult),
+                    );
+                }
                 let (order_result, renewed_client) = execute_live_polymarket_signal(
                     &id, clob_client.clone(), &current_signal, live_result.size, &config, &live, &store, current_window,
-                    yes_token_price, no_token_price,
+                    yes_token_price, no_token_price, kelly_mult,
                 ).await;
                 // If credentials were renewed, update the runner's client so all
                 // subsequent windows use the fresh L2 session, and persist to disk.
@@ -1327,9 +2782,15 @@ async fn polymarket_runner_loop(
             // Metrics from backtest (historical) are still useful for display
             let metrics = eval_polymarket(&script_content, &buffer, window_minutes, &config);
             let wallet_balance = if let Some(ref client) = clob_client {
+                // Live mode: read real USDC balance from the CLOB/exchange
                 fetch_usdc_balance_clob(client).await
             } else {
-                Some(config.initial_balance)
+                // Paper mode: running balance = initial + sum of all settled pnl.
+                // Previously this returned `initial_balance` verbatim, so the UI
+                // showed a stuck $1000. Now it reflects the paper P&L so the
+                // user sees their strategy's realized P&L in the Wallet widget.
+                let settled_pnl: f64 = live_orders.iter().filter_map(|o| o.pnl).sum();
+                Some(config.initial_balance + settled_pnl)
             };
             update_runner_result(
                 &store, &id, &config, &metrics, None,
@@ -1395,11 +2856,48 @@ async fn polymarket_runner_loop(
             }
         }
     }
-    tracing::info!("[RUNNER {id}] Polymarket feed closed, exiting");
+    // If we left the loop because the watchdog tripped, mark the runner as
+    // errored so the dashboard surfaces it and (if auto_restart=true) the
+    // daemon respawns a fresh loop with a fresh WS connection.
+    if watchdog_tripped {
+        let mut map = store.runners.lock().unwrap();
+        if let Some(r) = map.get_mut(&id) {
+            r.status.status = "error".to_string();
+            r.status.error = Some(format!(
+                "Watchdog stopped runner: no WS candle for >{}s", WATCHDOG_STALL_SECS
+            ));
+        }
+    }
+    tracing::info!("[RUNNER {id}] Polymarket feed closed, exiting (watchdog_tripped={})", watchdog_tripped);
 }
 
 /// Resolve both YES and NO token IDs for the current window slug.
 async fn resolve_token_for_window(series_id: &str, window_ts: u64) -> anyhow::Result<(String, String, String)> {
+    // Retry with backoff: network blips to Gamma API are common during short
+    // connectivity outages. 3 attempts with 1.5s/3s/4.5s backoff covers ~10s
+    // of transient issues before returning an error the caller can handle.
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 1..=MAX_ATTEMPTS {
+        match resolve_token_for_window_once(series_id, window_ts).await {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                tracing::warn!(
+                    "[RESOLVE] Attempt {}/{} failed for window {}: {}",
+                    attempt, MAX_ATTEMPTS, window_ts, e
+                );
+                last_err = Some(e);
+                if attempt < MAX_ATTEMPTS {
+                    let delay_ms = 1500 * attempt as u64;
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("resolve_token_for_window exhausted retries")))
+}
+
+async fn resolve_token_for_window_once(series_id: &str, window_ts: u64) -> anyhow::Result<(String, String, String)> {
     let series = crate::tools::series::builtin_series()
         .into_iter()
         .find(|s| s.id == series_id)
@@ -1589,6 +3087,7 @@ async fn execute_live_polymarket_signal(
     window_ts: i64,
     yes_token_price: f64,
     no_token_price: f64,
+    kelly_mult: f64,
 ) -> (Option<LiveOrder>, Option<Arc<polymarket_trader::orders::ClobClient>>) {
     use polymarket_trader::orders::Side;
 
@@ -1644,7 +3143,16 @@ async fn execute_live_polymarket_signal(
                     amt
                 }
             };
-            (bal, amt)
+            // Apply confidence-weighted multiplier from the script's kelly_size.
+            // Cap at the runner's available balance regardless.
+            let amt_scaled = (amt * kelly_mult).max(5.0).round().min(bal);
+            if (kelly_mult - 1.0).abs() > 0.001 {
+                tracing::info!(
+                    "[RUNNER {id}] Kelly multiplier {:.2}x: amount {} → {}",
+                    kelly_mult, amt, amt_scaled
+                );
+            }
+            (bal, amt_scaled)
         }
         None => {
             // Paper mode: use initial_balance as simulated balance
@@ -1667,12 +3175,20 @@ async fn execute_live_polymarket_signal(
                     amt
                 }
             };
-            if amt <= 0.0 || amt > bal {
-                tracing::warn!("[RUNNER {id}] Paper order: insufficient balance ${:.2} for amount ${:.0}", bal, amt);
+            // Apply confidence-weighted multiplier (paper mode mirrors live).
+            let amt_scaled = (amt * kelly_mult).max(5.0).round().min(bal);
+            if (kelly_mult - 1.0).abs() > 0.001 {
+                tracing::info!(
+                    "[RUNNER {id}] Paper Kelly multiplier {:.2}x: amount {} → {}",
+                    kelly_mult, amt, amt_scaled
+                );
+            }
+            if amt_scaled <= 0.0 || amt_scaled > bal {
+                tracing::warn!("[RUNNER {id}] Paper order: insufficient balance ${:.2} for amount ${:.0}", bal, amt_scaled);
                 append_runner_log(store, id, &format!("Skipped: insufficient paper balance ${:.2}", bal));
                 return (None, None);
             }
-            (bal, amt)
+            (bal, amt_scaled)
         }
     };
 
@@ -2310,24 +3826,30 @@ async fn update_runner_result(
         .or_else(|| metrics.all_trades.last().map(|t| t.side.clone()))
         .unwrap_or_else(|| "flat".to_string());
 
-    // Preserve existing live counters/orders if not explicitly provided
-    let (orders, wins, total) = {
+    // Preserve existing live counters/orders + kv_state if not explicitly provided
+    let (orders, wins, total, kv_state) = {
         let map = store.runners.lock().unwrap();
         if let Some(ref existing) = map.get(id).and_then(|r| r.result.as_ref()) {
             (
                 live_orders.unwrap_or_else(|| existing.live_orders.clone()),
                 live_wins.unwrap_or(existing.live_wins),
                 live_total_trades.unwrap_or(existing.live_total_trades),
+                existing.live_kv_state.clone(),
             )
         } else {
-            (live_orders.unwrap_or_default(), live_wins.unwrap_or(0), live_total_trades.unwrap_or(0))
+            (
+                live_orders.unwrap_or_default(),
+                live_wins.unwrap_or(0),
+                live_total_trades.unwrap_or(0),
+                std::collections::HashMap::new(),
+            )
         }
     };
 
     let result = RunnerResult {
         total_return_pct: metrics.total_return_pct,
         balance: config.initial_balance * (1.0 + metrics.total_return_pct / 100.0),
-        position: 0.0,
+        position: metrics.position,
         total_trades: metrics.total_trades,
         win_rate_pct: metrics.win_rate_pct,
         sharpe_ratio: metrics.sharpe_ratio,
@@ -2341,6 +3863,7 @@ async fn update_runner_result(
         live_orders: orders,
         live_wins: wins,
         live_total_trades: total,
+        live_kv_state: kv_state,
     };
     let mut map = store.runners.lock().unwrap();
     if let Some(r) = map.get_mut(id) {
@@ -2415,4 +3938,24 @@ fn interval_to_secs(interval: &str) -> u64 {
     } else {
         s.parse::<u64>().unwrap_or(60) * 60
     }
+}
+
+/// Compute BTC 1-hour realized volatility from the candle buffer.
+/// Uses the last 60 1-minute close prices (stdev of log-returns).
+/// Returns None if fewer than 5 closes are available.
+fn compute_btc_rv_1h(buffer: &std::collections::VecDeque<crate::tools::backtest::Candle>) -> Option<f64> {
+    let closes: Vec<f64> = buffer.iter().rev().take(61).map(|c| c.close).collect();
+    if closes.len() < 5 {
+        return None;
+    }
+    let returns: Vec<f64> = closes.windows(2)
+        .filter(|w| w[0] > 0.0 && w[1] > 0.0)
+        .map(|w| (w[0] / w[1]).ln())
+        .collect();
+    if returns.len() < 4 {
+        return None;
+    }
+    let mean = returns.iter().sum::<f64>() / returns.len() as f64;
+    let var = returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / (returns.len() - 1) as f64;
+    Some(var.sqrt())
 }

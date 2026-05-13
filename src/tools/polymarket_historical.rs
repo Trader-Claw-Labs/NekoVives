@@ -66,6 +66,10 @@ pub struct ScrapeOptions {
     /// Total window count (set once at start of scrape) so the UI can
     /// compute a percentage without duplicating window generation logic.
     pub total_counter: Option<Arc<AtomicUsize>>,
+    /// Cancellation flag. Checked between worker spawns and inside the join
+    /// loop. When set to `true`, pending workers are aborted, completed
+    /// records are still flushed to disk, and the function returns early.
+    pub cancel_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 const GAMMA_API_BASE: &str = "https://gamma-api.polymarket.com";
@@ -153,6 +157,14 @@ pub async fn scrape_series_with_options(
     let mut tasks = tokio::task::JoinSet::new();
 
     for (window_open_ts, window_close_ts, decision_ts) in &windows {
+        // Check cancel flag before spawning any new fetch task. Lets us
+        // cap pending work even if many windows remain to be scraped.
+        if let Some(ref flag) = opts.cancel_flag {
+            if flag.load(Ordering::SeqCst) {
+                tracing::info!("[POLY-HIST] Cancellation requested — stopping new spawns");
+                break;
+            }
+        }
         if existing.contains_key(window_open_ts) {
             continue; // already cached
         }
@@ -175,6 +187,15 @@ pub async fn scrape_series_with_options(
     let mut missing_prices = 0usize;
 
     while let Some(res) = tasks.join_next().await {
+        // Check cancel flag periodically. When set, abort remaining workers
+        // and proceed to flush whatever we have so far.
+        if let Some(ref flag) = opts.cancel_flag {
+            if flag.load(Ordering::SeqCst) {
+                tracing::info!("[POLY-HIST] Cancellation requested — aborting {} pending tasks", tasks.len());
+                tasks.abort_all();
+                break;
+            }
+        }
         match res {
             Ok((ts, Ok(Some(window)))) => {
                 if window.yes_token_price.is_none() {

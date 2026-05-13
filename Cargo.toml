@@ -8,6 +8,11 @@ members = [
     "crates/polymarket-trader",
     "crates/market-analyzer",
     "crates/claw-api",
+    "crates/risk-manager",
+    "crates/wallet-tracker",
+    "crates/wallet-indexer",
+    "crates/copy-orchestrator",
+    "crates/hyperliquid-trader",
 ]
 resolver = "2"
 
@@ -111,6 +116,11 @@ polymarket-trader = { path = "crates/polymarket-trader" }
 wallet-manager = { path = "crates/wallet-manager" }
 solana-trader = { path = "crates/solana-trader" }
 evm-trader = { path = "crates/evm-trader" }
+risk-manager = { path = "crates/risk-manager" }
+wallet-tracker = { path = "crates/wallet-tracker" }
+wallet-indexer = { path = "crates/wallet-indexer" }
+copy-orchestrator = { path = "crates/copy-orchestrator" }
+hyperliquid-trader = { path = "crates/hyperliquid-trader" }
 
 # Memory / persistence
 rusqlite = { version = "0.37", features = ["bundled"] }

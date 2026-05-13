@@ -3485,6 +3485,12 @@ pub struct BacktestRunBody {
     /// Price mode for Polymarket binary entry: 'historical' = real scraped price,
     /// 'mid' = average of buy/sell (mid-price).
     pub price_mode: Option<String>,
+    /// Hour gate: only trade during these UTC hours (0-23). Empty = no restriction.
+    #[serde(default)]
+    pub allowed_hours: Vec<u8>,
+    /// RV floor: skip windows where BTC 1h realized-vol < this value. 0 = disabled.
+    #[serde(default)]
+    pub rv_min_btc: Option<f64>,
 }
 
 fn default_market_type() -> String {
@@ -3966,7 +3972,7 @@ pub async fn handle_api_backtest_polymarket_historical_sync(
     let to_date = to_dt.format("%Y-%m-%d").to_string();
     let workspace_dir = state.config.lock().workspace_dir.clone();
 
-    // Initialise progress.
+    // Initialise progress + reset cancel flag from any previous run.
     {
         let mut prog = state.poly_sync_progress.lock();
         *prog = crate::tools::polymarket_historical::SyncProgress {
@@ -3984,32 +3990,44 @@ pub async fn handle_api_backtest_polymarket_historical_sync(
             completed_at: None,
         };
     }
+    state.poly_sync_cancel.store(false, std::sync::atomic::Ordering::SeqCst);
+    let cancel_flag = state.poly_sync_cancel.clone();
 
     // Spawn the scrape task. Minute-4 first (main dataset), then minute-3.
+    //
+    // Internally uses a SINGLE poll task across both stages with an explicit
+    // AtomicBool stop flag. The previous design had two poll tasks whose
+    // break condition (`running==false || stage∈{error,done}`) never tripped
+    // during the stage-1 → stage-2 transition (stage was "min3", running
+    // still true) — so the outer task hung forever on `poll_handle.await`
+    // and `running` never flipped back to false in the dashboard.
     let progress = state.poly_sync_progress.clone();
     tokio::spawn(async move {
         use crate::tools::polymarket_historical::{scrape_series_with_options, ScrapeOptions};
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-        // ── Stage 1: minute-4 (P4 decision) ──
+        // Shared between stages: counters reset between stages, stop flag
+        // signals the poll task to exit at the very end.
         let fetched = Arc::new(AtomicUsize::new(0));
         let total = Arc::new(AtomicUsize::new(0));
+        let stop_flag = Arc::new(AtomicBool::new(false));
+
         let poll_fetched = fetched.clone();
         let poll_total = total.clone();
+        let poll_stop = stop_flag.clone();
         let poll_progress = progress.clone();
         let poll_handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
             loop {
                 interval.tick().await;
+                if poll_stop.load(Ordering::SeqCst) { break; }
                 let mut p = poll_progress.lock();
-                if !p.running || p.stage == "error" || p.stage == "done" {
-                    break;
-                }
                 p.windows_fetched = poll_fetched.load(Ordering::SeqCst);
                 p.windows_total = poll_total.load(Ordering::SeqCst);
             }
         });
 
+        // ── Stage 1: minute-4 (P4 decision) ──
         let min4_result = scrape_series_with_options(
             &series_id,
             &from_date,
@@ -4020,17 +4038,37 @@ pub async fn handle_api_backtest_polymarket_historical_sync(
                 file_prefix: None,              // main dataset
                 fetched_counter: Some(fetched.clone()),
                 total_counter: Some(total.clone()),
+                cancel_flag: Some(cancel_flag.clone()),
             },
         )
         .await;
 
         match min4_result {
             Ok(n) => {
-                let mut p = progress.lock();
-                p.min4_count = n;
-                p.stage = "min3".to_string();
-                p.windows_fetched = 0;
-                p.windows_total = 0;
+                // If cancellation was requested during stage 1, stop here
+                // instead of starting stage 2. Mark as cancelled and exit.
+                if cancel_flag.load(Ordering::SeqCst) {
+                    {
+                        let mut p = progress.lock();
+                        p.min4_count = n;
+                        p.running = false;
+                        p.stage = "cancelled".to_string();
+                        p.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                    }
+                    stop_flag.store(true, Ordering::SeqCst);
+                    let _ = poll_handle.await;
+                    return;
+                }
+                {
+                    let mut p = progress.lock();
+                    p.min4_count = n;
+                    p.stage = "min3".to_string();
+                    p.windows_fetched = 0;
+                    p.windows_total = 0;
+                }
+                // Reset counters for stage 2.
+                fetched.store(0, Ordering::SeqCst);
+                total.store(0, Ordering::SeqCst);
             }
             Err(e) => {
                 {
@@ -4040,35 +4078,14 @@ pub async fn handle_api_backtest_polymarket_historical_sync(
                     p.error = Some(format!("min4 scrape failed: {}", e));
                     p.completed_at = Some(chrono::Utc::now().to_rfc3339());
                 }
+                stop_flag.store(true, Ordering::SeqCst);
                 let _ = poll_handle.await;
                 return;
             }
         }
 
         // ── Stage 2: minute-3 (P3 drift signal) ──
-        let fetched3 = Arc::new(AtomicUsize::new(0));
-        let total3 = Arc::new(AtomicUsize::new(0));
-        // Replace the progress-poll task to track stage 2 counters.
-        let _ = poll_handle.await;
-        let poll_fetched3 = fetched3.clone();
-        let poll_total3 = total3.clone();
-        let poll_progress3 = progress.clone();
-        let poll_handle3 = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
-            loop {
-                interval.tick().await;
-                let mut p = poll_progress3.lock();
-                if !p.running || p.stage == "error" || p.stage == "done" {
-                    break;
-                }
-                p.windows_fetched = poll_fetched3.load(Ordering::SeqCst);
-                p.windows_total = poll_total3.load(Ordering::SeqCst);
-            }
-        });
-
         // Decision offset for minute-3: (window_minutes - 2) * 60s.
-        // For the default 5m series, this is 180s. Derived from the series
-        // record so non-5m future series (e.g. 15m) also work.
         let series = crate::tools::series::builtin_series()
             .into_iter()
             .find(|s| s.id == series_id);
@@ -4095,8 +4112,9 @@ pub async fn handle_api_backtest_polymarket_historical_sync(
             ScrapeOptions {
                 decision_offset_secs: Some(min3_offset),
                 file_prefix: Some("min3_".to_string()),
-                fetched_counter: Some(fetched3.clone()),
-                total_counter: Some(total3.clone()),
+                fetched_counter: Some(fetched.clone()),
+                total_counter: Some(total.clone()),
+                cancel_flag: Some(cancel_flag.clone()),
             },
         )
         .await;
@@ -4108,7 +4126,13 @@ pub async fn handle_api_backtest_polymarket_historical_sync(
             match min3_result {
                 Ok(n) => {
                     p.min3_count = n;
-                    p.stage = "done".to_string();
+                    // If cancel flag was raised during stage 2, mark as
+                    // cancelled (we still flushed whatever we had).
+                    if cancel_flag.load(Ordering::SeqCst) {
+                        p.stage = "cancelled".to_string();
+                    } else {
+                        p.stage = "done".to_string();
+                    }
                 }
                 Err(e) => {
                     p.stage = "error".to_string();
@@ -4116,13 +4140,42 @@ pub async fn handle_api_backtest_polymarket_historical_sync(
                 }
             }
         }
-        let _ = poll_handle3.await;
+        // Stop the single poll task and join it cleanly.
+        stop_flag.store(true, Ordering::SeqCst);
+        let _ = poll_handle.await;
     });
 
     let snapshot = state.poly_sync_progress.lock().clone();
     Json(serde_json::json!({
         "started": true,
         "progress": snapshot,
+    }))
+    .into_response()
+}
+
+/// POST /api/backtest/polymarket-historical/cancel
+///
+/// Sets the shared cancel flag so the active sync task exits early.
+/// Returns immediately. The task may take a few seconds to wind down
+/// (it finishes any in-flight worker tasks and flushes already-fetched
+/// records to disk before marking stage = "cancelled").
+pub async fn handle_api_backtest_polymarket_historical_cancel(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let was_running = state.poly_sync_progress.lock().running;
+    state.poly_sync_cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+    Json(serde_json::json!({
+        "ok": true,
+        "was_running": was_running,
+        "message": if was_running {
+            "Cancel signal sent. Sync will stop within a few seconds."
+        } else {
+            "No sync was running; cancel flag set anyway."
+        }
     }))
     .into_response()
 }
@@ -4231,6 +4284,41 @@ pub struct CreateRunnerBody {
     pub price_mode: Option<String>,
     #[serde(default)]
     pub max_spread_pct: Option<f64>,
+    #[serde(default)]
+    pub allowed_hours: Option<Vec<u8>>,
+    #[serde(default)]
+    pub rv_min_btc: Option<f64>,
+    /// Wallet password for decrypting the Hyperliquid trading key.
+    /// Only used when creating a live CEX runner. Never stored.
+    #[serde(default)]
+    pub wallet_password: Option<String>,
+    /// Binance Futures API key. Only used for live CEX trading on Binance.
+    #[serde(default)]
+    pub binance_api_key: Option<String>,
+    /// Binance Futures API secret. Only used for live CEX trading on Binance.
+    #[serde(default)]
+    pub binance_api_secret: Option<String>,
+    /// Funding arbitrage watchlist (e.g. ["BTC", "ETH"]).
+    #[serde(default)]
+    pub funding_watchlist: Option<Vec<String>>,
+    /// Minimum APR diff to open a funding arb position.
+    #[serde(default)]
+    pub min_apr_diff: Option<f64>,
+    /// APR diff threshold to force-close an open position.
+    #[serde(default)]
+    pub force_close_diff: Option<f64>,
+    /// Max concurrent funding arb pairs.
+    #[serde(default)]
+    pub max_open_pairs: Option<usize>,
+    /// Max % of capital per pair.
+    #[serde(default)]
+    pub max_pos_pct: Option<f64>,
+    /// Polling interval in seconds.
+    #[serde(default)]
+    pub funding_poll_secs: Option<u64>,
+    /// Fee buffer in basis points per leg per cycle.
+    #[serde(default)]
+    pub fee_buffer_bps: Option<f64>,
 }
 
 #[derive(serde::Deserialize)]
@@ -4238,7 +4326,9 @@ pub struct PatchRunnerBody {
     pub auto_restart: Option<bool>,
     pub live_sizing_mode: Option<String>,
     pub live_sizing_value: Option<f64>,
-    // These three use Option<Option<T>> so we can distinguish:
+    /// Hide / unhide a runner in the Live Strategies UI.
+    pub hidden: Option<bool>,
+    // These use Option<Option<T>> so we can distinguish:
     //   absent → None (skip)   |   null → Some(None) (clear)   |   value → Some(Some(v)) (set)
     #[serde(default, deserialize_with = "nullable::deserialize")]
     pub max_entry_price: Option<Option<f64>>,
@@ -4247,10 +4337,55 @@ pub struct PatchRunnerBody {
     pub max_spread_pct: Option<Option<f64>>,
     #[serde(default, deserialize_with = "nullable::deserialize")]
     pub early_fire_secs: Option<Option<u32>>,
+    /// UTC hours (0-23) where trading is allowed. Empty array = no restriction.
+    pub allowed_hours: Option<Vec<u8>>,
+    /// Minimum BTC RV-1h threshold; null/0 = disabled.
+    #[serde(default, deserialize_with = "nullable::deserialize")]
+    pub rv_min_btc: Option<Option<f64>>,
 }
 
-async fn hydrate_live_runtime_config(state: &AppState, config: &mut crate::strategy_runner::RunnerConfig) -> anyhow::Result<()> {
-    if config.mode != "live" || config.market_type != "polymarket_binary" {
+async fn hydrate_live_runtime_config(
+    state: &AppState,
+    config: &mut crate::strategy_runner::RunnerConfig,
+    wallet_password: Option<&str>,
+) -> anyhow::Result<()> {
+    if config.mode != "live" {
+        return Ok(());
+    }
+
+    // CEX live mode: build signer from wallet-manager
+    if config.market_type != "polymarket_binary" {
+        let hl_cfg = state.config.lock().hyperliquid.clone();
+        let label = hl_cfg.wallet_label.as_deref().unwrap_or("");
+        if label.is_empty() {
+            anyhow::bail!("hyperliquid.wallet_label is not set in config.");
+        }
+
+        let wallets = state.wallets.lock();
+        let wallet = wallets
+            .iter()
+            .find(|w| w.chain == "evm" && (label == "*" || w.label == label))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No EVM wallet found with label '{}' for Hyperliquid trading.",
+                    label
+                )
+            })?;
+
+        let password = wallet_password.ok_or_else(|| {
+            anyhow::anyhow!("Wallet password required for live CEX trading.")
+        })?;
+
+        let pk_bytes = wallet_manager::evm::export_private_key(&wallet.encrypted_key, password)
+            .map_err(|e| anyhow::anyhow!("Failed to decrypt wallet: {e}"))?;
+
+        let signer = hyperliquid_trader::exchange::Signer::from_pk_bytes(pk_bytes)
+            .map_err(|e| anyhow::anyhow!("Invalid private key: {e}"))?;
+
+        config.wallet_address = Some(signer.address().to_string());
+        config.hl_signer = Some(signer);
+        // Pass risk gate reference for live trading
+        config.risk_gate = state.trading_risk_gate.clone();
         return Ok(());
     }
 
@@ -4312,7 +4447,12 @@ async fn rehydrate_live_runner_config(state: &AppState, config: &mut crate::stra
     if config.mode != "live" {
         return Ok(());
     }
-    hydrate_live_runtime_config(state, config).await
+    // CEX live runners require wallet password which is not persisted.
+    // They must be restarted manually through the UI.
+    if config.market_type != "polymarket_binary" {
+        return Ok(());
+    }
+    hydrate_live_runtime_config(state, config, None).await
 }
 
 pub async fn restart_stored_runners(state: &AppState) {
@@ -4383,24 +4523,33 @@ pub async fn handle_api_live_patch(
         }
     }
 
+    if let Some(hidden) = body.hidden {
+        match state.strategy_runner.set_hidden(&id, hidden) {
+            Some(runner) => return Json(serde_json::json!({ "runner": runner })).into_response(),
+            None => return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "runner not found" }))).into_response(),
+        }
+    }
+
     if body.live_sizing_mode.is_some()
         || body.live_sizing_value.is_some()
         || body.max_entry_price.is_some()
         || body.price_mode.is_some()
         || body.max_spread_pct.is_some()
         || body.early_fire_secs.is_some()
+        || body.allowed_hours.is_some()
+        || body.rv_min_btc.is_some()
     {
         let mode = body.live_sizing_mode.map(|m| match m.as_str() {
             "fixed" => crate::strategy_runner::LiveSizingMode::Fixed,
             _ => crate::strategy_runner::LiveSizingMode::Percent,
         });
-        // body.max_entry_price / max_spread_pct / early_fire_secs are
-        // Option<Option<T>>: Some(None) = clear the field, Some(Some(v)) = set it.
         match state.strategy_runner.update_runner_config(
             &id,
             mode,
             body.live_sizing_value,
             body.max_entry_price,
+            body.allowed_hours,
+            body.rv_min_btc,
             body.price_mode,
             body.max_spread_pct,
             body.early_fire_secs,
@@ -4456,13 +4605,42 @@ pub async fn handle_api_live_create(
     }
 
     let is_live = body.mode == "live";
-    if is_live && body.market_type != "polymarket_binary" {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "Live mode is only supported for market_type=polymarket_binary"
-            })),
-        ).into_response();
+    if is_live {
+        if body.market_type == "polymarket_binary" {
+            // Polymarket live — ok
+        } else if body.market_type == "funding_arb" {
+            // Funding arb requires BOTH Hyperliquid wallet AND Binance credentials
+            let hl_cfg = state.config.lock().hyperliquid.clone();
+            if !hl_cfg.enabled || hl_cfg.wallet_label.is_none() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "Live funding arb requires hyperliquid.enabled=true and hyperliquid.wallet_label set in config."
+                    })),
+                ).into_response();
+            }
+            let has_binance = body.binance_api_key.as_ref().map(|k| !k.is_empty()).unwrap_or(false)
+                && body.binance_api_secret.as_ref().map(|s| !s.is_empty()).unwrap_or(false);
+            if !has_binance {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "Live funding arb requires Binance API key and secret."
+                    })),
+                ).into_response();
+            }
+        } else {
+            // CEX live — requires Hyperliquid wallet configuration
+            let hl_cfg = state.config.lock().hyperliquid.clone();
+            if !hl_cfg.enabled || hl_cfg.wallet_label.is_none() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "Live mode for CEX requires hyperliquid.enabled=true and hyperliquid.wallet_label set in config."
+                    })),
+                ).into_response();
+            }
+        }
     }
 
     let mut config = crate::strategy_runner::RunnerConfig {
@@ -4501,9 +4679,34 @@ pub async fn handle_api_live_create(
         max_entry_price: body.max_entry_price,
         price_mode: body.price_mode,
         max_spread_pct: body.max_spread_pct,
+        allowed_hours: body.allowed_hours.unwrap_or_default(),
+        rv_min_btc: body.rv_min_btc,
+        hl_signer: None,
+        risk_gate: None,
+        binance_creds: None,
+        funding_watchlist: body.funding_watchlist.unwrap_or_else(|| {
+            vec!["BTC".into(), "ETH".into(), "SOL".into(), "AVAX".into()]
+        }),
+        min_apr_diff: body.min_apr_diff.unwrap_or(0.10),
+        force_close_diff: body.force_close_diff.unwrap_or(0.02),
+        max_open_pairs: body.max_open_pairs.unwrap_or(4),
+        max_pos_pct: body.max_pos_pct.unwrap_or(0.15),
+        funding_poll_secs: body.funding_poll_secs.unwrap_or(60),
+        fee_buffer_bps: body.fee_buffer_bps.unwrap_or(12.0),
+        ..Default::default()
     };
 
-    if let Err(e) = hydrate_live_runtime_config(&state, &mut config).await {
+    // Populate Binance credentials if provided (live mode only, never persisted)
+    if let (Some(key), Some(secret)) = (body.binance_api_key, body.binance_api_secret) {
+        if !key.is_empty() && !secret.is_empty() {
+            config.binance_creds = Some(crate::tools::binance_perps::BinanceCredentials {
+                api_key: key,
+                api_secret: secret,
+            });
+        }
+    }
+
+    if let Err(e) = hydrate_live_runtime_config(&state, &mut config, body.wallet_password.as_deref()).await {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": friendly_live_error(&e.to_string()) })),
@@ -4821,6 +5024,595 @@ pub async fn handle_api_logs(
         Vec::new()
     };
     Json(serde_json::json!({ "lines": lines, "file": entries.first().map(|e| e.1.to_string_lossy().to_string()).unwrap_or_default() })).into_response()
+}
+
+// ── Copy Trading handlers ─────────────────────────────────────────
+
+/// GET /api/copy/leaders — list active watched leaders
+pub async fn handle_api_copy_leaders(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let watchlist = state.copy_orchestrator.watchlist.lock().await;
+    let leaders: Vec<_> = watchlist.list().iter().map(|e| serde_json::json!({
+        "address": e.address,
+        "venue": e.venue,
+        "category": e.category,
+        "mirror_enabled": e.mirror_enabled,
+        "consensus_weight": e.consensus_weight,
+        "wallet_score": e.wallet_score,
+        "size_factor": e.size_factor,
+    })).collect();
+
+    Json(serde_json::json!({ "leaders": leaders })).into_response()
+}
+
+/// POST /api/copy/leaders/{addr}/toggle — toggle mirror for a leader
+pub async fn handle_api_copy_leader_toggle(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(addr): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let mut watchlist = state.copy_orchestrator.watchlist.lock().await;
+    let new_state = watchlist.toggle_mirror(&addr);
+    Json(serde_json::json!({ "address": addr, "mirror_enabled": new_state })).into_response()
+}
+
+/// GET /api/copy/discovery — list discovery candidates
+pub async fn handle_api_copy_discovery(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    match state.wallet_indexer.list_candidates(None).await {
+        Ok(candidates) => Json(serde_json::json!({ "candidates": candidates })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /api/copy/discovery/{addr}/graduate — promote candidate to watchlist
+pub async fn handle_api_copy_discovery_graduate(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(addr): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    // Fetch candidate info from indexer
+    let candidates = match state.wallet_indexer.list_candidates(None).await {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
+    let candidate = match candidates.into_iter().find(|c| c.wallet_address == addr) {
+        Some(c) => c,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "Candidate not found" })),
+            )
+                .into_response();
+        }
+    };
+
+    // Add to watchlist
+    let entry = copy_orchestrator::watchlist::WatchlistEntry {
+        address: candidate.wallet_address.clone(),
+        venue: candidate.venue.clone(),
+        category: None,
+        mirror_enabled: false,
+        consensus_weight: 1.0,
+        size_factor: 0.5,
+        wallet_score: candidate.discovery_score,
+        added_at: chrono::Utc::now().to_rfc3339(),
+    };
+
+    let mut watchlist = state.copy_orchestrator.watchlist.lock().await;
+    watchlist.add(entry);
+
+    Json(serde_json::json!({ "graduated": addr })).into_response()
+}
+
+/// POST /api/copy/discovery/{addr}/blacklist — reject a candidate
+pub async fn handle_api_copy_discovery_blacklist(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(addr): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    // TODO: implement blacklist in indexer
+    Json(serde_json::json!({ "blacklisted": addr })).into_response()
+}
+
+/// GET /api/copy/positions — list open mirror positions
+pub async fn handle_api_copy_positions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let tracker = state.copy_orchestrator.mirror.lock().await;
+    let positions: Vec<_> = tracker.list_open().iter().map(|p| serde_json::json!({
+        "leader_address": p.leader_address,
+        "leader_fill_id": p.leader_fill_id,
+        "venue": p.venue,
+        "symbol": p.symbol,
+        "side": p.side,
+        "notional": p.notional,
+        "entry_price": p.entry_price,
+        "status": format!("{:?}", p.status),
+        "opened_at": p.opened_at,
+    })).collect();
+
+    Json(serde_json::json!({ "positions": positions })).into_response()
+}
+
+// ── Hyperliquid ─────────────────────────────────────────────────
+
+/// GET /api/health/hyperliquid — Hyperliquid API connectivity check
+pub async fn handle_api_health_hyperliquid(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let Some(ref client) = state.hyperliquid_client else {
+        return Json(serde_json::json!({
+            "status": "disabled",
+            "message": "Hyperliquid is not enabled in config"
+        })).into_response();
+    };
+
+    match client.mids().await {
+        Ok(mids) => {
+            let btc = mids.get("BTC").copied();
+            Json(serde_json::json!({
+                "status": "ok",
+                "connected": true,
+                "assets_tracked": mids.len(),
+                "btc_mid": btc,
+            })).into_response()
+        }
+        Err(e) => {
+            tracing::warn!("Hyperliquid health check failed: {}", e);
+            Json(serde_json::json!({
+                "status": "error",
+                "connected": false,
+                "message": format!("{}", e),
+            })).into_response()
+        }
+    }
+}
+
+/// GET /api/hyperliquid/mids — current mid prices for all assets
+pub async fn handle_api_hyperliquid_mids(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let Some(ref client) = state.hyperliquid_client else {
+        return Json(serde_json::json!({
+            "status": "disabled",
+            "message": "Hyperliquid is not enabled in config"
+        })).into_response();
+    };
+
+    match client.mids().await {
+        Ok(mids) => {
+            Json(serde_json::json!({
+                "status": "ok",
+                "mids": mids,
+            })).into_response()
+        }
+        Err(e) => {
+            tracing::warn!("Hyperliquid mids failed: {}", e);
+            Json(serde_json::json!({
+                "status": "error",
+                "message": format!("{}", e),
+            })).into_response()
+        }
+    }
+}
+
+/// GET /api/hyperliquid/funding — funding rate for a coin or all predicted
+pub async fn handle_api_hyperliquid_funding(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let Some(ref client) = state.hyperliquid_client else {
+        return Json(serde_json::json!({
+            "status": "disabled",
+            "message": "Hyperliquid is not enabled in config"
+        })).into_response();
+    };
+
+    if let Some(coin) = params.get("coin") {
+        match client.funding_rate(coin).await {
+            Ok(rate) => {
+                Json(serde_json::json!({
+                    "status": "ok",
+                    "coin": coin,
+                    "funding_rate": rate.funding_rate,
+                    "next_funding_time": rate.next_funding_time,
+                })).into_response()
+            }
+            Err(e) => {
+                tracing::warn!("Hyperliquid funding rate failed for {}: {}", coin, e);
+                Json(serde_json::json!({
+                    "status": "error",
+                    "message": format!("{}", e),
+                })).into_response()
+            }
+        }
+    } else {
+        match client.predicted_funding().await {
+            Ok(rates) => {
+                Json(serde_json::json!({
+                    "status": "ok",
+                    "predicted_funding": rates,
+                })).into_response()
+            }
+            Err(e) => {
+                tracing::warn!("Hyperliquid predicted funding failed: {}", e);
+                Json(serde_json::json!({
+                    "status": "error",
+                    "message": format!("{}", e),
+                })).into_response()
+            }
+        }
+    }
+}
+
+/// GET /api/funding/comparison — cross-venue funding rate comparison
+pub async fn handle_api_funding_comparison(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let watchlist: Vec<String> = params.get("symbols")
+        .map(|s| s.split(',').map(|c| c.trim().to_uppercase()).collect())
+        .unwrap_or_else(|| vec!["BTC".into(), "ETH".into(), "SOL".into(), "AVAX".into()]);
+
+    // Fetch Hyperliquid predicted funding
+    let hl_client = state.hyperliquid_client.clone()
+        .unwrap_or_else(|| Arc::new(hyperliquid_trader::HyperliquidClient::new_mainnet()));
+
+    let hl_rates = match hl_client.predicted_funding().await {
+        Ok(rates) => rates,
+        Err(e) => {
+            tracing::warn!("Funding comparison: HL predicted funding failed: {}", e);
+            std::collections::HashMap::new()
+        }
+    };
+
+    // Fetch Binance funding rates
+    let binance_rates = match fetch_binance_funding_for_comparison(&watchlist).await {
+        Ok(rates) => rates,
+        Err(e) => {
+            tracing::warn!("Funding comparison: Binance funding failed: {}", e);
+            std::collections::HashMap::new()
+        }
+    };
+
+    let mut results = Vec::new();
+    for coin in &watchlist {
+        let hl_raw = hl_rates.get(coin).copied().unwrap_or(0.0);
+        let bin_raw = binance_rates.get(coin).copied().unwrap_or(0.0);
+
+        let hl_apr = hl_raw * 24.0 * 365.0;
+        let bin_apr = bin_raw * 3.0 * 365.0;
+        let diff_apr = (hl_apr - bin_apr).abs();
+
+        let recommendation = if diff_apr < 0.02 {
+            "hold"
+        } else if hl_apr > bin_apr {
+            "short_hl_long_binance"
+        } else {
+            "long_hl_short_binance"
+        };
+
+        results.push(serde_json::json!({
+            "symbol": coin,
+            "hyperliquid": {
+                "rate": hl_raw,
+                "apr": hl_apr,
+            },
+            "binance": {
+                "rate": bin_raw,
+                "apr": bin_apr,
+            },
+            "diff_apr": diff_apr,
+            "recommendation": recommendation,
+        }));
+    }
+
+    Json(serde_json::json!({
+        "status": "ok",
+        "timestamp": chrono::Utc::now().timestamp_millis(),
+        "rates": results,
+    })).into_response()
+}
+
+async fn fetch_binance_funding_for_comparison(
+    watchlist: &[String],
+) -> anyhow::Result<std::collections::HashMap<String, f64>> {
+    let client = reqwest::Client::new();
+    let url = "https://fapi.binance.com/fapi/v1/premiumIndex";
+    let resp = client.get(url).send().await?;
+    let arr: Vec<serde_json::Value> = resp.json().await?;
+
+    let mut rates = std::collections::HashMap::new();
+    for item in &arr {
+        let symbol = item["symbol"].as_str().unwrap_or("");
+        let rate_str = item["lastFundingRate"].as_str().unwrap_or("0");
+        let rate: f64 = rate_str.parse().unwrap_or(0.0);
+        for coin in watchlist {
+            if symbol == format!("{}USDT", coin) {
+                rates.insert(coin.clone(), rate);
+            }
+        }
+    }
+    Ok(rates)
+}
+
+// ── Live CEX Positions ─────────────────────────────────────────
+
+/// GET /api/live/positions — list open Hyperliquid positions for an address.
+/// Query `address` overrides the configured hyperliquid.wallet_address.
+pub async fn handle_api_live_positions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let address = params.get("address").cloned().or_else(|| {
+        let label = { state.config.lock().hyperliquid.wallet_label.clone()? };
+        let addr = {
+            let wallets = state.wallets.lock();
+            wallets.iter()
+                .find(|w| w.chain == "evm" && w.label == label)
+                .map(|w| w.address.clone())
+        };
+        addr
+    });
+    let Some(address) = address else {
+        return Json(serde_json::json!({
+            "status": "error",
+            "message": "No address provided and no hyperliquid wallet configured"
+        })).into_response();
+    };
+
+    let client = state.hyperliquid_client.clone().unwrap_or_else(|| {
+        Arc::new(hyperliquid_trader::HyperliquidClient::new_mainnet())
+    });
+
+    match client.clearinghouse_state(&address).await {
+        Ok(chs) => {
+            let positions: Vec<serde_json::Value> = chs.asset_positions.iter().map(|ap| {
+                serde_json::json!({
+                    "coin": ap.position.coin,
+                    "size": ap.position.szi,
+                    "entry_price": ap.position.entry_px,
+                    "position_value": ap.position.position_value,
+                    "unrealized_pnl": ap.position.unrealized_pnl,
+                    "leverage": ap.position.leverage,
+                    "margin_used": ap.position.margin_used,
+                })
+            }).collect();
+            Json(serde_json::json!({
+                "status": "ok",
+                "address": address,
+                "account_value": chs.margin_summary.account_value.parse::<f64>().unwrap_or(0.0),
+                "positions": positions,
+            })).into_response()
+        }
+        Err(e) => {
+            tracing::warn!("Hyperliquid clearinghouse_state failed for {}: {}", address, e);
+            Json(serde_json::json!({
+                "status": "error",
+                "message": format!("{}", e),
+            })).into_response()
+        }
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ClosePositionBody {
+    pub wallet_password: String,
+}
+
+/// POST /api/live/positions/{symbol}/close — manually close a Hyperliquid position.
+#[axum::debug_handler]
+pub async fn handle_api_live_position_close(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(symbol): Path<String>,
+    Json(body): Json<ClosePositionBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let label = match { state.config.lock().hyperliquid.wallet_label.clone() } {
+        Some(l) => l,
+        None => {
+            return Json(serde_json::json!({
+                "status": "error",
+                "message": "hyperliquid.wallet_label is not configured"
+            })).into_response();
+        }
+    };
+
+    let wallet = {
+        let wallets = state.wallets.lock();
+        match wallets.iter().find(|w| w.chain == "evm" && w.label == label) {
+            Some(w) => w.clone(),
+            None => {
+                return Json(serde_json::json!({
+                    "status": "error",
+                    "message": format!("EVM wallet with label '{}' not found", label)
+                })).into_response();
+            }
+        }
+    };
+
+    let pk_hex = match wallet_manager::evm::export_private_key(&wallet.encrypted_key, &body.wallet_password
+    ) {
+        Ok(k) => k,
+        Err(e) => {
+            return Json(serde_json::json!({
+                "status": "error",
+                "message": format!("Failed to decrypt wallet: {e}")
+            })).into_response();
+        }
+    };
+
+    let signer = match hyperliquid_trader::exchange::Signer::from_pk_bytes(pk_hex) {
+        Ok(s) => s,
+        Err(e) => {
+            return Json(serde_json::json!({
+                "status": "error",
+                "message": format!("Invalid private key: {e}")
+            })).into_response();
+        }
+    };
+
+    let client = hyperliquid_trader::HyperliquidClient::new_mainnet_with_signer(signer);
+    match client.close_position(&symbol).await {
+        Ok(resp) => {
+            Json(serde_json::json!({
+                "status": "ok",
+                "symbol": symbol,
+                "order_id": resp.order_id,
+            })).into_response()
+        }
+        Err(e) => {
+            tracing::warn!("Hyperliquid close_position failed for {}: {}", symbol, e);
+            Json(serde_json::json!({
+                "status": "error",
+                "message": format!("{}", e),
+            })).into_response()
+        }
+    }
+}
+
+// ── General Trading Risk ────────────────────────────────────────
+
+/// POST /api/risk/halt — manual kill-switch
+pub async fn handle_api_risk_halt(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let Some(ref gate) = state.trading_risk_gate else {
+        return Json(serde_json::json!({
+            "status": "disabled",
+            "message": "Trading risk gate is not initialized"
+        })).into_response();
+    };
+
+    gate.halt_all();
+    Json(serde_json::json!({
+        "status": "halted",
+        "message": "All trading halted via kill-switch"
+    })).into_response()
+}
+
+/// POST /api/risk/resume — clear manual halt
+pub async fn handle_api_risk_resume(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let Some(ref gate) = state.trading_risk_gate else {
+        return Json(serde_json::json!({
+            "status": "disabled",
+            "message": "Trading risk gate is not initialized"
+        })).into_response();
+    };
+
+    gate.resume_all();
+    Json(serde_json::json!({
+        "status": "resumed",
+        "message": "Trading resumed"
+    })).into_response()
+}
+
+/// GET /api/risk/status — current risk gate state
+pub async fn handle_api_risk_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let Some(ref gate) = state.trading_risk_gate else {
+        return Json(serde_json::json!({
+            "status": "disabled",
+            "message": "Trading risk gate is not initialized"
+        })).into_response();
+    };
+
+    let st = gate.status();
+    Json(serde_json::json!({
+        "status": if gate.is_halted() { "halted" } else { "ok" },
+        "total_capital": st.total_capital,
+        "drawdown_pct": st.drawdown_pct,
+        "daily_pnl_pct": st.daily_pnl_pct,
+        "open_positions": st.total_positions,
+    })).into_response()
 }
 
 #[cfg(test)]

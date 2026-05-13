@@ -17,9 +17,12 @@ import LLMSettings from './pages/LLMSettings'
 import Config from './pages/Config'
 import Backtesting from './pages/Backtesting'
 import LiveStrategies from './pages/LiveStrategies'
+import CopyTrading from './pages/CopyTrading'
+import CopyDiscovery from './pages/CopyDiscovery'
 import SystemHealth from './pages/SystemHealth'
 import Logs from './pages/Logs'
 import Help from './pages/Help'
+import RiskCenter from './pages/RiskCenter'
 import { apiFetch, getAuthToken, setAuthErrorCallback } from './hooks/useApi'
 
 // ── Error boundary ────────────────────────────────────────────────
@@ -146,6 +149,9 @@ export default function App() {
             <Route path="/chat" element={<Chat />} />
             <Route path="/backtesting" element={<StrategyWithChatLayout><Backtesting /></StrategyWithChatLayout>} />
             <Route path="/live" element={<StrategyWithChatLayout><LiveStrategies /></StrategyWithChatLayout>} />
+            <Route path="/copy-trading" element={<StrategyWithChatLayout><CopyTrading /></StrategyWithChatLayout>} />
+            <Route path="/copy-discovery" element={<StrategyWithChatLayout><CopyDiscovery /></StrategyWithChatLayout>} />
+            <Route path="/risk" element={<RiskCenter />} />
             <Route path="/health" element={<SystemHealth />} />
             <Route path="/logs" element={<Logs />} />
             <Route path="/help" element={<Help />} />

@@ -434,6 +434,13 @@ pub struct BacktestMetrics {
     /// Debug values captured for flat (no-trade) windows, keyed by timestamp.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub flat_debugs: Vec<(String, std::collections::HashMap<String, f64>)>,
+    /// Final position after backtest: +N = long, -N = short, 0 = flat.
+    /// Populated by live runner to detect signal changes between candles.
+    #[serde(default)]
+    pub position: f64,
+    /// Persistent script kv_state (ctx.set/ctx.get) for live runners.
+    #[serde(default)]
+    pub kv_state: std::collections::HashMap<String, f64>,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -1416,6 +1423,38 @@ let ctx = #{
                 atr
             });
 
+            // realized_vol(period) — standard deviation of log-returns
+            let closes_rv = closes_arc.clone();
+            eng2.register_fn("realized_vol_impl", move |period: i64| -> f64 {
+                let period = period.max(2) as usize;
+                let idx = cur_i;
+                if idx == 0 || closes_rv.len() < 2 {
+                    return 0.0;
+                }
+                let start = if idx + 1 >= period {
+                    idx + 1 - period
+                } else {
+                    0
+                };
+                if start >= idx {
+                    return 0.0;
+                }
+                let mut returns: Vec<f64> = Vec::with_capacity(idx - start);
+                for j in (start + 1)..=idx {
+                    let r0 = closes_rv[j - 1];
+                    let r1 = closes_rv[j];
+                    if r0 > 0.0 && r1 > 0.0 {
+                        returns.push((r1 / r0).ln());
+                    }
+                }
+                if returns.is_empty() {
+                    return 0.0;
+                }
+                let mean = returns.iter().sum::<f64>() / returns.len() as f64;
+                let var = returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / returns.len() as f64;
+                var.sqrt()
+            });
+
             // sma(period) - Simple Moving Average
             let closes_sma = closes_arc.clone();
             eng2.register_fn("sma_impl", move |period: i64| -> f64 {
@@ -1767,6 +1806,7 @@ on_candle_shim();
                 .replace("ctx.rsi(",            "rsi_impl(")
                 .replace("ctx.ema(",            "ema_impl(")
                 .replace("ctx.atr(",            "atr_impl(")
+                .replace("ctx.realized_vol(",   "realized_vol_impl(")
                 .replace("ctx.sma(",            "sma_impl(")
                 .replace("ctx.macd_hist(",      "macd_hist_impl(")
                 .replace("ctx.close_at(",       "close_at_impl(")
@@ -1943,6 +1983,8 @@ on_candle(ctx);
     }
 
     let final_value = s.balance;
+    let final_position = s.position;
+    let kv_state = s.kv.clone();
     let trades      = std::mem::take(&mut s.trades);
     drop(s);
     let total_return_pct = (final_value / initial_balance - 1.0) * 100.0;
@@ -2009,6 +2051,8 @@ on_candle(ctx);
         total_trades,
         worst_trades,
         all_trades,
+        position: final_position,
+        kv_state,
         analysis,
         avg_token_price: None,
         correct_direction_pct: None,
@@ -2019,6 +2063,7 @@ on_candle(ctx);
         historical_data_coverage_pct: None,
         recommended_max_stake_usd: None,
         flat_debugs: vec![],
+        ..Default::default()
     })
 }
 
@@ -2609,6 +2654,8 @@ on_candle(ctx);
         total_trades,
         worst_trades,
         all_trades,
+        position: 0.0,
+        kv_state: std::collections::HashMap::new(),
         analysis,
         avg_token_price,
         correct_direction_pct,
@@ -2706,6 +2753,7 @@ fn run_polymarket_slug_backtest(
         .replace("ctx.short(",           "sell_impl(")
         .replace("ctx.set(",             "set_impl(")
         .replace("ctx.get(",             "get_impl(")
+        .replace("ctx.realized_vol(",    "realized_vol_impl(")
         .replace("ctx.log(",             "log_impl(");
 
     #[derive(Clone)]
@@ -2837,6 +2885,27 @@ fn run_polymarket_slug_backtest(
         let mut atr = tr_vals[..period].iter().sum::<f64>() / period as f64;
         for j in period..tr_vals.len() { atr = (atr * (period - 1) as f64 + tr_vals[j]) / period as f64; }
         atr
+    });
+
+    let ci = cur_idx.clone(); let crv = closes_arc.clone();
+    engine.register_fn("realized_vol_impl", move |period: i64| -> f64 {
+        let idx = *ci.lock().unwrap();
+        let period = period.max(2) as usize;
+        if idx == 0 || crv.len() < 2 { return 0.0; }
+        let start = if idx + 1 >= period { idx + 1 - period } else { 0 };
+        if start >= idx { return 0.0; }
+        let mut returns: Vec<f64> = Vec::with_capacity(idx - start);
+        for j in (start + 1)..=idx {
+            let r0 = crv[j - 1];
+            let r1 = crv[j];
+            if r0 > 0.0 && r1 > 0.0 {
+                returns.push((r1 / r0).ln());
+            }
+        }
+        if returns.is_empty() { return 0.0; }
+        let mean = returns.iter().sum::<f64>() / returns.len() as f64;
+        let var = returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / returns.len() as f64;
+        var.sqrt()
     });
 
     engine.register_fn("set_stop_loss_impl",   |_: f64| {});
@@ -3150,6 +3219,7 @@ fn run_polymarket_slug_backtest(
         historical_data_coverage_pct: coverage_pct,
         recommended_max_stake_usd: recommended_max_stake,
         flat_debugs,
+        ..Default::default()
     })
 }
 
@@ -3195,6 +3265,7 @@ pub async fn run_backtest_engine(
                 markets_tested: None, windows_with_real_price: None, windows_with_estimated_price: None,
                 historical_data_coverage_pct: None, recommended_max_stake_usd: None, flat_debugs: vec![],
                 analysis: format!("Error reading script: {e}"),
+                ..Default::default()
             };
         }
     };
@@ -3217,12 +3288,14 @@ pub async fn run_backtest_engine(
                     win_rate_pct: 0.0, total_trades: 0, worst_trades: vec![], all_trades: vec![],
                     avg_token_price: None, correct_direction_pct: None, break_even_win_rate: None, markets_tested: None, windows_with_real_price: None, windows_with_estimated_price: None, historical_data_coverage_pct: None, recommended_max_stake_usd: None, flat_debugs: vec![],
                     analysis: format!("No weather data from Open-Meteo for '{symbol}' ({from_date}->{to_date}). Check city name."),
+                    ..Default::default()
                 },
                 Err(e) => return BacktestMetrics {
                     total_return_pct: 0.0, sharpe_ratio: 0.0, max_drawdown_pct: 0.0,
                     win_rate_pct: 0.0, total_trades: 0, worst_trades: vec![], all_trades: vec![],
                     avg_token_price: None, correct_direction_pct: None, break_even_win_rate: None, markets_tested: None, windows_with_real_price: None, windows_with_estimated_price: None, historical_data_coverage_pct: None, recommended_max_stake_usd: None, flat_debugs: vec![],
                     analysis: format!("Failed to fetch Open-Meteo data: {e}"),
+                    ..Default::default()
                 },
             }
         } else {
@@ -3234,12 +3307,14 @@ pub async fn run_backtest_engine(
                     win_rate_pct: 0.0, total_trades: 0, worst_trades: vec![], all_trades: vec![],
                     avg_token_price: None, correct_direction_pct: None, break_even_win_rate: None, markets_tested: None, windows_with_real_price: None, windows_with_estimated_price: None, historical_data_coverage_pct: None, recommended_max_stake_usd: None, flat_debugs: vec![],
                     analysis: format!("No 1m candle data from Binance for {symbol} ({from_date}->{to_date}). Check symbol."),
+                    ..Default::default()
                 },
                 Err(e) => return BacktestMetrics {
                     total_return_pct: 0.0, sharpe_ratio: 0.0, max_drawdown_pct: 0.0,
                     win_rate_pct: 0.0, total_trades: 0, worst_trades: vec![], all_trades: vec![],
                     avg_token_price: None, correct_direction_pct: None, break_even_win_rate: None, markets_tested: None, windows_with_real_price: None, windows_with_estimated_price: None, historical_data_coverage_pct: None, recommended_max_stake_usd: None, flat_debugs: vec![],
                     analysis: format!("Failed to fetch Binance data: {e}"),
+                    ..Default::default()
                 },
             }
         };
@@ -3292,6 +3367,7 @@ pub async fn run_backtest_engine(
                     markets_tested: None, windows_with_real_price: None, windows_with_estimated_price: None,
                 historical_data_coverage_pct: None, recommended_max_stake_usd: None, flat_debugs: vec![],
                     analysis: format!("Binary slug engine error: {e}"),
+                    ..Default::default()
                 }
             }
             Err(e) => BacktestMetrics {
@@ -3301,6 +3377,7 @@ pub async fn run_backtest_engine(
                 markets_tested: None, windows_with_real_price: None, windows_with_estimated_price: None,
                 historical_data_coverage_pct: None, recommended_max_stake_usd: None, flat_debugs: vec![],
                 analysis: format!("Binary slug task panicked: {e}"),
+                ..Default::default()
             },
         };
     }
@@ -3324,6 +3401,7 @@ pub async fn run_backtest_engine(
                         "Could not fetch historical data from Polymarket: {e}. \
                         Ensure the condition ID is valid."
                     ),
+                    ..Default::default()
                 };
             }
         }
@@ -3349,6 +3427,7 @@ pub async fn run_backtest_engine(
                     ),
                     markets_tested: None, windows_with_real_price: None, windows_with_estimated_price: None,
                 historical_data_coverage_pct: None, recommended_max_stake_usd: None, flat_debugs: vec![],
+                    ..Default::default()
                 };
             }
             Err(e) => {
@@ -3363,6 +3442,7 @@ pub async fn run_backtest_engine(
                         "Could not fetch historical data from Binance: {e}. \
                         Ensure the gateway has internet access."
                     ),
+                    ..Default::default()
                 };
             }
         }
@@ -3403,6 +3483,7 @@ pub async fn run_backtest_engine(
                 markets_tested: None, windows_with_real_price: None, windows_with_estimated_price: None,
                 historical_data_coverage_pct: None, recommended_max_stake_usd: None, flat_debugs: vec![],
                 analysis: format!("Rhai execution error: {e}"),
+                ..Default::default()
             }
         }
         Err(e) => {
@@ -3414,6 +3495,7 @@ pub async fn run_backtest_engine(
                 markets_tested: None, windows_with_real_price: None, windows_with_estimated_price: None,
                 historical_data_coverage_pct: None, recommended_max_stake_usd: None, flat_debugs: vec![],
                 analysis: format!("Backtest task panicked: {e}"),
+                ..Default::default()
             }
         }
     }
@@ -3439,6 +3521,7 @@ pub fn run_rhai_on_candle_buffer(
             markets_tested: None, windows_with_real_price: None, windows_with_estimated_price: None,
             historical_data_coverage_pct: None, recommended_max_stake_usd: None, flat_debugs: vec![],
             analysis: format!("Strategy error: {e}"),
+            ..Default::default()
         })
 }
 
@@ -3563,6 +3646,7 @@ pub fn run_polymarket_live_signal(
         .replace("ctx.short(",           "sell_impl(")
         .replace("ctx.set(",             "set_impl(")
         .replace("ctx.get(",             "get_impl(")
+        .replace("ctx.realized_vol(",    "realized_vol_impl(")
         .replace("ctx.log(",             "log_impl(");
 
     #[derive(Clone)]
@@ -3647,6 +3731,28 @@ pub fn run_polymarket_live_signal(
         let mut atr = tr_vals[..period].iter().sum::<f64>() / period as f64;
         for j in period..tr_vals.len() { atr = (atr * (period - 1) as f64 + tr_vals[j]) / period as f64; }
         atr
+    });
+
+    let ci = Arc::new(Mutex::new(dec_idx));
+    let crv = closes_arc.clone();
+    engine.register_fn("realized_vol_impl", move |period: i64| -> f64 {
+        let idx = *ci.lock().unwrap();
+        let period = period.max(2) as usize;
+        if idx == 0 || crv.len() < 2 { return 0.0; }
+        let start = if idx + 1 >= period { idx + 1 - period } else { 0 };
+        if start >= idx { return 0.0; }
+        let mut returns: Vec<f64> = Vec::with_capacity(idx - start);
+        for j in (start + 1)..=idx {
+            let r0 = crv[j - 1];
+            let r1 = crv[j];
+            if r0 > 0.0 && r1 > 0.0 {
+                returns.push((r1 / r0).ln());
+            }
+        }
+        if returns.is_empty() { return 0.0; }
+        let mean = returns.iter().sum::<f64>() / returns.len() as f64;
+        let var = returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / returns.len() as f64;
+        var.sqrt()
     });
 
     engine.register_fn("set_stop_loss_impl",   |_: f64| {});
@@ -3844,6 +3950,7 @@ pub fn run_polymarket_bt_signal_preview(
         .replace("ctx.short(",           "sell_impl(")
         .replace("ctx.set(",             "set_impl(")
         .replace("ctx.get(",             "get_impl(")
+        .replace("ctx.realized_vol(",    "realized_vol_impl(")
         .replace("ctx.log(",             "log_impl(");
 
     #[derive(Clone)]
@@ -3934,6 +4041,27 @@ pub fn run_polymarket_bt_signal_preview(
         let mut atr = tr_vals[..period].iter().sum::<f64>() / period as f64;
         for j in period..tr_vals.len() { atr = (atr * (period - 1) as f64 + tr_vals[j]) / period as f64; }
         atr
+    });
+
+    let ci = cur_idx.clone(); let crv = closes_arc.clone();
+    engine.register_fn("realized_vol_impl", move |period: i64| -> f64 {
+        let idx = *ci.lock().unwrap();
+        let period = period.max(2) as usize;
+        if idx == 0 || crv.len() < 2 { return 0.0; }
+        let start = if idx + 1 >= period { idx + 1 - period } else { 0 };
+        if start >= idx { return 0.0; }
+        let mut returns: Vec<f64> = Vec::with_capacity(idx - start);
+        for j in (start + 1)..=idx {
+            let r0 = crv[j - 1];
+            let r1 = crv[j];
+            if r0 > 0.0 && r1 > 0.0 {
+                returns.push((r1 / r0).ln());
+            }
+        }
+        if returns.is_empty() { return 0.0; }
+        let mean = returns.iter().sum::<f64>() / returns.len() as f64;
+        let var = returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / returns.len() as f64;
+        var.sqrt()
     });
 
     engine.register_fn("set_stop_loss_impl",   |_: f64| {});
@@ -4177,6 +4305,7 @@ pub fn run_polymarket_binary_on_candle_buffer(
         markets_tested: None, windows_with_real_price: None, windows_with_estimated_price: None,
         historical_data_coverage_pct: None, recommended_max_stake_usd: None, flat_debugs: vec![],
         analysis: format!("Polymarket strategy error: {e}"),
+        ..Default::default()
     })
 }
 

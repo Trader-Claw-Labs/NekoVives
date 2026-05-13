@@ -372,6 +372,19 @@ pub struct AppState {
     pub strategy_runner: Arc<crate::strategy_runner::StrategyRunnerStore>,
     /// Polymarket historical sync progress (shared with background task)
     pub poly_sync_progress: Arc<Mutex<crate::tools::polymarket_historical::SyncProgress>>,
+    /// Cancellation flag for the active Polymarket historical sync. The sync
+    /// task polls this between fetches and exits early when set to `true`.
+    /// The cancel endpoint flips it; the spawn-site resets it before each
+    /// new sync starts so cancellations don't leak across runs.
+    pub poly_sync_cancel: Arc<std::sync::atomic::AtomicBool>,
+    /// Copy trading orchestrator (dispatcher for mirror/consensus/discovery).
+    pub copy_orchestrator: Arc<copy_orchestrator::Orchestrator>,
+    /// Wallet indexer for scoring and candidate discovery.
+    pub wallet_indexer: Arc<wallet_indexer::Indexer>,
+    /// Hyperliquid unified client (perps + spot). None if disabled/unconfigured.
+    pub hyperliquid_client: Option<Arc<hyperliquid_trader::HyperliquidClient>>,
+    /// General trading risk gate (daily loss, drawdown, ATR sizing, correlation).
+    pub trading_risk_gate: Option<Arc<risk_manager::general::TradingRiskGate>>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -592,6 +605,62 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             event_tx.clone(),
         ));
 
+    // Initialize copy-trading infrastructure
+    let risk_config = risk_manager::RiskConfig {
+        max_single_leader_exposure_pct: config.copy_trading.max_single_leader_exposure_pct,
+        max_per_venue_copy_exposure_pct: config.copy_trading.max_per_venue_copy_exposure_pct,
+        max_aggregate_memecoin_copy_pct: config.copy_trading.max_aggregate_memecoin_copy_pct,
+        max_follow_lag_seconds: config.copy_trading.max_follow_lag_seconds,
+        min_leader_score_to_mirror: config.copy_trading.min_leader_score_mirror,
+        min_leader_score_to_consensus: config.copy_trading.min_leader_score_consensus,
+        max_single_trade_notional_pct: 0.02,
+        max_correlated_exposure_pct: 0.40,
+    };
+    let risk_gate = Arc::new(risk_manager::RiskGate::new(risk_config));
+    let copy_orchestrator = Arc::new(copy_orchestrator::Orchestrator::new(
+        risk_gate.clone(),
+        25_000.0, // default capital — should be configurable
+    ));
+    let wallet_indexer = Arc::new(
+        wallet_indexer::Indexer::new(&config.workspace_dir)
+            .unwrap_or_else(|e| {
+                tracing::warn!("Failed to initialize wallet indexer: {}", e);
+                // Return a dummy indexer that will fail gracefully
+                wallet_indexer::Indexer::new(std::path::Path::new("/tmp"))
+                    .expect("fallback indexer must work")
+            }),
+    );
+
+    // Initialize Hyperliquid client if enabled
+    let hyperliquid_client: Option<Arc<hyperliquid_trader::HyperliquidClient>> =
+        if config.hyperliquid.enabled {
+            let client = if config.hyperliquid.use_testnet {
+                hyperliquid_trader::HyperliquidClient::new_testnet()
+            } else {
+                hyperliquid_trader::HyperliquidClient::new_mainnet()
+            };
+            Some(Arc::new(client))
+        } else {
+            None
+        };
+
+    // Initialize general trading risk gate
+    let trading_risk_gate = {
+        let risk_cfg = risk_manager::general::TradingRiskConfig {
+            daily_loss_limit_pct: config.risk_trading.daily_loss_limit_pct,
+            drawdown_hard_limit_pct: config.risk_trading.drawdown_hard_limit_pct,
+            drawdown_soft_limit_pct: config.risk_trading.drawdown_soft_limit_pct,
+            risk_per_trade_pct: config.risk_trading.risk_per_trade_pct,
+            correlation_threshold: config.risk_trading.correlation_threshold,
+            max_correlated_exposure_pct: config.risk_trading.max_correlated_exposure_pct,
+            max_strategy_exposure_pct: config.risk_trading.max_strategy_exposure_pct,
+            max_memecoin_exposure_pct: config.risk_trading.max_memecoin_exposure_pct,
+            min_notional_usd: config.risk_trading.min_notional_usd,
+        };
+        let capital = 25_000.0; // TODO: pull from wallet balance or config
+        Some(Arc::new(risk_manager::general::TradingRiskGate::new(risk_cfg, capital)))
+    };
+
     let state = AppState {
         config: config_state,
         provider,
@@ -621,6 +690,11 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             config.workspace_dir.clone(),
         )),
         poly_sync_progress: Arc::new(Mutex::new(Default::default())),
+        poly_sync_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        copy_orchestrator,
+        wallet_indexer,
+        hyperliquid_client,
+        trading_risk_gate,
     };
 
     // Restart any strategies that were running before the last shutdown
@@ -733,6 +807,37 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             "/api/polymarket/order/{id}",
             delete(api::handle_api_polymarket_order_cancel),
         )
+        // ── Copy Trading ──
+        .route("/api/copy/leaders", get(api::handle_api_copy_leaders))
+        .route(
+            "/api/copy/leaders/{addr}/toggle",
+            post(api::handle_api_copy_leader_toggle),
+        )
+        .route("/api/copy/discovery", get(api::handle_api_copy_discovery))
+        .route(
+            "/api/copy/discovery/{addr}/graduate",
+            post(api::handle_api_copy_discovery_graduate),
+        )
+        .route(
+            "/api/copy/discovery/{addr}/blacklist",
+            post(api::handle_api_copy_discovery_blacklist),
+        )
+        .route("/api/copy/positions", get(api::handle_api_copy_positions))
+        // ── Hyperliquid ──
+        .route(
+            "/api/health/hyperliquid",
+            get(api::handle_api_health_hyperliquid),
+        )
+        .route("/api/hyperliquid/mids", get(api::handle_api_hyperliquid_mids))
+        .route("/api/hyperliquid/funding", get(api::handle_api_hyperliquid_funding))
+        .route("/api/funding/comparison", get(api::handle_api_funding_comparison))
+        // ── Live CEX Positions ──
+        .route("/api/live/positions", get(api::handle_api_live_positions))
+        .route("/api/live/positions/{symbol}/close", post(api::handle_api_live_position_close))
+        // ── General Trading Risk ──
+        .route("/api/risk/halt", post(api::handle_api_risk_halt))
+        .route("/api/risk/resume", post(api::handle_api_risk_resume))
+        .route("/api/risk/status", get(api::handle_api_risk_status))
         // ── TradingView ──
         .route("/api/tradingview/scan", get(api::handle_api_tradingview_scan))
         // ── Backtesting ──
@@ -749,6 +854,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route(
             "/api/backtest/polymarket-historical/status",
             get(api::handle_api_backtest_polymarket_historical_status),
+        )
+        .route(
+            "/api/backtest/polymarket-historical/cancel",
+            post(api::handle_api_backtest_polymarket_historical_cancel),
         )
         .route(
             "/api/channels/telegram/configure",
@@ -1250,6 +1359,14 @@ mod tests {
             wallets_path: Arc::new(std::env::temp_dir().join("traderclaw_test_wallets.json")),
             strategy_runner: Arc::new(crate::strategy_runner::StrategyRunnerStore::new(std::env::temp_dir())),
             poly_sync_progress: Arc::new(Mutex::new(Default::default())),
+            poly_sync_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            copy_orchestrator: Arc::new(copy_orchestrator::Orchestrator::new(
+                Arc::new(risk_manager::RiskGate::with_defaults()),
+                25_000.0,
+            )),
+            wallet_indexer: Arc::new(wallet_indexer::Indexer::new(&std::env::temp_dir()).unwrap()),
+            hyperliquid_client: None,
+            trading_risk_gate: None,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1295,6 +1412,14 @@ mod tests {
             wallets_path: Arc::new(std::env::temp_dir().join("traderclaw_test_wallets.json")),
             strategy_runner: Arc::new(crate::strategy_runner::StrategyRunnerStore::new(std::env::temp_dir())),
             poly_sync_progress: Arc::new(Mutex::new(Default::default())),
+            poly_sync_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            copy_orchestrator: Arc::new(copy_orchestrator::Orchestrator::new(
+                Arc::new(risk_manager::RiskGate::with_defaults()),
+                25_000.0,
+            )),
+            wallet_indexer: Arc::new(wallet_indexer::Indexer::new(&std::env::temp_dir()).unwrap()),
+            hyperliquid_client: None,
+            trading_risk_gate: None,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1641,6 +1766,14 @@ mod tests {
             wallets_path: Arc::new(std::env::temp_dir().join("traderclaw_test_wallets.json")),
             strategy_runner: Arc::new(crate::strategy_runner::StrategyRunnerStore::new(std::env::temp_dir())),
             poly_sync_progress: Arc::new(Mutex::new(Default::default())),
+            poly_sync_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            copy_orchestrator: Arc::new(copy_orchestrator::Orchestrator::new(
+                Arc::new(risk_manager::RiskGate::with_defaults()),
+                25_000.0,
+            )),
+            wallet_indexer: Arc::new(wallet_indexer::Indexer::new(&std::env::temp_dir()).unwrap()),
+            hyperliquid_client: None,
+            trading_risk_gate: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -1701,6 +1834,14 @@ mod tests {
             wallets_path: Arc::new(std::env::temp_dir().join("traderclaw_test_wallets.json")),
             strategy_runner: Arc::new(crate::strategy_runner::StrategyRunnerStore::new(std::env::temp_dir())),
             poly_sync_progress: Arc::new(Mutex::new(Default::default())),
+            poly_sync_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            copy_orchestrator: Arc::new(copy_orchestrator::Orchestrator::new(
+                Arc::new(risk_manager::RiskGate::with_defaults()),
+                25_000.0,
+            )),
+            wallet_indexer: Arc::new(wallet_indexer::Indexer::new(&std::env::temp_dir()).unwrap()),
+            hyperliquid_client: None,
+            trading_risk_gate: None,
         };
 
         let headers = HeaderMap::new();
@@ -1773,6 +1914,14 @@ mod tests {
             wallets_path: Arc::new(std::env::temp_dir().join("traderclaw_test_wallets.json")),
             strategy_runner: Arc::new(crate::strategy_runner::StrategyRunnerStore::new(std::env::temp_dir())),
             poly_sync_progress: Arc::new(Mutex::new(Default::default())),
+            poly_sync_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            copy_orchestrator: Arc::new(copy_orchestrator::Orchestrator::new(
+                Arc::new(risk_manager::RiskGate::with_defaults()),
+                25_000.0,
+            )),
+            wallet_indexer: Arc::new(wallet_indexer::Indexer::new(&std::env::temp_dir()).unwrap()),
+            hyperliquid_client: None,
+            trading_risk_gate: None,
         };
 
         let response = handle_webhook(
@@ -1817,6 +1966,14 @@ mod tests {
             wallets_path: Arc::new(std::env::temp_dir().join("traderclaw_test_wallets.json")),
             strategy_runner: Arc::new(crate::strategy_runner::StrategyRunnerStore::new(std::env::temp_dir())),
             poly_sync_progress: Arc::new(Mutex::new(Default::default())),
+            poly_sync_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            copy_orchestrator: Arc::new(copy_orchestrator::Orchestrator::new(
+                Arc::new(risk_manager::RiskGate::with_defaults()),
+                25_000.0,
+            )),
+            wallet_indexer: Arc::new(wallet_indexer::Indexer::new(&std::env::temp_dir()).unwrap()),
+            hyperliquid_client: None,
+            trading_risk_gate: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -1866,6 +2023,14 @@ mod tests {
             wallets_path: Arc::new(std::env::temp_dir().join("traderclaw_test_wallets.json")),
             strategy_runner: Arc::new(crate::strategy_runner::StrategyRunnerStore::new(std::env::temp_dir())),
             poly_sync_progress: Arc::new(Mutex::new(Default::default())),
+            poly_sync_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            copy_orchestrator: Arc::new(copy_orchestrator::Orchestrator::new(
+                Arc::new(risk_manager::RiskGate::with_defaults()),
+                25_000.0,
+            )),
+            wallet_indexer: Arc::new(wallet_indexer::Indexer::new(&std::env::temp_dir()).unwrap()),
+            hyperliquid_client: None,
+            trading_risk_gate: None,
         };
 
         let mut headers = HeaderMap::new();

@@ -16,6 +16,9 @@
 //! [`all_tools_with_runtime`]. See `AGENTS.md` §7.3 for the full change playbook.
 
 pub mod backtest;
+pub mod binance_perps;
+pub mod event_backtest;
+pub mod historical_data;
 pub mod script_migrator;
 pub mod series;
 pub mod browser;

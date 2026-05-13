@@ -17,6 +17,9 @@ import {
   FileText,
   Blocks,
   HelpCircle,
+  Users,
+  Search,
+  Shield,
 } from 'lucide-react'
 import { useQuery } from '@tanstack/react-query'
 import { apiFetch } from '../hooks/useApi'
@@ -36,6 +39,9 @@ const mainNavItems: NavItem[] = [
   { to: '/strategy-builder', icon: <Blocks size={18} />, label: 'Strategy Builder' },
   { to: '/backtesting', icon: <FlaskConical size={18} />, label: 'Backtesting' },
   { to: '/live', icon: <Bot size={18} />, label: 'Live Strategies' },
+  { to: '/risk', icon: <Shield size={18} />, label: 'Risk Center' },
+  { to: '/copy-trading', icon: <Users size={18} />, label: 'Copy Trading' },
+  { to: '/copy-discovery', icon: <Search size={18} />, label: 'Discovery' },
   { to: '/scheduled-jobs', icon: <Activity size={18} />, label: 'Scheduled Jobs' },
   { to: '/help', icon: <HelpCircle size={18} />, label: 'Help' },
 ]

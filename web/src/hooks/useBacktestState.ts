@@ -72,6 +72,10 @@ export interface BacktestConfig {
   // Price mode for Polymarket binary entry: 'historical' = real scraped price,
   // 'mid' = average of buy/sell (mid-price).
   price_mode?: 'historical' | 'mid'
+  // Hour gate: only trade during these UTC hours. Empty = no restriction.
+  allowed_hours?: number[]
+  // RV floor: skip windows where BTC 1h realized-vol < this value. 0/undefined = disabled.
+  rv_min_btc?: number
 }
 
 export interface TradeLog {
@@ -148,6 +152,8 @@ const DEFAULT_CONFIG: BacktestConfig = {
   sizing_mode: 'percent',
   sizing_value: 1.0,
   price_mode: 'historical',
+  allowed_hours: [],
+  rv_min_btc: undefined,
 }
 
 const DEFAULT_STATE: BacktestState = {

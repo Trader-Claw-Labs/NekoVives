@@ -254,3 +254,101 @@ fn extract_price_from_json(json: &serde_json::Value) -> Option<f64> {
 
     None
 }
+
+// ── Binance USD-M Perps funding rate feed ────────────────────────────────────
+
+/// Real-time mark price + funding rate tick from Binance Futures.
+#[derive(Debug, Clone)]
+pub struct FundingTick {
+    pub ts_ms: i64,
+    pub symbol: String,
+    pub mark_price: f64,
+    pub funding_rate: f64,
+    pub next_funding_time_ms: i64,
+}
+
+#[derive(Deserialize)]
+struct BinanceMarkPriceMsg {
+    #[serde(rename = "E")]
+    event_time: i64,
+    #[serde(rename = "s")]
+    symbol: String,
+    #[serde(rename = "p")]
+    mark_price: String,
+    #[serde(rename = "r")]
+    funding_rate: String,
+    #[serde(rename = "T")]
+    next_funding_time: i64,
+}
+
+/// Spawn a background task that connects to the Binance USD-M Futures
+/// mark-price WebSocket (`<symbol>@markPrice`) and emits a [`FundingTick`]
+/// every ~3 seconds.  Auto-reconnects on disconnect.
+///
+/// Feed URL: `wss://fstream.binance.com/ws/{symbol}@markPrice`
+pub fn spawn_binance_funding_feed(symbol: String) -> mpsc::Receiver<FundingTick> {
+    let (tx, rx) = mpsc::channel::<FundingTick>(128);
+    tokio::spawn(async move {
+        loop {
+            let url = format!(
+                "wss://fstream.binance.com/ws/{}@markPrice",
+                symbol.to_lowercase()
+            );
+            tracing::info!("[FUNDING_FEED] Connecting: {url}");
+            match connect_async(&url).await {
+                Ok((ws, _)) => {
+                    let (_, mut read) = ws.split();
+                    tracing::info!(
+                        "[FUNDING_FEED] Connected - streaming {symbol}@markPrice"
+                    );
+                    loop {
+                        match read.next().await {
+                            Some(Ok(Message::Text(text))) => {
+                                if let Ok(msg) =
+                                    serde_json::from_str::<BinanceMarkPriceMsg>(&text)
+                                {
+                                    let tick = FundingTick {
+                                        ts_ms: msg.event_time,
+                                        symbol: msg.symbol.clone(),
+                                        mark_price: msg
+                                            .mark_price
+                                            .parse()
+                                            .unwrap_or(0.0),
+                                        funding_rate: msg
+                                            .funding_rate
+                                            .parse()
+                                            .unwrap_or(0.0),
+                                        next_funding_time_ms: msg.next_funding_time,
+                                    };
+                                    tracing::debug!(
+                                        "[FUNDING_FEED] {} rate={:.6}% mark={}",
+                                        tick.symbol,
+                                        tick.funding_rate * 100.0,
+                                        tick.mark_price
+                                    );
+                                    if tx.send(tick).await.is_err() {
+                                        return; // receiver dropped
+                                    }
+                                }
+                            }
+                            Some(Ok(_)) => {}
+                            Some(Err(e)) => {
+                                tracing::warn!(
+                                    "[FUNDING_FEED] WebSocket error: {e}"
+                                );
+                                break;
+                            }
+                            None => break,
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("[FUNDING_FEED] Connect failed: {e}");
+                }
+            }
+            tracing::info!("[FUNDING_FEED] Reconnecting in 5s...");
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+    });
+    rx
+}
