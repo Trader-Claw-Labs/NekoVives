@@ -7887,6 +7887,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "strategy-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "stringprep"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8764,6 +8778,7 @@ dependencies = [
  "sha2",
  "shellexpand",
  "solana-trader",
+ "strategy-core",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

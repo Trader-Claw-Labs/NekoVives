@@ -3455,6 +3455,8 @@ pub async fn handle_api_backtest_series(
 
 #[derive(serde::Deserialize)]
 pub struct BacktestRunBody {
+    /// Rhai script path — required for rhai_candle, ignored for other engine kinds.
+    #[serde(default)]
     pub script: String,
     #[serde(default = "default_market_type")]
     pub market_type: String,
@@ -3491,6 +3493,11 @@ pub struct BacktestRunBody {
     /// RV floor: skip windows where BTC 1h realized-vol < this value. 0 = disabled.
     #[serde(default)]
     pub rv_min_btc: Option<f64>,
+    /// Engine kind for strategy-core engines. When set to anything other than
+    /// "rhai_candle" (or absent), the Rhai script path is ignored and the engine
+    /// is driven directly by the normalised Binance OHLCV feed.
+    #[serde(default)]
+    pub kind: Option<String>,
 }
 
 fn default_market_type() -> String {
@@ -3512,6 +3519,39 @@ pub async fn handle_api_backtest_run(
     }
 
     let workspace_dir = state.config.lock().workspace_dir.clone();
+
+    // ── Strategy-core engine backtest (non-Rhai path) ─────────────────────────
+    let engine_kind = body.kind.as_deref().unwrap_or("rhai_candle");
+    if engine_kind != "rhai_candle" && !engine_kind.is_empty() {
+        let markets: Vec<String> = body.symbol
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let params = crate::tools::engine_backtest::EngineBacktestParams {
+            kind: engine_kind,
+            markets,
+            threshold: body.threshold,
+            from_date: &body.from_date,
+            to_date: &body.to_date,
+            initial_balance: body.initial_balance,
+            workspace_dir: &workspace_dir,
+        };
+        let metrics = crate::tools::engine_backtest::run_engine_backtest(params).await;
+        return Json(serde_json::json!({
+            "script": format!("engine:{engine_kind}"),
+            "symbol": body.symbol,
+            "total_return_pct":  metrics.total_return_pct,
+            "sharpe_ratio":      metrics.sharpe_ratio,
+            "max_drawdown_pct":  metrics.max_drawdown_pct,
+            "win_rate_pct":      metrics.win_rate_pct,
+            "total_trades":      metrics.total_trades,
+            "analysis":          metrics.analysis,
+            "markets_tested":    metrics.markets_tested,
+            "worst_trades":      serde_json::Value::Array(vec![]),
+            "all_trades":        serde_json::Value::Array(vec![]),
+        })).into_response();
+    }
 
     // Resolve script path: try as-is, then relative to scripts/ dir
     let script_path = {
@@ -4284,41 +4324,6 @@ pub struct CreateRunnerBody {
     pub price_mode: Option<String>,
     #[serde(default)]
     pub max_spread_pct: Option<f64>,
-    #[serde(default)]
-    pub allowed_hours: Option<Vec<u8>>,
-    #[serde(default)]
-    pub rv_min_btc: Option<f64>,
-    /// Wallet password for decrypting the Hyperliquid trading key.
-    /// Only used when creating a live CEX runner. Never stored.
-    #[serde(default)]
-    pub wallet_password: Option<String>,
-    /// Binance Futures API key. Only used for live CEX trading on Binance.
-    #[serde(default)]
-    pub binance_api_key: Option<String>,
-    /// Binance Futures API secret. Only used for live CEX trading on Binance.
-    #[serde(default)]
-    pub binance_api_secret: Option<String>,
-    /// Funding arbitrage watchlist (e.g. ["BTC", "ETH"]).
-    #[serde(default)]
-    pub funding_watchlist: Option<Vec<String>>,
-    /// Minimum APR diff to open a funding arb position.
-    #[serde(default)]
-    pub min_apr_diff: Option<f64>,
-    /// APR diff threshold to force-close an open position.
-    #[serde(default)]
-    pub force_close_diff: Option<f64>,
-    /// Max concurrent funding arb pairs.
-    #[serde(default)]
-    pub max_open_pairs: Option<usize>,
-    /// Max % of capital per pair.
-    #[serde(default)]
-    pub max_pos_pct: Option<f64>,
-    /// Polling interval in seconds.
-    #[serde(default)]
-    pub funding_poll_secs: Option<u64>,
-    /// Fee buffer in basis points per leg per cycle.
-    #[serde(default)]
-    pub fee_buffer_bps: Option<f64>,
 }
 
 #[derive(serde::Deserialize)]
@@ -4679,21 +4684,6 @@ pub async fn handle_api_live_create(
         max_entry_price: body.max_entry_price,
         price_mode: body.price_mode,
         max_spread_pct: body.max_spread_pct,
-        allowed_hours: body.allowed_hours.unwrap_or_default(),
-        rv_min_btc: body.rv_min_btc,
-        hl_signer: None,
-        risk_gate: None,
-        binance_creds: None,
-        funding_watchlist: body.funding_watchlist.unwrap_or_else(|| {
-            vec!["BTC".into(), "ETH".into(), "SOL".into(), "AVAX".into()]
-        }),
-        min_apr_diff: body.min_apr_diff.unwrap_or(0.10),
-        force_close_diff: body.force_close_diff.unwrap_or(0.02),
-        max_open_pairs: body.max_open_pairs.unwrap_or(4),
-        max_pos_pct: body.max_pos_pct.unwrap_or(0.15),
-        funding_poll_secs: body.funding_poll_secs.unwrap_or(60),
-        fee_buffer_bps: body.fee_buffer_bps.unwrap_or(12.0),
-        ..Default::default()
     };
 
     // Populate Binance credentials if provided (live mode only, never persisted)

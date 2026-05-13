@@ -121,6 +121,7 @@ wallet-tracker = { path = "crates/wallet-tracker" }
 wallet-indexer = { path = "crates/wallet-indexer" }
 copy-orchestrator = { path = "crates/copy-orchestrator" }
 hyperliquid-trader = { path = "crates/hyperliquid-trader" }
+strategy-core = { path = "crates/strategy-core" }
 
 # Memory / persistence
 rusqlite = { version = "0.37", features = ["bundled"] }

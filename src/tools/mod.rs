@@ -19,6 +19,7 @@ pub mod backtest;
 pub mod binance_perps;
 pub mod event_backtest;
 pub mod historical_data;
+pub mod engine_backtest;
 pub mod script_migrator;
 pub mod series;
 pub mod browser;

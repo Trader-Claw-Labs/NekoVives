@@ -77,6 +77,7 @@ mod providers;
 mod runtime;
 mod security;
 mod service;
+mod engines;
 mod skillforge;
 mod skills;
 mod live_feed;

@@ -697,6 +697,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         trading_risk_gate,
     };
 
+    // Expose runner store to the /strat Telegram command handler.
+    crate::channels::strat_commands::init_runner_store(Arc::clone(&state.strategy_runner));
+
     // Restart any strategies that were running before the last shutdown
     let restarted = state.strategy_runner.restart_previously_running(
         config.workspace_dir.clone(),

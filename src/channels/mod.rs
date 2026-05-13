@@ -16,6 +16,7 @@
 
 pub mod cli;
 pub mod poly_commands;
+pub mod strat_commands;
 pub mod telegram;
 pub mod traits;
 pub mod transcription;
@@ -1526,6 +1527,22 @@ async fn process_channel_message(
                         .in_thread(msg.thread_ts.clone()),
                 )
                 .await;
+        }
+        return;
+    }
+
+    // ── /strat commands ───────────────────────────────────────────────────────
+    if msg.content.trim_start().starts_with("/strat") {
+        if let Some(store) = strat_commands::runner_store() {
+            let result = strat_commands::handle_strat_command(&msg.content, true, store);
+            if let Some(channel) = target_channel.as_ref() {
+                let _ = channel
+                    .send(
+                        &SendMessage::new(result.message, &msg.reply_target)
+                            .in_thread(msg.thread_ts.clone()),
+                    )
+                    .await;
+            }
         }
         return;
     }

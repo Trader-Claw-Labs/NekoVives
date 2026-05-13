@@ -44,6 +44,7 @@ export const POLY_BINARY_PRESETS: PolyBinaryPreset[] = [
 ]
 
 export interface BacktestConfig {
+  kind?: string
   script: string
   market_type: MarketType
   symbol: string
@@ -136,6 +137,7 @@ const TODAY = new Date().toISOString().slice(0, 10)
 const THREE_MONTHS_AGO = new Date(Date.now() - 90 * 86400 * 1000).toISOString().slice(0, 10)
 
 const DEFAULT_CONFIG: BacktestConfig = {
+  kind: 'rhai_candle',
   script: '',
   market_type: 'polymarket_binary',
   symbol: 'BTCUSDT',
@@ -292,11 +294,12 @@ export function useBacktestState() {
 
       // After 8s advance to 'running', after 15s advance to 'analyzing'
       // These timers reflect what the backend is actually doing during the single API call.
+      const engineLabel = cfg.kind && cfg.kind !== 'rhai_candle' ? cfg.kind : 'Rhai script'
       const phaseTimer = setTimeout(() => {
         updateState({
           progress: {
             step: 'running',
-            message: 'Executing Rhai strategy engine against historical data…',
+            message: `Executing ${engineLabel} engine against historical data…`,
             startTime: Date.now(),
           },
         })
