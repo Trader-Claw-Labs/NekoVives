@@ -1301,8 +1301,10 @@ export default function Backtesting() {
     setConfigField(k, v)
   }
 
+  const isEngineKind = (config.kind ?? 'rhai_candle') !== 'rhai_candle'
+
   const isBatchMode = selectedScripts.length > 1
-  const canRun = (isBatchMode || !!config.script) && !isRunning && !batchProgress
+  const canRun = (isBatchMode || !!config.script || isEngineKind) && !isRunning && !batchProgress
 
   // Sort scripts by selected metric descending
   const sortedScripts = [...scripts].sort((a, b) => {
@@ -1413,6 +1415,44 @@ export default function Backtesting() {
         </h2>
 
         <div className="space-y-3">
+          {/* Engine Kind selector */}
+          <div className="grid grid-cols-1 gap-3">
+            <div>
+              <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>Strategy Engine</label>
+              <select
+                value={config.kind ?? 'rhai_candle'}
+                onChange={(e) => {
+                  const k = e.target.value
+                  setFullConfig({
+                    ...config,
+                    kind: k,
+                    market_type: 'polymarket_binary',
+                    ...(k !== 'rhai_candle' ? { script: '' } : {}),
+                  })
+                }}
+                className="w-full rounded px-2 py-2 text-sm"
+                style={{
+                  backgroundColor: 'var(--color-surface-2)',
+                  border: '1px solid var(--color-border)',
+                  color: 'var(--color-text)',
+                }}
+              >
+                <option value="rhai_candle">Rhai Script (default)</option>
+                <option value="arb_binary">Arb Binary — synthetic arb YES+NO</option>
+                <option value="fair_value">Fair Value — FV edge estimator</option>
+                <option value="fv_momentum">FV + Momentum — AND-gate FV &amp; trend</option>
+                <option value="rotation_compounder">Rotation Compounder — Kelly scoring</option>
+                <option value="arb_hedge">Arb + Hedge Overlay — HYB-02</option>
+                <option value="minting_mm">Minting MM — CTF mint/merge cycle</option>
+              </select>
+              {isEngineKind && (
+                <p className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
+                  Engine backtests use Binance BTCUSDT candles normalized to probability space. No Rhai script needed.
+                </p>
+              )}
+            </div>
+          </div>
+
           {/* Row 1: Market, Script, Symbol/Series, Window */}
           <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-12 gap-3 items-end">
             {/* Market Type Select */}
@@ -1456,59 +1496,101 @@ export default function Backtesting() {
             </select>
           </div>
 
-          {/* Script select */}
-          <div className="col-span-2 lg:col-span-4">
-            <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>
-              Strategy Script
-            </label>
-            {scriptsLoading ? (
-              <div className="text-xs py-2" style={{ color: 'var(--color-text-muted)' }}>Loading...</div>
-            ) : scripts.length === 0 ? (
-              <div
-                className="rounded px-3 py-2 text-xs"
-                style={{
-                  backgroundColor: 'var(--color-surface-2)',
-                  border: '1px solid var(--color-border)',
-                  color: 'var(--color-text-muted)',
-                }}
-              >
-                No scripts found
-              </div>
-            ) : isBatchMode ? (
-              <div
-                className="w-full rounded px-3 py-2 text-sm font-mono"
-                style={{
-                  backgroundColor: 'var(--color-surface-2)',
-                  border: '1px solid var(--color-border)',
-                  color: 'var(--color-text)',
-                }}
-              >
-                <ListChecks size={12} className="inline mr-1.5" style={{ color: 'var(--color-accent)' }} />
-                {selectedScripts.length} scripts selected
-              </div>
-            ) : (
-              <select
-                value={config.script}
-                onChange={(e) => set('script', e.target.value)}
-                className="w-full rounded px-3 py-2 text-sm font-mono"
-                style={{
-                  backgroundColor: 'var(--color-surface-2)',
-                  border: '1px solid var(--color-border)',
-                  color: 'var(--color-text)',
-                }}
-              >
-                <option value="">Select a script...</option>
-                {scripts.map((s) => (
-                  <option key={s.path} value={s.path}>
-                    {s.name}
-                  </option>
-                ))}
-              </select>
-            )}
-          </div>
+          {/* Script select — hidden for engine kinds */}
+          {!isEngineKind && (
+            <div className="col-span-2 lg:col-span-4">
+              <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>
+                Strategy Script
+              </label>
+              {scriptsLoading ? (
+                <div className="text-xs py-2" style={{ color: 'var(--color-text-muted)' }}>Loading...</div>
+              ) : scripts.length === 0 ? (
+                <div
+                  className="rounded px-3 py-2 text-xs"
+                  style={{
+                    backgroundColor: 'var(--color-surface-2)',
+                    border: '1px solid var(--color-border)',
+                    color: 'var(--color-text-muted)',
+                  }}
+                >
+                  No scripts found
+                </div>
+              ) : isBatchMode ? (
+                <div
+                  className="w-full rounded px-3 py-2 text-sm font-mono"
+                  style={{
+                    backgroundColor: 'var(--color-surface-2)',
+                    border: '1px solid var(--color-border)',
+                    color: 'var(--color-text)',
+                  }}
+                >
+                  <ListChecks size={12} className="inline mr-1.5" style={{ color: 'var(--color-accent)' }} />
+                  {selectedScripts.length} scripts selected
+                </div>
+              ) : (
+                <select
+                  value={config.script}
+                  onChange={(e) => set('script', e.target.value)}
+                  className="w-full rounded px-3 py-2 text-sm font-mono"
+                  style={{
+                    backgroundColor: 'var(--color-surface-2)',
+                    border: '1px solid var(--color-border)',
+                    color: 'var(--color-text)',
+                  }}
+                >
+                  <option value="">Select a script...</option>
+                  {scripts.map((s) => (
+                    <option key={s.path} value={s.path}>
+                      {s.name}
+                    </option>
+                  ))}
+                </select>
+              )}
+            </div>
+          )}
 
-          {/* Symbol / Market selector — adapts to market type */}
-          {config.market_type === 'crypto' ? (
+          {/* Markets + Threshold — shown for engine kinds */}
+          {isEngineKind && (
+            <>
+              <div className="col-span-2 lg:col-span-3">
+                <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>
+                  Market Slugs
+                </label>
+                <input
+                  value={config.symbol}
+                  onChange={(e) => set('symbol', e.target.value)}
+                  placeholder="btc-usd-winner,eth-usd-winner"
+                  className="w-full rounded px-3 py-2 text-sm font-mono"
+                  style={{
+                    backgroundColor: 'var(--color-surface-2)',
+                    border: '1px solid var(--color-border)',
+                    color: 'var(--color-text)',
+                  }}
+                />
+              </div>
+              <div className="lg:col-span-2">
+                <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>
+                  Threshold / Edge
+                </label>
+                <input
+                  type="number"
+                  step="0.001"
+                  value={config.threshold ?? ''}
+                  onChange={(e) => set('threshold', e.target.value === '' ? undefined : Number(e.target.value))}
+                  placeholder="default"
+                  className="w-full rounded px-3 py-2 text-sm"
+                  style={{
+                    backgroundColor: 'var(--color-surface-2)',
+                    border: '1px solid var(--color-border)',
+                    color: 'var(--color-text)',
+                  }}
+                />
+              </div>
+            </>
+          )}
+
+          {/* Symbol / Market selector — adapts to market type (hidden for engine kinds; they use Markets input above) */}
+          {!isEngineKind && config.market_type === 'crypto' ? (
             <div className="lg:col-span-3">
               <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>Symbol</label>
               <input
@@ -1583,8 +1665,8 @@ export default function Backtesting() {
             </div>
           ) : null}
 
-          {/* Interval / Window */}
-          <div className={config.market_type === 'crypto' ? 'lg:col-span-3' : 'lg:col-span-2'}>
+          {/* Interval / Window — hidden for engine kinds (5m fixed internally) */}
+          {!isEngineKind && <div className={config.market_type === 'crypto' ? 'lg:col-span-3' : 'lg:col-span-2'}>
             <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>
               {config.market_type === 'polymarket_binary' ? 'Window' : 'Interval'}
             </label>
@@ -1607,7 +1689,7 @@ export default function Backtesting() {
                 </option>
               ))}
             </select>
-          </div>
+          </div>}
 
           {/* Row 2: Dates, Balance, Fee, MaxPos, Run */}
           </div>

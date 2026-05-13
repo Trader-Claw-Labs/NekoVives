@@ -3455,6 +3455,8 @@ pub async fn handle_api_backtest_series(
 
 #[derive(serde::Deserialize)]
 pub struct BacktestRunBody {
+    /// Rhai script path — required for rhai_candle, ignored for other engine kinds.
+    #[serde(default)]
     pub script: String,
     #[serde(default = "default_market_type")]
     pub market_type: String,
@@ -3485,6 +3487,11 @@ pub struct BacktestRunBody {
     /// Price mode for Polymarket binary entry: 'historical' = real scraped price,
     /// 'mid' = average of buy/sell (mid-price).
     pub price_mode: Option<String>,
+    /// Engine kind for strategy-core engines. When set to anything other than
+    /// "rhai_candle" (or absent), the Rhai script path is ignored and the engine
+    /// is driven directly by the normalised Binance OHLCV feed.
+    #[serde(default)]
+    pub kind: Option<String>,
 }
 
 fn default_market_type() -> String {
@@ -3506,6 +3513,39 @@ pub async fn handle_api_backtest_run(
     }
 
     let workspace_dir = state.config.lock().workspace_dir.clone();
+
+    // ── Strategy-core engine backtest (non-Rhai path) ─────────────────────────
+    let engine_kind = body.kind.as_deref().unwrap_or("rhai_candle");
+    if engine_kind != "rhai_candle" && !engine_kind.is_empty() {
+        let markets: Vec<String> = body.symbol
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let params = crate::tools::engine_backtest::EngineBacktestParams {
+            kind: engine_kind,
+            markets,
+            threshold: body.threshold,
+            from_date: &body.from_date,
+            to_date: &body.to_date,
+            initial_balance: body.initial_balance,
+            workspace_dir: &workspace_dir,
+        };
+        let metrics = crate::tools::engine_backtest::run_engine_backtest(params).await;
+        return Json(serde_json::json!({
+            "script": format!("engine:{engine_kind}"),
+            "symbol": body.symbol,
+            "total_return_pct":  metrics.total_return_pct,
+            "sharpe_ratio":      metrics.sharpe_ratio,
+            "max_drawdown_pct":  metrics.max_drawdown_pct,
+            "win_rate_pct":      metrics.win_rate_pct,
+            "total_trades":      metrics.total_trades,
+            "analysis":          metrics.analysis,
+            "markets_tested":    metrics.markets_tested,
+            "worst_trades":      serde_json::Value::Array(vec![]),
+            "all_trades":        serde_json::Value::Array(vec![]),
+        })).into_response();
+    }
 
     // Resolve script path: try as-is, then relative to scripts/ dir
     let script_path = {
@@ -4231,6 +4271,9 @@ pub struct CreateRunnerBody {
     pub price_mode: Option<String>,
     #[serde(default)]
     pub max_spread_pct: Option<f64>,
+    /// Engine kind — None or "rhai_candle" = legacy default.
+    #[serde(default)]
+    pub kind: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -4501,6 +4544,7 @@ pub async fn handle_api_live_create(
         max_entry_price: body.max_entry_price,
         price_mode: body.price_mode,
         max_spread_pct: body.max_spread_pct,
+        kind: body.kind,
     };
 
     if let Err(e) = hydrate_live_runtime_config(&state, &mut config).await {

@@ -505,6 +505,7 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript }: Crea
   const allSeries: MarketSeries[] = seriesData?.series ?? []
 
   const [form, setForm] = useState({
+    kind: 'rhai_candle' as string,
     name: '',
     script: defaultScript ?? scripts[0]?.path ?? '',
     market_type: 'polymarket_binary',
@@ -524,6 +525,8 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript }: Crea
     max_entry_price: 0.65 as number | null,
     max_spread_pct: 0.03 as number | null,
   })
+
+  const isEngineKind = form.kind !== 'rhai_candle'
   const [error, setError] = useState('')
   const [showMissingApiKeyModal, setShowMissingApiKeyModal] = useState(false)
   const [showMissingPrivateKeyModal, setShowMissingPrivateKeyModal] = useState(false)
@@ -619,6 +622,22 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript }: Crea
     }
   }
 
+  function onKindChange(newKind: string) {
+    if (newKind === 'rhai_candle') {
+      setForm(f => ({ ...f, kind: newKind }))
+    } else {
+      // Engine kinds always use polymarket_binary; reset symbol to slug placeholder
+      setForm(f => ({
+        ...f,
+        kind: newKind,
+        market_type: 'polymarket_binary',
+        mode: 'paper',
+        symbol: f.symbol || 'btc-usd-winner',
+        series_id: '',
+      }))
+    }
+  }
+
   const currentSeries = allSeries.length > 0
     ? allSeries.find(s => s.symbol === form.symbol && s.cadence === form.interval)
     : POLY_BINARY_PRESETS.find(p => p.symbol === form.symbol && p.defaultInterval === form.interval)
@@ -642,26 +661,76 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript }: Crea
           </div>
 
           <div>
-            <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>Strategy Script</label>
-            <select className="w-full rounded px-3 py-2 text-sm font-mono" value={form.script}
-              onChange={e => set('script', e.target.value)}>
-              {scripts.map(s => (
-                <option key={s.path} value={s.path}>
-                  {s.name} {s.last_run_stats ? `(${(s.last_run_stats.win_rate_pct ?? 0).toFixed(1)}% WR)` : ''}
-                </option>
-              ))}
+            <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>Strategy Engine</label>
+            <select className="w-full rounded px-3 py-2 text-sm" value={form.kind}
+              onChange={e => onKindChange(e.target.value)}>
+              <option value="rhai_candle">Rhai Script (default)</option>
+              <option value="arb_binary">Arb Binary — synthetic arb YES+NO</option>
+              <option value="fair_value">Fair Value — FV edge estimator</option>
+              <option value="fv_momentum">FV + Momentum — AND-gate FV &amp; trend</option>
+              <option value="rotation_compounder">Rotation Compounder — Kelly scoring</option>
+              <option value="arb_hedge">Arb + Hedge Overlay — HYB-02</option>
+              <option value="minting_mm">Minting MM — CTF mint/merge cycle</option>
             </select>
+            {isEngineKind && (
+              <p className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
+                Engine strategies run on Polymarket Binary markets. Dry Run mode is fully supported.
+              </p>
+            )}
           </div>
 
-          <div className="grid grid-cols-2 gap-3">
+          {!isEngineKind && (
             <div>
-              <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>Market Type</label>
-              <select className="w-full rounded px-3 py-2 text-sm" value={form.market_type}
-                onChange={e => onMarketTypeChange(e.target.value)}>
-                <option value="crypto">Crypto</option>
-                <option value="polymarket_binary">Polymarket Binary</option>
+              <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>Strategy Script</label>
+              <select className="w-full rounded px-3 py-2 text-sm font-mono" value={form.script}
+                onChange={e => set('script', e.target.value)}>
+                {scripts.map(s => (
+                  <option key={s.path} value={s.path}>
+                    {s.name} {s.last_run_stats ? `(${(s.last_run_stats.win_rate_pct ?? 0).toFixed(1)}% WR)` : ''}
+                  </option>
+                ))}
               </select>
             </div>
+          )}
+
+          {isEngineKind && (
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>Market Slugs</label>
+                <input
+                  className="w-full rounded px-3 py-2 text-sm font-mono"
+                  value={form.symbol}
+                  onChange={e => set('symbol', e.target.value)}
+                  placeholder="btc-usd-winner,eth-usd-winner"
+                />
+                <p className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-muted)' }}>Comma-separated Polymarket slugs</p>
+              </div>
+              <div>
+                <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>Threshold / Edge</label>
+                <input
+                  type="number"
+                  step="0.001"
+                  className="w-full rounded px-3 py-2 text-sm"
+                  value={form.threshold ?? ''}
+                  onChange={e => set('threshold', e.target.value === '' ? null : Number(e.target.value))}
+                  placeholder="0.03"
+                />
+                <p className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-muted)' }}>Min edge / arb spread (engine default if blank)</p>
+              </div>
+            </div>
+          )}
+
+          <div className={`grid gap-3 ${isEngineKind ? 'grid-cols-1' : 'grid-cols-2'}`}>
+            {!isEngineKind && (
+              <div>
+                <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>Market Type</label>
+                <select className="w-full rounded px-3 py-2 text-sm" value={form.market_type}
+                  onChange={e => onMarketTypeChange(e.target.value)}>
+                  <option value="crypto">Crypto</option>
+                  <option value="polymarket_binary">Polymarket Binary</option>
+                </select>
+              </div>
+            )}
             <div>
               <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>Mode</label>
               <SegmentedToggle
@@ -670,12 +739,12 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript }: Crea
                 leftLabel="Dry Run"
                 rightLabel="Live"
                 activeColor={form.mode === 'live' ? 'var(--color-warning)' : 'var(--color-accent)'}
-                disabled={form.market_type !== 'polymarket_binary'}
+                disabled={!isEngineKind && form.market_type !== 'polymarket_binary'}
               />
             </div>
           </div>
 
-          {form.market_type === 'polymarket_binary' ? (
+          {!isEngineKind && form.market_type === 'polymarket_binary' && (
             <div>
               <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>Market Series</label>
               <select
@@ -694,7 +763,9 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript }: Crea
                 {form.threshold !== null ? <> {' · '}Threshold: <span className="font-mono">{form.threshold}</span></> : null}
               </p>
             </div>
-          ) : (
+          )}
+
+          {!isEngineKind && form.market_type !== 'polymarket_binary' && (
             <div className="grid grid-cols-2 gap-3">
               <div>
                 <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>Symbol</label>
@@ -913,7 +984,7 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript }: Crea
                 This will send <strong>real orders</strong> to Polymarket via the CLOB API using your configured wallet.
                 Ensure your Polymarket API key, secret, and passphrase are set in <strong>Settings → Config</strong> before starting.
               </p>
-              {form.market_type !== 'polymarket_binary' && (
+              {!isEngineKind && form.market_type !== 'polymarket_binary' && (
                 <p className="font-medium">Live mode is only supported for Polymarket Binary markets.</p>
               )}
             </div>
@@ -926,13 +997,13 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript }: Crea
           <button
             onClick={() => mutation.mutate()}
             disabled={
-              !form.script || !form.symbol || mutation.isPending ||
-              (form.mode === 'live' && form.market_type !== 'polymarket_binary')
+              (!isEngineKind && !form.script) || !form.symbol || mutation.isPending ||
+              (form.mode === 'live' && !isEngineKind && form.market_type !== 'polymarket_binary')
             }
             className="flex-1 py-2 rounded text-sm font-medium disabled:opacity-50"
             style={{ backgroundColor: 'var(--color-accent)', color: '#000' }}
           >
-            {mutation.isPending ? 'Starting...' : form.mode === 'live' ? 'Start Live Strategy' : 'Start Strategy'}
+            {mutation.isPending ? 'Starting...' : form.mode === 'live' ? 'Start Live Strategy' : 'Start Dry Run'}
           </button>
           <button onClick={onClose} className="px-4 py-2 rounded text-sm border hover:bg-white/5"
             style={{ borderColor: 'var(--color-border)' }}>Cancel</button>

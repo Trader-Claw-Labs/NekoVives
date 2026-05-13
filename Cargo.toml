@@ -8,6 +8,7 @@ members = [
     "crates/polymarket-trader",
     "crates/market-analyzer",
     "crates/claw-api",
+    "crates/strategy-core",
 ]
 resolver = "2"
 
@@ -111,6 +112,7 @@ polymarket-trader = { path = "crates/polymarket-trader" }
 wallet-manager = { path = "crates/wallet-manager" }
 solana-trader = { path = "crates/solana-trader" }
 evm-trader = { path = "crates/evm-trader" }
+strategy-core = { path = "crates/strategy-core" }
 
 # Memory / persistence
 rusqlite = { version = "0.37", features = ["bundled"] }

@@ -66,6 +66,7 @@ pub mod runtime;
 pub(crate) mod security;
 pub(crate) mod service;
 pub(crate) mod skills;
+pub mod engines;
 pub mod live_feed;
 pub mod strategy_runner;
 pub mod tools;
