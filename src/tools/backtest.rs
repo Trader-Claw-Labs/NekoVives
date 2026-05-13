@@ -2934,17 +2934,16 @@ fn run_polymarket_slug_backtest(
         let mut s = ss.lock().unwrap();
         if !s.pending_buy && !s.pending_sell && s.balance > 0.0 { s.pending_sell = true; }
     });
-    let sset = state.clone();
-    engine.register_fn("set_impl", move |key: String, val: f64| {
-        sset.lock().unwrap().kv.insert(key, val);
-    });
-    let sset_i = state.clone();
-    engine.register_fn("set_impl", move |key: String, val: i64| {
-        sset_i.lock().unwrap().kv.insert(key, val as f64);
+    let sset_d = state.clone();
+    engine.register_fn("set_impl", move |key: String, val: rhai::Dynamic| {
+        if let Some(f) = dynamic_to_f64(&val) {
+            sset_d.lock().unwrap().kv.insert(key, f);
+        }
     });
     let sget = state.clone();
-    engine.register_fn("get_impl", move |key: String, def: f64| -> f64 {
-        sget.lock().unwrap().kv.get(&key).copied().unwrap_or(def)
+    engine.register_fn("get_impl", move |key: String, def: rhai::Dynamic| -> f64 {
+        let d = dynamic_to_f64(&def).unwrap_or(0.0);
+        sget.lock().unwrap().kv.get(&key).copied().unwrap_or(d)
     });
 
     let ast = engine.compile(&patched_script)
@@ -3792,17 +3791,16 @@ pub fn run_polymarket_live_signal(
         .map(|(k, v)| (k.clone(), *v))
         .collect();
     let kv = Arc::new(Mutex::new(kv_seed_clean));
-    let kv_set = kv.clone();
-    engine.register_fn("set_impl", move |key: String, val: f64| {
-        kv_set.lock().unwrap().insert(key, val);
-    });
-    let kv_set_i = kv.clone();
-    engine.register_fn("set_impl", move |key: String, val: i64| {
-        kv_set_i.lock().unwrap().insert(key, val as f64);
+    let kv_set_d = kv.clone();
+    engine.register_fn("set_impl", move |key: String, val: rhai::Dynamic| {
+        if let Some(f) = dynamic_to_f64(&val) {
+            kv_set_d.lock().unwrap().insert(key, f);
+        }
     });
     let kv_get = kv.clone();
-    engine.register_fn("get_impl", move |key: String, def: f64| -> f64 {
-        kv_get.lock().unwrap().get(&key).copied().unwrap_or(def)
+    engine.register_fn("get_impl", move |key: String, def: rhai::Dynamic| -> f64 {
+        let d = dynamic_to_f64(&def).unwrap_or(0.0);
+        kv_get.lock().unwrap().get(&key).copied().unwrap_or(d)
     });
 
     let ast = engine.compile(&patched_script)
@@ -4092,17 +4090,16 @@ pub fn run_polymarket_bt_signal_preview(
         if !s.pending_buy && !s.pending_sell { s.pending_sell = true; }
         s.size = frac;
     });
-    let sset = state.clone();
-    engine.register_fn("set_impl", move |key: String, val: f64| {
-        sset.lock().unwrap().kv.insert(key, val);
-    });
-    let sset_i = state.clone();
-    engine.register_fn("set_impl", move |key: String, val: i64| {
-        sset_i.lock().unwrap().kv.insert(key, val as f64);
+    let sset_d = state.clone();
+    engine.register_fn("set_impl", move |key: String, val: rhai::Dynamic| {
+        if let Some(f) = dynamic_to_f64(&val) {
+            sset_d.lock().unwrap().kv.insert(key, f);
+        }
     });
     let sget = state.clone();
-    engine.register_fn("get_impl", move |key: String, def: f64| -> f64 {
-        sget.lock().unwrap().kv.get(&key).copied().unwrap_or(def)
+    engine.register_fn("get_impl", move |key: String, def: rhai::Dynamic| -> f64 {
+        let d = dynamic_to_f64(&def).unwrap_or(0.0);
+        sget.lock().unwrap().kv.get(&key).copied().unwrap_or(d)
     });
 
     let ast = engine.compile(&patched_script)
