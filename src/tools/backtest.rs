@@ -956,6 +956,18 @@ fn parse_polymarket_prices(body: &str) -> anyhow::Result<Vec<Candle>> {
 
 // ── Technical indicators ─────────────────────────────────────────────
 
+/// Convert a Rhai `Dynamic` value to `f64` when possible.
+///
+/// Used by `set_impl(String, Dynamic)` so scripts that accidentally pass `()`,
+/// a string, or another non-numeric type to `ctx.set(...)` don't crash the
+/// backtest run; the value is simply dropped instead.
+fn dynamic_to_f64(d: &rhai::Dynamic) -> Option<f64> {
+    if d.is::<f64>()  { return d.clone().as_float().ok(); }
+    if d.is::<i64>()  { return d.clone().as_int().ok().map(|i| i as f64); }
+    if d.is::<bool>() { return d.clone().as_bool().ok().map(|b| if b { 1.0 } else { 0.0 }); }
+    None
+}
+
 fn compute_ema(values: &[f64], period: usize) -> Vec<f64> {
     if values.len() < period { return vec![0.0; values.len()]; }
     let k = 2.0 / (period as f64 + 1.0);
@@ -1737,17 +1749,18 @@ let ctx = #{
             });
 
             // ctx.set(key, val) / ctx.get(key, default)
-            let sset = state_set.clone();
-            eng2.register_fn("set_impl", move |key: String, val: f64| {
-                sset.lock().unwrap().kv.insert(key, val);
-            });
-            let sset_i = state_set.clone();
-            eng2.register_fn("set_impl", move |key: String, val: i64| {
-                sset_i.lock().unwrap().kv.insert(key, val as f64);
+            // Single Dynamic overload accepts f64/i64/bool/()/string — avoids
+            // Rhai overload-resolution mismatches when scripts pass `()`.
+            let sset_d = state_set.clone();
+            eng2.register_fn("set_impl", move |key: String, val: rhai::Dynamic| {
+                if let Some(f) = dynamic_to_f64(&val) {
+                    sset_d.lock().unwrap().kv.insert(key, f);
+                }
             });
             let sget = state_get.clone();
-            eng2.register_fn("get_impl", move |key: String, default: f64| -> f64 {
-                sget.lock().unwrap().kv.get(&key).copied().unwrap_or(default)
+            eng2.register_fn("get_impl", move |key: String, default: rhai::Dynamic| -> f64 {
+                let def = dynamic_to_f64(&default).unwrap_or(0.0);
+                sget.lock().unwrap().kv.get(&key).copied().unwrap_or(def)
             });
 
             // Re-compile the script with our engine + a shim that maps ctx.* methods
@@ -2499,17 +2512,16 @@ fn run_polymarket_binary_backtest(
         });
 
         // ── Key-value store ──────────────────────────────────────────────────
-        let sset = state.clone();
-        eng.register_fn("set_impl", move |key: String, val: f64| {
-            sset.lock().unwrap().kv.insert(key, val);
-        });
-        let sset_i = state.clone();
-        eng.register_fn("set_impl", move |key: String, val: i64| {
-            sset_i.lock().unwrap().kv.insert(key, val as f64);
+        let sset_d = state.clone();
+        eng.register_fn("set_impl", move |key: String, val: rhai::Dynamic| {
+            if let Some(f) = dynamic_to_f64(&val) {
+                sset_d.lock().unwrap().kv.insert(key, f);
+            }
         });
         let sget = state.clone();
-        eng.register_fn("get_impl", move |key: String, def: f64| -> f64 {
-            sget.lock().unwrap().kv.get(&key).copied().unwrap_or(def)
+        eng.register_fn("get_impl", move |key: String, def: rhai::Dynamic| -> f64 {
+            let d = dynamic_to_f64(&def).unwrap_or(0.0);
+            sget.lock().unwrap().kv.get(&key).copied().unwrap_or(d)
         });
 
         // ── Run script for this candle ────────────────────────────────────────
