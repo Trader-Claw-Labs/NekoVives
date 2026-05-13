@@ -718,6 +718,18 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             post(api::handle_api_polymarket_refresh_credentials),
         )
         .route(
+            "/api/polymarket/setup/verify-wallet",
+            post(api::handle_api_polymarket_setup_verify_wallet),
+        )
+        .route(
+            "/api/polymarket/setup/detect-proxy",
+            post(api::handle_api_polymarket_setup_detect_proxy),
+        )
+        .route(
+            "/api/polymarket/setup/generate-creds",
+            post(api::handle_api_polymarket_setup_generate_creds),
+        )
+        .route(
             "/api/polymarket/positions",
             get(api::handle_api_polymarket_positions),
         )

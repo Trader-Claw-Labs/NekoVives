@@ -1956,6 +1956,291 @@ pub async fn handle_api_polymarket_diagnose_auth(
     })).into_response()
 }
 
+// ── Setup wizard endpoints ─────────────────────────────────────────────────
+//
+// The wizard guides a new user through 4 steps:
+//   1. POST /api/polymarket/setup/verify-wallet      → verify the PK derives a real EOA on Polygon,
+//                                                       check whether it's a smart-account (EIP-7702).
+//   2. POST /api/polymarket/setup/detect-proxy       → query Polymarket Data API for the user's
+//                                                       Builder/Polymarket proxy address and detect
+//                                                       its on-chain type (Safe, EIP-1167, custom).
+//   3. POST /api/polymarket/setup/generate-creds     → derive (or create) L2 credentials, save to config.
+//   4. (existing) POST /api/polymarket/test          → test order signing flow.
+
+#[derive(serde::Deserialize)]
+pub struct SetupVerifyWalletBody {
+    pub private_key: String,
+}
+
+/// POST /api/polymarket/setup/verify-wallet
+///
+/// Validates the private key format, derives the EOA address, and inspects on-chain
+/// bytecode to detect EIP-7702 smart accounts (which require `signature_type=poly1271`).
+pub async fn handle_api_polymarket_setup_verify_wallet(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<SetupVerifyWalletBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+
+    let pk_hex = body.private_key.trim().trim_start_matches("0x");
+    if pk_hex.len() != 64 || !pk_hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "Invalid private key format. Expected 64-character hex (with or without 0x prefix)."
+        }))).into_response();
+    }
+
+    // Derive the EOA via the polymarket-trader auth helper (which owns the k256 dep).
+    // We fail through derive_api_key which uses the same address derivation path.
+    let eoa_address = match polymarket_trader::auth::eoa_address_from_pk_hex(pk_hex) {
+        Ok(a) => a,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": format!("Invalid private key: {e}")
+        }))).into_response(),
+    };
+    let bytecode = fetch_polygon_bytecode(&eoa_address).await.unwrap_or_default();
+    let (account_type, suggested_sig_type) = classify_bytecode(&bytecode);
+
+    Json(serde_json::json!({
+        "eoa_address": eoa_address,
+        "account_type": account_type,
+        "is_smart_account": bytecode.starts_with("0xef0100") || (!bytecode.is_empty() && bytecode != "0x"),
+        "suggested_signature_type": suggested_sig_type,
+    })).into_response()
+}
+
+#[derive(serde::Deserialize)]
+pub struct SetupDetectProxyBody {
+    pub eoa_address: String,
+    /// Optional: if user already has a known proxy address, verify it instead of auto-detecting.
+    #[serde(default)]
+    pub proxy_address: Option<String>,
+}
+
+/// POST /api/polymarket/setup/detect-proxy
+///
+/// Inspects on-chain bytecode of the candidate proxy address to determine its type
+/// (Gnosis Safe, EIP-1167, Polymarket custom proxy, etc.) and the appropriate
+/// signature_type for the SDK.
+pub async fn handle_api_polymarket_setup_detect_proxy(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<SetupDetectProxyBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+
+    let proxy_address = match body.proxy_address.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(p) => p.to_string(),
+        None => {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "error": "Auto-detection of proxy address requires the user to paste it from the Polymarket dashboard. Provide `proxy_address` in the request body."
+            }))).into_response();
+        }
+    };
+
+    if !proxy_address.starts_with("0x") || proxy_address.len() != 42 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "Invalid proxy address format. Expected 0x-prefixed 40-hex-char address."
+        }))).into_response();
+    }
+
+    let bytecode = fetch_polygon_bytecode(&proxy_address).await.unwrap_or_default();
+    let (proxy_type, suggested_sig_type) = classify_bytecode(&bytecode);
+    let owner_in_bytecode = extract_embedded_owner(&bytecode);
+
+    let owner_match = match (&owner_in_bytecode, body.eoa_address.as_str()) {
+        (Some(owner), eoa) if !eoa.is_empty() => owner.to_lowercase() == eoa.to_lowercase(),
+        _ => false,
+    };
+
+    Json(serde_json::json!({
+        "proxy_address": proxy_address,
+        "proxy_type": proxy_type,
+        "suggested_signature_type": suggested_sig_type,
+        "owner_embedded": owner_in_bytecode,
+        "owner_matches_eoa": owner_match,
+        "is_contract": !bytecode.is_empty() && bytecode != "0x",
+    })).into_response()
+}
+
+#[derive(serde::Deserialize)]
+pub struct SetupGenerateCredsBody {
+    pub private_key: String,
+    pub wallet_address: String,
+    #[serde(default)]
+    pub proxy_address: Option<String>,
+    #[serde(default)]
+    pub signature_type: Option<String>,
+    /// "create" → POST /auth/api-key (first time setup)
+    /// "derive" → GET /auth/derive-api-key (recover existing creds)
+    /// "auto"   → try derive first, fall back to create
+    #[serde(default = "default_creds_mode")]
+    pub mode: String,
+    /// Whether to persist credentials to config.toml. If false, credentials
+    /// are returned to the caller without saving (preview mode).
+    #[serde(default = "default_persist")]
+    pub persist: bool,
+    #[serde(default)]
+    pub is_builder: Option<bool>,
+}
+
+fn default_creds_mode() -> String { "auto".to_string() }
+fn default_persist() -> bool { true }
+
+/// POST /api/polymarket/setup/generate-creds
+///
+/// Generates Polymarket L2 credentials (api_key, secret, passphrase) for the supplied
+/// private key. Either creates new (first time) or derives existing.
+/// Persists them along with wallet_address, proxy_address and signature_type to config.toml.
+pub async fn handle_api_polymarket_setup_generate_creds(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<SetupGenerateCredsBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+
+    let pk = body.private_key.trim().trim_start_matches("0x").to_string();
+    if pk.len() != 64 || !pk.chars().all(|c| c.is_ascii_hexdigit()) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "Invalid private key format."
+        }))).into_response();
+    }
+
+    let mode = body.mode.to_lowercase();
+    let mut last_error = String::new();
+    let mut method_used = "";
+    let creds_result: Option<polymarket_trader::auth::PolyCredentials> = match mode.as_str() {
+        "create" => {
+            method_used = "create";
+            polymarket_trader::auth::setup_credentials(&pk, None).await
+                .map_err(|e| last_error = format!("create: {e:#}")).ok()
+        }
+        "derive" => {
+            method_used = "derive";
+            polymarket_trader::auth::derive_api_key(&pk).await
+                .map_err(|e| last_error = format!("derive: {e:#}")).ok()
+        }
+        _ => {
+            // auto: try derive first (more permissive), fall back to create
+            match polymarket_trader::auth::derive_api_key(&pk).await {
+                Ok(c) => { method_used = "derive"; Some(c) }
+                Err(de) => {
+                    last_error = format!("derive: {de:#}");
+                    match polymarket_trader::auth::setup_credentials(&pk, None).await {
+                        Ok(c) => { method_used = "create"; Some(c) }
+                        Err(ce) => {
+                            last_error = format!("derive failed ({de:#}); create failed ({ce:#})");
+                            None
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    let creds = match creds_result {
+        Some(c) => c,
+        None => return (StatusCode::BAD_GATEWAY, Json(serde_json::json!({
+            "success": false,
+            "error": last_error,
+        }))).into_response(),
+    };
+
+    if body.persist {
+        let mut config = state.config.lock().clone();
+        config.polymarket = crate::config::schema::PolymarketConfig {
+            api_key: Some(creds.api_key.clone()),
+            secret: Some(creds.secret.clone()),
+            passphrase: Some(creds.passphrase.clone()),
+            wallet_address: Some(body.wallet_address.clone()),
+            private_key: Some(pk),
+            is_builder: body.is_builder.or(config.polymarket.is_builder),
+            proxy_address: body.proxy_address.clone().filter(|p| !p.trim().is_empty()),
+            signature_type: body.signature_type.clone().filter(|s| !s.trim().is_empty()),
+        };
+        if let Err(e) = config.save().await {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "success": false,
+                "error": format!("Failed to save config: {e}"),
+            }))).into_response();
+        }
+        *state.config.lock() = config;
+    }
+
+    Json(serde_json::json!({
+        "success": true,
+        "method_used": method_used,
+        "api_key": creds.api_key,
+        "api_key_masked": mask_token(&creds.api_key),
+        "secret_masked": mask_token(&creds.secret),
+        "passphrase_masked": mask_token(&creds.passphrase),
+        "wallet_address": creds.wallet_address,
+        "persisted": body.persist,
+    })).into_response()
+}
+
+fn mask_token(s: &str) -> String {
+    if s.len() <= 8 { "•".repeat(s.len()) }
+    else { format!("{}…{}", &s[..4], &s[s.len()-4..]) }
+}
+
+/// Reads bytecode at an address from a public Polygon RPC.
+/// Returns "0x" if the address has no code (pure EOA), or the deployed bytecode.
+async fn fetch_polygon_bytecode(addr: &str) -> Option<String> {
+    let rpcs = ["https://polygon.drpc.org", "https://1rpc.io/matic", "https://polygon-bor-rpc.publicnode.com"];
+    let body = serde_json::json!({
+        "jsonrpc":"2.0","method":"eth_getCode","id":1,
+        "params":[addr.to_lowercase(), "latest"],
+    });
+    let client = reqwest::Client::new();
+    for rpc in rpcs {
+        let resp = match client.post(rpc).timeout(std::time::Duration::from_secs(8)).json(&body).send().await {
+            Ok(r) => r, Err(_) => continue,
+        };
+        if !resp.status().is_success() { continue; }
+        let json: serde_json::Value = match resp.json().await { Ok(v) => v, Err(_) => continue };
+        if let Some(code) = json.get("result").and_then(|v| v.as_str()) {
+            return Some(code.to_string());
+        }
+    }
+    None
+}
+
+/// Classifies on-chain bytecode and returns (account_type, suggested_signature_type).
+fn classify_bytecode(code: &str) -> (&'static str, &'static str) {
+    if code.is_empty() || code == "0x" {
+        return ("eoa", "eoa");
+    }
+    if code.starts_with("0xef0100") {
+        // EIP-7702 delegate to a smart contract (MetaMask Smart Account, Coinbase Smart Wallet, etc.)
+        return ("eip7702_smart_account", "poly1271");
+    }
+    if code.starts_with("0x363d3d373d3d3d363d73") {
+        // Standard EIP-1167 minimal proxy clone (Magic/email Polymarket accounts).
+        return ("eip1167_proxy", "proxy");
+    }
+    if code.starts_with("0x363d3d373d3d363d7f") {
+        // Polymarket's custom proxy factory (introduced ~April 2026 for new accounts).
+        // Parametrized with the owner EOA in the trailing bytecode.
+        return ("polymarket_custom_proxy", "poly1271");
+    }
+    if code.starts_with("0x6080") {
+        // Generic Solidity contract — likely Gnosis Safe or similar.
+        return ("contract", "gnosis_safe");
+    }
+    ("contract", "poly1271")
+}
+
+/// Extracts the owner address embedded at the end of a Polymarket custom proxy bytecode.
+/// Polymarket's factory templates the owner EOA into the last 20 bytes.
+fn extract_embedded_owner(code: &str) -> Option<String> {
+    let hex = code.trim_start_matches("0x");
+    if hex.len() < 40 { return None; }
+    let owner_hex = &hex[hex.len()-40..];
+    if owner_hex.chars().all(|c| c == '0') { return None; }
+    Some(format!("0x{}", owner_hex))
+}
+
 /// POST /api/polymarket/refresh-credentials — derive fresh API credentials via L1 EIP-712 auth.
 ///
 /// Uses the private key from config to sign a ClobAuth message and call
