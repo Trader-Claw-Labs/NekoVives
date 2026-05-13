@@ -211,6 +211,8 @@ pub async fn run_engine_backtest(params: EngineBacktestParams<'_>) -> BacktestMe
         historical_data_coverage_pct: None,
         recommended_max_stake_usd:    None,
         flat_debugs:                  vec![],
+        position:                     0.0,
+        kv_state:                     std::collections::HashMap::new(),
     }
 }
 

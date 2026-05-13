@@ -796,7 +796,7 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript }: Crea
             </div>
           </div>
 
-          {!isEngineKind && form.market_type === 'polymarket_binary' && (
+          {!isEngineKind && form.market_type === 'polymarket_binary' ? (
             <div>
               <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>Market Series</label>
               <select
@@ -815,7 +815,7 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript }: Crea
                 {form.threshold !== null ? <> {' · '}Threshold: <span className="font-mono">{form.threshold}</span></> : null}
               </p>
             </div>
-          ) : form.market_type === 'funding_arb' ? (
+          ) : !isEngineKind && form.market_type === 'funding_arb' ? (
             <div>
               <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>Watchlist</label>
               <input className="w-full rounded px-3 py-2 text-sm font-mono" value={form.funding_watchlist}

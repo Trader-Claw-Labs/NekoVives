@@ -514,6 +514,7 @@ impl StrategyRunnerStore {
                 live_wins: 0,
                 live_total_trades: 0,
                 all_trades: vec![],
+                live_kv_state: std::collections::HashMap::new(),
             });
             f(result);
             runner.status.last_tick_at = Some(chrono::Utc::now().to_rfc3339());
@@ -627,15 +628,6 @@ async fn runner_loop(
     workspace_dir: PathBuf,
     config_path: Option<PathBuf>,
 ) {
-    // Dispatch to the correct loop based on market type
-    if config.market_type == "polymarket_binary" {
-        polymarket_runner_loop(store, config, workspace_dir, config_path).await;
-    } else if config.market_type == "funding_arb" {
-        funding_arb_runner_loop(store, config, workspace_dir).await;
-    } else {
-        crypto_runner_loop(store, config, workspace_dir).await;
-    }
-
     // Dispatch to the correct loop based on engine kind (new) or market_type (legacy).
     // New engine kinds short-circuit before the legacy market_type dispatch so that
     // existing runners continue to work without any config changes.
@@ -663,6 +655,8 @@ async fn runner_loop(
         _ => {
             if config.market_type == "polymarket_binary" {
                 polymarket_runner_loop(store, config, workspace_dir, config_path).await;
+            } else if config.market_type == "funding_arb" {
+                funding_arb_runner_loop(store, config, workspace_dir).await;
             } else {
                 crypto_runner_loop(store, config, workspace_dir).await;
             }
@@ -1883,13 +1877,25 @@ async fn polymarket_runner_loop(
         }
     };
 
-    // ─ Live mode: validate credentials/token and build CLOB client
+    // ─ Live mode: validate credentials and build CLOB client.
+    //
+    // Token IDs are resolved dynamically per window in the main loop (see
+    // `resolve_token_for_window` at the `current_window != last_window`
+    // boundary). We do NOT require a token to be pre-populated on entry:
+    //   - On first window, `last_window = -1` triggers resolve immediately.
+    //   - On manual restart after a stop, the persisted config has
+    //     `poly_token_id = None` (it's #[serde(skip)]) and the rehydrate path
+    //     may not populate it if the slug for the current minute hasn't been
+    //     listed yet by Polymarket (transient).
+    // Failing here would leave the runner stuck in error until manually
+    // recreated. Instead we proceed and let the per-window resolver retry
+    // with backoff every minute until the slug appears.
     let mut clob_client: Option<std::sync::Arc<polymarket_trader::orders::ClobClient>> = if is_live {
-        if config.poly_token_id.as_deref().unwrap_or("").trim().is_empty() {
+        if config.series_id.as_deref().unwrap_or("").trim().is_empty() {
             set_runner_error(
                 &store,
                 &id,
-                "Live mode cannot start: no Polymarket token resolved for this series. Recreate the strategy and ensure a valid market series is selected.",
+                "Live mode cannot start: no Market Series selected. Recreate the strategy and choose a supported series (BTC/ETH/SOL/...).",
             );
             return;
         }

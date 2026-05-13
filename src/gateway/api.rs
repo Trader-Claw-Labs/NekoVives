@@ -4609,6 +4609,39 @@ pub struct CreateRunnerBody {
     pub price_mode: Option<String>,
     #[serde(default)]
     pub max_spread_pct: Option<f64>,
+    #[serde(default)]
+    pub allowed_hours: Option<Vec<u8>>,
+    #[serde(default)]
+    pub rv_min_btc: Option<f64>,
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Wallet password for decrypting EVM key (live CEX modes only). Never persisted.
+    #[serde(default)]
+    pub wallet_password: Option<String>,
+    /// Binance Futures API credentials (live funding_arb / cex). Never persisted.
+    #[serde(default)]
+    pub binance_api_key: Option<String>,
+    #[serde(default)]
+    pub binance_api_secret: Option<String>,
+    /// Funding-arb watchlist + tunables.
+    #[serde(default)]
+    pub funding_watchlist: Option<Vec<String>>,
+    #[serde(default)]
+    pub min_apr_diff: Option<f64>,
+    #[serde(default)]
+    pub force_close_diff: Option<f64>,
+    #[serde(default)]
+    pub max_open_pairs: Option<usize>,
+    #[serde(default)]
+    pub max_pos_pct: Option<f64>,
+    #[serde(default)]
+    pub funding_poll_secs: Option<u64>,
+    #[serde(default)]
+    pub fee_buffer_bps: Option<f64>,
+    #[serde(default)]
+    pub chainlink_endpoint_url: Option<String>,
+    #[serde(default)]
+    pub chainlink_interval_secs: Option<u64>,
 }
 
 #[derive(serde::Deserialize)]
@@ -4969,6 +5002,21 @@ pub async fn handle_api_live_create(
         max_entry_price: body.max_entry_price,
         price_mode: body.price_mode,
         max_spread_pct: body.max_spread_pct,
+        allowed_hours: body.allowed_hours.unwrap_or_default(),
+        rv_min_btc: body.rv_min_btc.filter(|&v| v > 0.0),
+        hl_signer: None,
+        risk_gate: state.trading_risk_gate.clone(),
+        binance_creds: None,
+        funding_watchlist: body.funding_watchlist.unwrap_or_else(|| {
+            ["BTC", "ETH", "SOL", "AVAX"].iter().map(|s| s.to_string()).collect()
+        }),
+        min_apr_diff: body.min_apr_diff.unwrap_or(0.10),
+        force_close_diff: body.force_close_diff.unwrap_or(0.02),
+        max_open_pairs: body.max_open_pairs.unwrap_or(4),
+        max_pos_pct: body.max_pos_pct.unwrap_or(0.15),
+        funding_poll_secs: body.funding_poll_secs.unwrap_or(60),
+        fee_buffer_bps: body.fee_buffer_bps.unwrap_or(12.0),
+        kind: body.kind,
     };
 
     // Populate Binance credentials if provided (live mode only, never persisted)
