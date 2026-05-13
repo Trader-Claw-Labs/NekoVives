@@ -16,6 +16,7 @@
 //! [`all_tools_with_runtime`]. See `AGENTS.md` §7.3 for the full change playbook.
 
 pub mod backtest;
+pub mod engine_backtest;
 pub mod script_migrator;
 pub mod series;
 pub mod browser;

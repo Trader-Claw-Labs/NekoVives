@@ -96,6 +96,12 @@ pub struct RunnerConfig {
     /// like 1.0 to disable the gate entirely.
     #[serde(default)]
     pub max_spread_pct: Option<f64>,
+    /// Engine kind identifier.  `None` (or "rhai_candle") = legacy Rhai path.
+    /// New values: "arb_binary", "minting_mm", "rotation_compounder",
+    /// "fair_value", "fv_momentum".  Serialised configs without this field
+    /// continue to work unchanged because of the serde default.
+    #[serde(default)]
+    pub kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -400,6 +406,39 @@ impl StrategyRunnerStore {
     pub fn register_handle(&self, id: String, handle: AbortHandle) {
         self.handles.lock().unwrap().insert(id, handle);
     }
+
+    /// Mutate the `RunnerResult` of an existing runner in-place.
+    /// Creates a default result if none exists yet.  Used by new-style engines.
+    pub fn update_result<F>(&self, id: &str, f: F)
+    where
+        F: FnOnce(&mut RunnerResult),
+    {
+        let mut map = self.runners.lock().unwrap();
+        if let Some(runner) = map.get_mut(id) {
+            let result = runner.result.get_or_insert_with(|| RunnerResult {
+                total_return_pct: 0.0,
+                balance: runner.config.initial_balance,
+                position: 0.0,
+                total_trades: 0,
+                win_rate_pct: 0.0,
+                sharpe_ratio: 0.0,
+                max_drawdown_pct: 0.0,
+                last_signal: "none".to_string(),
+                analysis: String::new(),
+                live_feed: None,
+                wallet_address: None,
+                wallet_balance_usdc: None,
+                live_orders: vec![],
+                live_wins: 0,
+                live_total_trades: 0,
+                all_trades: vec![],
+            });
+            f(result);
+            runner.status.last_tick_at = Some(chrono::Utc::now().to_rfc3339());
+        }
+        drop(map);
+        self.persist();
+    }
 }
 
 // ── Start a new runner ───────────────────────────────────────────────────────
@@ -443,11 +482,37 @@ async fn runner_loop(
     workspace_dir: PathBuf,
     config_path: Option<PathBuf>,
 ) {
-    // Dispatch to the correct loop based on market type
-    if config.market_type == "polymarket_binary" {
-        polymarket_runner_loop(store, config, workspace_dir, config_path).await;
-    } else {
-        crypto_runner_loop(store, config, workspace_dir).await;
+    // Dispatch to the correct loop based on engine kind (new) or market_type (legacy).
+    // New engine kinds short-circuit before the legacy market_type dispatch so that
+    // existing runners continue to work without any config changes.
+    let kind = config.kind.as_deref().unwrap_or(strategy_core::engines::RHAI_CANDLE);
+    match kind {
+        strategy_core::engines::ARB_BINARY => {
+            crate::engines::arb_binary::run_arb_binary_loop(store, config, workspace_dir).await;
+        }
+        strategy_core::engines::MINTING_MM => {
+            crate::engines::minting_mm::run_minting_mm_loop(store, config, workspace_dir).await;
+        }
+        strategy_core::engines::ROTATION_COMPOUNDER => {
+            crate::engines::rotation_compounder::run_rotation_compounder_loop(store, config, workspace_dir).await;
+        }
+        strategy_core::engines::FAIR_VALUE => {
+            crate::engines::fair_value::run_fair_value_loop(store, config, workspace_dir).await;
+        }
+        strategy_core::engines::FV_MOMENTUM => {
+            crate::engines::fv_momentum::run_fv_momentum_loop(store, config, workspace_dir).await;
+        }
+        strategy_core::engines::ARB_HEDGE => {
+            crate::engines::arb_hedge::run_arb_hedge_loop(store, config, workspace_dir).await;
+        }
+        // "rhai_candle" or None → legacy path (unchanged behaviour)
+        _ => {
+            if config.market_type == "polymarket_binary" {
+                polymarket_runner_loop(store, config, workspace_dir, config_path).await;
+            } else {
+                crypto_runner_loop(store, config, workspace_dir).await;
+            }
+        }
     }
 }
 
@@ -2235,7 +2300,7 @@ fn eval_polymarket(
 
 // ── Store helpers ─────────────────────────────────────────────────────────────
 
-fn set_runner_error(store: &Arc<StrategyRunnerStore>, id: &str, msg: &str) {
+pub fn set_runner_error(store: &Arc<StrategyRunnerStore>, id: &str, msg: &str) {
     tracing::error!("[RUNNER {id}] Error: {msg}");
     let mut map = store.runners.lock().unwrap();
     if let Some(r) = map.get_mut(id) {
@@ -2246,7 +2311,7 @@ fn set_runner_error(store: &Arc<StrategyRunnerStore>, id: &str, msg: &str) {
     store.persist();
 }
 
-fn set_runner_status(store: &Arc<StrategyRunnerStore>, id: &str, status: &str) {
+pub fn set_runner_status(store: &Arc<StrategyRunnerStore>, id: &str, status: &str) {
     let mut map = store.runners.lock().unwrap();
     if let Some(r) = map.get_mut(id) {
         r.status.status = status.to_string();

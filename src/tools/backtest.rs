@@ -471,7 +471,7 @@ pub struct Candle {
 /// Fetch OHLCV candles from Binance REST API with pagination.
 /// Automatically fetches multiple batches to cover the full date range.
 /// Caches the result to `<workspace>/data/<symbol>_<interval>_<from>_<to>.json`.
-async fn fetch_candles(
+pub(crate) async fn fetch_candles(
     symbol: &str,
     interval: &str,
     from_date: &str,
