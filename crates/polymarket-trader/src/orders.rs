@@ -183,6 +183,23 @@ impl ClobClient {
                         auth
                     }
                 }
+                "poly1271" | "smart_account" | "eip1271" => {
+                    // EIP-1271 smart-contract wallet signatures (V2 orders).
+                    // Used by Polymarket's "deposit wallet" / smart-account flow,
+                    // including EIP-7702 delegated MetaMask accounts and other
+                    // contract wallets where the funder is not a Safe/Proxy that
+                    // the SDK can derive from the signing EOA.
+                    let funder_addr = self.creds.proxy_address.as_deref()
+                        .filter(|s| !s.is_empty())
+                        .and_then(|s| s.parse::<polymarket_client_sdk_v2::types::Address>().ok());
+                    if let Some(addr) = funder_addr {
+                        tracing::info!("CLOB auth: forced Poly1271 (EIP-1271) {}", addr);
+                        auth.funder(addr).signature_type(SignatureType::Poly1271)
+                    } else {
+                        tracing::warn!("CLOB auth: poly1271 requires explicit proxy_address; using EOA");
+                        auth
+                    }
+                }
                 other => {
                     tracing::warn!("CLOB auth: unknown signature_type '{}', falling back to auto-detect", other);
                     // fall through to auto-detect below by re-entering default path

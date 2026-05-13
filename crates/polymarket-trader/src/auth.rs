@@ -241,14 +241,38 @@ pub async fn setup_credentials(private_key_hex: &str, wallet_address: Option<&st
 /// passphrase that were created originally (derived from the signature as a seed).
 /// Use this for credential renewal — `POST /auth/api-key` (used by setup_credentials)
 /// fails with `"Could not create api key"` when one already exists.
+///
+/// `wallet_address` overrides the address sent in `POLY_ADDRESS`. Use this when
+/// the trading wallet (Safe / proxy / smart-account) is not the same as the EOA
+/// signer — Polymarket associates the API key with the address in `POLY_ADDRESS`,
+/// so this MUST match the funder/maker_address that orders will be signed against.
+/// When `None`, defaults to the EOA derived from the private key (correct for
+/// pure-EOA accounts and Gnosis Safes that the SDK can derive).
 pub async fn derive_api_key(private_key_hex: &str) -> Result<PolyCredentials> {
+    derive_api_key_for(private_key_hex, None).await
+}
+
+/// Derive the checksummed EOA address from a private key hex string.
+/// Exposed so the gateway crate can validate keys without depending on `k256`.
+pub fn eoa_address_from_pk_hex(private_key_hex: &str) -> Result<String> {
+    let key_bytes = hex::decode(private_key_hex.strip_prefix("0x").unwrap_or(private_key_hex))
+        .map_err(|e| PolyError::Auth(format!("Invalid private key hex: {e}")))?;
+    let signing_key = SigningKey::from_slice(&key_bytes)
+        .map_err(|e| PolyError::Auth(format!("Invalid private key bytes: {e}")))?;
+    Ok(address_from_signing_key(&signing_key))
+}
+
+pub async fn derive_api_key_for(
+    private_key_hex: &str,
+    wallet_address: Option<&str>,
+) -> Result<PolyCredentials> {
     let key_bytes = hex::decode(private_key_hex.strip_prefix("0x").unwrap_or(private_key_hex))
         .map_err(|e| PolyError::Auth(format!("Invalid private key hex: {e}")))?;
     let signing_key = SigningKey::from_slice(&key_bytes)
         .map_err(|e| PolyError::Auth(format!("Invalid private key: {e}")))?;
 
-    // L1 auth always uses the EOA signer address; proxy/Safe context is not relevant here
-    let address = address_from_signing_key(&signing_key);
+    let eoa_address = address_from_signing_key(&signing_key);
+    let address = wallet_address.map(str::to_string).unwrap_or(eoa_address);
 
     let timestamp = Utc::now().timestamp() as u64;
     let timestamp_str = timestamp.to_string();
