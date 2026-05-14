@@ -1487,8 +1487,22 @@ async fn crypto_runner_loop(
         config.fee_pct,
     );
     let mut last_position = initial_metrics.position;
-    let mut live_orders: Vec<LiveOrder> = Vec::new();
-    update_runner_result(&store, &id, &config, &initial_metrics, None, None, None, Some(live_orders.clone()), None, None, None).await;
+    // Rehydrate live_orders from the persisted store so paper/live trade
+    // history survives pause/restart cycles. Mirror what
+    // `polymarket_runner_loop` does at startup.
+    let mut live_orders: Vec<LiveOrder> = {
+        let map = store.runners.lock().unwrap();
+        map.get(&id)
+            .and_then(|r| r.result.as_ref().map(|res| res.live_orders.clone()))
+            .unwrap_or_default()
+    };
+    if !live_orders.is_empty() {
+        tracing::info!(
+            "[RUNNER {id}] Restored {} live_orders from persisted state",
+            live_orders.len()
+        );
+    }
+    update_runner_result(&store, &id, &config, &initial_metrics, None, None, None, None, None, None, None).await;
     set_runner_status(&store, &id, "running");
 
     // ─ Connect Binance WebSocket for real-time closed candles ──────────────────
@@ -2157,7 +2171,10 @@ async fn polymarket_runner_loop(
     let watchdog_sleep = tokio::time::sleep(std::time::Duration::from_secs(WATCHDOG_POLL_SECS));
     tokio::pin!(watchdog_sleep);
 
-    let mut watchdog_tripped = false;
+    // Always false now: the watchdog reconnects the feed in-place rather than
+    // exiting the runner. Kept so the post-loop block stays a no-op without
+    // needing to remove that branch.
+    let watchdog_tripped = false;
     loop {
         // Either a new closed candle arrives, the early-fire timer fires,
         // or the watchdog wakes up to check feed health.
@@ -2249,19 +2266,26 @@ async fn polymarket_runner_loop(
                 );
                 let stale_secs = last_candle_at.elapsed().as_secs();
                 if stale_secs >= WATCHDOG_STALL_SECS {
-                    tracing::error!(
-                        "[RUNNER {id}] WATCHDOG: no candle for {}s (>{}s limit) — exiting runner loop",
+                    // Feed is zombie — drop the receiver (which kills the
+                    // background WS task) and spawn a fresh one. Keeps the
+                    // runner alive across OS sleep / lid-close / network blip.
+                    tracing::warn!(
+                        "[RUNNER {id}] WATCHDOG: no candle for {}s (>{}s limit) — respawning feed",
                         stale_secs, WATCHDOG_STALL_SECS
                     );
                     append_runner_log(
                         &store, &id,
                         &format!(
-                            "WATCHDOG tripped: no WS candle for {}s. Runner will stop. auto_restart will relaunch if enabled.",
+                            "WATCHDOG: no WS candle for {}s — reconnecting feed (runner stays alive)",
                             stale_secs
                         ),
                     );
-                    watchdog_tripped = true;
-                    break; // exits the select, then exits the outer loop below
+                    candle_rx = crate::live_feed::spawn_binance_kline_feed(
+                        binance_sym.clone(), "1m".to_string(),
+                    );
+                    last_candle_at = tokio::time::Instant::now();
+                    watchdog_warned = false;
+                    continue;
                 } else if stale_secs >= WATCHDOG_WARN_SECS && !watchdog_warned {
                     tracing::warn!(
                         "[RUNNER {id}] WATCHDOG: no candle for {}s (warn threshold {}s)",
@@ -3904,14 +3928,37 @@ async fn update_runner_result(
         .or_else(|| metrics.all_trades.last().map(|t| t.side.clone()))
         .unwrap_or_else(|| "flat".to_string());
 
-    // Preserve existing live counters/orders + kv_state if not explicitly provided
+    // Preserve existing live counters/orders + kv_state if not explicitly
+    // provided. Defensive guard: if a caller passes an EMPTY vec (e.g. a
+    // freshly-allocated `Vec::new()` in a runner-loop init path) but the
+    // store already has a non-empty trade history, prefer the existing one.
+    // Without this guard, an init-time `update_runner_result(.., Some(vec![]), ..)`
+    // would silently wipe the dry-run / live history accumulated across
+    // pause/restart cycles.
     let (orders, wins, total, kv_state) = {
         let map = store.runners.lock().unwrap();
         if let Some(ref existing) = map.get(id).and_then(|r| r.result.as_ref()) {
+            let merged_orders = match live_orders {
+                Some(v) if v.is_empty() && !existing.live_orders.is_empty() => {
+                    existing.live_orders.clone()
+                }
+                Some(v) => v,
+                None => existing.live_orders.clone(),
+            };
+            let merged_wins = match live_wins {
+                Some(0) if existing.live_wins > 0 => existing.live_wins,
+                Some(v) => v,
+                None => existing.live_wins,
+            };
+            let merged_total = match live_total_trades {
+                Some(0) if existing.live_total_trades > 0 => existing.live_total_trades,
+                Some(v) => v,
+                None => existing.live_total_trades,
+            };
             (
-                live_orders.unwrap_or_else(|| existing.live_orders.clone()),
-                live_wins.unwrap_or(existing.live_wins),
-                live_total_trades.unwrap_or(existing.live_total_trades),
+                merged_orders,
+                merged_wins,
+                merged_total,
                 existing.live_kv_state.clone(),
             )
         } else {

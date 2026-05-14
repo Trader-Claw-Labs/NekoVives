@@ -6,7 +6,7 @@
 //! Other feed sources (Chainlink Data Streams, etc.) can be added here
 //! following the same `spawn_*` / mpsc pattern.
 
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
@@ -57,35 +57,57 @@ pub fn spawn_binance_kline_feed(
             tracing::info!("[LIVE_FEED] Connecting: {url}");
             match connect_async(&url).await {
                 Ok((ws, _)) => {
-                    let (_, mut read) = ws.split();
+                    let (mut write, mut read) = ws.split();
                     tracing::info!("[LIVE_FEED] Connected - streaming {symbol}@kline_{interval}");
+                    // Keepalive ping every 30s. If the connection is zombie
+                    // (NAT timeout / OS sleep / lid close), the send will fail
+                    // and we break out so the outer reconnect loop fires.
+                    let mut ping_ticker = tokio::time::interval(std::time::Duration::from_secs(30));
+                    ping_ticker.tick().await; // consume immediate first tick
+                    let mut had_error = false;
                     loop {
-                        match read.next().await {
-                            Some(Ok(Message::Text(text))) => {
-                                if let Ok(msg) = serde_json::from_str::<BinanceKlineMsg>(&text) {
-                                    if msg.k.is_closed {
-                                        let candle = LiveCandle {
-                                            open_time_ms: msg.k.t,
-                                            open:   msg.k.open.parse().unwrap_or(0.0),
-                                            high:   msg.k.high.parse().unwrap_or(0.0),
-                                            low:    msg.k.low.parse().unwrap_or(0.0),
-                                            close:  msg.k.close.parse().unwrap_or(0.0),
-                                            volume: msg.k.volume.parse().unwrap_or(0.0),
-                                        };
-                                        tracing::debug!("[LIVE_FEED] Closed candle close={}", candle.close);
-                                        if tx.send(candle).await.is_err() {
-                                            return; // receiver dropped
+                        tokio::select! {
+                            msg = read.next() => match msg {
+                                Some(Ok(Message::Text(text))) => {
+                                    if let Ok(parsed) = serde_json::from_str::<BinanceKlineMsg>(&text) {
+                                        if parsed.k.is_closed {
+                                            let candle = LiveCandle {
+                                                open_time_ms: parsed.k.t,
+                                                open:   parsed.k.open.parse().unwrap_or(0.0),
+                                                high:   parsed.k.high.parse().unwrap_or(0.0),
+                                                low:    parsed.k.low.parse().unwrap_or(0.0),
+                                                close:  parsed.k.close.parse().unwrap_or(0.0),
+                                                volume: parsed.k.volume.parse().unwrap_or(0.0),
+                                            };
+                                            tracing::debug!("[LIVE_FEED] Closed candle close={}", candle.close);
+                                            if tx.send(candle).await.is_err() {
+                                                return; // receiver dropped
+                                            }
                                         }
                                     }
                                 }
+                                Some(Ok(Message::Ping(payload))) => {
+                                    let _ = write.send(Message::Pong(payload)).await;
+                                }
+                                Some(Ok(_)) => {}
+                                Some(Err(e)) => {
+                                    tracing::warn!("[LIVE_FEED] WebSocket error: {e}");
+                                    had_error = true;
+                                    break;
+                                }
+                                None => break,
+                            },
+                            _ = ping_ticker.tick() => {
+                                if let Err(e) = write.send(Message::Ping(Default::default())).await {
+                                    tracing::warn!("[LIVE_FEED] Ping send failed: {e} — connection likely zombie, reconnecting");
+                                    had_error = true;
+                                    break;
+                                }
                             }
-                            Some(Ok(_)) => {}
-                            Some(Err(e)) => {
-                                tracing::warn!("[LIVE_FEED] WebSocket error: {e}");
-                                break;
-                            }
-                            None => break,
                         }
+                    }
+                    if !had_error {
+                        tracing::info!("[LIVE_FEED] Stream ended cleanly");
                     }
                 }
                 Err(e) => tracing::warn!("[LIVE_FEED] Connect failed: {e}"),
@@ -114,25 +136,38 @@ pub fn spawn_binance_ticker_feed(symbol: String) -> mpsc::Receiver<f64> {
             tracing::info!("[TICKER] Connecting: {url}");
             match connect_async(&url).await {
                 Ok((ws, _)) => {
-                    let (_, mut read) = ws.split();
+                    let (mut write, mut read) = ws.split();
                     tracing::info!("[TICKER] Connected - streaming {symbol}@miniTicker");
+                    let mut ping_ticker = tokio::time::interval(std::time::Duration::from_secs(30));
+                    ping_ticker.tick().await;
                     loop {
-                        match read.next().await {
-                            Some(Ok(Message::Text(text))) => {
-                                if let Ok(msg) = serde_json::from_str::<BinanceMiniTicker>(&text) {
-                                    let price: f64 = msg.c.parse().unwrap_or(0.0);
-                                    tracing::debug!("[TICKER] Price: {price}");
-                                    if tx.send(price).await.is_err() {
-                                        return; // receiver dropped
+                        tokio::select! {
+                            msg = read.next() => match msg {
+                                Some(Ok(Message::Text(text))) => {
+                                    if let Ok(parsed) = serde_json::from_str::<BinanceMiniTicker>(&text) {
+                                        let price: f64 = parsed.c.parse().unwrap_or(0.0);
+                                        tracing::debug!("[TICKER] Price: {price}");
+                                        if tx.send(price).await.is_err() {
+                                            return;
+                                        }
                                     }
                                 }
+                                Some(Ok(Message::Ping(payload))) => {
+                                    let _ = write.send(Message::Pong(payload)).await;
+                                }
+                                Some(Ok(_)) => {}
+                                Some(Err(e)) => {
+                                    tracing::warn!("[TICKER] WebSocket error: {e}");
+                                    break;
+                                }
+                                None => break,
+                            },
+                            _ = ping_ticker.tick() => {
+                                if let Err(e) = write.send(Message::Ping(Default::default())).await {
+                                    tracing::warn!("[TICKER] Ping send failed: {e} — connection likely zombie, reconnecting");
+                                    break;
+                                }
                             }
-                            Some(Ok(_)) => {}
-                            Some(Err(e)) => {
-                                tracing::warn!("[TICKER] WebSocket error: {e}");
-                                break;
-                            }
-                            None => break,
                         }
                     }
                 }
