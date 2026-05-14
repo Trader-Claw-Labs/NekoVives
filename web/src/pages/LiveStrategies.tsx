@@ -488,6 +488,144 @@ function MissingPrivateKeyModal({ onClose }: { onClose: () => void }) {
 
 // ── Create Runner Modal ───────────────────────────────────────────────
 
+// ── EngineMarketPicker ────────────────────────────────────────────────
+
+interface PolyMarket {
+  slug: string
+  question: string
+  volume: number
+  liquidity: number
+  end_date: string | null
+  yes_price: number | null
+  category: string | null
+}
+
+function daysUntil(iso: string | null): string {
+  if (!iso) return '—'
+  const diff = Math.round((new Date(iso).getTime() - Date.now()) / 86_400_000)
+  if (diff <= 0) return 'expired'
+  if (diff === 1) return '1 day'
+  return `${diff} days`
+}
+
+function fmtVol(v: number): string {
+  if (v >= 1_000_000) return `$${(v / 1_000_000).toFixed(1)}M`
+  if (v >= 1_000) return `$${(v / 1_000).toFixed(0)}k`
+  return `$${v.toFixed(0)}`
+}
+
+interface EngineMarketPickerProps {
+  selected: string[]          // array of slugs
+  onChange: (slugs: string[]) => void
+}
+
+function EngineMarketPicker({ selected, onChange }: EngineMarketPickerProps) {
+  const [search, setSearch] = useState('')
+  const [open, setOpen] = useState(false)
+  const containerRef = useRef<HTMLDivElement>(null)
+
+  const { data, isFetching } = useQuery<{ markets: PolyMarket[] }>({
+    queryKey: ['engine-markets', search],
+    queryFn: () => {
+      const q = search.trim()
+      const base = '/api/polymarket/markets?min_days=1&max_days=180&limit=80'
+      return apiFetch(q ? `${base}&q=${encodeURIComponent(q)}` : `${base}&tag=crypto`)
+    },
+    staleTime: 5 * 60 * 1000,
+    placeholderData: prev => prev,
+  })
+
+  const markets = data?.markets ?? []
+
+  // Close on outside click
+  useEffect(() => {
+    function handle(e: MouseEvent) {
+      if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
+        setOpen(false)
+      }
+    }
+    document.addEventListener('mousedown', handle)
+    return () => document.removeEventListener('mousedown', handle)
+  }, [])
+
+  function toggle(slug: string) {
+    onChange(selected.includes(slug) ? selected.filter(s => s !== slug) : [...selected, slug])
+  }
+
+  return (
+    <div ref={containerRef} className="relative">
+      <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>
+        Market Slugs <span style={{ color: 'var(--color-danger)' }}>*</span>
+      </label>
+
+      {/* Selected chips */}
+      {selected.length > 0 && (
+        <div className="flex flex-wrap gap-1 mb-1.5">
+          {selected.map(slug => (
+            <span
+              key={slug}
+              className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-mono"
+              style={{ background: 'var(--color-accent)', color: '#000' }}
+            >
+              {slug}
+              <button onClick={() => toggle(slug)} className="opacity-60 hover:opacity-100">×</button>
+            </span>
+          ))}
+        </div>
+      )}
+
+      {/* Search input */}
+      <div className="relative">
+        <input
+          className="w-full rounded px-3 py-2 text-sm pr-8"
+          placeholder={selected.length ? 'Add another market…' : 'Search crypto markets or paste slug…'}
+          value={search}
+          onChange={e => { setSearch(e.target.value); setOpen(true) }}
+          onFocus={() => setOpen(true)}
+          autoFocus
+        />
+        {isFetching && (
+          <span className="absolute right-2 top-1/2 -translate-y-1/2 text-[10px]"
+            style={{ color: 'var(--color-text-muted)' }}>…</span>
+        )}
+      </div>
+
+      {/* Dropdown */}
+      {open && markets.length > 0 && (
+        <div
+          className="absolute z-50 w-full mt-1 rounded border overflow-auto max-h-56 shadow-lg"
+          style={{ background: 'var(--color-surface)', borderColor: 'var(--color-border)' }}
+        >
+          {markets.map(m => {
+            const isSelected = selected.includes(m.slug)
+            return (
+              <button
+                key={m.slug}
+                onClick={() => { toggle(m.slug); setSearch('') }}
+                className="w-full text-left px-3 py-2 text-xs flex items-start justify-between gap-2 hover:bg-white/5"
+                style={isSelected ? { background: 'rgba(0,200,100,0.08)' } : undefined}
+              >
+                <span className="flex-1 min-w-0">
+                  <span className="block truncate" style={{ color: 'var(--color-text)' }}>{m.question}</span>
+                  <span className="font-mono text-[10px]" style={{ color: 'var(--color-text-muted)' }}>{m.slug}</span>
+                </span>
+                <span className="shrink-0 text-right text-[10px]" style={{ color: 'var(--color-text-muted)' }}>
+                  <span className="block">{daysUntil(m.end_date)}</span>
+                  <span className="block">{fmtVol(m.volume)}</span>
+                </span>
+              </button>
+            )
+          })}
+        </div>
+      )}
+
+      <p className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
+        Mercados activos de Polymarket (1–180 días). Puedes seleccionar varios para engines multi-mercado.
+      </p>
+    </div>
+  )
+}
+
 export interface CreateModalProps {
   scripts: BacktestScript[]
   onClose: () => void
@@ -695,22 +833,11 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript }: Crea
           )}
 
           {isEngineKind && (
-            <div className="grid grid-cols-2 gap-3">
-              <div>
-                <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>
-                  Market Slugs <span style={{ color: 'var(--color-danger)' }}>*</span>
-                </label>
-                <input
-                  className="w-full rounded px-3 py-2 text-sm font-mono"
-                  value={form.symbol}
-                  onChange={e => set('symbol', e.target.value)}
-                  placeholder="will-btc-hit-100k-in-2025"
-                  autoFocus
-                />
-                <p className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
-                  Slug de la URL de Polymarket — ej. <span className="font-mono">polymarket.com/event/<strong>will-btc-hit-100k</strong></span>. Comas para múltiples mercados.
-                </p>
-              </div>
+            <div className="space-y-3">
+              <EngineMarketPicker
+                selected={form.symbol ? form.symbol.split(',').map(s => s.trim()).filter(Boolean) : []}
+                onChange={slugs => set('symbol', slugs.join(','))}
+              />
               <div>
                 <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>Threshold / Edge</label>
                 <input

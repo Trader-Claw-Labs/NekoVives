@@ -5,6 +5,8 @@ use anyhow::{anyhow, Result};
 #[derive(Default)]
 pub struct MarketFilter {
     pub category: Option<String>,
+    /// Gamma API tag_slug filter (e.g. "crypto")
+    pub tag: Option<String>,
     pub min_volume_usdc: Option<f64>,
     pub min_liquidity_usdc: Option<f64>,
     pub active_only: bool,
@@ -12,6 +14,10 @@ pub struct MarketFilter {
     pub query: Option<String>,
     /// Max number of results to return (default 50)
     pub limit: Option<usize>,
+    /// Only include markets closing at least this many days from now
+    pub min_days: Option<u32>,
+    /// Only include markets closing at most this many days from now
+    pub max_days: Option<u32>,
 }
 
 /// Polymarket prediction market
@@ -111,6 +117,7 @@ fn gamma_to_market(g: GammaMarket) -> Option<Market> {
 }
 
 fn apply_filter(markets: Vec<GammaMarket>, filter: &MarketFilter) -> Vec<Market> {
+    let now = chrono::Utc::now();
     markets
         .into_iter()
         .filter(|m| {
@@ -120,6 +127,29 @@ fn apply_filter(markets: Vec<GammaMarket>, filter: &MarketFilter) -> Vec<Market>
             if let Some(ref cat) = filter.category {
                 if m.category.as_deref().unwrap_or("") != cat.as_str() {
                     return false;
+                }
+            }
+            // Date-range filter: parse end_date_iso and check days until close
+            if filter.min_days.is_some() || filter.max_days.is_some() {
+                match m.end_date_iso.as_deref() {
+                    Some(s) => {
+                        let parsed = chrono::DateTime::parse_from_rfc3339(s)
+                            .ok()
+                            .map(|dt| dt.with_timezone(&chrono::Utc));
+                        match parsed {
+                            Some(end_dt) => {
+                                let days = (end_dt - now).num_days();
+                                if let Some(min_d) = filter.min_days {
+                                    if days < min_d as i64 { return false; }
+                                }
+                                if let Some(max_d) = filter.max_days {
+                                    if days > max_d as i64 { return false; }
+                                }
+                            }
+                            None => return false, // unparseable date — exclude
+                        }
+                    }
+                    None => return false, // no end date — exclude when date filter set
                 }
             }
             true
@@ -156,6 +186,9 @@ pub async fn list_markets(filter: MarketFilter) -> Result<Vec<Market>> {
             let encoded = q.replace(' ', "+");
             url.push_str(&format!("&question_mid_partial={encoded}"));
         }
+    }
+    if let Some(ref tag) = filter.tag {
+        url.push_str(&format!("&tag_slug={tag}"));
     }
 
     let bytes = client
