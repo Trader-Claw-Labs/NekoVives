@@ -669,15 +669,16 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript }: Crea
 
   function onKindChange(newKind: string) {
     if (newKind === 'rhai_candle') {
-      setForm(f => ({ ...f, kind: newKind }))
+      // Restore crypto symbol when going back to Rhai
+      setForm(f => ({ ...f, kind: newKind, symbol: 'BTCUSDT' }))
     } else {
-      // Engine kinds always use polymarket_binary; reset symbol to slug placeholder
+      // Engine kinds always use polymarket_binary — clear symbol so user must enter a real slug
       setForm(f => ({
         ...f,
         kind: newKind,
         market_type: 'polymarket_binary',
         mode: 'paper',
-        symbol: f.symbol || 'btc-usd-winner',
+        symbol: '',
         series_id: '',
       }))
     }
@@ -748,14 +749,19 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript }: Crea
           {isEngineKind && (
             <div className="grid grid-cols-2 gap-3">
               <div>
-                <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>Market Slugs</label>
+                <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>
+                  Market Slugs <span style={{ color: 'var(--color-danger)' }}>*</span>
+                </label>
                 <input
                   className="w-full rounded px-3 py-2 text-sm font-mono"
                   value={form.symbol}
                   onChange={e => set('symbol', e.target.value)}
-                  placeholder="btc-usd-winner,eth-usd-winner"
+                  placeholder="will-btc-hit-100k-in-2025"
+                  autoFocus
                 />
-                <p className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-muted)' }}>Comma-separated Polymarket slugs</p>
+                <p className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
+                  Slug de la URL de Polymarket — ej. <span className="font-mono">polymarket.com/event/<strong>will-btc-hit-100k</strong></span>. Comas para múltiples mercados.
+                </p>
               </div>
               <div>
                 <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>Threshold / Edge</label>
