@@ -1310,6 +1310,12 @@ pub async fn handle_api_polymarket_prices_history(
 pub struct PolymarketsQuery {
     pub q: Option<String>,
     pub limit: Option<usize>,
+    /// Only include markets closing >= min_days from now
+    pub min_days: Option<u32>,
+    /// Only include markets closing <= max_days from now
+    pub max_days: Option<u32>,
+    /// Gamma API tag_slug filter (e.g. "crypto")
+    pub tag: Option<String>,
 }
 
 /// GET /api/polymarket/markets — fetch markets from Gamma API, optional ?q=search
@@ -1326,6 +1332,9 @@ pub async fn handle_api_polymarket_markets(
         active_only: true,
         query: params.q.clone(),
         limit: Some(limit),
+        min_days: params.min_days,
+        max_days: params.max_days,
+        tag: params.tag.clone(),
         ..Default::default()
     };
     match polymarket_trader::markets::list_markets(filter).await {
@@ -1347,11 +1356,14 @@ pub async fn handle_api_polymarket_markets(
                 .map(|(m, price_res)| {
                     serde_json::json!({
                         "id": m.condition_id,
+                        "slug": m.slug,
                         "question": m.question,
                         "yes_price": price_res.ok(),
                         "volume": m.volume,
+                        "liquidity": m.liquidity,
                         "end_date": m.end_date_iso,
                         "yes_token_id": m.yes_token_id,
+                        "category": m.category,
                     })
                 })
                 .collect();
