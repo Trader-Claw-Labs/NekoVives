@@ -1,8 +1,12 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { useQuery, useMutation } from '@tanstack/react-query'
+import CodeMirror from '@uiw/react-codemirror'
+import { rust } from '@codemirror/lang-rust'
 import { apiFetch, apiPost, apiDelete } from '../hooks/useApi'
 import { useBacktestState, type BacktestConfig, type ProgressState, type MarketType, type BacktestResult, type TradeLog, type MarketSeries, POLY_BINARY_PRESETS } from '../hooks/useBacktestState'
 import { CreateModal } from './LiveStrategies'
+import EngineParamsForm, { defaultEngineParams } from '../components/EngineParamsForm'
 import {
   FlaskConical, Play, FileCode2, BarChart2, TrendingDown,
   AlertCircle, ChevronDown, ChevronRight, RefreshCw, Trash2,
@@ -318,7 +322,15 @@ function EquityChart({
   )
 }
 
-function ResultPanel({ result }: { result: BacktestResult }) {
+function ResultPanel({
+  result,
+  onRunPaper,
+  onRunLive,
+}: {
+  result: BacktestResult
+  onRunPaper?: () => void
+  onRunLive?: () => void
+}) {
   const [showTrades, setShowTrades] = useState(false)
   const [selectedTradeIndex, setSelectedTradeIndex] = useState<number | null>(null)
   const isBinary = result.avg_token_price != null
@@ -640,6 +652,40 @@ function ResultPanel({ result }: { result: BacktestResult }) {
                 </div>
               ))}
             </div>
+          )}
+        </div>
+      )}
+
+      {/* Promote to live/paper */}
+      {(onRunPaper || onRunLive) && (
+        <div
+          className="flex items-center gap-3 pt-1"
+          style={{ borderTop: '1px solid var(--color-border)', paddingTop: '0.75rem' }}
+        >
+          <span className="text-xs" style={{ color: 'var(--color-text-muted)', marginRight: 'auto' }}>
+            Deploy this strategy:
+          </span>
+          {onRunPaper && (
+            <button
+              type="button"
+              onClick={onRunPaper}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-semibold"
+              style={{ backgroundColor: 'var(--color-surface-2)', border: '1px solid var(--color-border)', color: 'var(--color-text)' }}
+            >
+              <Play size={11} />
+              Run in Paper
+            </button>
+          )}
+          {onRunLive && (
+            <button
+              type="button"
+              onClick={onRunLive}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-semibold"
+              style={{ backgroundColor: 'var(--color-accent)', color: '#000' }}
+            >
+              <Zap size={11} />
+              Run Live
+            </button>
           )}
         </div>
       )}
@@ -986,6 +1032,102 @@ function ScriptItem({ script, isSelected, isRunning, isChecked, onSelect, onTogg
   )
 }
 
+// ── Rhai API Reference Panel ──────────────────────────────────────
+
+const RHAI_API = [
+  {
+    category: 'Candle data',
+    items: [
+      { name: 'ctx.close', desc: 'Close price of current candle' },
+      { name: 'ctx.open', desc: 'Open price' },
+      { name: 'ctx.high / ctx.low', desc: 'High / low price' },
+      { name: 'ctx.volume', desc: 'Volume of current candle' },
+      { name: 'ctx.index', desc: 'Current candle index (int)' },
+      { name: 'ctx.close_at(i)', desc: 'Close price at candle i' },
+    ],
+  },
+  {
+    category: 'Signals & position',
+    items: [
+      { name: 'ctx.buy(size)', desc: 'Open long (size: 0-1, fraction of balance)' },
+      { name: 'ctx.sell(size)', desc: 'Close long or open short' },
+      { name: 'ctx.position', desc: 'Current position (+1 long, -1 short, 0 flat)' },
+      { name: 'ctx.entry_price', desc: 'Price at which current position was opened' },
+      { name: 'ctx.entry_index', desc: 'Candle index when position was opened' },
+    ],
+  },
+  {
+    category: 'Indicators',
+    items: [
+      { name: 'rsi(ctx, n)', desc: 'RSI over last n candles' },
+      { name: 'ema(ctx, n)', desc: 'Exponential MA (n candles)' },
+      { name: 'sma(ctx, n)', desc: 'Simple MA (n candles)' },
+      { name: 'atr(ctx, n)', desc: 'Average True Range (n candles)' },
+    ],
+  },
+  {
+    category: 'State & logging',
+    items: [
+      { name: 'ctx.get("key", default)', desc: 'Read persisted state value' },
+      { name: 'ctx.set("key", val)', desc: 'Write persisted state value' },
+      { name: 'ctx.log("msg")', desc: 'Append to debug log for this tick' },
+    ],
+  },
+  {
+    category: 'Binary market extras',
+    items: [
+      { name: 'yes_price', desc: 'YES token market price (0-1)' },
+      { name: 'no_price', desc: 'NO token market price (0-1)' },
+      { name: 'btc_price', desc: 'Current BTC/USD spot price' },
+      { name: 'window_secs_left', desc: 'Seconds until market resolves' },
+    ],
+  },
+]
+
+function RhaiApiPanel() {
+  const [open, setOpen] = useState(false)
+
+  return (
+    <div
+      className="flex-shrink-0 border-l flex flex-col"
+      style={{ borderColor: 'var(--color-border)', width: open ? '220px' : '36px', transition: 'width 150ms' }}
+    >
+      <button
+        type="button"
+        onClick={() => setOpen(v => !v)}
+        className="flex items-center justify-center p-2 border-b text-xs font-semibold"
+        style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-muted)', gap: '6px', whiteSpace: 'nowrap' }}
+        title={open ? 'Hide API reference' : 'Show API reference'}
+      >
+        <Info size={13} style={{ flexShrink: 0 }} />
+        {open && <span>API Reference</span>}
+      </button>
+      {open && (
+        <div className="flex-1 overflow-y-auto px-2 py-2 space-y-3 text-[11px]">
+          {RHAI_API.map((section) => (
+            <div key={section.category}>
+              <p className="font-semibold uppercase tracking-widest mb-1" style={{ color: 'var(--color-text-muted)', fontSize: '10px' }}>
+                {section.category}
+              </p>
+              {section.items.map((item) => (
+                <div key={item.name} className="mb-1.5">
+                  <code
+                    className="block px-1 rounded font-mono"
+                    style={{ backgroundColor: 'var(--color-surface-2)', color: 'var(--color-accent)', fontSize: '10px' }}
+                  >
+                    {item.name}
+                  </code>
+                  <p style={{ color: 'var(--color-text-muted)', marginTop: '1px' }}>{item.desc}</p>
+                </div>
+              ))}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ── Script Viewer Modal ───────────────────────────────────────────
 
 interface ScriptViewerProps {
@@ -1000,6 +1142,7 @@ function ScriptViewer({ script, onClose, onSave }: ScriptViewerProps) {
   const [isLoading, setIsLoading] = useState(true)
   const [isSaving, setIsSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const onChangeEditor = useCallback((val: string) => setContent(val), [])
 
   useEffect(() => {
     if (!script) return
@@ -1080,32 +1223,39 @@ function ScriptViewer({ script, onClose, onSave }: ScriptViewerProps) {
         </div>
 
         {/* Content */}
-        <div className="flex-1 overflow-hidden p-4">
-          {isLoading ? (
-            <div className="flex items-center justify-center h-64">
-              <RefreshCw size={24} className="animate-spin" style={{ color: 'var(--color-accent)' }} />
-            </div>
-          ) : error ? (
-            <div
-              className="flex items-center gap-2 p-4 rounded"
-              style={{ backgroundColor: 'rgba(255,68,68,0.1)', color: 'var(--color-danger)' }}
-            >
-              <AlertCircle size={16} />
-              <span className="text-sm">{error}</span>
-            </div>
-          ) : (
-            <textarea
-              value={content}
-              onChange={(e) => setContent(e.target.value)}
-              className="w-full h-full min-h-[400px] rounded p-3 font-mono text-sm resize-none"
-              style={{
-                backgroundColor: 'var(--color-surface-2)',
-                border: '1px solid var(--color-border)',
-                color: 'var(--color-text)',
-              }}
-              spellCheck={false}
-            />
-          )}
+        <div className="flex-1 overflow-hidden flex">
+          {/* Editor */}
+          <div className="flex-1 overflow-auto p-4">
+            {isLoading ? (
+              <div className="flex items-center justify-center h-64">
+                <RefreshCw size={24} className="animate-spin" style={{ color: 'var(--color-accent)' }} />
+              </div>
+            ) : error ? (
+              <div
+                className="flex items-center gap-2 p-4 rounded"
+                style={{ backgroundColor: 'rgba(255,68,68,0.1)', color: 'var(--color-danger)' }}
+              >
+                <AlertCircle size={16} />
+                <span className="text-sm">{error}</span>
+              </div>
+            ) : (
+              <div
+                className="w-full h-full min-h-[400px] rounded overflow-auto"
+                style={{ border: '1px solid var(--color-border)' }}
+              >
+                <CodeMirror
+                  value={content}
+                  extensions={[rust()]}
+                  onChange={onChangeEditor}
+                  theme="dark"
+                  style={{ fontSize: '13px', minHeight: '400px' }}
+                  basicSetup={{ lineNumbers: true, foldGutter: true, highlightActiveLine: true }}
+                />
+              </div>
+            )}
+          </div>
+          {/* API Reference panel */}
+          <RhaiApiPanel />
         </div>
 
         {/* Footer */}
@@ -1152,6 +1302,8 @@ function ScriptViewer({ script, onClose, onSave }: ScriptViewerProps) {
 // ── Main page ─────────────────────────────────────────────────────
 
 export default function Backtesting() {
+  const navigate = useNavigate()
+
   // Use persisted backtest state hook - survives navigation
   const {
     config,
@@ -1427,6 +1579,7 @@ export default function Backtesting() {
                     ...config,
                     kind: k,
                     market_type: 'polymarket_binary',
+                    engine_params: k !== 'rhai_candle' ? defaultEngineParams(k) : undefined,
                     ...(k !== 'rhai_candle' ? { script: '' } : {}),
                   })
                 }}
@@ -1587,6 +1740,17 @@ export default function Backtesting() {
                 />
               </div>
             </>
+          )}
+
+          {/* Engine-specific parameter panel */}
+          {isEngineKind && (
+            <div className="col-span-2 sm:col-span-4 lg:col-span-12">
+              <EngineParamsForm
+                kind={config.kind ?? ''}
+                params={config.engine_params ?? defaultEngineParams(config.kind ?? '')}
+                onChange={(p) => set('engine_params', p)}
+              />
+            </div>
           )}
 
           {/* Symbol / Market selector — adapts to market type (hidden for engine kinds; they use Markets input above) */}
@@ -2266,7 +2430,39 @@ export default function Backtesting() {
                     </button>
                   )}
                 </div>
-                <ResultPanel result={displayResult} />
+                <ResultPanel
+                  result={displayResult}
+                  onRunPaper={() =>
+                    navigate('/live', {
+                      state: {
+                        prefill: {
+                          kind: config.kind ?? 'rhai_candle',
+                          script: config.script,
+                          symbol: config.symbol,
+                          market_type: config.market_type,
+                          series_id: config.series_id,
+                          engine_params: config.engine_params,
+                          mode: 'paper',
+                        },
+                      },
+                    })
+                  }
+                  onRunLive={() =>
+                    navigate('/live', {
+                      state: {
+                        prefill: {
+                          kind: config.kind ?? 'rhai_candle',
+                          script: config.script,
+                          symbol: config.symbol,
+                          market_type: config.market_type,
+                          series_id: config.series_id,
+                          engine_params: config.engine_params,
+                          mode: 'live',
+                        },
+                      },
+                    })
+                  }
+                />
               </>
             )}
 

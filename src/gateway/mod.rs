@@ -27,7 +27,7 @@ use axum::{
     extract::{ConnectInfo, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Json},
-    routing::{delete, get, post, put},
+    routing::{delete, get, patch, post, put},
     Router,
 };
 use parking_lot::Mutex;
@@ -823,12 +823,30 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             delete(api::handle_api_polymarket_order_cancel),
         )
         // ── Copy Trading ──
-        .route("/api/copy/leaders", get(api::handle_api_copy_leaders))
+        .route(
+            "/api/copy/leaders",
+            get(api::handle_api_copy_leaders).post(api::handle_api_copy_leader_add),
+        )
+        .route(
+            "/api/copy/leaders/{addr}",
+            patch(api::handle_api_copy_leader_patch).delete(api::handle_api_copy_leader_remove),
+        )
         .route(
             "/api/copy/leaders/{addr}/toggle",
             post(api::handle_api_copy_leader_toggle),
         )
-        .route("/api/copy/discovery", get(api::handle_api_copy_discovery))
+        .route(
+            "/api/copy/discovery",
+            get(api::handle_api_copy_discovery).post(api::handle_api_copy_discovery_add),
+        )
+        .route(
+            "/api/copy/discovery/refresh",
+            post(api::handle_api_copy_discovery_refresh),
+        )
+        .route(
+            "/api/copy/discovery/{addr}",
+            delete(api::handle_api_copy_discovery_remove),
+        )
         .route(
             "/api/copy/discovery/{addr}/graduate",
             post(api::handle_api_copy_discovery_graduate),
@@ -838,6 +856,12 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             post(api::handle_api_copy_discovery_blacklist),
         )
         .route("/api/copy/positions", get(api::handle_api_copy_positions))
+        .route("/api/copy/positions/history", get(api::handle_api_copy_positions_history))
+        .route("/api/copy/capital", get(api::handle_api_copy_get_capital).post(api::handle_api_copy_set_capital))
+        .route("/api/copy/consensus", get(api::handle_api_copy_consensus))
+        .route("/api/copy/sizing", patch(api::handle_api_copy_patch_sizing))
+        .route("/api/copy/score/{addr}", get(api::handle_api_copy_score))
+        .route("/api/copy/leaders/{addr}/trades", get(api::handle_api_copy_leader_trades))
         // ── Hyperliquid ──
         .route(
             "/api/health/hyperliquid",
@@ -912,6 +936,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         // ── SPA fallback: non-API GET requests serve index.html ──
         .fallback(get(static_files::handle_spa_fallback));
 
+    // Extract handles needed for background tasks before state is moved.
+    let nightly_indexer = state.wallet_indexer.clone();
+
     // WebSocket and SSE routes must NOT have a timeout layer — they are long-lived connections.
     // The agent itself enforces a 5-minute hard timeout internally.
     let ws_router = axum::Router::new()
@@ -920,6 +947,20 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
 
     // Merge all routers: WS (no timeout) + backtest/run (5min timeout) + main (30s timeout)
     let app = ws_router.merge(backtest_run_router).merge(app);
+
+    // Spawn nightly wallet indexer (runs once immediately, then every 24 hours).
+    {
+        let indexer = nightly_indexer;
+        tokio::spawn(async move {
+            loop {
+                tracing::info!("Nightly wallet indexer: running Polymarket scan (top 50)...");
+                if let Err(e) = indexer.run_polymarket_nightly(50).await {
+                    tracing::warn!("Nightly indexer error: {e}");
+                }
+                tokio::time::sleep(tokio::time::Duration::from_secs(24 * 3600)).await;
+            }
+        });
+    }
 
     // Spawn cron scheduler alongside the HTTP server.
     if config.cron.enabled {
