@@ -1,0 +1,164 @@
+{
+  "configs": {
+    "crypto_binance_4m": {
+      "enabled": true,
+      "market_type": "crypto",
+      "exchange": "binance",
+      "symbol": "BTCUSDT",
+      "interval": "4m",
+      "script_path": "scripts/crypto_4min.rhai",
+      
+      "account": {
+        "api_key": "${BINANCE_API_KEY}",
+        "api_secret": "${BINANCE_API_SECRET}",
+        "initial_balance": 1000.0,
+        "leverage": 1.0,
+        "fee_pct": 0.2
+      },
+      
+      "strategy": {
+        "lookback_4": 4,
+        "lookback_14": 14,
+        "lookback_50": 50,
+        
+        "mom_threshold": 1.8,
+        "mom1_threshold": 0.5,
+        "rsi_oversold": 25.0,
+        "rsi_overbought": 75.0,
+        
+        "atr_sl_mult": 2.0,
+        "atr_tp_mult": 3.0,
+        "max_loss_pct": 3.5,
+        "take_pft_pct": 6.0,
+        "min_vol_mult": 1.5,
+        "max_hold": 8,
+        "min_idx": 100,
+        "confirmation_required": 4
+      },
+      
+      "backtest": {
+        "enabled": true,
+        "historical_days": 90,
+        "start_date": "2024-01-01",
+        "end_date": "2024-04-01",
+        "output_file": "results/crypto_backtest_90d.json"
+      },
+      
+      "paper_trading": {
+        "enabled": false,
+        "duration_days": 21,
+        "alert_webhook": "https://your-slack-webhook/crypto"
+      },
+      
+      "live_trading": {
+        "enabled": false,
+        "risk_per_trade_pct": 0.5,
+        "max_concurrent_positions": 2,
+        "alert_webhook": "https://your-slack-webhook/crypto-live",
+        "shutdown_on_loss_pct": -5.0
+      },
+      
+      "logging": {
+        "level": "INFO",
+        "log_file": "logs/crypto_4m.log",
+        "log_trades": true,
+        "log_signals": true,
+        "log_indicators": true
+      }
+    },
+    
+    "polymarket_5m": {
+      "enabled": true,
+      "market_type": "polymarket",
+      "symbol": "BTC_UP",
+      "interval": "5m",
+      "script_path": "scripts/polymarket_5min.rhai",
+      
+      "account": {
+        "api_key": "${POLYMARKET_API_KEY}",
+        "private_key": "${POLYMARKET_PRIVATE_KEY}",
+        "initial_balance": 1000.0,
+        "fee_pct": 1.5
+      },
+      
+      "strategy": {
+        "lookback_4": 4,
+        "lookback_14": 14,
+        "lookback_50": 50,
+        
+        "mom_threshold": 1.2,
+        "mom1_threshold": 0.3,
+        "rsi_oversold": 30.0,
+        "rsi_overbought": 70.0,
+        
+        "atr_sl_mult": 1.5,
+        "atr_tp_mult": 2.5,
+        "max_loss_pct": 2.5,
+        "take_pft_pct": 5.0,
+        "min_vol_mult": 1.2,
+        "max_hold": 12,
+        "min_idx": 80,
+        "confirmation_required": 3
+      },
+      
+      "backtest": {
+        "enabled": true,
+        "historical_days": 30,
+        "start_date": "2024-03-15",
+        "end_date": "2024-04-15",
+        "output_file": "results/polymarket_backtest_30d.json"
+      },
+      
+      "paper_trading": {
+        "enabled": false,
+        "duration_days": 14,
+        "alert_webhook": "https://your-slack-webhook/polymarket"
+      },
+      
+      "live_trading": {
+        "enabled": false,
+        "risk_per_trade_pct": 0.3,
+        "max_concurrent_positions": 1,
+        "alert_webhook": "https://your-slack-webhook/polymarket-live",
+        "shutdown_on_loss_pct": -3.0,
+        "trading_hours": {
+          "enabled": true,
+          "start_utc": "06:00",
+          "end_utc": "22:00",
+          "skip_before_resolution": 30
+        }
+      },
+      
+      "logging": {
+        "level": "INFO",
+        "log_file": "logs/polymarket_5m.log",
+        "log_trades": true,
+        "log_signals": true,
+        "log_indicators": false
+      }
+    }
+  },
+  
+  "global": {
+    "environment": "backtest",
+    "timezone": "UTC",
+    "db_path": "data/trading.db",
+    "dashboard_port": 3000,
+    "slack_webhook": "https://hooks.slack.com/services/YOUR/WEBHOOK/URL"
+  },
+  
+  "performance_targets": {
+    "crypto": {
+      "min_win_rate": 0.55,
+      "min_sharpe_ratio": 0.8,
+      "max_drawdown": 0.15,
+      "target_return_monthly": 0.05
+    },
+    "polymarket": {
+      "min_win_rate": 0.60,
+      "min_sharpe_ratio": 1.0,
+      "max_drawdown": 0.10,
+      "target_return_monthly": 0.06
+    }
+  }
+}
