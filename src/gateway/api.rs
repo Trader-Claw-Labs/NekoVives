@@ -3,14 +3,34 @@
 //! All `/api/*` routes require bearer token authentication (PairingGuard).
 
 use super::AppState;
+
 use axum::{
     extract::{Path, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Json},
 };
 use serde::Deserialize;
+use std::sync::Arc;
 
 const MASKED_SECRET: &str = "***MASKED***";
+
+// ── Nullable patch helper ────────────────────────────────────────────────
+// Distinguishes three JSON states for optional-but-clearable fields:
+//   - field absent    → Option<Option<T>> = None       (no update)
+//   - field = null    → Option<Option<T>> = Some(None) (clear/disable)
+//   - field = value   → Option<Option<T>> = Some(Some(v)) (set)
+//
+// Use with #[serde(default, deserialize_with = "nullable::deserialize")]
+mod nullable {
+    use serde::{Deserialize, Deserializer};
+    pub fn deserialize<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
+    where
+        D: Deserializer<'de>,
+        T: Deserialize<'de>,
+    {
+        Ok(Some(Option::<T>::deserialize(d)?))
+    }
+}
 
 // ── Bearer token auth extractor ─────────────────────────────────
 
@@ -296,9 +316,12 @@ pub async fn handle_api_cron_list(
                         "id": job.id,
                         "name": job.name,
                         "command": job.command,
+                        "prompt": job.prompt,
+                        "schedule": job.expression,
                         "next_run": job.next_run.to_rfc3339(),
                         "last_run": job.last_run.map(|t| t.to_rfc3339()),
                         "last_status": job.last_status,
+                        "last_output": job.last_output,
                         "enabled": job.enabled,
                     })
                 })
@@ -364,6 +387,111 @@ pub async fn handle_api_cron_delete(
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("Failed to remove cron job: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct CronAgentBody {
+    pub name: Option<String>,
+    pub schedule: String,
+    pub prompt: String,
+}
+
+/// POST /api/cron/agent — add a new agent job (with prompt)
+pub async fn handle_api_cron_agent_add(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<CronAgentBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let config = state.config.lock().clone();
+    let schedule = crate::cron::Schedule::Cron {
+        expr: body.schedule,
+        tz: None,
+    };
+
+    match crate::cron::add_agent_job(
+        &config,
+        body.name,
+        schedule,
+        &body.prompt,
+        crate::cron::SessionTarget::Isolated,
+        None,
+        None,
+        false,
+    ) {
+        Ok(job) => Json(serde_json::json!({
+            "status": "ok",
+            "job": {
+                "id": job.id,
+                "name": job.name,
+                "prompt": job.prompt,
+                "enabled": job.enabled,
+            }
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to add agent job: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct CronUpdateBody {
+    pub enabled: Option<bool>,
+    pub name: Option<String>,
+    pub schedule: Option<String>,
+    pub prompt: Option<String>,
+    pub command: Option<String>,
+}
+
+/// PUT /api/cron/:id — update a cron job (enable/disable, rename, etc.)
+pub async fn handle_api_cron_update(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<CronUpdateBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let config = state.config.lock().clone();
+
+    let schedule = body.schedule.map(|expr| crate::cron::Schedule::Cron {
+        expr,
+        tz: None,
+    });
+
+    let patch = crate::cron::CronJobPatch {
+        enabled: body.enabled,
+        name: body.name,
+        schedule,
+        command: body.command,
+        prompt: body.prompt,
+        ..crate::cron::CronJobPatch::default()
+    };
+
+    match crate::cron::update_job(&config, &id, patch) {
+        Ok(job) => Json(serde_json::json!({
+            "status": "ok",
+            "job": {
+                "id": job.id,
+                "name": job.name,
+                "enabled": job.enabled,
+            }
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to update cron job: {e}")})),
         )
             .into_response(),
     }
@@ -612,6 +740,9 @@ pub struct PolymarketConfigBody {
     pub api_key: Option<String>,
     pub secret: Option<String>,
     pub passphrase: Option<String>,
+    pub private_key: Option<String>,
+    #[serde(default)]
+    pub signature_type: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -878,23 +1009,339 @@ pub async fn handle_api_wallet_balance(
     }
 }
 
-/// GET /api/polymarket/markets — fetch top markets from Gamma API
-pub async fn handle_api_polymarket_markets(
+// ── Swap body types ───────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct SwapQuoteBody {
+    pub chain: String,
+    pub from_token: String,
+    pub to_token: String,
+    pub amount: f64,
+}
+
+#[derive(Deserialize)]
+pub struct SwapExecuteBody {
+    pub chain: String,
+    pub from_token: String,
+    pub to_token: String,
+    pub amount: f64,
+    pub wallet_address: String,
+    pub password: Option<String>,
+    pub slippage_bps: Option<u64>,
+}
+
+/// POST /api/wallets/quote — get a swap quote (EVM via Uniswap QuoterV2 or Solana via Jupiter)
+pub async fn handle_api_wallets_quote(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Json(body): Json<SwapQuoteBody>,
 ) -> impl IntoResponse {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
+
+    match body.chain.as_str() {
+        "evm" => {
+            // EVM: use Uniswap QuoterV2 (chain_id 1 = Ethereum mainnet)
+            let amount_in = (body.amount * 1e18) as u128; // assume 18-decimal input token
+            match evm_trader::uniswap::get_quote(&body.from_token, &body.to_token, amount_in, 1).await {
+                Ok(q) => Json(serde_json::json!({
+                    "quote": {
+                        "in_amount": body.amount,
+                        "out_amount": q.amount_out_readable,
+                        "out_amount_min": q.amount_out_readable * 0.995,
+                        "price_impact_pct": q.price_impact_bps.map(|b| b as f64 / 100.0).unwrap_or(0.0),
+                        "route": format!("{} → UniV3(0.3%) → {}", body.from_token, body.to_token),
+                        "gas_estimate": q.gas_estimate,
+                    }
+                })).into_response(),
+                Err(e) => (StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({"error": format!("QuoterV2 error: {e}")}))).into_response(),
+            }
+        }
+        "solana" => {
+            // Solana: use Jupiter /v6/quote
+            let amount_lamports = (body.amount * 1e9) as u64; // assume SOL-like 9 decimals
+            let url = format!(
+                "https://quote-api.jup.ag/v6/quote?inputMint={}&outputMint={}&amount={}",
+                body.from_token, body.to_token, amount_lamports
+            );
+            let client = reqwest::Client::new();
+            match client.get(&url).send().await {
+                Ok(r) => {
+                    match r.json::<serde_json::Value>().await {
+                        Ok(jup) => {
+                            let out_amount = jup["outAmount"].as_str()
+                                .and_then(|s| s.parse::<f64>().ok())
+                                .unwrap_or(0.0) / 1e6; // assume 6-decimal output
+                            let price_impact = jup["priceImpactPct"].as_str()
+                                .and_then(|s| s.parse::<f64>().ok())
+                                .unwrap_or(0.0);
+                            let route = jup["routePlan"].as_array()
+                                .and_then(|r| r.first())
+                                .and_then(|s| s["swapInfo"]["label"].as_str())
+                                .unwrap_or("Jupiter")
+                                .to_string();
+                            Json(serde_json::json!({
+                                "quote": {
+                                    "in_amount": body.amount,
+                                    "out_amount": out_amount,
+                                    "out_amount_min": out_amount * 0.995,
+                                    "price_impact_pct": price_impact,
+                                    "route": route,
+                                    "_jupiter_quote": jup,
+                                }
+                            })).into_response()
+                        }
+                        Err(e) => (StatusCode::BAD_GATEWAY,
+                            Json(serde_json::json!({"error": format!("Jupiter parse error: {e}")}))).into_response(),
+                    }
+                }
+                Err(e) => (StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({"error": format!("Jupiter request error: {e}")}))).into_response(),
+            }
+        }
+        chain => (StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("Unsupported chain: {chain}")}))).into_response(),
+    }
+}
+
+/// POST /api/wallets/swap — execute a swap
+pub async fn handle_api_wallets_swap(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<SwapExecuteBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    match body.chain.as_str() {
+        "evm" => {
+            // EVM execute_swap requires signer integration not yet wired
+            (StatusCode::NOT_IMPLEMENTED, Json(serde_json::json!({
+                "error": "EVM swap execution requires signer integration. Use a hardware wallet or external signer. Quote via /api/wallets/quote and broadcast via your EVM wallet."
+            }))).into_response()
+        }
+        "solana" => {
+            // Find wallet and decrypt private key
+            let (encrypted_key, _) = {
+                let wallets = state.wallets.lock();
+                match wallets.iter().find(|w| w.address.eq_ignore_ascii_case(&body.wallet_address) && w.chain == "solana") {
+                    Some(w) => (w.encrypted_key.clone(), w.address.clone()),
+                    None => return (StatusCode::NOT_FOUND,
+                        Json(serde_json::json!({"error": "Solana wallet not found"}))).into_response(),
+                }
+            };
+
+            let password = match body.password.as_deref() {
+                Some(p) if !p.is_empty() => p.to_string(),
+                _ => return (StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "Wallet password required for Solana swap"}))).into_response(),
+            };
+
+            let privkey_bytes = match wallet_manager::solana::export_private_key(&encrypted_key, &password) {
+                Ok(b) => b,
+                Err(e) => return (StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": format!("Decrypt failed: {e}")}))).into_response(),
+            };
+
+            // First get a Jupiter quote, then execute
+            let amount_lamports = (body.amount * 1e9) as u64;
+            let quote_url = format!(
+                "https://quote-api.jup.ag/v6/quote?inputMint={}&outputMint={}&amount={}&slippageBps={}",
+                body.from_token, body.to_token, amount_lamports, body.slippage_bps.unwrap_or(50)
+            );
+            let client = reqwest::Client::new();
+            let quote = match client.get(&quote_url).send().await {
+                Ok(r) => match r.json::<serde_json::Value>().await {
+                    Ok(j) => j,
+                    Err(e) => return (StatusCode::BAD_GATEWAY,
+                        Json(serde_json::json!({"error": format!("Jupiter quote parse: {e}")}))).into_response(),
+                },
+                Err(e) => return (StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({"error": format!("Jupiter quote request: {e}")}))).into_response(),
+            };
+
+            let trader = solana_trader::SolanaTrader::new(None);
+            let mut key_arr = [0u8; 32];
+            if privkey_bytes.len() >= 32 {
+                key_arr.copy_from_slice(&privkey_bytes[..32]);
+            }
+            match trader.swap(&quote, &body.wallet_address, &key_arr).await {
+                Ok(sig) => Json(serde_json::json!({"status": "ok", "tx_hash": sig})).into_response(),
+                Err(e) => (StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({"error": format!("Swap failed: {e}")}))).into_response(),
+            }
+        }
+        chain => (StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("Unsupported chain: {chain}")}))).into_response(),
+    }
+}
+
+/// POST /api/wallets/transfer — send native token to another address
+#[derive(serde::Deserialize)]
+pub struct TransferBody {
+    pub from_address: String,
+    pub to_address: String,
+    pub amount: f64,
+    pub chain: String,
+    pub password: String,
+}
+
+pub async fn handle_api_wallets_transfer(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<TransferBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    if body.to_address.is_empty() || body.amount <= 0.0 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "Invalid to_address or amount"
+        }))).into_response();
+    }
+
+    match body.chain.as_str() {
+        "evm" => {
+            (StatusCode::NOT_IMPLEMENTED, Json(serde_json::json!({
+                "error": "EVM native transfers require signer integration. Use your EVM wallet (MetaMask, hardware wallet) to send ETH/MATIC directly."
+            }))).into_response()
+        }
+        "solana" => {
+            // Verify password is correct before showing "not implemented"
+            let encrypted_key = {
+                let wallets = state.wallets.lock();
+                match wallets.iter().find(|w| w.address.eq_ignore_ascii_case(&body.from_address) && w.chain == "solana") {
+                    Some(w) => w.encrypted_key.clone(),
+                    None => return (StatusCode::NOT_FOUND,
+                        Json(serde_json::json!({"error": "Solana wallet not found"}))).into_response(),
+                }
+            };
+            if let Err(e) = wallet_manager::solana::export_private_key(&encrypted_key, &body.password) {
+                return (StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": format!("Decrypt failed: {e}")}))).into_response();
+            }
+            (StatusCode::NOT_IMPLEMENTED, Json(serde_json::json!({
+                "error": "Solana native SOL transfers are coming soon. For now, use a Solana wallet (Phantom, Backpack) to send SOL. Your private key can be exported from the wallet page."
+            }))).into_response()
+        }
+        "ton" => {
+            (StatusCode::NOT_IMPLEMENTED, Json(serde_json::json!({
+                "error": "TON transfers are not yet implemented. Use the TON wallet app or tonkeeper.com."
+            }))).into_response()
+        }
+        chain => (StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("Unsupported chain: {chain}")}))).into_response(),
+    }
+}
+
+/// GET /api/polymarket/prices-history — proxy to Polymarket CLOB /prices-history
+/// Query params: token_id (required), interval (optional: 1h/6h/1d/1w/all, default 1d)
+pub async fn handle_api_polymarket_prices_history(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let token_id = match params.get("token_id") {
+        Some(t) => t.clone(),
+        None => return (StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "token_id query param required"}))).into_response(),
+    };
+    let interval = params.get("interval").map(String::as_str).unwrap_or("1d");
+
+    // Map interval to Polymarket CLOB fidelity + startTs
+    let (fidelity, start_offset_secs): (u64, u64) = match interval {
+        "1h"  => (1,    3_600),
+        "6h"  => (5,   21_600),
+        "1d"  => (10,  86_400),
+        "1w"  => (60, 604_800),
+        "all" => (1440, 0),
+        _     => (10,  86_400),
+    };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let start_ts = if start_offset_secs > 0 { now - start_offset_secs } else { 0 };
+
+    let url = if start_offset_secs > 0 {
+        format!(
+            "https://clob.polymarket.com/prices-history?market={}&interval={}&fidelity={}&startTs={}",
+            token_id, interval, fidelity, start_ts
+        )
+    } else {
+        format!(
+            "https://clob.polymarket.com/prices-history?market={}&interval={}&fidelity={}",
+            token_id, interval, fidelity
+        )
+    };
+
+    let client = reqwest::Client::new();
+    match client.get(&url).send().await {
+        Ok(r) => {
+            match r.json::<serde_json::Value>().await {
+                Ok(data) => {
+                    // Extract the history array (Polymarket returns {"history": [{t, p}, ...]})
+                    let history = data.get("history").cloned().unwrap_or(data);
+                    Json(serde_json::json!({
+                        "token_id": token_id,
+                        "interval": interval,
+                        "history": history,
+                    })).into_response()
+                }
+                Err(e) => (StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({"error": format!("Parse error: {e}")}))).into_response(),
+            }
+        }
+        Err(e) => (StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error": format!("CLOB request failed: {e}")}))).into_response(),
+    }
+}
+
+#[derive(serde::Deserialize, Default)]
+pub struct PolymarketsQuery {
+    pub q: Option<String>,
+    pub limit: Option<usize>,
+    /// Only include markets closing >= min_days from now
+    pub min_days: Option<u32>,
+    /// Only include markets closing <= max_days from now
+    pub max_days: Option<u32>,
+    /// Gamma API tag_slug filter (e.g. "crypto")
+    pub tag: Option<String>,
+}
+
+/// GET /api/polymarket/markets — fetch markets from Gamma API, optional ?q=search
+pub async fn handle_api_polymarket_markets(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<PolymarketsQuery>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let limit = params.limit.unwrap_or(50).min(200);
     let filter = polymarket_trader::markets::MarketFilter {
         active_only: true,
+        query: params.q.clone(),
+        limit: Some(limit),
+        min_days: params.min_days,
+        max_days: params.max_days,
+        tag: params.tag.clone(),
         ..Default::default()
     };
     match polymarket_trader::markets::list_markets(filter).await {
         Ok(markets) => {
             let mut sorted = markets;
             sorted.sort_by(|a, b| b.volume.partial_cmp(&a.volume).unwrap_or(std::cmp::Ordering::Equal));
-            let top: Vec<_> = sorted.into_iter().take(20).collect();
+            let top: Vec<_> = sorted.into_iter().take(limit).collect();
 
             // Fetch YES prices in parallel (best-effort — ignore failures)
             let price_futs: Vec<_> = top
@@ -909,10 +1356,14 @@ pub async fn handle_api_polymarket_markets(
                 .map(|(m, price_res)| {
                     serde_json::json!({
                         "id": m.condition_id,
+                        "slug": m.slug,
                         "question": m.question,
                         "yes_price": price_res.ok(),
                         "volume": m.volume,
+                        "liquidity": m.liquidity,
                         "end_date": m.end_date_iso,
+                        "yes_token_id": m.yes_token_id,
+                        "category": m.category,
                     })
                 })
                 .collect();
@@ -949,6 +1400,8 @@ pub async fn handle_api_polymarket_configure_get(
         "wallet_address": pm.wallet_address,
         "has_secret": pm.secret.as_deref().map(|s| !s.is_empty()).unwrap_or(false),
         "has_passphrase": pm.passphrase.as_deref().map(|p| !p.is_empty()).unwrap_or(false),
+        "has_private_key": pm.private_key.as_deref().map(|k| !k.is_empty()).unwrap_or(false),
+        "signature_type": pm.signature_type,
     }))
     .into_response()
 }
@@ -963,18 +1416,58 @@ pub async fn handle_api_polymarket_configure(
         return e.into_response();
     }
 
-    let api_key = body.api_key.as_deref().unwrap_or("").to_string();
-    let secret = body.secret.clone().unwrap_or_default();
-    let passphrase = body.passphrase.clone().unwrap_or_default();
-    let wallet_address = body.wallet_address.clone();
+    // Trim whitespace — copy/paste from browser often carries trailing spaces or newlines,
+    // which break the HMAC signature with a silent 401 at request time.
+    fn clean(s: Option<String>) -> Option<String> {
+        s.map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+    }
+    /// A masked placeholder (e.g. "••••••••") was shown in the UI for a field
+    /// that already had a value stored. If the user didn't re-type it, we must
+    /// NOT overwrite the real secret with the literal bullet characters.
+    /// Also detects the api_key "abcd…wxyz" mask returned by GET /configure.
+    fn is_placeholder(s: &str) -> bool {
+        if s.is_empty() { return false; }
+        if s.chars().all(|c| matches!(c, '•' | '*' | '·' | '●')) { return true; }
+        if s.contains('…') { return true; }
+        false
+    }
 
-    // Save to config (validation is handled separately via POST /api/polymarket/test)
+    let api_key_input = clean(body.api_key.clone());
+    let secret_input = clean(body.secret.clone());
+    let passphrase_input = clean(body.passphrase.clone());
+    let private_key_input = clean(body.private_key.clone());
+    let wallet_address = clean(body.wallet_address.clone());
+
     let mut config = state.config.lock().clone();
+    let existing = config.polymarket.clone();
+
+    // Skip overwriting with masked placeholders — keep the previously stored value.
+    let api_key = match api_key_input {
+        Some(v) if is_placeholder(&v) => existing.api_key.clone(),
+        other => other.or(existing.api_key.clone()),
+    };
+    let secret = match secret_input {
+        Some(v) if is_placeholder(&v) => existing.secret.clone(),
+        other => other.or(existing.secret.clone()),
+    };
+    let passphrase = match passphrase_input {
+        Some(v) if is_placeholder(&v) => existing.passphrase.clone(),
+        other => other.or(existing.passphrase.clone()),
+    };
+    let private_key = match private_key_input {
+        Some(v) if is_placeholder(&v) => existing.private_key.clone(),
+        other => other.or(existing.private_key.clone()),
+    };
+
     config.polymarket = crate::config::schema::PolymarketConfig {
-        api_key: if api_key.is_empty() { None } else { Some(api_key) },
-        secret: if secret.is_empty() { None } else { Some(secret) },
-        passphrase: if passphrase.is_empty() { None } else { Some(passphrase) },
-        wallet_address,
+        api_key,
+        secret,
+        passphrase,
+        wallet_address: wallet_address.or(existing.wallet_address),
+        private_key,
+        is_builder: existing.is_builder,
+        proxy_address: existing.proxy_address,
+        signature_type: body.signature_type.filter(|s| !s.is_empty()).or(existing.signature_type),
     };
     if let Err(e) = config.save().await {
         return (
@@ -990,6 +1483,18 @@ pub async fn handle_api_polymarket_configure(
 }
 
 /// POST /api/polymarket/test — validate API key against Polymarket CLOB API
+///
+/// Real validation flow:
+///   1. Ping the CLOB public endpoint for connectivity.
+///   2. Make an L2-authenticated request to `GET /auth/api-keys` trying each
+///      secret-decoding strategy (Base64 default, then Raw, then Hex). The one
+///      that returns 2xx is the real encoding Polymarket expects for this key.
+///   3. On failure, report which part is likely wrong (api_key length/preview,
+///      secret length, passphrase length, and hint on encoding).
+///
+/// Empty or masked (bullet / "abcd…wxyz") fields in the request body fall back
+/// to the stored config values — so the user can hit "Test Connection" without
+/// re-typing the secret every time.
 pub async fn handle_api_polymarket_test(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -999,82 +1504,793 @@ pub async fn handle_api_polymarket_test(
         return e.into_response();
     }
 
-    let api_key = match body.api_key.as_deref().filter(|k| !k.is_empty()) {
-        Some(k) => k.to_string(),
-        None => {
+    fn clean(s: Option<String>) -> Option<String> {
+        s.map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+    }
+    fn is_placeholder(s: &str) -> bool {
+        if s.is_empty() { return false; }
+        if s.chars().all(|c| matches!(c, '•' | '*' | '·' | '●')) { return true; }
+        if s.contains('…') { return true; }
+        false
+    }
+    fn resolve(input: Option<String>, stored: Option<String>) -> Option<String> {
+        match clean(input) {
+            Some(v) if is_placeholder(&v) => stored,
+            other => other.or(stored),
+        }
+    }
+
+    // Resolve credentials: prefer the form input, fall back to stored config
+    // when the user left the field empty or the UI rendered a placeholder mask.
+    let stored = { state.config.lock().polymarket.clone() };
+    let api_key = resolve(body.api_key.clone(), stored.api_key.clone()).unwrap_or_default();
+    let secret = resolve(body.secret.clone(), stored.secret.clone()).unwrap_or_default();
+    let passphrase = resolve(body.passphrase.clone(), stored.passphrase.clone()).unwrap_or_default();
+    let wallet_address = resolve(body.wallet_address.clone(), stored.wallet_address.clone())
+        .unwrap_or_default();
+
+    if api_key.is_empty() || secret.is_empty() || passphrase.is_empty() {
+        let mut missing = Vec::new();
+        if api_key.is_empty() { missing.push("api_key"); }
+        if secret.is_empty() { missing.push("secret"); }
+        if passphrase.is_empty() { missing.push("passphrase"); }
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "status": "error",
+                "error": format!("Missing credentials: {}", missing.join(", ")),
+            })),
+        )
+            .into_response();
+    }
+
+    // Build a client with a real User-Agent — some CDNs block the default reqwest UA.
+    let client = match reqwest::Client::builder()
+        .user_agent("trader-claw/0.1 (+https://github.com/Trader-Claw-Labs/trader-claw)")
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
             return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "API key is required to test connection"})),
-            )
-                .into_response();
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "status": "error",
+                    "error": format!("Failed to build HTTP client: {e}"),
+                })),
+            ).into_response();
         }
     };
-    let secret = body.secret.clone().unwrap_or_default();
-    let passphrase = body.passphrase.clone().unwrap_or_default();
 
-    // Verify the CLOB API is reachable via a public endpoint, then validate credentials
-    // with a lightweight L2-authenticated request to GET /sampling/simplifiedmarkets
-    let client = reqwest::Client::new();
+    // Step 1 — connectivity (with one retry on transient network errors).
+    async fn send_with_retry(
+        req_builder: impl Fn() -> reqwest::RequestBuilder,
+        attempts: u32,
+    ) -> std::result::Result<reqwest::Response, String> {
+        let mut last_err = String::from("unknown network error");
+        for i in 0..attempts {
+            match req_builder().send().await {
+                Ok(r) => return Ok(r),
+                Err(e) => {
+                    last_err = format!("{e}");
+                    if i + 1 < attempts {
+                        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                    }
+                }
+            }
+        }
+        Err(last_err)
+    }
 
-    // Step 1: ping CLOB
-    let ping = client
-        .get("https://clob.polymarket.com/markets?limit=1")
-        .timeout(std::time::Duration::from_secs(8))
-        .send()
-        .await;
-
+    let ping = send_with_retry(
+        || {
+            client
+                .get("https://clob.polymarket.com/markets?limit=1")
+                .timeout(std::time::Duration::from_secs(10))
+        },
+        2,
+    )
+    .await;
     match ping {
-        Err(e) => return (
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({"error": format!("Cannot reach Polymarket CLOB: {e}")})),
-        ).into_response(),
-        Ok(r) if !r.status().is_success() => return (
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({"error": format!("Polymarket CLOB returned {}", r.status())})),
-        ).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "status": "error",
+                    "error": format!(
+                        "Cannot reach Polymarket CLOB public endpoint: {e}. \
+                         Check your internet connection or firewall."
+                    ),
+                })),
+            ).into_response();
+        }
+        Ok(r) if !r.status().is_success() => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "status": "error",
+                    "error": format!("Polymarket CLOB returned {} on public ping", r.status()),
+                })),
+            ).into_response();
+        }
         _ => {}
     }
 
-    // Step 2: authenticated request — GET /auth/api-key with L2 headers
-    let creds = polymarket_trader::auth::PolyCredentials {
+    // Step 2 — L2 auth probe on /auth/api-keys with all three secret strategies.
+    //         If /auth/api-keys is unreachable, fall back to POST /order with a dummy
+    //         body (401 on bad auth, 400/422 on valid auth with bad order — both tell us
+    //         whether auth succeeded).
+    use polymarket_trader::auth::{create_l2_headers_with_strategy, PolyCredentials, SecretDecodeStrategy};
+    let creds = PolyCredentials {
         api_key: api_key.clone(),
-        secret,
-        passphrase,
+        secret: secret.clone(),
+        passphrase: passphrase.clone(),
+        wallet_address: wallet_address.clone().to_lowercase(),
+        private_key: None,
+        is_builder: stored.is_builder.unwrap_or(false),
+        proxy_address: stored.proxy_address.clone().filter(|k| !k.is_empty()).map(|s| s.to_lowercase()),
+        signature_type: stored.signature_type.clone().filter(|k| !k.is_empty()),
     };
-    let l2 = polymarket_trader::auth::create_l2_headers(&creds, "GET", "/auth/api-key", None);
-    let mut req = client
-        .get("https://clob.polymarket.com/auth/api-key")
-        .timeout(std::time::Duration::from_secs(8));
-    for (k, v) in &l2 {
-        req = req.header(k.as_str(), v.as_str());
+
+    /// Probe result: http status (0 = network error), response body, error detail.
+    async fn probe_get(
+        client: &reqwest::Client,
+        creds: &PolyCredentials,
+        path: &str,
+        strategy: SecretDecodeStrategy,
+    ) -> (u16, String) {
+        let headers = create_l2_headers_with_strategy(creds, "GET", path, None, strategy);
+        for attempt in 0..2u32 {
+            let mut req = client
+                .get(format!("https://clob.polymarket.com{}", path))
+                .timeout(std::time::Duration::from_secs(12));
+            for (k, v) in &headers {
+                req = req.header(k.as_str(), v.as_str());
+            }
+            match req.send().await {
+                Ok(r) => {
+                    let s = r.status().as_u16();
+                    let b = r.text().await.unwrap_or_default();
+                    return (s, b);
+                }
+                Err(e) => {
+                    if attempt == 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                        continue;
+                    }
+                    return (0, format!("network error: {e}"));
+                }
+            }
+        }
+        (0, String::from("network error (unreachable)"))
     }
 
-    match req.send().await {
-        Ok(resp) if resp.status().is_success() => Json(serde_json::json!({
-            "status": "ok",
-            "message": "Connected — Polymarket CLOB authenticated successfully",
-        })).into_response(),
-        Ok(resp) if resp.status().as_u16() == 401 || resp.status().as_u16() == 403 => (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "Invalid API key, secret, or passphrase"})),
-        ).into_response(),
-        Ok(resp) if resp.status().as_u16() == 405 => {
-            // Some CLOB versions don't support GET /auth/api-key — fall back to connectivity-only check
-            Json(serde_json::json!({
+    /// Fallback probe: POST /order with a dummy token id.
+    /// - 401: auth failed.
+    /// - Any other status: auth succeeded (the server looked past the headers
+    ///   and started validating the order payload), so we treat it as "OK".
+    async fn probe_post_order(
+        client: &reqwest::Client,
+        creds: &PolyCredentials,
+        strategy: SecretDecodeStrategy,
+    ) -> (u16, String) {
+        let body = r#"{"order":{"tokenID":"0","price":"0.5","size":"1","side":"BUY","type":"GTC"},"owner":""}"#;
+        let headers = create_l2_headers_with_strategy(creds, "POST", "/order", Some(body), strategy);
+        for attempt in 0..2u32 {
+            let mut req = client
+                .post("https://clob.polymarket.com/order")
+                .header("Content-Type", "application/json")
+                .body(body)
+                .timeout(std::time::Duration::from_secs(12));
+            for (k, v) in &headers {
+                req = req.header(k.as_str(), v.as_str());
+            }
+            match req.send().await {
+                Ok(r) => {
+                    let s = r.status().as_u16();
+                    let b = r.text().await.unwrap_or_default();
+                    return (s, b);
+                }
+                Err(e) => {
+                    if attempt == 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                        continue;
+                    }
+                    return (0, format!("network error: {e}"));
+                }
+            }
+        }
+        (0, String::from("network error (unreachable)"))
+    }
+
+    let strategies = [
+        ("Base64", SecretDecodeStrategy::Base64),
+        ("Raw", SecretDecodeStrategy::Raw),
+        ("Hex", SecretDecodeStrategy::Hex),
+    ];
+
+    let mut last_status: u16 = 0;
+    let mut last_body = String::new();
+    let mut last_strategy_name: &str = "Base64";
+    let mut last_endpoint: &str = "/auth/api-keys";
+    let mut all_network_errors = true;
+    for (name, strat) in strategies {
+        // First try the dedicated L2 list endpoint.
+        let (mut status, mut body_text) = probe_get(&client, &creds, "/auth/api-keys", strat).await;
+        last_endpoint = "/auth/api-keys";
+        // If /auth/api-keys is unreachable (0) OR returns 401/403, fall back to
+        // POST /order. The GET endpoint may reject valid Builder Key credentials
+        // while POST /order accurately reflects whether L2 auth headers are correct.
+        if status == 0 || status == 401 || status == 403 {
+            let (s2, b2) = probe_post_order(&client, &creds, strat).await;
+            if s2 != 0 {
+                status = s2;
+                body_text = b2;
+                last_endpoint = "POST /order";
+                // POST /order returns non-401 on auth-ok + order-invalid.
+                if status != 401 && status != 403 {
+                    let preview: String = body_text.chars().take(240).collect();
+                    let api_key_head: String = api_key.chars().take(4).collect();
+                    let api_key_tail: String = api_key.chars().rev().take(4).collect::<Vec<_>>()
+                        .into_iter().rev().collect();
+                    return Json(serde_json::json!({
+                        "status": "ok",
+                        "message": format!(
+                            "Polymarket CLOB authenticated OK (fallback POST /order → HTTP {status}, \
+                             auth passed; secret decoded as {name})."
+                        ),
+                        "strategy": name,
+                        "http_status": status,
+                        "endpoint": "POST /order",
+                        "api_key_preview": format!("{api_key_head}…{api_key_tail}"),
+                        "api_key_length": api_key.len(),
+                        "secret_length": secret.len(),
+                        "passphrase_length": passphrase.len(),
+                        "wallet_address": wallet_address,
+                        "response_preview": preview,
+                    })).into_response();
+                }
+            }
+        }
+        last_status = status;
+        last_body = body_text;
+        last_strategy_name = name;
+        if status != 0 {
+            all_network_errors = false;
+        }
+        if (200..300).contains(&status) {
+            let preview: String = last_body.chars().take(240).collect();
+            let api_key_head: String = api_key.chars().take(4).collect();
+            let api_key_tail: String = api_key.chars().rev().take(4).collect::<Vec<_>>()
+                .into_iter().rev().collect();
+            return Json(serde_json::json!({
                 "status": "ok",
-                "message": "Polymarket CLOB is reachable. Credentials will be validated on first order.",
+                "message": format!(
+                    "Polymarket CLOB authenticated OK (HTTP {status}, secret decoded as {name})."
+                ),
+                "strategy": name,
+                "http_status": status,
+                "endpoint": last_endpoint,
+                "api_key_preview": format!("{api_key_head}…{api_key_tail}"),
+                "api_key_length": api_key.len(),
+                "secret_length": secret.len(),
+                "passphrase_length": passphrase.len(),
+                "wallet_address": wallet_address,
+                "response_preview": preview,
+            })).into_response();
+        }
+        // Keep probing on 401/403 to see if another encoding works.
+        if status != 401 && status != 403 && status != 0 {
+            break;
+        }
+    }
+
+    // If every strategy only produced network errors, report that explicitly
+    // instead of leaking an empty "credentials rejected (HTTP 0)" message.
+    if all_network_errors {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "status": "error",
+                "error": format!(
+                    "Cannot reach Polymarket CLOB authenticated endpoints. Last error: {last_body}. \
+                     The public /markets endpoint responded but /auth/api-keys and POST /order \
+                     both failed — this is almost always a transient network issue, try again."
+                ),
+                "http_status": 0,
+                "endpoint": last_endpoint,
+                "response_preview": last_body.chars().take(180).collect::<String>(),
+            })),
+        ).into_response();
+    }
+
+    // All strategies failed — build actionable diagnostics.
+    let detail: String = last_body.chars().take(180).collect();
+    let api_key_head: String = api_key.chars().take(4).collect();
+    let api_key_tail: String = api_key.chars().rev().take(4).collect::<Vec<_>>()
+        .into_iter().rev().collect();
+    let hint = if last_status == 401 || last_status == 403 {
+        "Credentials were rejected with every secret encoding (Base64/Raw/Hex). \
+         Most likely the api_key/secret/passphrase trío doesn't belong to the configured wallet. \
+         Open the Polymarket page and click 'Regenerate API Credentials' to derive a fresh trío from your private_key."
+    } else {
+        "Polymarket CLOB returned an unexpected status."
+    };
+    // IMPORTANT: never return 401/403 to the frontend for Polymarket-side auth
+    // failures — the SPA treats any 401 as "gateway Bearer expired", wipes the
+    // token and shows the pairing modal. Use 422 instead so the caller can
+    // distinguish this from a gateway-auth error.
+    let http_code = if last_status == 401 || last_status == 403 {
+        StatusCode::UNPROCESSABLE_ENTITY
+    } else {
+        StatusCode::BAD_GATEWAY
+    };
+    (
+        http_code,
+        Json(serde_json::json!({
+            "status": "error",
+            "error": format!(
+                "Polymarket credentials rejected (HTTP {last_status}). {hint}"
+            ),
+            "http_status": last_status,
+            "endpoint": last_endpoint,
+            "last_strategy": last_strategy_name,
+            "response_preview": detail,
+            "api_key_preview": format!("{api_key_head}…{api_key_tail}"),
+            "api_key_length": api_key.len(),
+            "secret_length": secret.len(),
+            "passphrase_length": passphrase.len(),
+            "wallet_address": wallet_address,
+        })),
+    ).into_response()
+}
+
+/// POST /api/polymarket/diagnose-auth — test which secret decoding strategy works.
+///
+/// Tries Raw, Base64, and Hex secret decoding against real CLOB endpoints.
+/// The key test is POST /order with a dummy body: if auth passes we get 400/404,
+/// if auth fails we get 401.
+#[derive(serde::Deserialize)]
+pub struct DiagnoseAuthBody {
+    pub api_key: String,
+    pub secret: String,
+    pub passphrase: String,
+    pub wallet_address: String,
+    #[serde(default)]
+    pub is_builder: Option<bool>,
+    #[serde(default)]
+    pub proxy_address: Option<String>,
+}
+
+pub async fn handle_api_polymarket_diagnose_auth(
+    State(_state): State<AppState>,
+    Json(body): Json<DiagnoseAuthBody>,
+) -> impl IntoResponse {
+    use polymarket_trader::auth::{PolyCredentials, SecretDecodeStrategy, create_l2_headers_with_strategy};
+
+    let client = reqwest::Client::new();
+    let mut results = Vec::new();
+
+    for strategy in [
+        SecretDecodeStrategy::Raw,
+        SecretDecodeStrategy::Base64,
+        SecretDecodeStrategy::Hex,
+    ] {
+        let creds = PolyCredentials {
+            api_key: body.api_key.clone(),
+            secret: body.secret.clone(),
+            passphrase: body.passphrase.clone(),
+            wallet_address: body.wallet_address.clone(),
+            private_key: None,
+            is_builder: body.is_builder.unwrap_or(false),
+            proxy_address: body.proxy_address.clone().filter(|k| !k.is_empty()),
+            signature_type: None,
+        };
+
+        // ── Test 1: POST /order with dummy body ──
+        // If auth is correct but body is malformed → 400 Bad Request
+        // If auth is wrong → 401 Unauthorized
+        let order_body = r#"{"order":{"tokenID":"dummy","price":"0.50","size":"1","side":"BUY","type":"GTC"},"owner":""}"#;
+        let order_headers = create_l2_headers_with_strategy(
+            &creds, "POST", "/order", Some(order_body), strategy);
+
+        let mut order_req = client
+            .post("https://clob.polymarket.com/order")
+            .header("Content-Type", "application/json")
+            .body(order_body)
+            .timeout(std::time::Duration::from_secs(10));
+        for (k, v) in &order_headers {
+            order_req = order_req.header(k.as_str(), v.as_str());
+        }
+
+        let order_result = match order_req.send().await {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                let body_text = resp.text().await.unwrap_or_default();
+                serde_json::json!({
+                    "endpoint": "POST /order",
+                    "status": status,
+                    "auth_ok": status != 401,
+                    "response_preview": body_text.chars().take(200).collect::<String>()
+                })
+            }
+            Err(e) => serde_json::json!({
+                "endpoint": "POST /order",
+                "status": 0,
+                "auth_ok": false,
+                "error": format!("Network error: {}", e)
+            }),
+        };
+
+        // ── Test 2: GET /sampling/simplifiedmarkets ──
+        // Mentioned in original code as a lightweight authenticated endpoint
+        let samp_headers = create_l2_headers_with_strategy(
+            &creds, "GET", "/sampling/simplifiedmarkets", None, strategy);
+
+        let mut samp_req = client
+            .get("https://clob.polymarket.com/sampling/simplifiedmarkets")
+            .timeout(std::time::Duration::from_secs(10));
+        for (k, v) in &samp_headers {
+            samp_req = samp_req.header(k.as_str(), v.as_str());
+        }
+
+        let samp_result = match samp_req.send().await {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                let body_text = resp.text().await.unwrap_or_default();
+                serde_json::json!({
+                    "endpoint": "GET /sampling/simplifiedmarkets",
+                    "status": status,
+                    "auth_ok": status != 401,
+                    "response_preview": body_text.chars().take(200).collect::<String>()
+                })
+            }
+            Err(e) => serde_json::json!({
+                "endpoint": "GET /sampling/simplifiedmarkets",
+                "status": 0,
+                "auth_ok": false,
+                "error": format!("Network error: {}", e)
+            }),
+        };
+
+        results.push(serde_json::json!({
+            "strategy": format!("{:?}", strategy),
+            "tests": [order_result, samp_result],
+        }));
+    }
+
+    Json(serde_json::json!({
+        "wallet_address": body.wallet_address,
+        "api_key_prefix": body.api_key.chars().take(8).collect::<String>(),
+        "secret_length": body.secret.len(),
+        "secret_preview": format!("{}...", &body.secret[..body.secret.len().min(4)]),
+        "results": results,
+    })).into_response()
+}
+
+// ── Setup wizard endpoints ─────────────────────────────────────────────────
+//
+// The wizard guides a new user through 4 steps:
+//   1. POST /api/polymarket/setup/verify-wallet      → verify the PK derives a real EOA on Polygon,
+//                                                       check whether it's a smart-account (EIP-7702).
+//   2. POST /api/polymarket/setup/detect-proxy       → query Polymarket Data API for the user's
+//                                                       Builder/Polymarket proxy address and detect
+//                                                       its on-chain type (Safe, EIP-1167, custom).
+//   3. POST /api/polymarket/setup/generate-creds     → derive (or create) L2 credentials, save to config.
+//   4. (existing) POST /api/polymarket/test          → test order signing flow.
+
+#[derive(serde::Deserialize)]
+pub struct SetupVerifyWalletBody {
+    pub private_key: String,
+}
+
+/// POST /api/polymarket/setup/verify-wallet
+///
+/// Validates the private key format, derives the EOA address, and inspects on-chain
+/// bytecode to detect EIP-7702 smart accounts (which require `signature_type=poly1271`).
+pub async fn handle_api_polymarket_setup_verify_wallet(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<SetupVerifyWalletBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+
+    let pk_hex = body.private_key.trim().trim_start_matches("0x");
+    if pk_hex.len() != 64 || !pk_hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "Invalid private key format. Expected 64-character hex (with or without 0x prefix)."
+        }))).into_response();
+    }
+
+    // Derive the EOA via the polymarket-trader auth helper (which owns the k256 dep).
+    // We fail through derive_api_key which uses the same address derivation path.
+    let eoa_address = match polymarket_trader::auth::eoa_address_from_pk_hex(pk_hex) {
+        Ok(a) => a,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": format!("Invalid private key: {e}")
+        }))).into_response(),
+    };
+    let bytecode = fetch_polygon_bytecode(&eoa_address).await.unwrap_or_default();
+    let (account_type, suggested_sig_type) = classify_bytecode(&bytecode);
+
+    Json(serde_json::json!({
+        "eoa_address": eoa_address,
+        "account_type": account_type,
+        "is_smart_account": bytecode.starts_with("0xef0100") || (!bytecode.is_empty() && bytecode != "0x"),
+        "suggested_signature_type": suggested_sig_type,
+    })).into_response()
+}
+
+#[derive(serde::Deserialize)]
+pub struct SetupDetectProxyBody {
+    pub eoa_address: String,
+    /// Optional: if user already has a known proxy address, verify it instead of auto-detecting.
+    #[serde(default)]
+    pub proxy_address: Option<String>,
+}
+
+/// POST /api/polymarket/setup/detect-proxy
+///
+/// Inspects on-chain bytecode of the candidate proxy address to determine its type
+/// (Gnosis Safe, EIP-1167, Polymarket custom proxy, etc.) and the appropriate
+/// signature_type for the SDK.
+pub async fn handle_api_polymarket_setup_detect_proxy(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<SetupDetectProxyBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+
+    let proxy_address = match body.proxy_address.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(p) => p.to_string(),
+        None => {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "error": "Auto-detection of proxy address requires the user to paste it from the Polymarket dashboard. Provide `proxy_address` in the request body."
+            }))).into_response();
+        }
+    };
+
+    if !proxy_address.starts_with("0x") || proxy_address.len() != 42 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "Invalid proxy address format. Expected 0x-prefixed 40-hex-char address."
+        }))).into_response();
+    }
+
+    let bytecode = fetch_polygon_bytecode(&proxy_address).await.unwrap_or_default();
+    let (proxy_type, suggested_sig_type) = classify_bytecode(&bytecode);
+    let owner_in_bytecode = extract_embedded_owner(&bytecode);
+
+    let owner_match = match (&owner_in_bytecode, body.eoa_address.as_str()) {
+        (Some(owner), eoa) if !eoa.is_empty() => owner.to_lowercase() == eoa.to_lowercase(),
+        _ => false,
+    };
+
+    Json(serde_json::json!({
+        "proxy_address": proxy_address,
+        "proxy_type": proxy_type,
+        "suggested_signature_type": suggested_sig_type,
+        "owner_embedded": owner_in_bytecode,
+        "owner_matches_eoa": owner_match,
+        "is_contract": !bytecode.is_empty() && bytecode != "0x",
+    })).into_response()
+}
+
+#[derive(serde::Deserialize)]
+pub struct SetupGenerateCredsBody {
+    pub private_key: String,
+    pub wallet_address: String,
+    #[serde(default)]
+    pub proxy_address: Option<String>,
+    #[serde(default)]
+    pub signature_type: Option<String>,
+    /// "create" → POST /auth/api-key (first time setup)
+    /// "derive" → GET /auth/derive-api-key (recover existing creds)
+    /// "auto"   → try derive first, fall back to create
+    #[serde(default = "default_creds_mode")]
+    pub mode: String,
+    /// Whether to persist credentials to config.toml. If false, credentials
+    /// are returned to the caller without saving (preview mode).
+    #[serde(default = "default_persist")]
+    pub persist: bool,
+    #[serde(default)]
+    pub is_builder: Option<bool>,
+}
+
+fn default_creds_mode() -> String { "auto".to_string() }
+fn default_persist() -> bool { true }
+
+/// POST /api/polymarket/setup/generate-creds
+///
+/// Generates Polymarket L2 credentials (api_key, secret, passphrase) for the supplied
+/// private key. Either creates new (first time) or derives existing.
+/// Persists them along with wallet_address, proxy_address and signature_type to config.toml.
+pub async fn handle_api_polymarket_setup_generate_creds(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<SetupGenerateCredsBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+
+    let pk = body.private_key.trim().trim_start_matches("0x").to_string();
+    if pk.len() != 64 || !pk.chars().all(|c| c.is_ascii_hexdigit()) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "Invalid private key format."
+        }))).into_response();
+    }
+
+    let mode = body.mode.to_lowercase();
+    let mut last_error = String::new();
+    let mut method_used = "";
+    let creds_result: Option<polymarket_trader::auth::PolyCredentials> = match mode.as_str() {
+        "create" => {
+            method_used = "create";
+            polymarket_trader::auth::setup_credentials(&pk, None).await
+                .map_err(|e| last_error = format!("create: {e:#}")).ok()
+        }
+        "derive" => {
+            method_used = "derive";
+            polymarket_trader::auth::derive_api_key(&pk).await
+                .map_err(|e| last_error = format!("derive: {e:#}")).ok()
+        }
+        _ => {
+            // auto: try derive first (more permissive), fall back to create
+            match polymarket_trader::auth::derive_api_key(&pk).await {
+                Ok(c) => { method_used = "derive"; Some(c) }
+                Err(de) => {
+                    last_error = format!("derive: {de:#}");
+                    match polymarket_trader::auth::setup_credentials(&pk, None).await {
+                        Ok(c) => { method_used = "create"; Some(c) }
+                        Err(ce) => {
+                            last_error = format!("derive failed ({de:#}); create failed ({ce:#})");
+                            None
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    let creds = match creds_result {
+        Some(c) => c,
+        None => return (StatusCode::BAD_GATEWAY, Json(serde_json::json!({
+            "success": false,
+            "error": last_error,
+        }))).into_response(),
+    };
+
+    if body.persist {
+        let mut config = state.config.lock().clone();
+        config.polymarket = crate::config::schema::PolymarketConfig {
+            api_key: Some(creds.api_key.clone()),
+            secret: Some(creds.secret.clone()),
+            passphrase: Some(creds.passphrase.clone()),
+            wallet_address: Some(body.wallet_address.clone()),
+            private_key: Some(pk),
+            is_builder: body.is_builder.or(config.polymarket.is_builder),
+            proxy_address: body.proxy_address.clone().filter(|p| !p.trim().is_empty()),
+            signature_type: body.signature_type.clone().filter(|s| !s.trim().is_empty()),
+        };
+        if let Err(e) = config.save().await {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "success": false,
+                "error": format!("Failed to save config: {e}"),
+            }))).into_response();
+        }
+        *state.config.lock() = config;
+    }
+
+    Json(serde_json::json!({
+        "success": true,
+        "method_used": method_used,
+        "api_key": creds.api_key,
+        "api_key_masked": mask_token(&creds.api_key),
+        "secret_masked": mask_token(&creds.secret),
+        "passphrase_masked": mask_token(&creds.passphrase),
+        "wallet_address": creds.wallet_address,
+        "persisted": body.persist,
+    })).into_response()
+}
+
+fn mask_token(s: &str) -> String {
+    if s.len() <= 8 { "•".repeat(s.len()) }
+    else { format!("{}…{}", &s[..4], &s[s.len()-4..]) }
+}
+
+/// Reads bytecode at an address from a public Polygon RPC.
+/// Returns "0x" if the address has no code (pure EOA), or the deployed bytecode.
+async fn fetch_polygon_bytecode(addr: &str) -> Option<String> {
+    let rpcs = ["https://polygon.drpc.org", "https://1rpc.io/matic", "https://polygon-bor-rpc.publicnode.com"];
+    let body = serde_json::json!({
+        "jsonrpc":"2.0","method":"eth_getCode","id":1,
+        "params":[addr.to_lowercase(), "latest"],
+    });
+    let client = reqwest::Client::new();
+    for rpc in rpcs {
+        let resp = match client.post(rpc).timeout(std::time::Duration::from_secs(8)).json(&body).send().await {
+            Ok(r) => r, Err(_) => continue,
+        };
+        if !resp.status().is_success() { continue; }
+        let json: serde_json::Value = match resp.json().await { Ok(v) => v, Err(_) => continue };
+        if let Some(code) = json.get("result").and_then(|v| v.as_str()) {
+            return Some(code.to_string());
+        }
+    }
+    None
+}
+
+/// Classifies on-chain bytecode and returns (account_type, suggested_signature_type).
+fn classify_bytecode(code: &str) -> (&'static str, &'static str) {
+    if code.is_empty() || code == "0x" {
+        return ("eoa", "eoa");
+    }
+    if code.starts_with("0xef0100") {
+        // EIP-7702 delegate to a smart contract (MetaMask Smart Account, Coinbase Smart Wallet, etc.)
+        return ("eip7702_smart_account", "poly1271");
+    }
+    if code.starts_with("0x363d3d373d3d3d363d73") {
+        // Standard EIP-1167 minimal proxy clone (Magic/email Polymarket accounts).
+        return ("eip1167_proxy", "proxy");
+    }
+    if code.starts_with("0x363d3d373d3d363d7f") {
+        // Polymarket's custom proxy factory (introduced ~April 2026 for new accounts).
+        // Parametrized with the owner EOA in the trailing bytecode.
+        return ("polymarket_custom_proxy", "poly1271");
+    }
+    if code.starts_with("0x6080") {
+        // Generic Solidity contract — likely Gnosis Safe or similar.
+        return ("contract", "gnosis_safe");
+    }
+    ("contract", "poly1271")
+}
+
+/// Extracts the owner address embedded at the end of a Polymarket custom proxy bytecode.
+/// Polymarket's factory templates the owner EOA into the last 20 bytes.
+fn extract_embedded_owner(code: &str) -> Option<String> {
+    let hex = code.trim_start_matches("0x");
+    if hex.len() < 40 { return None; }
+    let owner_hex = &hex[hex.len()-40..];
+    if owner_hex.chars().all(|c| c == '0') { return None; }
+    Some(format!("0x{}", owner_hex))
+}
+
+/// POST /api/polymarket/refresh-credentials — derive fresh API credentials via L1 EIP-712 auth.
+///
+/// Uses the private key from config to sign a ClobAuth message and call
+/// POST /auth/api-key on the CLOB. Returns new api_key, secret, passphrase.
+/// The old credentials are NOT automatically saved — caller must confirm.
+pub async fn handle_api_polymarket_refresh_credentials(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let private_key = {
+        let cfg = state.config.lock();
+        match cfg.polymarket.private_key.clone().filter(|k| !k.is_empty()) {
+            Some(pk) => pk,
+            None => {
+                return (axum::http::StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                    "error": "No private_key configured in [polymarket] section. L1 auth requires the wallet private key."
+                }))).into_response();
+            }
+        }
+    };
+
+    match polymarket_trader::auth::setup_credentials(&private_key, None).await {
+        Ok(creds) => {
+            Json(serde_json::json!({
+                "success": true,
+                "api_key": creds.api_key,
+                "secret": creds.secret,
+                "passphrase": creds.passphrase,
+                "wallet_address": creds.wallet_address,
+                "note": "These credentials are NOT saved. Copy them into Settings → Config → [polymarket] section."
             })).into_response()
         }
-        Ok(resp) => {
-            let status = resp.status();
-            let body_text = resp.text().await.unwrap_or_default();
-            (StatusCode::BAD_GATEWAY, Json(serde_json::json!({
-                "error": format!("CLOB API returned {status}: {body_text}")
+        Err(e) => {
+            let err_str = format!("{e:#}");
+            (axum::http::StatusCode::BAD_GATEWAY, Json(serde_json::json!({
+                "success": false,
+                "error": err_str
             }))).into_response()
         }
-        Err(e) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({
-            "error": format!("Cannot reach Polymarket CLOB: {e}")
-        }))).into_response(),
     }
 }
 
@@ -1088,7 +2304,313 @@ fn get_poly_creds(state: &AppState) -> Option<polymarket_trader::auth::PolyCrede
         api_key,
         secret: pm.secret.clone().unwrap_or_default(),
         passphrase: pm.passphrase.clone().unwrap_or_default(),
+        wallet_address: pm.wallet_address.clone().unwrap_or_default().to_lowercase(),
+        private_key: pm.private_key.clone().filter(|k| !k.is_empty()),
+        is_builder: pm.is_builder.unwrap_or(false),
+        proxy_address: pm.proxy_address.clone().filter(|k| !k.is_empty()).map(|s| s.to_lowercase()),
+        signature_type: pm.signature_type.clone().filter(|k| !k.is_empty()),
     })
+}
+
+fn get_poly_wallet_address(state: &AppState) -> Option<String> {
+    let cfg = state.config.lock();
+    cfg.polymarket
+        .wallet_address
+        .clone()
+        .filter(|w| !w.trim().is_empty())
+}
+
+async fn resolve_live_token_ids(series_id: Option<&str>) -> anyhow::Result<(String, String)> {
+    let sid = series_id.ok_or_else(|| anyhow::anyhow!("Please select a Market Series before starting live mode."))?;
+    let series = crate::tools::series::builtin_series()
+        .into_iter()
+        .find(|s| s.id == sid)
+        .ok_or_else(|| anyhow::anyhow!("Selected Market Series is not recognized. Please refresh and choose again."))?;
+
+    let slug_prefix = series.slug_prefix;
+    let cadence = series.cadence.as_str();
+    let seconds = match cadence {
+        "1m" => 60,
+        "5m" => 300,
+        "15m" => 900,
+        "1h" => 3600,
+        _ => 300, // fallback to 5m
+    };
+
+    let now_utc = chrono::Utc::now();
+    let now_secs = now_utc.timestamp() as u64;
+    let windows = calculate_resolution_windows(now_secs, seconds);
+
+    tracing::info!(
+        "[resolve_live_token_ids] UTC now: {}, window_ts: {}, series_id={}, slug_prefix={}",
+        now_utc.to_rfc3339(), windows[0], sid, slug_prefix
+    );
+
+    let mut last_err = anyhow::anyhow!("No active market found");
+
+    for ts in &windows {
+        let target_slug = format!("{}-{}", slug_prefix, ts);
+        match polymarket_trader::markets::get_market(&target_slug).await {
+            Ok(m) => {
+                if !m.yes_token_id.trim().is_empty() && !m.no_token_id.trim().is_empty() {
+                    tracing::info!("[resolve_live_token_ids] Resolved YES={} NO={} from slug {}", m.yes_token_id, m.no_token_id, target_slug);
+                    return Ok((m.yes_token_id, m.no_token_id));
+                }
+            }
+            Err(e) => {
+                last_err = e;
+                tracing::debug!("[resolve_live_token_ids] Slug {} not available: {}", target_slug, last_err);
+            }
+        }
+    }
+
+    anyhow::bail!(
+        "No active market with both YES and NO tokens found for the selected series right now. (Tried windows around {}). Error: {}",
+        windows[0], last_err
+    );
+}
+
+/// Pure helper for resolution window selection.
+/// Returns [current, next, previous, next+1, previous-1] windows.
+fn calculate_resolution_windows(now_secs: u64, seconds: u64) -> Vec<u64> {
+    let window_ts = now_secs - (now_secs % seconds);
+    vec![
+        window_ts,
+        window_ts + seconds,
+        window_ts - seconds,
+        window_ts + (2 * seconds),
+        window_ts - (2 * seconds),
+    ]
+}
+
+/// Query USDC balance on Polygon via public RPC for the EOA + (optional) proxy
+/// wallet, summing across native USDC and bridged USDC.e contracts.
+/// Polymarket may hold trading funds in either contract / either wallet
+/// depending on how the user funded the account.
+async fn ensure_live_wallet_has_min_balance(
+    wallet_address: &str,
+    proxy_address: Option<&str>,
+    min_usdc: f64,
+) -> anyhow::Result<()> {
+    const USDC_E:    &str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"; // bridged
+    const USDC_NATIVE: &str = "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359";
+    const PUSD:      &str = "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb";
+    let tokens = [("USDC.e", USDC_E), ("USDC", USDC_NATIVE), ("pUSD", PUSD)];
+
+    let mut addrs: Vec<String> = Vec::with_capacity(2);
+    for raw in [Some(wallet_address), proxy_address].into_iter().flatten() {
+        let clean = raw.trim().trim_start_matches("0x").to_lowercase();
+        if clean.len() == 40 && !addrs.contains(&clean) {
+            addrs.push(clean);
+        }
+    }
+    if addrs.is_empty() { return Ok(()); }
+
+    let rpcs = ["https://polygon.drpc.org", "https://1rpc.io/matic", "https://polygon-bor-rpc.publicnode.com"];
+    let client = reqwest::Client::new();
+
+    async fn read_balance(client: &reqwest::Client, rpcs: &[&str], token: &str, addr: &str) -> anyhow::Result<u128> {
+        let calldata = format!("0x70a08231000000000000000000000000{}", addr);
+        let body = serde_json::json!({
+            "jsonrpc":"2.0","method":"eth_call","id":1,
+            "params":[{"to":token,"data":calldata},"latest"],
+        });
+        let mut last_err: Option<anyhow::Error> = None;
+        for rpc in rpcs {
+            let resp = match client.post(*rpc).timeout(std::time::Duration::from_secs(8)).json(&body).send().await {
+                Ok(r) => r, Err(e) => { last_err = Some(e.into()); continue; }
+            };
+            if !resp.status().is_success() {
+                last_err = Some(anyhow::anyhow!("RPC {} → {}", rpc, resp.status()));
+                continue;
+            }
+            let json: serde_json::Value = match resp.json().await {
+                Ok(v) => v, Err(e) => { last_err = Some(e.into()); continue; }
+            };
+            let Some(hex) = json.get("result").and_then(|v| v.as_str()) else {
+                last_err = Some(anyhow::anyhow!("missing result: {}", json)); continue;
+            };
+            return u128::from_str_radix(hex.trim_start_matches("0x"), 16)
+                .map_err(|e| anyhow::anyhow!("hex parse: {e}"));
+        }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("all RPCs failed")))
+    }
+
+    let mut total_units: u128 = 0;
+    let mut all_failed = true;
+    let mut breakdown: Vec<String> = Vec::new();
+    for addr in &addrs {
+        for (label, token) in tokens.iter() {
+            match read_balance(&client, &rpcs, token, addr).await {
+                Ok(units) => {
+                    all_failed = false;
+                    total_units = total_units.saturating_add(units);
+                    if units > 0 {
+                        breakdown.push(format!("0x{}…/{}: ${:.4}", &addr[..6], label, (units as f64) / 1_000_000.0));
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("balance check 0x{}/{} failed: {}", &addr[..6], label, e);
+                }
+            }
+        }
+    }
+
+    if all_failed {
+        tracing::warn!("Skipping Polymarket wallet balance pre-check (all RPCs unreachable)");
+        return Ok(());
+    }
+
+    let total_usdc = (total_units as f64) / 1_000_000.0;
+    tracing::info!(
+        "Polymarket wallet balance check: total ${:.4} ({})",
+        total_usdc,
+        if breakdown.is_empty() { "all zero".to_string() } else { breakdown.join(", ") }
+    );
+
+    if total_usdc + 1e-6 < min_usdc {
+        anyhow::bail!(
+            "Insufficient wallet balance for live mode. Required at least ${:.2} USDC/pUSD, detected ${:.2} across EOA+proxy on USDC + USDC.e + pUSD.",
+            min_usdc, total_usdc
+        );
+    }
+    Ok(())
+}
+
+fn friendly_live_error(e: &str) -> String {
+    if e.contains("Market Series") || e.contains("No active Polymarket market") {
+        format!("{e} Open Live Strategies and select a supported built-in BTC/ETH series.")
+    } else if e.contains("wallet balance") || e.contains("Insufficient wallet balance") {
+        format!("{e} Please fund your Polymarket wallet and try again.")
+    } else if e.contains("wallet address") {
+        "Live mode requires a Polymarket wallet address. Go to Settings → Config and set polymarket.wallet_address.".to_string()
+    } else if e.contains("Invalid api key") || e.contains("Polymarket credentials rejected") {
+        format!("{e} Go to the Polymarket page and click \"Regenerate API credentials\" so they match your wallet.")
+    } else {
+        e.to_string()
+    }
+}
+
+/// Pre-flight validation of Polymarket L2 credentials.
+///
+/// Calls an authenticated CLOB endpoint (`GET /auth/api-keys`) with the supplied
+/// credentials. On 401 tries all 3 secret-decoding strategies (Base64 / Raw / Hex)
+/// to distinguish "wrong key" from "wrong encoding", and reports which part is
+/// likely bad so the user can act.
+async fn validate_live_poly_credentials(
+    creds: &polymarket_trader::auth::PolyCredentials,
+) -> anyhow::Result<()> {
+    use polymarket_trader::auth::{create_l2_headers_with_strategy, SecretDecodeStrategy};
+
+    let path = "/auth/api-keys";
+    let client = reqwest::Client::new();
+
+    async fn try_get(
+        client: &reqwest::Client,
+        creds: &polymarket_trader::auth::PolyCredentials,
+        path: &str,
+        strategy: SecretDecodeStrategy,
+    ) -> (u16, String) {
+        let headers = create_l2_headers_with_strategy(creds, "GET", path, None, strategy);
+        let mut req = client
+            .get(format!("https://clob.polymarket.com{}", path))
+            .timeout(std::time::Duration::from_secs(10));
+        for (k, v) in &headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
+        match req.send().await {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                let body = resp.text().await.unwrap_or_default();
+                (status, body)
+            }
+            Err(e) => (0, format!("network error: {e}")),
+        }
+    }
+
+    async fn try_post_order(
+        client: &reqwest::Client,
+        creds: &polymarket_trader::auth::PolyCredentials,
+        strategy: SecretDecodeStrategy,
+    ) -> (u16, String) {
+        let body = r#"{"order":{"tokenID":"0","price":"0.5","size":"1","side":"BUY","type":"GTC"},"owner":""}"#;
+        let headers = create_l2_headers_with_strategy(creds, "POST", "/order", Some(body), strategy);
+        let mut req = client
+            .post("https://clob.polymarket.com/order")
+            .header("Content-Type", "application/json")
+            .body(body)
+            .timeout(std::time::Duration::from_secs(10));
+        for (k, v) in &headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
+        match req.send().await {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                let body = resp.text().await.unwrap_or_default();
+                (status, body)
+            }
+            Err(e) => (0, format!("network error: {e}")),
+        }
+    }
+
+    // Start with the library default (Base64). This is what real order calls will use.
+    let (status, body) = try_get(&client, creds, path, SecretDecodeStrategy::Base64).await;
+    if status >= 200 && status < 300 {
+        return Ok(());
+    }
+    if status == 0 {
+        anyhow::bail!("Cannot reach Polymarket CLOB to validate credentials: {body}");
+    }
+    if status != 401 && status != 403 {
+        tracing::warn!(
+            "Polymarket credential pre-flight returned {status} (non-auth) — continuing: {body}"
+        );
+        return Ok(());
+    }
+
+    // GET /auth/api-keys returned 401/403. For Builder Keys this endpoint may
+    // reject valid credentials while POST /order correctly reflects auth status.
+    // Try the fallback before giving up.
+    let (post_status, _post_body) = try_post_order(&client, creds, SecretDecodeStrategy::Base64).await;
+    if post_status != 0 && post_status != 401 && post_status != 403 {
+        tracing::info!(
+            "Polymarket credential pre-flight: GET /auth/api-keys → 401, \
+             but POST /order → {post_status} (auth OK, order rejected). Continuing."
+        );
+        return Ok(());
+    }
+
+    // 401 / 403 on both endpoints — probe the other two strategies for diagnostics.
+    let (raw_status, _) = try_get(&client, creds, path, SecretDecodeStrategy::Raw).await;
+    let (hex_status, _) = try_get(&client, creds, path, SecretDecodeStrategy::Hex).await;
+
+    let detail = body.chars().take(120).collect::<String>();
+    let api_key_preview = creds.api_key.chars().take(4).collect::<String>();
+    let api_key_tail: String = creds
+        .api_key
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let secret_len = creds.secret.len();
+    let passphrase_len = creds.passphrase.len();
+
+    let hint = if raw_status == 200 || raw_status == 204 {
+        " Hint: the secret works when treated as raw bytes — you may have pasted it already-decoded."
+    } else if hex_status == 200 || hex_status == 204 {
+        " Hint: the secret works as hex — you may have pasted a hex-encoded value by mistake."
+    } else {
+        " Tip: open the Polymarket page and click 'Regenerate API Credentials'; it derives a fresh L2 trío for the wallet of your saved private_key."
+    };
+
+    anyhow::bail!(
+        "Polymarket credentials rejected ({status}): {detail}. api_key='{api_key_preview}…{api_key_tail}' (len={}), secret_len={secret_len}, passphrase_len={passphrase_len}, wallet={}.{hint}",
+        creds.api_key.len(),
+        creds.wallet_address,
+    );
 }
 
 /// GET /api/polymarket/positions — open positions
@@ -1290,6 +2812,45 @@ pub async fn handle_api_polymarket_order_cancel(
     }
 }
 
+/// GET /api/polymarket/markets/resolve?slug=... — resolve a Polymarket slug to condition_id
+pub async fn handle_api_polymarket_resolve_slug(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let slug = match query.get("slug") {
+        Some(s) => s.clone(),
+        None => {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "missing slug parameter"}))).into_response();
+        }
+    };
+
+    let url = format!("https://gamma-api.polymarket.com/markets?slug={}", slug);
+    match reqwest::Client::new().get(&url).timeout(std::time::Duration::from_secs(10)).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            match resp.json::<serde_json::Value>().await {
+                Ok(data) => {
+                    if let Some(market) = data.as_array().and_then(|a| a.first()) {
+                        Json(serde_json::json!({
+                            "condition_id": market.get("conditionId").and_then(|v| v.as_str()),
+                            "question": market.get("question").and_then(|v| v.as_str()),
+                            "slug": market.get("slug").and_then(|v| v.as_str()),
+                        })).into_response()
+                    } else {
+                        (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "market not found"}))).into_response()
+                    }
+                }
+                Err(e) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+            }
+        }
+        Ok(resp) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error": format!("Gamma API error: {}", resp.status())}))).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
 /// GET /api/channels/telegram/configure — return current Telegram config (token masked)
 pub async fn handle_api_telegram_get(
     State(state): State<AppState>,
@@ -1375,6 +2936,7 @@ pub async fn handle_api_telegram_configure(
         draft_update_interval_ms: 1500,
         interrupt_on_new_message: false,
         mention_only: false,
+        chat_id: None,
     });
     tg.bot_token = token;
     if let Some(users) = body.allowed_users {
@@ -1957,6 +3519,98 @@ fn hydrate_config_for_save(
     incoming
 }
 
+// ── Agent Skills ─────────────────────────────────────────────────
+
+/// GET /api/skills — list installed agent skills
+pub async fn handle_api_skills_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let skills = crate::skills::load_skills(&workspace_dir);
+
+    let skills_json: Vec<serde_json::Value> = skills
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "name": s.name,
+                "description": s.description,
+                "version": s.version,
+                "author": s.author,
+                "tags": s.tags,
+                "location": s.location.as_ref().map(|p| p.to_string_lossy().to_string()).unwrap_or_default(),
+            })
+        })
+        .collect();
+
+    Json(serde_json::json!({ "skills": skills_json })).into_response()
+}
+
+#[derive(serde::Deserialize)]
+pub struct SkillContentQuery {
+    pub path: String,
+}
+
+/// GET /api/skills/content — read skill file content
+pub async fn handle_api_skills_content(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<SkillContentQuery>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let path = std::path::Path::new(&query.path);
+
+    // Security: only allow reading from skills directory
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let skills_dir = workspace_dir.join("skills");
+
+    // Also check open-skills directory if enabled
+    let is_valid_path = path.starts_with(&skills_dir)
+        || path.ancestors().any(|p| p.file_name().map(|n| n == "skills").unwrap_or(false));
+
+    if !is_valid_path {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "Can only read files from skills directories" })),
+        )
+            .into_response();
+    }
+
+    if !path.exists() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "Skill file not found" })),
+        )
+            .into_response();
+    }
+
+    // Only allow reading SKILL.md or SKILL.toml files
+    let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if filename != "SKILL.md" && filename != "SKILL.toml" {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "Can only read SKILL.md or SKILL.toml files" })),
+        )
+            .into_response();
+    }
+
+    match std::fs::read_to_string(path) {
+        Ok(content) => Json(serde_json::json!({ "content": content })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("Failed to read: {e}") })),
+        )
+            .into_response(),
+    }
+}
+
 // ── TradingView Screener ─────────────────────────────────────────
 
 #[derive(serde::Deserialize)]
@@ -2084,8 +3738,22 @@ pub async fn handle_api_backtest_scripts(
     Json(serde_json::json!({ "scripts": scripts })).into_response()
 }
 
+/// GET /api/backtest/series u2014 list all built-in (and future user-defined) recurring market series
+pub async fn handle_api_backtest_series(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let series = crate::tools::series::builtin_series();
+    Json(serde_json::json!({ "series": series })).into_response()
+}
+
 #[derive(serde::Deserialize)]
 pub struct BacktestRunBody {
+    /// Rhai script path — required for rhai_candle, ignored for other engine kinds.
+    #[serde(default)]
     pub script: String,
     #[serde(default = "default_market_type")]
     pub market_type: String,
@@ -2096,6 +3764,41 @@ pub struct BacktestRunBody {
     pub to_date: String,
     pub initial_balance: f64,
     pub fee_pct: f64,
+    /// Optional series identifier u2014 if provided, overrides symbol/interval/resolution_logic
+    pub series_id: Option<String>,
+    /// Resolution logic override: "price_up" | "threshold_above" | "threshold_below"
+    pub resolution_logic: Option<String>,
+    /// Threshold for threshold_above/below resolution (e.g. 25.0 for u00b0C)
+    pub threshold: Option<f64>,
+    /// Maximum stake per trade in USD — enforces Polymarket per-market liquidity limits.
+    /// Polymarket recurring 5-min binary windows have ~$500-$3,000 liquidity each.
+    /// Default (None) = no cap (use for crypto backtests).
+    pub max_position_usd: Option<f64>,
+    /// Maximum entry price threshold. If the current price (crypto) or token price
+    /// (binary) exceeds this value, the trade/bet is skipped.
+    pub max_entry_price: Option<f64>,
+    /// Position sizing mode: 'fixed' = fixed USD amount, 'percent' = cap fraction of balance.
+    pub sizing_mode: Option<String>,
+    /// Sizing value: USD amount for fixed mode, or max fraction (0.0-1.0) for percent mode.
+    pub sizing_value: Option<f64>,
+    /// Price mode for Polymarket binary entry: 'historical' = real scraped price,
+    /// 'mid' = average of buy/sell (mid-price).
+    pub price_mode: Option<String>,
+    /// Hour gate: only trade during these UTC hours (0-23). Empty = no restriction.
+    #[serde(default)]
+    pub allowed_hours: Vec<u8>,
+    /// RV floor: skip windows where BTC 1h realized-vol < this value. 0 = disabled.
+    #[serde(default)]
+    pub rv_min_btc: Option<f64>,
+    /// Engine kind for strategy-core engines. When set to anything other than
+    /// "rhai_candle" (or absent), the Rhai script path is ignored and the engine
+    /// is driven directly by the normalised Binance OHLCV feed.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Per-engine tunable parameters from the UI EngineParamsForm.
+    /// Merged over each engine's default config at runtime.
+    #[serde(default)]
+    pub engine_params: Option<serde_json::Value>,
 }
 
 fn default_market_type() -> String {
@@ -2118,6 +3821,40 @@ pub async fn handle_api_backtest_run(
 
     let workspace_dir = state.config.lock().workspace_dir.clone();
 
+    // ── Strategy-core engine backtest (non-Rhai path) ─────────────────────────
+    let engine_kind = body.kind.as_deref().unwrap_or("rhai_candle");
+    if engine_kind != "rhai_candle" && !engine_kind.is_empty() {
+        let markets: Vec<String> = body.symbol
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let params = crate::tools::engine_backtest::EngineBacktestParams {
+            kind: engine_kind,
+            markets,
+            threshold: body.threshold,
+            engine_params: body.engine_params.clone(),
+            from_date: &body.from_date,
+            to_date: &body.to_date,
+            initial_balance: body.initial_balance,
+            workspace_dir: &workspace_dir,
+        };
+        let metrics = crate::tools::engine_backtest::run_engine_backtest(params).await;
+        return Json(serde_json::json!({
+            "script": format!("engine:{engine_kind}"),
+            "symbol": body.symbol,
+            "total_return_pct":  metrics.total_return_pct,
+            "sharpe_ratio":      metrics.sharpe_ratio,
+            "max_drawdown_pct":  metrics.max_drawdown_pct,
+            "win_rate_pct":      metrics.win_rate_pct,
+            "total_trades":      metrics.total_trades,
+            "analysis":          metrics.analysis,
+            "markets_tested":    metrics.markets_tested,
+            "worst_trades":      serde_json::Value::Array(vec![]),
+            "all_trades":        serde_json::Value::Array(vec![]),
+        })).into_response();
+    }
+
     // Resolve script path: try as-is, then relative to scripts/ dir
     let script_path = {
         let p = std::path::Path::new(&body.script);
@@ -2136,15 +3873,47 @@ pub async fn handle_api_backtest_run(
             .into_response();
     }
 
+    // If a series_id was provided, resolve it to symbol/interval/resolution_logic/threshold
+    let (symbol, interval, resolution_logic, threshold) = if let Some(ref sid) = body.series_id {
+        let series = crate::tools::series::builtin_series();
+        if let Some(s) = series.iter().find(|s| s.id == *sid) {
+            let rl = match s.resolution_logic {
+                crate::tools::series::ResolutionLogic::PriceUp        => "price_up",
+                crate::tools::series::ResolutionLogic::ThresholdAbove => "threshold_above",
+                crate::tools::series::ResolutionLogic::ThresholdBelow => "threshold_below",
+            };
+            (s.symbol.clone(), s.cadence.clone(), rl.to_string(), s.threshold)
+        } else {
+            (body.symbol.clone(), body.interval.clone(),
+             body.resolution_logic.clone().unwrap_or_else(|| "price_up".into()),
+             body.threshold)
+        }
+    } else {
+        (body.symbol.clone(), body.interval.clone(),
+         body.resolution_logic.clone().unwrap_or_else(|| "price_up".into()),
+         body.threshold)
+    };
+
+    let sizing_mode = body.sizing_mode.as_deref().unwrap_or("percent");
+    let sizing_value = body.sizing_value.unwrap_or(1.0);
+    let price_mode = body.price_mode.as_deref().unwrap_or("historical");
+
     let metrics = crate::tools::backtest::run_backtest_engine(
         &script_path,
         &body.market_type,
-        &body.symbol,
-        &body.interval,
+        &symbol,
+        &interval,
         &body.from_date,
         &body.to_date,
         body.initial_balance,
         body.fee_pct,
+        &resolution_logic,
+        threshold,
+        body.max_position_usd,
+        body.max_entry_price,
+        sizing_mode,
+        sizing_value,
+        price_mode,
         &workspace_dir,
     )
     .await;
@@ -2160,6 +3929,19 @@ pub async fn handle_api_backtest_run(
         }))
         .collect();
 
+    let all_trades: Vec<serde_json::Value> = metrics
+        .all_trades
+        .iter()
+        .map(|t| serde_json::json!({
+            "timestamp": t.timestamp,
+            "side": t.side,
+            "price": t.price,
+            "size": t.size,
+            "pnl": t.pnl,
+            "balance": t.balance,
+        }))
+        .collect();
+
     Json(serde_json::json!({
         "script": body.script,
         "market_type": body.market_type,
@@ -2169,13 +3951,27 @@ pub async fn handle_api_backtest_run(
         "to_date": body.to_date,
         "initial_balance": body.initial_balance,
         "fee_pct": body.fee_pct,
+        "series_id": body.series_id,
+        "resolution_logic": resolution_logic,
+        "threshold": threshold,
         "total_return_pct": metrics.total_return_pct,
         "sharpe_ratio": metrics.sharpe_ratio,
         "max_drawdown_pct": metrics.max_drawdown_pct,
         "win_rate_pct": metrics.win_rate_pct,
         "total_trades": metrics.total_trades,
         "worst_trades": worst_trades,
+        "all_trades": all_trades,
         "analysis": metrics.analysis,
+        "avg_token_price": metrics.avg_token_price,
+        "correct_direction_pct": metrics.correct_direction_pct,
+        "break_even_win_rate": metrics.break_even_win_rate,
+        "markets_tested": metrics.markets_tested,
+        "windows_with_real_price": metrics.windows_with_real_price,
+        "windows_with_estimated_price": metrics.windows_with_estimated_price,
+        "historical_data_coverage_pct": metrics.historical_data_coverage_pct,
+        "recommended_max_stake_usd": metrics.recommended_max_stake_usd,
+        "flat_debugs": metrics.flat_debugs,
+        "final_balance": body.initial_balance * (1.0 + metrics.total_return_pct / 100.0),
     }))
     .into_response()
 }
@@ -2368,6 +4164,2140 @@ pub async fn handle_api_backtest_scripts_stats(
     }
 }
 
+#[derive(serde::Deserialize)]
+pub struct GetScriptContentQuery {
+    pub path: String,
+}
+
+/// GET /api/backtest/scripts/content — read script content
+pub async fn handle_api_backtest_scripts_content_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<GetScriptContentQuery>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let script_path = std::path::Path::new(&query.path);
+    if !script_path.exists() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "Script not found" })),
+        )
+            .into_response();
+    }
+
+    // Only allow reading .rhai files
+    if script_path.extension().and_then(|e| e.to_str()) != Some("rhai") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "Can only read .rhai files" })),
+        )
+            .into_response();
+    }
+
+    match std::fs::read_to_string(script_path) {
+        Ok(content) => Json(serde_json::json!({ "content": content })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("Failed to read: {e}") })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct SaveScriptContentBody {
+    pub path: String,
+    pub content: String,
+}
+
+/// POST /api/backtest/scripts/content — save script content
+pub async fn handle_api_backtest_scripts_content_post(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<SaveScriptContentBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let script_path = std::path::Path::new(&body.path);
+
+    // Only allow writing .rhai files
+    if script_path.extension().and_then(|e| e.to_str()) != Some("rhai") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "Can only write .rhai files" })),
+        )
+            .into_response();
+    }
+
+    // Create parent directories if needed
+    if let Some(parent) = script_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    match std::fs::write(script_path, &body.content) {
+        Ok(_) => Json(serde_json::json!({ "success": true })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("Failed to save: {e}") })),
+        )
+            .into_response(),
+    }
+}
+
+// ── Polymarket historical dataset sync (dashboard) ────────────────────────
+
+#[derive(serde::Deserialize)]
+pub struct PolyHistSyncBody {
+    /// Series to sync. Defaults to "btc_5m".
+    #[serde(default)]
+    pub series_id: Option<String>,
+    /// Rolling window in days ending today (UTC). Defaults to 60.
+    #[serde(default)]
+    pub days_back: Option<u32>,
+}
+
+/// POST /api/backtest/polymarket-historical/sync
+///
+/// Starts a background scrape of the last `days_back` days of Polymarket
+/// data for the given series. Fetches both minute-4 (P4, main dataset) and
+/// minute-3 (P3, drift signal) token prices via CLOB `/prices-history`.
+///
+/// The request returns immediately. Progress is exposed at
+/// `GET /api/backtest/polymarket-historical/status`.
+///
+/// If a sync is already running, returns `started: false` plus the current
+/// progress snapshot — callers should just poll `/status` in that case.
+pub async fn handle_api_backtest_polymarket_historical_sync(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<PolyHistSyncBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let series_id = body.series_id.unwrap_or_else(|| "btc_5m".to_string());
+    let days_back = body.days_back.unwrap_or(60).clamp(1, 365) as i64;
+
+    // Reject unknown series early so the UI gets a clean error.
+    let series_known = crate::tools::series::builtin_series()
+        .into_iter()
+        .any(|s| s.id == series_id);
+    if !series_known {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("Unknown series_id: {}", series_id) })),
+        )
+            .into_response();
+    }
+
+    // Guard: at most one sync at a time.
+    {
+        let prog = state.poly_sync_progress.lock();
+        if prog.running {
+            return Json(serde_json::json!({
+                "started": false,
+                "progress": *prog,
+            }))
+            .into_response();
+        }
+    }
+
+    let to_dt = chrono::Utc::now();
+    let from_dt = to_dt - chrono::Duration::days(days_back);
+    let from_date = from_dt.format("%Y-%m-%d").to_string();
+    let to_date = to_dt.format("%Y-%m-%d").to_string();
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+
+    // Initialise progress + reset cancel flag from any previous run.
+    {
+        let mut prog = state.poly_sync_progress.lock();
+        *prog = crate::tools::polymarket_historical::SyncProgress {
+            running: true,
+            series_id: series_id.clone(),
+            from_date: from_date.clone(),
+            to_date: to_date.clone(),
+            stage: "min4".to_string(),
+            windows_total: 0,
+            windows_fetched: 0,
+            min4_count: 0,
+            min3_count: 0,
+            error: None,
+            started_at: Some(chrono::Utc::now().to_rfc3339()),
+            completed_at: None,
+        };
+    }
+    state.poly_sync_cancel.store(false, std::sync::atomic::Ordering::SeqCst);
+    let cancel_flag = state.poly_sync_cancel.clone();
+
+    // Spawn the scrape task. Minute-4 first (main dataset), then minute-3.
+    //
+    // Internally uses a SINGLE poll task across both stages with an explicit
+    // AtomicBool stop flag. The previous design had two poll tasks whose
+    // break condition (`running==false || stage∈{error,done}`) never tripped
+    // during the stage-1 → stage-2 transition (stage was "min3", running
+    // still true) — so the outer task hung forever on `poll_handle.await`
+    // and `running` never flipped back to false in the dashboard.
+    let progress = state.poly_sync_progress.clone();
+    tokio::spawn(async move {
+        use crate::tools::polymarket_historical::{scrape_series_with_options, ScrapeOptions};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        // Shared between stages: counters reset between stages, stop flag
+        // signals the poll task to exit at the very end.
+        let fetched = Arc::new(AtomicUsize::new(0));
+        let total = Arc::new(AtomicUsize::new(0));
+        let stop_flag = Arc::new(AtomicBool::new(false));
+
+        let poll_fetched = fetched.clone();
+        let poll_total = total.clone();
+        let poll_stop = stop_flag.clone();
+        let poll_progress = progress.clone();
+        let poll_handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+            loop {
+                interval.tick().await;
+                if poll_stop.load(Ordering::SeqCst) { break; }
+                let mut p = poll_progress.lock();
+                p.windows_fetched = poll_fetched.load(Ordering::SeqCst);
+                p.windows_total = poll_total.load(Ordering::SeqCst);
+            }
+        });
+
+        // ── Stage 1: minute-4 (P4 decision) ──
+        let min4_result = scrape_series_with_options(
+            &series_id,
+            &from_date,
+            &to_date,
+            &workspace_dir,
+            ScrapeOptions {
+                decision_offset_secs: None,     // default = minute 4 for 5m
+                file_prefix: None,              // main dataset
+                fetched_counter: Some(fetched.clone()),
+                total_counter: Some(total.clone()),
+                cancel_flag: Some(cancel_flag.clone()),
+            },
+        )
+        .await;
+
+        match min4_result {
+            Ok(n) => {
+                // If cancellation was requested during stage 1, stop here
+                // instead of starting stage 2. Mark as cancelled and exit.
+                if cancel_flag.load(Ordering::SeqCst) {
+                    {
+                        let mut p = progress.lock();
+                        p.min4_count = n;
+                        p.running = false;
+                        p.stage = "cancelled".to_string();
+                        p.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                    }
+                    stop_flag.store(true, Ordering::SeqCst);
+                    let _ = poll_handle.await;
+                    return;
+                }
+                {
+                    let mut p = progress.lock();
+                    p.min4_count = n;
+                    p.stage = "min3".to_string();
+                    p.windows_fetched = 0;
+                    p.windows_total = 0;
+                }
+                // Reset counters for stage 2.
+                fetched.store(0, Ordering::SeqCst);
+                total.store(0, Ordering::SeqCst);
+            }
+            Err(e) => {
+                {
+                    let mut p = progress.lock();
+                    p.running = false;
+                    p.stage = "error".to_string();
+                    p.error = Some(format!("min4 scrape failed: {}", e));
+                    p.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                }
+                stop_flag.store(true, Ordering::SeqCst);
+                let _ = poll_handle.await;
+                return;
+            }
+        }
+
+        // ── Stage 2: minute-3 (P3 drift signal) ──
+        // Decision offset for minute-3: (window_minutes - 2) * 60s.
+        let series = crate::tools::series::builtin_series()
+            .into_iter()
+            .find(|s| s.id == series_id);
+        let window_minutes: i64 = match series {
+            Some(s) => {
+                let c = &s.cadence;
+                if let Some(m) = c.strip_suffix('m') {
+                    m.parse().unwrap_or(5)
+                } else if let Some(h) = c.strip_suffix('h') {
+                    h.parse::<i64>().unwrap_or(1) * 60
+                } else {
+                    5
+                }
+            }
+            None => 5,
+        };
+        let min3_offset = (window_minutes - 2) * 60;
+
+        let min3_result = scrape_series_with_options(
+            &series_id,
+            &from_date,
+            &to_date,
+            &workspace_dir,
+            ScrapeOptions {
+                decision_offset_secs: Some(min3_offset),
+                file_prefix: Some("min3_".to_string()),
+                fetched_counter: Some(fetched.clone()),
+                total_counter: Some(total.clone()),
+                cancel_flag: Some(cancel_flag.clone()),
+            },
+        )
+        .await;
+
+        {
+            let mut p = progress.lock();
+            p.running = false;
+            p.completed_at = Some(chrono::Utc::now().to_rfc3339());
+            match min3_result {
+                Ok(n) => {
+                    p.min3_count = n;
+                    // If cancel flag was raised during stage 2, mark as
+                    // cancelled (we still flushed whatever we had).
+                    if cancel_flag.load(Ordering::SeqCst) {
+                        p.stage = "cancelled".to_string();
+                    } else {
+                        p.stage = "done".to_string();
+                    }
+                }
+                Err(e) => {
+                    p.stage = "error".to_string();
+                    p.error = Some(format!("min3 scrape failed: {}", e));
+                }
+            }
+        }
+        // Stop the single poll task and join it cleanly.
+        stop_flag.store(true, Ordering::SeqCst);
+        let _ = poll_handle.await;
+    });
+
+    let snapshot = state.poly_sync_progress.lock().clone();
+    Json(serde_json::json!({
+        "started": true,
+        "progress": snapshot,
+    }))
+    .into_response()
+}
+
+/// POST /api/backtest/polymarket-historical/cancel
+///
+/// Sets the shared cancel flag so the active sync task exits early.
+/// Returns immediately. The task may take a few seconds to wind down
+/// (it finishes any in-flight worker tasks and flushes already-fetched
+/// records to disk before marking stage = "cancelled").
+pub async fn handle_api_backtest_polymarket_historical_cancel(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let was_running = state.poly_sync_progress.lock().running;
+    state.poly_sync_cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+    Json(serde_json::json!({
+        "ok": true,
+        "was_running": was_running,
+        "message": if was_running {
+            "Cancel signal sent. Sync will stop within a few seconds."
+        } else {
+            "No sync was running; cancel flag set anyway."
+        }
+    }))
+    .into_response()
+}
+
+/// GET /api/backtest/polymarket-historical/status
+///
+/// Returns the current sync progress snapshot plus a lightweight summary of
+/// cached datasets on disk so the dashboard can render "last synced" info
+/// even across server restarts.
+pub async fn handle_api_backtest_polymarket_historical_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let progress = state.poly_sync_progress.lock().clone();
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let hist_dir = workspace_dir.join("data").join("polymarket_historical");
+
+    // Summarise available datasets (main + min3 pairs per series).
+    let mut datasets: Vec<serde_json::Value> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&hist_dir) {
+        use std::collections::BTreeMap;
+        let mut by_series: BTreeMap<String, (Option<u64>, Option<u64>, Option<std::time::SystemTime>)> = BTreeMap::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(n) if n.ends_with(".jsonl") => n.to_string(),
+                _ => continue,
+            };
+            let (series_key, is_min3) = if let Some(rest) = name.strip_prefix("min3_") {
+                (rest.trim_end_matches(".jsonl").to_string(), true)
+            } else {
+                (name.trim_end_matches(".jsonl").to_string(), false)
+            };
+            let meta = std::fs::metadata(&path).ok();
+            let modified = meta.as_ref().and_then(|m| m.modified().ok());
+            // Approx record count = line count. Cheap enough for small files.
+            let line_count = std::fs::read_to_string(&path)
+                .map(|c| c.lines().filter(|l| !l.trim().is_empty()).count() as u64)
+                .ok();
+            let slot = by_series.entry(series_key).or_default();
+            if is_min3 {
+                slot.1 = line_count;
+            } else {
+                slot.0 = line_count;
+            }
+            if let Some(m) = modified {
+                slot.2 = Some(match slot.2 {
+                    Some(prev) if prev > m => prev,
+                    _ => m,
+                });
+            }
+        }
+        for (series_key, (min4, min3, modified)) in by_series {
+            let modified_rfc = modified.and_then(|t| {
+                let dt: chrono::DateTime<chrono::Utc> = t.into();
+                Some(dt.to_rfc3339())
+            });
+            datasets.push(serde_json::json!({
+                "series_id": series_key,
+                "min4_count": min4,
+                "min3_count": min3,
+                "last_modified": modified_rfc,
+            }));
+        }
+    }
+
+    Json(serde_json::json!({
+        "progress": progress,
+        "datasets": datasets,
+    }))
+    .into_response()
+}
+
+// ── Live Strategy Runner API ──────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+pub struct CreateRunnerBody {
+    pub name: Option<String>,
+    pub script: String,
+    pub market_type: String,
+    pub symbol: String,
+    pub interval: String,
+    pub mode: String,
+    pub initial_balance: f64,
+    pub fee_pct: Option<f64>,
+    pub warmup_days: Option<u32>,
+    pub auto_restart: Option<bool>,
+    pub series_id: Option<String>,
+    pub resolution_logic: Option<String>,
+    pub threshold: Option<f64>,
+    #[serde(default)]
+    pub live_sizing_mode: Option<String>,
+    #[serde(default)]
+    pub live_sizing_value: Option<f64>,
+    #[serde(default)]
+    pub stop_loss_pct: Option<f64>,
+    #[serde(default)]
+    pub early_fire_secs: Option<u32>,
+    #[serde(default)]
+    pub max_entry_price: Option<f64>,
+    #[serde(default)]
+    pub price_mode: Option<String>,
+    #[serde(default)]
+    pub max_spread_pct: Option<f64>,
+    #[serde(default)]
+    pub allowed_hours: Option<Vec<u8>>,
+    #[serde(default)]
+    pub rv_min_btc: Option<f64>,
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Wallet password for decrypting EVM key (live CEX modes only). Never persisted.
+    #[serde(default)]
+    pub wallet_password: Option<String>,
+    /// Binance Futures API credentials (live funding_arb / cex). Never persisted.
+    #[serde(default)]
+    pub binance_api_key: Option<String>,
+    #[serde(default)]
+    pub binance_api_secret: Option<String>,
+    /// Funding-arb watchlist + tunables.
+    #[serde(default)]
+    pub funding_watchlist: Option<Vec<String>>,
+    #[serde(default)]
+    pub min_apr_diff: Option<f64>,
+    #[serde(default)]
+    pub force_close_diff: Option<f64>,
+    #[serde(default)]
+    pub max_open_pairs: Option<usize>,
+    #[serde(default)]
+    pub max_pos_pct: Option<f64>,
+    #[serde(default)]
+    pub funding_poll_secs: Option<u64>,
+    #[serde(default)]
+    pub fee_buffer_bps: Option<f64>,
+    #[serde(default)]
+    pub chainlink_endpoint_url: Option<String>,
+    #[serde(default)]
+    pub chainlink_interval_secs: Option<u64>,
+    /// Per-engine tunable parameters from the UI EngineParamsForm.
+    #[serde(default)]
+    pub engine_params: Option<serde_json::Value>,
+}
+
+#[derive(serde::Deserialize)]
+pub struct PatchRunnerBody {
+    pub auto_restart: Option<bool>,
+    pub live_sizing_mode: Option<String>,
+    pub live_sizing_value: Option<f64>,
+    /// Hide / unhide a runner in the Live Strategies UI.
+    pub hidden: Option<bool>,
+    // These use Option<Option<T>> so we can distinguish:
+    //   absent → None (skip)   |   null → Some(None) (clear)   |   value → Some(Some(v)) (set)
+    #[serde(default, deserialize_with = "nullable::deserialize")]
+    pub max_entry_price: Option<Option<f64>>,
+    pub price_mode: Option<String>,
+    #[serde(default, deserialize_with = "nullable::deserialize")]
+    pub max_spread_pct: Option<Option<f64>>,
+    #[serde(default, deserialize_with = "nullable::deserialize")]
+    pub early_fire_secs: Option<Option<u32>>,
+    /// UTC hours (0-23) where trading is allowed. Empty array = no restriction.
+    pub allowed_hours: Option<Vec<u8>>,
+    /// Minimum BTC RV-1h threshold; null/0 = disabled.
+    #[serde(default, deserialize_with = "nullable::deserialize")]
+    pub rv_min_btc: Option<Option<f64>>,
+}
+
+async fn hydrate_live_runtime_config(
+    state: &AppState,
+    config: &mut crate::strategy_runner::RunnerConfig,
+    wallet_password: Option<&str>,
+) -> anyhow::Result<()> {
+    if config.mode != "live" {
+        return Ok(());
+    }
+
+    // CEX live mode: build signer from wallet-manager
+    if config.market_type != "polymarket_binary" {
+        let hl_cfg = state.config.lock().hyperliquid.clone();
+        let label = hl_cfg.wallet_label.as_deref().unwrap_or("");
+        if label.is_empty() {
+            anyhow::bail!("hyperliquid.wallet_label is not set in config.");
+        }
+
+        let wallets = state.wallets.lock();
+        let wallet = wallets
+            .iter()
+            .find(|w| w.chain == "evm" && (label == "*" || w.label == label))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No EVM wallet found with label '{}' for Hyperliquid trading.",
+                    label
+                )
+            })?;
+
+        let password = wallet_password.ok_or_else(|| {
+            anyhow::anyhow!("Wallet password required for live CEX trading.")
+        })?;
+
+        let pk_bytes = wallet_manager::evm::export_private_key(&wallet.encrypted_key, password)
+            .map_err(|e| anyhow::anyhow!("Failed to decrypt wallet: {e}"))?;
+
+        let signer = hyperliquid_trader::exchange::Signer::from_pk_bytes(pk_bytes)
+            .map_err(|e| anyhow::anyhow!("Invalid private key: {e}"))?;
+
+        config.wallet_address = Some(signer.address().to_string());
+        config.hl_signer = Some(signer);
+        // Pass risk gate reference for live trading
+        config.risk_gate = state.trading_risk_gate.clone();
+        return Ok(());
+    }
+
+    let poly = state.config.lock().polymarket.clone();
+    let api_key = poly.api_key.unwrap_or_default();
+    let secret = poly.secret.unwrap_or_default();
+    let passphrase = poly.passphrase.unwrap_or_default();
+    if api_key.is_empty() || secret.is_empty() || passphrase.is_empty() {
+        anyhow::bail!("Live mode requires polymarket.api_key, polymarket.secret, and polymarket.passphrase in config.");
+    }
+
+    let wallet_address = get_poly_wallet_address(state)
+        .ok_or_else(|| anyhow::anyhow!("Live mode requires polymarket.wallet_address. Go to Settings → Config and set your Polymarket wallet address."))?;
+
+    let private_key = poly.private_key.filter(|k| !k.is_empty());
+    if private_key.is_none() {
+        anyhow::bail!("Live mode requires polymarket.private_key for EIP-712 order signing. Go to Settings → Polymarket and set your wallet private key.");
+    }
+
+    let (yes_token_id, no_token_id) = resolve_live_token_ids(config.series_id.as_deref()).await?;
+    let min_live_usdc = 1.0;
+    if config.mode == "live" {
+        let proxy_for_check = poly.proxy_address.clone().filter(|k| !k.trim().is_empty());
+        ensure_live_wallet_has_min_balance(&wallet_address, proxy_for_check.as_deref(), min_live_usdc).await?;
+    }
+
+    let creds = polymarket_trader::auth::PolyCredentials {
+        api_key,
+        secret,
+        passphrase,
+        wallet_address: wallet_address.clone().to_lowercase(),
+        private_key,
+        is_builder: poly.is_builder.unwrap_or(false),
+        proxy_address: poly.proxy_address.clone().filter(|k| !k.is_empty()).map(|s| s.to_lowercase()),
+        signature_type: poly.signature_type.clone().filter(|k| !k.is_empty()),
+    };
+
+    // Pre-flight: verify L2 auth actually works before starting the runner.
+    // Catches mismatched api_key/secret/passphrase so we don't discover the
+    // problem only when the first order is submitted.
+    validate_live_poly_credentials(&creds).await?;
+
+    config.poly_creds = Some(creds);
+    config.poly_token_id = Some(yes_token_id);
+    config.poly_no_token_id = Some(no_token_id);
+    config.wallet_address = Some(wallet_address);
+
+    // Populate Chainlink price feed config from global settings
+    let cl = state.config.lock().chainlink.clone();
+    if cl.enabled {
+        config.chainlink_endpoint_url = cl.endpoint_url;
+        config.chainlink_api_key = cl.api_key;
+        config.chainlink_interval_secs = cl.interval_secs;
+    }
+    Ok(())
+}
+
+async fn rehydrate_live_runner_config(state: &AppState, config: &mut crate::strategy_runner::RunnerConfig) -> anyhow::Result<()> {
+    if config.mode != "live" {
+        return Ok(());
+    }
+    // CEX live runners require wallet password which is not persisted.
+    // They must be restarted manually through the UI.
+    if config.market_type != "polymarket_binary" {
+        return Ok(());
+    }
+    hydrate_live_runtime_config(state, config, None).await
+}
+
+pub async fn restart_stored_runners(state: &AppState) {
+    let configs = state.strategy_runner.list_restartable_configs();
+    if configs.is_empty() {
+        return;
+    }
+
+    let mut restarted = 0usize;
+    for mut config in configs {
+        if let Err(e) = rehydrate_live_runner_config(state, &mut config).await {
+            let msg = friendly_live_error(&e.to_string());
+            let id = config.id.clone();
+            let _ = state.strategy_runner.set_starting(&id);
+            if let Some(mut r) = state.strategy_runner.get(&id) {
+                r.status.status = "error".to_string();
+                r.status.error = Some(msg);
+                state.strategy_runner.upsert(r);
+            }
+            continue;
+        }
+
+        let id = config.id.clone();
+        let Some(creds) = config.poly_creds.clone() else {
+            continue;
+        };
+        if !state.strategy_runner.hydrate_live_creds_for_runner(&id, creds) {
+            continue;
+        }
+        if let (Some(yes), Some(no)) = (config.poly_token_id.clone(), config.poly_no_token_id.clone()) {
+            let _ = state.strategy_runner.set_poly_token_ids(&id, yes, no);
+        }
+        if let Some(addr) = config.wallet_address.clone() {
+            let _ = state.strategy_runner.set_wallet_address(&id, addr);
+        }
+        let _ = state.strategy_runner.set_starting(&id);
+
+        let (workspace_dir, cfg_path) = {
+            let c = state.config.lock();
+            (c.workspace_dir.clone(), c.config_path.clone())
+        };
+        let _ = crate::strategy_runner::start_runner(
+            state.strategy_runner.clone(),
+            config,
+            workspace_dir,
+            Some(cfg_path),
+        );
+        restarted += 1;
+    }
+
+    if restarted > 0 {
+        tracing::info!("Auto-restarted {restarted} strategy runner(s) after startup");
+    }
+}
+
+pub async fn handle_api_live_patch(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<PatchRunnerBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+
+    if let Some(auto_restart) = body.auto_restart {
+        match state.strategy_runner.set_auto_restart(&id, auto_restart) {
+            Some(runner) => return Json(serde_json::json!({ "runner": runner })).into_response(),
+            None => return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "runner not found" }))).into_response(),
+        }
+    }
+
+    if let Some(hidden) = body.hidden {
+        match state.strategy_runner.set_hidden(&id, hidden) {
+            Some(runner) => return Json(serde_json::json!({ "runner": runner })).into_response(),
+            None => return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "runner not found" }))).into_response(),
+        }
+    }
+
+    if body.live_sizing_mode.is_some()
+        || body.live_sizing_value.is_some()
+        || body.max_entry_price.is_some()
+        || body.price_mode.is_some()
+        || body.max_spread_pct.is_some()
+        || body.early_fire_secs.is_some()
+        || body.allowed_hours.is_some()
+        || body.rv_min_btc.is_some()
+    {
+        let mode = body.live_sizing_mode.map(|m| match m.as_str() {
+            "fixed" => crate::strategy_runner::LiveSizingMode::Fixed,
+            _ => crate::strategy_runner::LiveSizingMode::Percent,
+        });
+        match state.strategy_runner.update_runner_config(
+            &id,
+            mode,
+            body.live_sizing_value,
+            body.max_entry_price,
+            body.allowed_hours,
+            body.rv_min_btc,
+            body.price_mode,
+            body.max_spread_pct,
+            body.early_fire_secs,
+        ) {
+            Some(runner) => return Json(serde_json::json!({ "runner": runner })).into_response(),
+            None => return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "runner not found" }))).into_response(),
+        }
+    }
+
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({ "error": "No valid fields to patch" })),
+    ).into_response()
+}
+
+/// GET /api/live/strategies — list all strategy runners
+/// GET /api/live/strategies — list all strategy runners
+pub async fn handle_api_live_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+    let runners = state.strategy_runner.list();
+    Json(serde_json::json!({ "runners": runners })).into_response()
+}
+
+/// POST /api/live/strategies — create & start a new runner
+pub async fn handle_api_live_create(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<CreateRunnerBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+
+    let id = uuid::Uuid::new_v4().to_string();
+
+    let mut symbol = body.symbol;
+    let mut interval = body.interval;
+    let mut resolution_logic = body.resolution_logic;
+    let mut threshold = body.threshold;
+
+    if let Some(ref sid) = body.series_id {
+        if let Some(s) = crate::tools::series::builtin_series().into_iter().find(|s| s.id == *sid) {
+            symbol = s.symbol;
+            interval = s.cadence;
+            resolution_logic = Some(match s.resolution_logic {
+                crate::tools::series::ResolutionLogic::PriceUp => "price_up".to_string(),
+                crate::tools::series::ResolutionLogic::ThresholdAbove => "threshold_above".to_string(),
+                crate::tools::series::ResolutionLogic::ThresholdBelow => "threshold_below".to_string(),
+            });
+            threshold = s.threshold;
+        }
+    }
+
+    let is_live = body.mode == "live";
+    if is_live {
+        if body.market_type == "polymarket_binary" {
+            // Polymarket live — ok
+        } else if body.market_type == "funding_arb" {
+            // Funding arb requires BOTH Hyperliquid wallet AND Binance credentials
+            let hl_cfg = state.config.lock().hyperliquid.clone();
+            if !hl_cfg.enabled || hl_cfg.wallet_label.is_none() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "Live funding arb requires hyperliquid.enabled=true and hyperliquid.wallet_label set in config."
+                    })),
+                ).into_response();
+            }
+            let has_binance = body.binance_api_key.as_ref().map(|k| !k.is_empty()).unwrap_or(false)
+                && body.binance_api_secret.as_ref().map(|s| !s.is_empty()).unwrap_or(false);
+            if !has_binance {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "Live funding arb requires Binance API key and secret."
+                    })),
+                ).into_response();
+            }
+        } else {
+            // CEX live — requires Hyperliquid wallet configuration
+            let hl_cfg = state.config.lock().hyperliquid.clone();
+            if !hl_cfg.enabled || hl_cfg.wallet_label.is_none() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "Live mode for CEX requires hyperliquid.enabled=true and hyperliquid.wallet_label set in config."
+                    })),
+                ).into_response();
+            }
+        }
+    }
+
+    let mut config = crate::strategy_runner::RunnerConfig {
+        id: id.clone(),
+        name: body.name.unwrap_or_else(|| format!("{} on {}", body.script, symbol)),
+        script: body.script,
+        market_type: body.market_type,
+        symbol,
+        interval,
+        mode: body.mode,
+        initial_balance: body.initial_balance,
+        fee_pct: body.fee_pct.unwrap_or(0.1),
+        warmup_days: body.warmup_days.unwrap_or(90),
+        auto_restart: body.auto_restart.unwrap_or(true),
+        series_id: body.series_id,
+        resolution_logic: Some(resolution_logic.unwrap_or_else(|| "price_up".to_string())),
+        threshold,
+        poly_creds: None,
+        poly_token_id: None,
+        poly_no_token_id: None,
+        poly_condition_id: None,
+        wallet_address: None,
+        chainlink_endpoint_url: None,
+        chainlink_api_key: None,
+        chainlink_interval_secs: 5,
+        live_sizing_mode: match body.live_sizing_mode.as_deref() {
+            Some("fixed") => crate::strategy_runner::LiveSizingMode::Fixed,
+            _ => crate::strategy_runner::LiveSizingMode::Percent,
+        },
+        live_sizing_value: body.live_sizing_value.unwrap_or(5.0), // stored as 0–100 percent
+        stop_loss_pct: body.stop_loss_pct.filter(|&v| v > 0.0),
+        early_fire_secs: body.early_fire_secs.or_else(|| {
+            let v = state.config.lock().live_strategy.early_fire_secs;
+            if v > 0 { Some(v) } else { None }
+        }),
+        max_entry_price: body.max_entry_price,
+        price_mode: body.price_mode,
+        max_spread_pct: body.max_spread_pct,
+        allowed_hours: body.allowed_hours.unwrap_or_default(),
+        rv_min_btc: body.rv_min_btc.filter(|&v| v > 0.0),
+        hl_signer: None,
+        risk_gate: state.trading_risk_gate.clone(),
+        binance_creds: None,
+        funding_watchlist: body.funding_watchlist.unwrap_or_else(|| {
+            ["BTC", "ETH", "SOL", "AVAX"].iter().map(|s| s.to_string()).collect()
+        }),
+        min_apr_diff: body.min_apr_diff.unwrap_or(0.10),
+        force_close_diff: body.force_close_diff.unwrap_or(0.02),
+        max_open_pairs: body.max_open_pairs.unwrap_or(4),
+        max_pos_pct: body.max_pos_pct.unwrap_or(0.15),
+        funding_poll_secs: body.funding_poll_secs.unwrap_or(60),
+        fee_buffer_bps: body.fee_buffer_bps.unwrap_or(12.0),
+        kind: body.kind,
+    };
+
+    // Populate Binance credentials if provided (live mode only, never persisted)
+    if let (Some(key), Some(secret)) = (body.binance_api_key, body.binance_api_secret) {
+        if !key.is_empty() && !secret.is_empty() {
+            config.binance_creds = Some(crate::tools::binance_perps::BinanceCredentials {
+                api_key: key,
+                api_secret: secret,
+            });
+        }
+    }
+
+    if let Err(e) = hydrate_live_runtime_config(&state, &mut config, body.wallet_password.as_deref()).await {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": friendly_live_error(&e.to_string()) })),
+        ).into_response();
+    }
+
+    let (workspace_dir, cfg_path) = {
+        let c = state.config.lock();
+        (c.workspace_dir.clone(), c.config_path.clone())
+    };
+    let runner = crate::strategy_runner::start_runner(
+        state.strategy_runner.clone(),
+        config,
+        workspace_dir,
+        Some(cfg_path),
+    );
+
+    (StatusCode::CREATED, Json(serde_json::json!({ "runner": runner }))).into_response()
+}
+
+/// GET /api/live/strategies/{id} — get single runner details
+pub async fn handle_api_live_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+    match state.strategy_runner.get(&id) {
+        Some(r) => Json(serde_json::json!({ "runner": r })).into_response(),
+        None => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "not found" }))).into_response(),
+    }
+}
+
+/// DELETE /api/live/strategies/{id} — stop and delete a runner
+pub async fn handle_api_live_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+    if state.strategy_runner.delete(&id) {
+        Json(serde_json::json!({ "success": true })).into_response()
+    } else {
+        (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "runner not found" }))).into_response()
+    }
+}
+
+/// POST /api/live/strategies/{id}/stop — stop a runner (keep it in list)
+pub async fn handle_api_live_stop(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+    state.strategy_runner.stop(&id);
+    Json(serde_json::json!({ "success": true })).into_response()
+}
+
+/// POST /api/live/strategies/{id}/restart — restart a stopped runner
+pub async fn handle_api_live_restart(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+
+    let mut config = match state.strategy_runner.get(&id) {
+        Some(r) => r.config.clone(),
+        None => return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "runner not found" }))).into_response(),
+    };
+
+    if let Err(e) = rehydrate_live_runner_config(&state, &mut config).await {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": friendly_live_error(&e.to_string()) })),
+        ).into_response();
+    }
+
+    let (workspace_dir, cfg_path) = {
+        let c = state.config.lock();
+        (c.workspace_dir.clone(), c.config_path.clone())
+    };
+    let runner = crate::strategy_runner::start_runner(
+        state.strategy_runner.clone(),
+        config,
+        workspace_dir,
+        Some(cfg_path),
+    );
+    Json(serde_json::json!({ "runner": runner })).into_response()
+}
+
+// ── Export / Import ──────────────────────────────────────────────────────────
+
+/// GET /api/export — download a ZIP with config, wallets, and scripts
+pub async fn handle_api_export(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let config = state.config.lock().clone();
+
+    let zip_bytes = match build_export_zip(&config).await {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Export failed: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/zip"),
+            (
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=\"traderclaw-export.zip\"",
+            ),
+        ],
+        zip_bytes,
+    )
+        .into_response()
+}
+
+async fn build_export_zip(config: &crate::config::Config) -> anyhow::Result<Vec<u8>> {
+    // Collect all file content first (async), then build zip (sync/blocking)
+    let masked = mask_sensitive_fields(config);
+    let toml_str = toml::to_string_pretty(&masked).unwrap_or_default();
+
+    let wallets_path = super::wallets_file_path(&config.config_path);
+    let wallets_bytes = if wallets_path.exists() {
+        tokio::fs::read(&wallets_path).await.unwrap_or_default()
+    } else {
+        vec![]
+    };
+
+    let mut script_files: Vec<(String, Vec<u8>)> = vec![];
+    let scripts_dir = config.workspace_dir.join("scripts");
+    if scripts_dir.is_dir() {
+        if let Ok(mut entries) = tokio::fs::read_dir(&scripts_dir).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("rhai") {
+                    if let Ok(content) = tokio::fs::read(&path).await {
+                        let name = path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("script.rhai")
+                            .to_owned();
+                        script_files.push((name, content));
+                    }
+                }
+            }
+        }
+    }
+
+    // Build zip synchronously
+    tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+        let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        let cursor = std::io::Cursor::new(Vec::new());
+        let mut zip = zip::ZipWriter::new(cursor);
+
+        zip.start_file("config.toml", opts)?;
+        zip.write_all(toml_str.as_bytes())?;
+
+        if !wallets_bytes.is_empty() {
+            zip.start_file("wallets.json", opts)?;
+            zip.write_all(&wallets_bytes)?;
+        }
+
+        for (name, content) in script_files {
+            zip.start_file(format!("scripts/{name}"), opts)?;
+            zip.write_all(&content)?;
+        }
+
+        let cursor = zip.finish()?;
+        Ok::<Vec<u8>, anyhow::Error>(cursor.into_inner())
+    })
+    .await?
+}
+
+/// POST /api/import — upload a ZIP to restore config, wallets, and scripts
+pub async fn handle_api_import(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let config = state.config.lock().clone();
+
+    let b64 = match body.get("data").and_then(|v| v.as_str()) {
+        Some(s) => s.to_owned(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Missing 'data' field (base64 zip)"})),
+            )
+                .into_response();
+        }
+    };
+
+    use base64::Engine as _;
+    let zip_bytes = match base64::engine::general_purpose::STANDARD.decode(&b64) {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid base64: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    match apply_import_zip(&config, zip_bytes).await {
+        Ok(imported) => Json(serde_json::json!({ "status": "ok", "imported": imported })).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("Import failed: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
+async fn apply_import_zip(config: &crate::config::Config, bytes: Vec<u8>) -> anyhow::Result<Vec<String>> {
+    // Parse zip synchronously, collect files to write
+    let wallets_path = super::wallets_file_path(&config.config_path);
+    let scripts_dir = config.workspace_dir.join("scripts");
+
+    let extracted: Vec<(String, Vec<u8>)> = tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let cursor = std::io::Cursor::new(bytes);
+        let mut archive = zip::ZipArchive::new(cursor)?;
+        let mut files = Vec::new();
+        for i in 0..archive.len() {
+            let mut file = archive.by_index(i)?;
+            let name = file.name().to_owned();
+            let mut content = Vec::new();
+            file.read_to_end(&mut content)?;
+            files.push((name, content));
+        }
+        Ok::<_, anyhow::Error>(files)
+    })
+    .await??;
+
+    let mut imported = Vec::new();
+    for (name, content) in extracted {
+        if name == "wallets.json" {
+            if let Some(parent) = wallets_path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            tokio::fs::write(&wallets_path, &content).await?;
+            imported.push("wallets.json".to_string());
+        } else if name.starts_with("scripts/") && name.ends_with(".rhai") {
+            tokio::fs::create_dir_all(&scripts_dir).await?;
+            let filename = std::path::Path::new(&name)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("script.rhai");
+            tokio::fs::write(scripts_dir.join(filename), &content).await?;
+            imported.push(name.clone());
+        }
+    }
+
+    Ok(imported)
+}
+
+/// GET /api/logs — return recent gateway log lines (last ~500)
+pub async fn handle_api_logs(
+    _headers: HeaderMap,
+) -> impl IntoResponse {
+    // Public endpoint — no auth required so logs can be viewed during troubleshooting
+    let log_dir = directories::BaseDirs::new()
+        .map(|b| b.home_dir().to_path_buf())
+        .unwrap_or_else(std::env::temp_dir)
+        .join(".traderclaw")
+        .join("logs");
+    // Find the newest gateway log file
+    let mut entries: Vec<_> = match tokio::fs::read_dir(&log_dir).await {
+        Ok(mut rd) => {
+            let mut v = Vec::new();
+            while let Ok(Some(entry)) = rd.next_entry().await {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with("gateway") {
+                    if let Ok(meta) = entry.metadata().await {
+                        if let Ok(modified) = meta.modified() {
+                            v.push((modified, entry.path()));
+                        }
+                    }
+                }
+            }
+            v
+        }
+        Err(_) => Vec::new(),
+    };
+    entries.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
+    let lines: Vec<String> = if let Some((_, path)) = entries.first() {
+        match tokio::fs::read_to_string(path).await {
+            Ok(content) => {
+                let all: Vec<String> = content.lines().map(String::from).collect();
+                all.into_iter().rev().take(500).collect::<Vec<_>>().into_iter().rev().collect()
+            }
+            Err(_) => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+    Json(serde_json::json!({ "lines": lines, "file": entries.first().map(|e| e.1.to_string_lossy().to_string()).unwrap_or_default() })).into_response()
+}
+
+// ── Copy Trading handlers ─────────────────────────────────────────
+
+/// GET /api/copy/leaders — list active watched leaders
+pub async fn handle_api_copy_leaders(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let watchlist = state.copy_orchestrator.watchlist.lock().await;
+    let leaders: Vec<_> = watchlist.list().iter().map(|e| serde_json::json!({
+        "address": e.address,
+        "venue": e.venue,
+        "category": e.category,
+        "mirror_enabled": e.mirror_enabled,
+        "consensus_weight": e.consensus_weight,
+        "wallet_score": e.wallet_score,
+        "size_factor": e.size_factor,
+    })).collect();
+
+    Json(serde_json::json!({ "leaders": leaders })).into_response()
+}
+
+/// POST /api/copy/leaders/{addr}/toggle — toggle mirror for a leader
+pub async fn handle_api_copy_leader_toggle(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(addr): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let mut watchlist = state.copy_orchestrator.watchlist.lock().await;
+    let new_state = watchlist.toggle_mirror(&addr);
+    Json(serde_json::json!({ "address": addr, "mirror_enabled": new_state })).into_response()
+}
+
+/// Request body for adding a leader directly to the watchlist.
+#[derive(Debug, Deserialize)]
+pub struct AddLeaderRequest {
+    pub address: String,
+    #[serde(default = "default_venue")]
+    pub venue: String,
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default = "default_size_factor")]
+    pub size_factor: f64,
+    #[serde(default = "default_consensus_weight")]
+    pub consensus_weight: f64,
+    #[serde(default)]
+    pub wallet_score: Option<f64>,
+    #[serde(default)]
+    pub mirror_enabled: bool,
+}
+
+fn default_venue() -> String {
+    "polymarket".to_string()
+}
+fn default_size_factor() -> f64 {
+    0.5
+}
+fn default_consensus_weight() -> f64 {
+    1.0
+}
+
+/// POST /api/copy/leaders — add a leader directly to the watchlist (bypasses Discovery)
+pub async fn handle_api_copy_leader_add(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<AddLeaderRequest>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let addr = req.address.trim().to_lowercase();
+    if !is_valid_evm_address(&addr) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "Invalid wallet address — expected 0x + 40 hex chars" })),
+        )
+            .into_response();
+    }
+
+    let entry = copy_orchestrator::watchlist::WatchlistEntry {
+        address: addr.clone(),
+        venue: req.venue,
+        category: req.category,
+        mirror_enabled: req.mirror_enabled,
+        consensus_weight: req.consensus_weight,
+        size_factor: req.size_factor,
+        wallet_score: req.wallet_score.unwrap_or(0.0),
+        added_at: chrono::Utc::now().to_rfc3339(),
+    };
+
+    let mut watchlist = state.copy_orchestrator.watchlist.lock().await;
+    watchlist.add(entry);
+    Json(serde_json::json!({ "added": addr })).into_response()
+}
+
+/// Patch body for a leader.
+#[derive(Debug, Deserialize)]
+pub struct PatchLeaderRequest {
+    #[serde(default)]
+    pub size_factor: Option<f64>,
+    #[serde(default)]
+    pub consensus_weight: Option<f64>,
+    #[serde(default)]
+    pub category: Option<Option<String>>,
+    #[serde(default)]
+    pub mirror_enabled: Option<bool>,
+}
+
+/// PATCH /api/copy/leaders/{addr} — edit leader knobs
+pub async fn handle_api_copy_leader_patch(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(addr): Path<String>,
+    Json(req): Json<PatchLeaderRequest>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let mut watchlist = state.copy_orchestrator.watchlist.lock().await;
+    let updated = watchlist.update(
+        &addr,
+        req.size_factor,
+        req.consensus_weight,
+        req.category,
+        req.mirror_enabled,
+    );
+    if !updated {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "Leader not found" })),
+        )
+            .into_response();
+    }
+    Json(serde_json::json!({ "address": addr, "updated": true })).into_response()
+}
+
+/// DELETE /api/copy/leaders/{addr} — remove a leader from the watchlist
+pub async fn handle_api_copy_leader_remove(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(addr): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let mut watchlist = state.copy_orchestrator.watchlist.lock().await;
+    let removed = watchlist.remove(&addr).is_some();
+    if !removed {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "Leader not found" })),
+        )
+            .into_response();
+    }
+    Json(serde_json::json!({ "address": addr, "removed": true })).into_response()
+}
+
+/// Validate a 0x-prefixed 20-byte EVM address.
+fn is_valid_evm_address(addr: &str) -> bool {
+    if !addr.starts_with("0x") || addr.len() != 42 {
+        return false;
+    }
+    addr[2..].chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Request body for adding a discovery candidate manually.
+#[derive(Debug, Deserialize)]
+pub struct AddCandidateRequest {
+    pub address: String,
+    #[serde(default = "default_venue")]
+    pub venue: String,
+    #[serde(default)]
+    pub discovery_score: Option<f64>,
+}
+
+/// POST /api/copy/discovery — manually add a wallet to the candidate list
+pub async fn handle_api_copy_discovery_add(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<AddCandidateRequest>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let addr = req.address.trim().to_lowercase();
+    if !is_valid_evm_address(&addr) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "Invalid wallet address — expected 0x + 40 hex chars" })),
+        )
+            .into_response();
+    }
+    let score = req.discovery_score.unwrap_or(0.0);
+    match state.wallet_indexer.add_candidate(&addr, &req.venue, score).await {
+        Ok(()) => Json(serde_json::json!({ "added": addr, "venue": req.venue, "discovery_score": score })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /api/copy/discovery/refresh — trigger the nightly Polymarket indexer on demand
+pub async fn handle_api_copy_discovery_refresh(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let indexer = state.wallet_indexer.clone();
+    tokio::spawn(async move {
+        if let Err(e) = indexer.run_polymarket_nightly(50).await {
+            tracing::warn!("Manual Polymarket indexer refresh failed: {}", e);
+        }
+    });
+    Json(serde_json::json!({ "started": true })).into_response()
+}
+
+/// GET /api/copy/discovery — list discovery candidates
+pub async fn handle_api_copy_discovery(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    match state.wallet_indexer.list_candidates(None).await {
+        Ok(candidates) => Json(serde_json::json!({ "candidates": candidates })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /api/copy/discovery/{addr}/graduate — promote candidate to watchlist
+pub async fn handle_api_copy_discovery_graduate(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(addr): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    // Fetch candidate info from indexer
+    let candidates = match state.wallet_indexer.list_candidates(None).await {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
+    let candidate = match candidates.into_iter().find(|c| c.wallet_address == addr) {
+        Some(c) => c,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "Candidate not found" })),
+            )
+                .into_response();
+        }
+    };
+
+    // Add to watchlist
+    let entry = copy_orchestrator::watchlist::WatchlistEntry {
+        address: candidate.wallet_address.clone(),
+        venue: candidate.venue.clone(),
+        category: None,
+        mirror_enabled: false,
+        consensus_weight: 1.0,
+        size_factor: 0.5,
+        wallet_score: candidate.discovery_score,
+        added_at: chrono::Utc::now().to_rfc3339(),
+    };
+
+    {
+        let mut watchlist = state.copy_orchestrator.watchlist.lock().await;
+        watchlist.add(entry);
+    }
+
+    // Reflect the new status on the candidate row so it disappears from the
+    // candidate filter in the UI.
+    if let Err(e) = state.wallet_indexer.set_candidate_status(&addr, "graduated").await {
+        tracing::warn!("Failed to update candidate status for {}: {}", addr, e);
+    }
+
+    Json(serde_json::json!({ "graduated": addr })).into_response()
+}
+
+/// POST /api/copy/discovery/{addr}/blacklist — reject a candidate
+pub async fn handle_api_copy_discovery_blacklist(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(addr): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    match state.wallet_indexer.set_candidate_status(&addr, "blacklisted").await {
+        Ok(true) => Json(serde_json::json!({ "blacklisted": addr })).into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "Candidate not found" })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// DELETE /api/copy/discovery/{addr} — remove a candidate entirely
+pub async fn handle_api_copy_discovery_remove(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(addr): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    match state.wallet_indexer.remove_candidate(&addr).await {
+        Ok(true) => Json(serde_json::json!({ "removed": addr })).into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "Candidate not found" })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /api/copy/positions — list open mirror positions
+pub async fn handle_api_copy_positions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let tracker = state.copy_orchestrator.mirror.lock().await;
+    let positions: Vec<_> = tracker.list_open().iter().map(|p| serde_json::json!({
+        "leader_address": p.leader_address,
+        "leader_fill_id": p.leader_fill_id,
+        "venue": p.venue,
+        "symbol": p.symbol,
+        "side": p.side,
+        "notional": p.notional,
+        "entry_price": p.entry_price,
+        "status": format!("{:?}", p.status),
+        "opened_at": p.opened_at,
+    })).collect();
+
+    Json(serde_json::json!({ "positions": positions })).into_response()
+}
+
+// ── Copy Trading – capital / sizing / consensus / history ─────────
+
+/// GET /api/copy/capital
+pub async fn handle_api_copy_get_capital(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+    let capital = *state.copy_orchestrator.capital.lock().await;
+    Json(serde_json::json!({ "capital_usd": capital })).into_response()
+}
+
+/// POST /api/copy/capital  { capital_usd: f64 }
+pub async fn handle_api_copy_set_capital(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+    let Some(capital) = body.get("capital_usd").and_then(|v| v.as_f64()) else {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "capital_usd required"}))).into_response();
+    };
+    state.copy_orchestrator.set_capital(capital).await;
+    Json(serde_json::json!({ "capital_usd": capital, "ok": true })).into_response()
+}
+
+/// GET /api/copy/positions/history — closed mirror positions
+pub async fn handle_api_copy_positions_history(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+    let tracker = state.copy_orchestrator.mirror.lock().await;
+    let positions: Vec<_> = tracker.list_all().iter()
+        .filter(|p| !matches!(p.status, copy_orchestrator::mirror::PositionStatus::Open))
+        .map(|p| serde_json::json!({
+            "leader_address": p.leader_address,
+            "symbol": p.symbol,
+            "side": p.side,
+            "notional": p.notional,
+            "entry_price": p.entry_price,
+            "status": format!("{:?}", p.status),
+            "opened_at": p.opened_at,
+            "closed_at": p.closed_at,
+            "pnl": p.pnl,
+        }))
+        .collect();
+    Json(serde_json::json!({ "positions": positions })).into_response()
+}
+
+/// GET /api/copy/consensus
+pub async fn handle_api_copy_consensus(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+    let acc = state.copy_orchestrator.consensus.lock().await;
+    let windows: Vec<_> = acc.list_active_windows(300).iter().map(|w| serde_json::json!({
+        "symbol": w.symbol,
+        "side": w.side,
+        "leader_count": w.leaders.len(),
+        "first_seen": w.first_seen.to_rfc3339(),
+        "last_seen": w.last_seen.to_rfc3339(),
+    })).collect();
+    Json(serde_json::json!({ "windows": windows })).into_response()
+}
+
+/// PATCH /api/copy/sizing  { max_single_trade_pct?: f64, liquidity_floor_factor?: f64 }
+/// Returns current values (live patching not supported without mutex; adjust and restart).
+pub async fn handle_api_copy_patch_sizing(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(_body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+    let sizing = &state.copy_orchestrator.sizing;
+    Json(serde_json::json!({
+        "max_single_trade_pct": sizing.max_single_trade_pct,
+        "liquidity_floor_factor": sizing.liquidity_floor_factor,
+        "note": "Live patching not yet supported; values shown are current."
+    })).into_response()
+}
+
+/// GET /api/copy/score/{addr}
+pub async fn handle_api_copy_score(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(addr): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+    match state.wallet_indexer.get_wallet_score(&addr).await {
+        Ok(Some(score)) => Json(serde_json::to_value(&score).unwrap_or_default()).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "score not found"}))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+/// GET /api/copy/leaders/{addr}/trades
+pub async fn handle_api_copy_leader_trades(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(addr): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+    match state.wallet_indexer.get_leader_trades(&addr).await {
+        Ok(trades) => Json(serde_json::json!({ "trades": trades })).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+// ── Hyperliquid ─────────────────────────────────────────────────
+
+/// GET /api/health/hyperliquid — Hyperliquid API connectivity check
+pub async fn handle_api_health_hyperliquid(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let Some(ref client) = state.hyperliquid_client else {
+        return Json(serde_json::json!({
+            "status": "disabled",
+            "message": "Hyperliquid is not enabled in config"
+        })).into_response();
+    };
+
+    match client.mids().await {
+        Ok(mids) => {
+            let btc = mids.get("BTC").copied();
+            Json(serde_json::json!({
+                "status": "ok",
+                "connected": true,
+                "assets_tracked": mids.len(),
+                "btc_mid": btc,
+            })).into_response()
+        }
+        Err(e) => {
+            tracing::warn!("Hyperliquid health check failed: {}", e);
+            Json(serde_json::json!({
+                "status": "error",
+                "connected": false,
+                "message": format!("{}", e),
+            })).into_response()
+        }
+    }
+}
+
+/// GET /api/hyperliquid/mids — current mid prices for all assets
+pub async fn handle_api_hyperliquid_mids(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let Some(ref client) = state.hyperliquid_client else {
+        return Json(serde_json::json!({
+            "status": "disabled",
+            "message": "Hyperliquid is not enabled in config"
+        })).into_response();
+    };
+
+    match client.mids().await {
+        Ok(mids) => {
+            Json(serde_json::json!({
+                "status": "ok",
+                "mids": mids,
+            })).into_response()
+        }
+        Err(e) => {
+            tracing::warn!("Hyperliquid mids failed: {}", e);
+            Json(serde_json::json!({
+                "status": "error",
+                "message": format!("{}", e),
+            })).into_response()
+        }
+    }
+}
+
+/// GET /api/hyperliquid/funding — funding rate for a coin or all predicted
+pub async fn handle_api_hyperliquid_funding(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let Some(ref client) = state.hyperliquid_client else {
+        return Json(serde_json::json!({
+            "status": "disabled",
+            "message": "Hyperliquid is not enabled in config"
+        })).into_response();
+    };
+
+    if let Some(coin) = params.get("coin") {
+        match client.funding_rate(coin).await {
+            Ok(rate) => {
+                Json(serde_json::json!({
+                    "status": "ok",
+                    "coin": coin,
+                    "funding_rate": rate.funding_rate,
+                    "next_funding_time": rate.next_funding_time,
+                })).into_response()
+            }
+            Err(e) => {
+                tracing::warn!("Hyperliquid funding rate failed for {}: {}", coin, e);
+                Json(serde_json::json!({
+                    "status": "error",
+                    "message": format!("{}", e),
+                })).into_response()
+            }
+        }
+    } else {
+        match client.predicted_funding().await {
+            Ok(rates) => {
+                Json(serde_json::json!({
+                    "status": "ok",
+                    "predicted_funding": rates,
+                })).into_response()
+            }
+            Err(e) => {
+                tracing::warn!("Hyperliquid predicted funding failed: {}", e);
+                Json(serde_json::json!({
+                    "status": "error",
+                    "message": format!("{}", e),
+                })).into_response()
+            }
+        }
+    }
+}
+
+/// GET /api/funding/comparison — cross-venue funding rate comparison
+pub async fn handle_api_funding_comparison(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let watchlist: Vec<String> = params.get("symbols")
+        .map(|s| s.split(',').map(|c| c.trim().to_uppercase()).collect())
+        .unwrap_or_else(|| vec!["BTC".into(), "ETH".into(), "SOL".into(), "AVAX".into()]);
+
+    // Fetch Hyperliquid predicted funding
+    let hl_client = state.hyperliquid_client.clone()
+        .unwrap_or_else(|| Arc::new(hyperliquid_trader::HyperliquidClient::new_mainnet()));
+
+    let hl_rates = match hl_client.predicted_funding().await {
+        Ok(rates) => rates,
+        Err(e) => {
+            tracing::warn!("Funding comparison: HL predicted funding failed: {}", e);
+            std::collections::HashMap::new()
+        }
+    };
+
+    // Fetch Binance funding rates
+    let binance_rates = match fetch_binance_funding_for_comparison(&watchlist).await {
+        Ok(rates) => rates,
+        Err(e) => {
+            tracing::warn!("Funding comparison: Binance funding failed: {}", e);
+            std::collections::HashMap::new()
+        }
+    };
+
+    let mut results = Vec::new();
+    for coin in &watchlist {
+        let hl_raw = hl_rates.get(coin).copied().unwrap_or(0.0);
+        let bin_raw = binance_rates.get(coin).copied().unwrap_or(0.0);
+
+        let hl_apr = hl_raw * 24.0 * 365.0;
+        let bin_apr = bin_raw * 3.0 * 365.0;
+        let diff_apr = (hl_apr - bin_apr).abs();
+
+        let recommendation = if diff_apr < 0.02 {
+            "hold"
+        } else if hl_apr > bin_apr {
+            "short_hl_long_binance"
+        } else {
+            "long_hl_short_binance"
+        };
+
+        results.push(serde_json::json!({
+            "symbol": coin,
+            "hyperliquid": {
+                "rate": hl_raw,
+                "apr": hl_apr,
+            },
+            "binance": {
+                "rate": bin_raw,
+                "apr": bin_apr,
+            },
+            "diff_apr": diff_apr,
+            "recommendation": recommendation,
+        }));
+    }
+
+    Json(serde_json::json!({
+        "status": "ok",
+        "timestamp": chrono::Utc::now().timestamp_millis(),
+        "rates": results,
+    })).into_response()
+}
+
+async fn fetch_binance_funding_for_comparison(
+    watchlist: &[String],
+) -> anyhow::Result<std::collections::HashMap<String, f64>> {
+    let client = reqwest::Client::new();
+    let url = "https://fapi.binance.com/fapi/v1/premiumIndex";
+    let resp = client.get(url).send().await?;
+    let arr: Vec<serde_json::Value> = resp.json().await?;
+
+    let mut rates = std::collections::HashMap::new();
+    for item in &arr {
+        let symbol = item["symbol"].as_str().unwrap_or("");
+        let rate_str = item["lastFundingRate"].as_str().unwrap_or("0");
+        let rate: f64 = rate_str.parse().unwrap_or(0.0);
+        for coin in watchlist {
+            if symbol == format!("{}USDT", coin) {
+                rates.insert(coin.clone(), rate);
+            }
+        }
+    }
+    Ok(rates)
+}
+
+// ── Live CEX Positions ─────────────────────────────────────────
+
+/// GET /api/live/positions — list open Hyperliquid positions for an address.
+/// Query `address` overrides the configured hyperliquid.wallet_address.
+pub async fn handle_api_live_positions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let address = params.get("address").cloned().or_else(|| {
+        let label = { state.config.lock().hyperliquid.wallet_label.clone()? };
+        let addr = {
+            let wallets = state.wallets.lock();
+            wallets.iter()
+                .find(|w| w.chain == "evm" && w.label == label)
+                .map(|w| w.address.clone())
+        };
+        addr
+    });
+    let Some(address) = address else {
+        return Json(serde_json::json!({
+            "status": "error",
+            "message": "No address provided and no hyperliquid wallet configured"
+        })).into_response();
+    };
+
+    let client = state.hyperliquid_client.clone().unwrap_or_else(|| {
+        Arc::new(hyperliquid_trader::HyperliquidClient::new_mainnet())
+    });
+
+    match client.clearinghouse_state(&address).await {
+        Ok(chs) => {
+            let positions: Vec<serde_json::Value> = chs.asset_positions.iter().map(|ap| {
+                serde_json::json!({
+                    "coin": ap.position.coin,
+                    "size": ap.position.szi,
+                    "entry_price": ap.position.entry_px,
+                    "position_value": ap.position.position_value,
+                    "unrealized_pnl": ap.position.unrealized_pnl,
+                    "leverage": ap.position.leverage,
+                    "margin_used": ap.position.margin_used,
+                })
+            }).collect();
+            Json(serde_json::json!({
+                "status": "ok",
+                "address": address,
+                "account_value": chs.margin_summary.account_value.parse::<f64>().unwrap_or(0.0),
+                "positions": positions,
+            })).into_response()
+        }
+        Err(e) => {
+            tracing::warn!("Hyperliquid clearinghouse_state failed for {}: {}", address, e);
+            Json(serde_json::json!({
+                "status": "error",
+                "message": format!("{}", e),
+            })).into_response()
+        }
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ClosePositionBody {
+    pub wallet_password: String,
+}
+
+/// POST /api/live/positions/{symbol}/close — manually close a Hyperliquid position.
+#[axum::debug_handler]
+pub async fn handle_api_live_position_close(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(symbol): Path<String>,
+    Json(body): Json<ClosePositionBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let label = match { state.config.lock().hyperliquid.wallet_label.clone() } {
+        Some(l) => l,
+        None => {
+            return Json(serde_json::json!({
+                "status": "error",
+                "message": "hyperliquid.wallet_label is not configured"
+            })).into_response();
+        }
+    };
+
+    let wallet = {
+        let wallets = state.wallets.lock();
+        match wallets.iter().find(|w| w.chain == "evm" && w.label == label) {
+            Some(w) => w.clone(),
+            None => {
+                return Json(serde_json::json!({
+                    "status": "error",
+                    "message": format!("EVM wallet with label '{}' not found", label)
+                })).into_response();
+            }
+        }
+    };
+
+    let pk_hex = match wallet_manager::evm::export_private_key(&wallet.encrypted_key, &body.wallet_password
+    ) {
+        Ok(k) => k,
+        Err(e) => {
+            return Json(serde_json::json!({
+                "status": "error",
+                "message": format!("Failed to decrypt wallet: {e}")
+            })).into_response();
+        }
+    };
+
+    let signer = match hyperliquid_trader::exchange::Signer::from_pk_bytes(pk_hex) {
+        Ok(s) => s,
+        Err(e) => {
+            return Json(serde_json::json!({
+                "status": "error",
+                "message": format!("Invalid private key: {e}")
+            })).into_response();
+        }
+    };
+
+    let client = hyperliquid_trader::HyperliquidClient::new_mainnet_with_signer(signer);
+    match client.close_position(&symbol).await {
+        Ok(resp) => {
+            Json(serde_json::json!({
+                "status": "ok",
+                "symbol": symbol,
+                "order_id": resp.order_id,
+            })).into_response()
+        }
+        Err(e) => {
+            tracing::warn!("Hyperliquid close_position failed for {}: {}", symbol, e);
+            Json(serde_json::json!({
+                "status": "error",
+                "message": format!("{}", e),
+            })).into_response()
+        }
+    }
+}
+
+// ── General Trading Risk ────────────────────────────────────────
+
+/// POST /api/risk/halt — manual kill-switch
+pub async fn handle_api_risk_halt(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let Some(ref gate) = state.trading_risk_gate else {
+        return Json(serde_json::json!({
+            "status": "disabled",
+            "message": "Trading risk gate is not initialized"
+        })).into_response();
+    };
+
+    gate.halt_all();
+    Json(serde_json::json!({
+        "status": "halted",
+        "message": "All trading halted via kill-switch"
+    })).into_response()
+}
+
+/// POST /api/risk/resume — clear manual halt
+pub async fn handle_api_risk_resume(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let Some(ref gate) = state.trading_risk_gate else {
+        return Json(serde_json::json!({
+            "status": "disabled",
+            "message": "Trading risk gate is not initialized"
+        })).into_response();
+    };
+
+    gate.resume_all();
+    Json(serde_json::json!({
+        "status": "resumed",
+        "message": "Trading resumed"
+    })).into_response()
+}
+
+/// GET /api/risk/status — current risk gate state
+pub async fn handle_api_risk_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let Some(ref gate) = state.trading_risk_gate else {
+        return Json(serde_json::json!({
+            "status": "disabled",
+            "message": "Trading risk gate is not initialized"
+        })).into_response();
+    };
+
+    let st = gate.status();
+    Json(serde_json::json!({
+        "status": if gate.is_halted() { "halted" } else { "ok" },
+        "total_capital": st.total_capital,
+        "drawdown_pct": st.drawdown_pct,
+        "daily_pnl_pct": st.daily_pnl_pct,
+        "open_positions": st.total_positions,
+    })).into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2396,19 +6326,6 @@ mod tests {
             allowed_users: vec!["*".to_string()],
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
-        });
-        cfg.channels_config.email = Some(crate::channels::email_channel::EmailConfig {
-            imap_host: "imap.example.com".to_string(),
-            imap_port: 993,
-            imap_folder: "INBOX".to_string(),
-            smtp_host: "smtp.example.com".to_string(),
-            smtp_port: 465,
-            smtp_tls: true,
-            username: "agent@example.com".to_string(),
-            password: "email-password-secret".to_string(),
-            from_address: "agent@example.com".to_string(),
-            idle_timeout_secs: 1740,
-            allowed_senders: vec!["*".to_string()],
         });
         cfg.model_routes = vec![crate::config::schema::ModelRouteConfig {
             hint: "reasoning".to_string(),
@@ -2489,14 +6406,6 @@ mod tests {
                 .and_then(|v| v.api_key.as_deref()),
             Some(MASKED_SECRET)
         );
-        assert_eq!(
-            parsed
-                .channels_config
-                .email
-                .as_ref()
-                .map(|v| v.password.as_str()),
-            Some(MASKED_SECRET)
-        );
     }
 
     #[test]
@@ -2529,19 +6438,6 @@ mod tests {
             allowed_users: vec!["*".to_string()],
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
-        });
-        current.channels_config.email = Some(crate::channels::email_channel::EmailConfig {
-            imap_host: "imap.example.com".to_string(),
-            imap_port: 993,
-            imap_folder: "INBOX".to_string(),
-            smtp_host: "smtp.example.com".to_string(),
-            smtp_port: 465,
-            smtp_tls: true,
-            username: "agent@example.com".to_string(),
-            password: "email-password-real".to_string(),
-            from_address: "agent@example.com".to_string(),
-            idle_timeout_secs: 1740,
-            allowed_senders: vec!["*".to_string()],
         });
         current.model_routes = vec![
             crate::config::schema::ModelRouteConfig {
@@ -2593,9 +6489,6 @@ mod tests {
             feishu.app_secret = MASKED_SECRET.to_string();
             feishu.encrypt_key = Some(MASKED_SECRET.to_string());
             feishu.verification_token = Some("feishu-verify-new".to_string());
-        }
-        if let Some(email) = incoming.channels_config.email.as_mut() {
-            email.password = MASKED_SECRET.to_string();
         }
         incoming.model_routes[1].api_key = Some("route-model-key-2-new".to_string());
         incoming.embedding_routes[1].api_key = Some("route-embed-key-2-new".to_string());
@@ -2682,14 +6575,6 @@ mod tests {
             hydrated.embedding_routes[1].api_key.as_deref(),
             Some("route-embed-key-2-new")
         );
-        assert_eq!(
-            hydrated
-                .channels_config
-                .email
-                .as_ref()
-                .map(|v| v.password.as_str()),
-            Some("email-password-real")
-        );
     }
 
     #[test]
@@ -2775,5 +6660,28 @@ mod tests {
             .embedding_routes
             .iter()
             .all(|route| route.api_key.as_deref() != Some(MASKED_SECRET)));
+    }
+
+    #[test]
+    fn test_calculate_resolution_windows() {
+        // Test 5m cadence (300 seconds)
+        let now = 1776871250; // Some random timestamp
+        let window_ts = now - (now % 300); // 1776871200
+
+        let windows = calculate_resolution_windows(now, 300);
+
+        assert_eq!(windows.len(), 5);
+        assert_eq!(windows[0], window_ts); // current
+        assert_eq!(windows[1], window_ts + 300); // next
+        assert_eq!(windows[2], window_ts - 300); // prev
+        assert_eq!(windows[3], window_ts + 600); // next+1
+        assert_eq!(windows[4], window_ts - 600); // prev-1
+
+        // Ensure rounding behaves properly exactly on the boundary
+        let exact = 1776871200;
+        let windows_exact = calculate_resolution_windows(exact, 300);
+        assert_eq!(windows_exact[0], exact);
+        assert_eq!(windows_exact[1], exact + 300);
+        assert_eq!(windows_exact[2], exact - 300);
     }
 }

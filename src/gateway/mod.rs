@@ -12,6 +12,7 @@ pub mod sse;
 pub mod static_files;
 pub mod ws;
 
+
 use crate::config::Config;
 use crate::cost::CostTracker;
 use crate::memory::{self, Memory, MemoryCategory};
@@ -26,7 +27,7 @@ use axum::{
     extract::{ConnectInfo, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Json},
-    routing::{delete, get, post, put},
+    routing::{delete, get, patch, post, put},
     Router,
 };
 use parking_lot::Mutex;
@@ -367,6 +368,23 @@ pub struct AppState {
     pub wallets: Arc<Mutex<Vec<StoredWallet>>>,
     /// Path to the wallets.json persistence file
     pub wallets_path: Arc<std::path::PathBuf>,
+    /// Live strategy runner store
+    pub strategy_runner: Arc<crate::strategy_runner::StrategyRunnerStore>,
+    /// Polymarket historical sync progress (shared with background task)
+    pub poly_sync_progress: Arc<Mutex<crate::tools::polymarket_historical::SyncProgress>>,
+    /// Cancellation flag for the active Polymarket historical sync. The sync
+    /// task polls this between fetches and exits early when set to `true`.
+    /// The cancel endpoint flips it; the spawn-site resets it before each
+    /// new sync starts so cancellations don't leak across runs.
+    pub poly_sync_cancel: Arc<std::sync::atomic::AtomicBool>,
+    /// Copy trading orchestrator (dispatcher for mirror/consensus/discovery).
+    pub copy_orchestrator: Arc<copy_orchestrator::Orchestrator>,
+    /// Wallet indexer for scoring and candidate discovery.
+    pub wallet_indexer: Arc<wallet_indexer::Indexer>,
+    /// Hyperliquid unified client (perps + spot). None if disabled/unconfigured.
+    pub hyperliquid_client: Option<Arc<hyperliquid_trader::HyperliquidClient>>,
+    /// General trading risk gate (daily loss, drawdown, ATR sizing, correlation).
+    pub trading_risk_gate: Option<Arc<risk_manager::general::TradingRiskGate>>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -395,8 +413,25 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     let actual_port = listener.local_addr()?.port();
     let display_addr = format!("{host}:{actual_port}");
 
+    // Resolve provider name: if bare "custom" or "anthropic-custom" appears without embedded URL,
+    // try to combine with top-level api_url. Avoids crashing on legacy or partially-saved configs.
+    let resolved_provider_name: String;
+    let raw_provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
+    let effective_provider_name = if (raw_provider_name == "custom" || raw_provider_name == "anthropic-custom")
+        && config.api_url.as_deref().map(|u| !u.trim().is_empty()).unwrap_or(false)
+    {
+        resolved_provider_name = format!("{}:{}", raw_provider_name, config.api_url.as_deref().unwrap().trim());
+        tracing::warn!(
+            "Provider '{}' has no embedded URL — combined with api_url: '{}'. Re-save in LLM Settings.",
+            raw_provider_name, resolved_provider_name
+        );
+        resolved_provider_name.as_str()
+    } else {
+        raw_provider_name
+    };
+
     let provider: Arc<dyn Provider> = Arc::from(providers::create_resilient_provider_with_options(
-        config.default_provider.as_deref().unwrap_or("openrouter"),
+        effective_provider_name,
         config.api_key.as_deref(),
         config.api_url.as_deref(),
         &config.reliability,
@@ -444,17 +479,17 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     let tools_registry: Arc<Vec<ToolSpec>> =
         Arc::new(tools_registry_raw.iter().map(|t| t.spec()).collect());
 
-    // Cost tracker (optional)
-    let cost_tracker = if config.cost.enabled {
-        match CostTracker::new(config.cost.clone(), &config.workspace_dir) {
-            Ok(ct) => Some(Arc::new(ct)),
-            Err(e) => {
-                tracing::warn!("Failed to initialize cost tracker: {e}");
-                None
-            }
+    // Cost tracker (always initialize for Dashboard metrics)
+    let cost_tracker = match CostTracker::new(config.cost.clone(), &config.workspace_dir) {
+        Ok(ct) => {
+            // If cost tracking was explicitly disabled, we still keep the tracker for metrics
+            // but we might want to bypass budget blocking in the provider layer.
+            Some(Arc::new(ct))
         }
-    } else {
-        None
+        Err(e) => {
+            tracing::warn!("Failed to initialize cost tracker: {e}");
+            None
+        }
     };
 
     // SSE broadcast channel for real-time events
@@ -510,6 +545,24 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         }
     }
 
+    // Log provider config for debugging
+    {
+        let raw_provider = effective_provider_name;
+        let (provider_label, base_url_hint) = if let Some(url) = raw_provider.strip_prefix("custom:") {
+            ("custom", url.to_string())
+        } else if let Some(url) = raw_provider.strip_prefix("anthropic-custom:") {
+            ("anthropic-custom", url.to_string())
+        } else if let Some(ref url) = config.api_url {
+            (raw_provider, url.clone())
+        } else {
+            (raw_provider, String::new())
+        };
+        if base_url_hint.is_empty() {
+            println!("  🤖 LLM: provider={provider_label}  model={}", config.default_model.as_deref().unwrap_or("(default)"));
+        } else {
+            println!("  🤖 LLM: provider={provider_label}  base_url={base_url_hint}  model={}", config.default_model.as_deref().unwrap_or("(default)"));
+        }
+    }
     println!("🦀 TraderClaw Gateway listening on http://{display_addr}");
     if let Some(ref url) = tunnel_url {
         println!("  🌐 Public URL: {url}");
@@ -522,14 +575,17 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     println!("  GET  /health    — health check");
     println!("  GET  /metrics   — Prometheus metrics");
     if let Some(code) = pairing.pairing_code() {
+        let label = if pairing.is_paired() {
+            "🔐 PAIRING CODE — add a new client:"
+        } else {
+            "🔐 PAIRING REQUIRED — use this one-time code:"
+        };
         println!();
-        println!("  🔐 PAIRING REQUIRED — use this one-time code:");
+        println!("  {label}");
         println!("     ┌──────────────┐");
         println!("     │  {code}  │");
         println!("     └──────────────┘");
         println!("     Send: POST /pair with header X-Pairing-Code: {code}");
-    } else if pairing.require_pairing() {
-        println!("  🔒 Pairing: ACTIVE (bearer token required)");
     } else {
         println!("  ⚠️  Pairing: DISABLED (all requests accepted)");
     }
@@ -548,6 +604,62 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             crate::observability::create_observer(&config.observability),
             event_tx.clone(),
         ));
+
+    // Initialize copy-trading infrastructure
+    let risk_config = risk_manager::RiskConfig {
+        max_single_leader_exposure_pct: config.copy_trading.max_single_leader_exposure_pct,
+        max_per_venue_copy_exposure_pct: config.copy_trading.max_per_venue_copy_exposure_pct,
+        max_aggregate_memecoin_copy_pct: config.copy_trading.max_aggregate_memecoin_copy_pct,
+        max_follow_lag_seconds: config.copy_trading.max_follow_lag_seconds,
+        min_leader_score_to_mirror: config.copy_trading.min_leader_score_mirror,
+        min_leader_score_to_consensus: config.copy_trading.min_leader_score_consensus,
+        max_single_trade_notional_pct: 0.02,
+        max_correlated_exposure_pct: 0.40,
+    };
+    let risk_gate = Arc::new(risk_manager::RiskGate::new(risk_config));
+    let copy_orchestrator = Arc::new(copy_orchestrator::Orchestrator::new(
+        risk_gate.clone(),
+        25_000.0, // default capital — should be configurable
+    ));
+    let wallet_indexer = Arc::new(
+        wallet_indexer::Indexer::new(&config.workspace_dir)
+            .unwrap_or_else(|e| {
+                tracing::warn!("Failed to initialize wallet indexer: {}", e);
+                // Return a dummy indexer that will fail gracefully
+                wallet_indexer::Indexer::new(std::path::Path::new("/tmp"))
+                    .expect("fallback indexer must work")
+            }),
+    );
+
+    // Initialize Hyperliquid client if enabled
+    let hyperliquid_client: Option<Arc<hyperliquid_trader::HyperliquidClient>> =
+        if config.hyperliquid.enabled {
+            let client = if config.hyperliquid.use_testnet {
+                hyperliquid_trader::HyperliquidClient::new_testnet()
+            } else {
+                hyperliquid_trader::HyperliquidClient::new_mainnet()
+            };
+            Some(Arc::new(client))
+        } else {
+            None
+        };
+
+    // Initialize general trading risk gate
+    let trading_risk_gate = {
+        let risk_cfg = risk_manager::general::TradingRiskConfig {
+            daily_loss_limit_pct: config.risk_trading.daily_loss_limit_pct,
+            drawdown_hard_limit_pct: config.risk_trading.drawdown_hard_limit_pct,
+            drawdown_soft_limit_pct: config.risk_trading.drawdown_soft_limit_pct,
+            risk_per_trade_pct: config.risk_trading.risk_per_trade_pct,
+            correlation_threshold: config.risk_trading.correlation_threshold,
+            max_correlated_exposure_pct: config.risk_trading.max_correlated_exposure_pct,
+            max_strategy_exposure_pct: config.risk_trading.max_strategy_exposure_pct,
+            max_memecoin_exposure_pct: config.risk_trading.max_memecoin_exposure_pct,
+            min_notional_usd: config.risk_trading.min_notional_usd,
+        };
+        let capital = 25_000.0; // TODO: pull from wallet balance or config
+        Some(Arc::new(risk_manager::general::TradingRiskGate::new(risk_cfg, capital)))
+    };
 
     let state = AppState {
         config: config_state,
@@ -574,12 +686,42 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             loaded
         })),
         wallets_path: Arc::new(wallets_file_path(&config.config_path)),
+        strategy_runner: Arc::new(crate::strategy_runner::StrategyRunnerStore::new(
+            config.workspace_dir.clone(),
+        )),
+        poly_sync_progress: Arc::new(Mutex::new(Default::default())),
+        poly_sync_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        copy_orchestrator,
+        wallet_indexer,
+        hyperliquid_client,
+        trading_risk_gate,
     };
+
+    // Expose runner store to the /strat Telegram command handler.
+    crate::channels::strat_commands::init_runner_store(Arc::clone(&state.strategy_runner));
+
+    // Restart any strategies that were running before the last shutdown
+    let restarted = state.strategy_runner.restart_previously_running(
+        config.workspace_dir.clone(),
+        Some(config.config_path.clone()),
+    );
+    if restarted > 0 {
+        tracing::info!("Restarted {} strategy runner(s) from disk", restarted);
+    }
 
     // Config PUT needs larger body limit (1MB)
     let config_put_router = Router::new()
         .route("/api/config", put(api::handle_api_config_put))
         .layer(RequestBodyLimitLayer::new(1_048_576));
+
+    // Backtest run needs longer timeout (5 minutes) for fetching large datasets
+    let backtest_run_router = Router::new()
+        .route("/api/backtest/run", post(api::handle_api_backtest_run))
+        .with_state(state.clone())
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(300), // 5 minutes
+        ));
 
     // Build router with middleware
     let app = Router::new()
@@ -596,7 +738,11 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/tools", get(api::handle_api_tools))
         .route("/api/cron", get(api::handle_api_cron_list))
         .route("/api/cron", post(api::handle_api_cron_add))
+        .route("/api/cron/agent", post(api::handle_api_cron_agent_add))
         .route("/api/cron/{id}", delete(api::handle_api_cron_delete))
+        .route("/api/cron/{id}", put(api::handle_api_cron_update))
+        .route("/api/skills", get(api::handle_api_skills_list))
+        .route("/api/skills/content", get(api::handle_api_skills_content))
         .route("/api/integrations", get(api::handle_api_integrations))
         .route(
             "/api/doctor",
@@ -605,6 +751,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/memory", get(api::handle_api_memory_list))
         .route("/api/memory", post(api::handle_api_memory_store))
         .route("/api/memory/{key}", delete(api::handle_api_memory_delete))
+        .route("/api/logs", get(api::handle_api_logs))
         .route("/api/cost", get(api::handle_api_cost))
         .route("/api/cli-tools", get(api::handle_api_cli_tools))
         .route("/api/health", get(api::handle_api_health))
@@ -612,6 +759,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/wallets", get(api::handle_api_wallets_list))
         .route("/api/wallets/create", post(api::handle_api_wallets_create))
         .route("/api/wallets/export", post(api::handle_api_wallets_export))
+        .route("/api/wallets/quote", post(api::handle_api_wallets_quote))
+        .route("/api/wallets/swap", post(api::handle_api_wallets_swap))
+        .route("/api/wallets/transfer", post(api::handle_api_wallets_transfer))
         .route(
             "/api/wallets/{address}/balance",
             get(api::handle_api_wallet_balance),
@@ -621,12 +771,40 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             get(api::handle_api_polymarket_markets),
         )
         .route(
+            "/api/polymarket/prices-history",
+            get(api::handle_api_polymarket_prices_history),
+        )
+        .route(
+            "/api/polymarket/markets/resolve",
+            get(api::handle_api_polymarket_resolve_slug),
+        )
+        .route(
             "/api/polymarket/configure",
             get(api::handle_api_polymarket_configure_get).post(api::handle_api_polymarket_configure),
         )
         .route(
             "/api/polymarket/test",
             post(api::handle_api_polymarket_test),
+        )
+        .route(
+            "/api/polymarket/diagnose-auth",
+            post(api::handle_api_polymarket_diagnose_auth),
+        )
+        .route(
+            "/api/polymarket/refresh-credentials",
+            post(api::handle_api_polymarket_refresh_credentials),
+        )
+        .route(
+            "/api/polymarket/setup/verify-wallet",
+            post(api::handle_api_polymarket_setup_verify_wallet),
+        )
+        .route(
+            "/api/polymarket/setup/detect-proxy",
+            post(api::handle_api_polymarket_setup_detect_proxy),
+        )
+        .route(
+            "/api/polymarket/setup/generate-creds",
+            post(api::handle_api_polymarket_setup_generate_creds),
         )
         .route(
             "/api/polymarket/positions",
@@ -644,14 +822,82 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             "/api/polymarket/order/{id}",
             delete(api::handle_api_polymarket_order_cancel),
         )
+        // ── Copy Trading ──
+        .route(
+            "/api/copy/leaders",
+            get(api::handle_api_copy_leaders).post(api::handle_api_copy_leader_add),
+        )
+        .route(
+            "/api/copy/leaders/{addr}",
+            patch(api::handle_api_copy_leader_patch).delete(api::handle_api_copy_leader_remove),
+        )
+        .route(
+            "/api/copy/leaders/{addr}/toggle",
+            post(api::handle_api_copy_leader_toggle),
+        )
+        .route(
+            "/api/copy/discovery",
+            get(api::handle_api_copy_discovery).post(api::handle_api_copy_discovery_add),
+        )
+        .route(
+            "/api/copy/discovery/refresh",
+            post(api::handle_api_copy_discovery_refresh),
+        )
+        .route(
+            "/api/copy/discovery/{addr}",
+            delete(api::handle_api_copy_discovery_remove),
+        )
+        .route(
+            "/api/copy/discovery/{addr}/graduate",
+            post(api::handle_api_copy_discovery_graduate),
+        )
+        .route(
+            "/api/copy/discovery/{addr}/blacklist",
+            post(api::handle_api_copy_discovery_blacklist),
+        )
+        .route("/api/copy/positions", get(api::handle_api_copy_positions))
+        .route("/api/copy/positions/history", get(api::handle_api_copy_positions_history))
+        .route("/api/copy/capital", get(api::handle_api_copy_get_capital).post(api::handle_api_copy_set_capital))
+        .route("/api/copy/consensus", get(api::handle_api_copy_consensus))
+        .route("/api/copy/sizing", patch(api::handle_api_copy_patch_sizing))
+        .route("/api/copy/score/{addr}", get(api::handle_api_copy_score))
+        .route("/api/copy/leaders/{addr}/trades", get(api::handle_api_copy_leader_trades))
+        // ── Hyperliquid ──
+        .route(
+            "/api/health/hyperliquid",
+            get(api::handle_api_health_hyperliquid),
+        )
+        .route("/api/hyperliquid/mids", get(api::handle_api_hyperliquid_mids))
+        .route("/api/hyperliquid/funding", get(api::handle_api_hyperliquid_funding))
+        .route("/api/funding/comparison", get(api::handle_api_funding_comparison))
+        // ── Live CEX Positions ──
+        .route("/api/live/positions", get(api::handle_api_live_positions))
+        .route("/api/live/positions/{symbol}/close", post(api::handle_api_live_position_close))
+        // ── General Trading Risk ──
+        .route("/api/risk/halt", post(api::handle_api_risk_halt))
+        .route("/api/risk/resume", post(api::handle_api_risk_resume))
+        .route("/api/risk/status", get(api::handle_api_risk_status))
         // ── TradingView ──
         .route("/api/tradingview/scan", get(api::handle_api_tradingview_scan))
         // ── Backtesting ──
+        .route("/api/backtest/series", get(api::handle_api_backtest_series))
         .route("/api/backtest/scripts", get(api::handle_api_backtest_scripts).delete(api::handle_api_backtest_scripts_delete))
         .route("/api/backtest/scripts/rename", post(api::handle_api_backtest_scripts_rename))
         .route("/api/backtest/scripts/description", post(api::handle_api_backtest_scripts_description))
         .route("/api/backtest/scripts/stats", post(api::handle_api_backtest_scripts_stats))
-        .route("/api/backtest/run", post(api::handle_api_backtest_run))
+        .route("/api/backtest/scripts/content", get(api::handle_api_backtest_scripts_content_get).post(api::handle_api_backtest_scripts_content_post))
+        .route(
+            "/api/backtest/polymarket-historical/sync",
+            post(api::handle_api_backtest_polymarket_historical_sync),
+        )
+        .route(
+            "/api/backtest/polymarket-historical/status",
+            get(api::handle_api_backtest_polymarket_historical_status),
+        )
+        .route(
+            "/api/backtest/polymarket-historical/cancel",
+            post(api::handle_api_backtest_polymarket_historical_cancel),
+        )
         .route(
             "/api/channels/telegram/configure",
             get(api::handle_api_telegram_get).post(api::handle_api_telegram_configure),
@@ -665,11 +911,20 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             get(api::handle_api_telegram_messages),
         )
         .route("/api/chat", post(api::handle_api_chat))
+        // ── Live Strategy Runner ──
+        .route("/api/live/strategies", get(api::handle_api_live_list).post(api::handle_api_live_create))
+        .route("/api/live/strategies/{id}", get(api::handle_api_live_get).patch(api::handle_api_live_patch).delete(api::handle_api_live_delete))
+        .route("/api/live/strategies/{id}/stop", post(api::handle_api_live_stop))
+        .route("/api/live/strategies/{id}/restart", post(api::handle_api_live_restart))
         // ── SSE event stream (no timeout — long-lived) ──
+        .route("/api/export", get(api::handle_api_export))
+        .route("/api/import", post(api::handle_api_import))
         .route("/api/events", get(sse::handle_sse_events))
         // ── Static assets (web dashboard) ──
         .route("/_app/{*path}", get(static_files::handle_static))
         .route("/assets/{*path}", get(static_files::handle_assets))
+        .route("/neko.png", get(static_files::handle_assets))
+        .route("/neko2.png", get(static_files::handle_assets))
         // ── Config PUT with larger body limit ──
         .merge(config_put_router)
         .with_state(state.clone())
@@ -681,13 +936,41 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         // ── SPA fallback: non-API GET requests serve index.html ──
         .fallback(get(static_files::handle_spa_fallback));
 
+    // Extract handles needed for background tasks before state is moved.
+    let nightly_indexer = state.wallet_indexer.clone();
+
     // WebSocket and SSE routes must NOT have a timeout layer — they are long-lived connections.
     // The agent itself enforces a 5-minute hard timeout internally.
     let ws_router = axum::Router::new()
         .route("/ws/chat", get(ws::handle_ws_chat))
         .with_state(state);
 
-    let app = ws_router.merge(app);
+    // Merge all routers: WS (no timeout) + backtest/run (5min timeout) + main (30s timeout)
+    let app = ws_router.merge(backtest_run_router).merge(app);
+
+    // Spawn nightly wallet indexer (runs once immediately, then every 24 hours).
+    {
+        let indexer = nightly_indexer;
+        tokio::spawn(async move {
+            loop {
+                tracing::info!("Nightly wallet indexer: running Polymarket scan (top 50)...");
+                if let Err(e) = indexer.run_polymarket_nightly(50).await {
+                    tracing::warn!("Nightly indexer error: {e}");
+                }
+                tokio::time::sleep(tokio::time::Duration::from_secs(24 * 3600)).await;
+            }
+        });
+    }
+
+    // Spawn cron scheduler alongside the HTTP server.
+    if config.cron.enabled {
+        let scheduler_cfg = config.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::cron::scheduler::run(scheduler_cfg).await {
+                tracing::error!("Cron scheduler exited with error: {e}");
+            }
+        });
+    }
 
     // Spawn Telegram (and any other configured channels) alongside the HTTP server.
     // start_channels() runs the long-poll loop; if no channels are configured it exits
@@ -1106,16 +1389,6 @@ mod tests {
     }
 
     #[test]
-    fn whatsapp_query_fields_are_optional() {
-        let q = WhatsAppVerifyQuery {
-            mode: None,
-            verify_token: None,
-            challenge: None,
-        };
-        assert!(q.mode.is_none());
-    }
-
-    #[test]
     fn app_state_is_clone() {
         fn assert_clone<T: Clone>() {}
         assert_clone::<AppState>();
@@ -1134,20 +1407,22 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
-            whatsapp: None,
-            whatsapp_app_secret: None,
-            linq: None,
-            linq_signing_secret: None,
-            nextcloud_talk: None,
-            nextcloud_talk_webhook_secret: None,
-            wati: None,
-            observer: Arc::new(crate::observability::NoopObserver),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),            observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             wallets: Arc::new(Mutex::new(Vec::new())),
             wallets_path: Arc::new(std::env::temp_dir().join("traderclaw_test_wallets.json")),
+            strategy_runner: Arc::new(crate::strategy_runner::StrategyRunnerStore::new(std::env::temp_dir())),
+            poly_sync_progress: Arc::new(Mutex::new(Default::default())),
+            poly_sync_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            copy_orchestrator: Arc::new(copy_orchestrator::Orchestrator::new(
+                Arc::new(risk_manager::RiskGate::with_defaults()),
+                25_000.0,
+            )),
+            wallet_indexer: Arc::new(wallet_indexer::Indexer::new(&std::env::temp_dir()).unwrap()),
+            hyperliquid_client: None,
+            trading_risk_gate: None,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1185,20 +1460,22 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
-            whatsapp: None,
-            whatsapp_app_secret: None,
-            linq: None,
-            linq_signing_secret: None,
-            nextcloud_talk: None,
-            nextcloud_talk_webhook_secret: None,
-            wati: None,
-            observer,
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),            observer,
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             wallets: Arc::new(Mutex::new(Vec::new())),
             wallets_path: Arc::new(std::env::temp_dir().join("traderclaw_test_wallets.json")),
+            strategy_runner: Arc::new(crate::strategy_runner::StrategyRunnerStore::new(std::env::temp_dir())),
+            poly_sync_progress: Arc::new(Mutex::new(Default::default())),
+            poly_sync_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            copy_orchestrator: Arc::new(copy_orchestrator::Orchestrator::new(
+                Arc::new(risk_manager::RiskGate::with_defaults()),
+                25_000.0,
+            )),
+            wallet_indexer: Arc::new(wallet_indexer::Indexer::new(&std::env::temp_dir()).unwrap()),
+            hyperliquid_client: None,
+            trading_risk_gate: None,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1387,22 +1664,6 @@ mod tests {
         assert_ne!(key1, key2);
     }
 
-    #[test]
-    fn whatsapp_memory_key_includes_sender_and_message_id() {
-        let msg = ChannelMessage {
-            id: "wamid-123".into(),
-            sender: "+1234567890".into(),
-            reply_target: "+1234567890".into(),
-            content: "hello".into(),
-            channel: "whatsapp".into(),
-            timestamp: 1,
-            thread_ts: None,
-        };
-
-        let key = whatsapp_memory_key(&msg);
-        assert_eq!(key, "whatsapp_+1234567890_wamid-123");
-    }
-
     #[derive(Default)]
     struct MockMemory;
 
@@ -1553,20 +1814,22 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
-            whatsapp: None,
-            whatsapp_app_secret: None,
-            linq: None,
-            linq_signing_secret: None,
-            nextcloud_talk: None,
-            nextcloud_talk_webhook_secret: None,
-            wati: None,
-            observer: Arc::new(crate::observability::NoopObserver),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),            observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             wallets: Arc::new(Mutex::new(Vec::new())),
             wallets_path: Arc::new(std::env::temp_dir().join("traderclaw_test_wallets.json")),
+            strategy_runner: Arc::new(crate::strategy_runner::StrategyRunnerStore::new(std::env::temp_dir())),
+            poly_sync_progress: Arc::new(Mutex::new(Default::default())),
+            poly_sync_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            copy_orchestrator: Arc::new(copy_orchestrator::Orchestrator::new(
+                Arc::new(risk_manager::RiskGate::with_defaults()),
+                25_000.0,
+            )),
+            wallet_indexer: Arc::new(wallet_indexer::Indexer::new(&std::env::temp_dir()).unwrap()),
+            hyperliquid_client: None,
+            trading_risk_gate: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -1619,20 +1882,22 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
-            whatsapp: None,
-            whatsapp_app_secret: None,
-            linq: None,
-            linq_signing_secret: None,
-            nextcloud_talk: None,
-            nextcloud_talk_webhook_secret: None,
-            wati: None,
-            observer: Arc::new(crate::observability::NoopObserver),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),            observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             wallets: Arc::new(Mutex::new(Vec::new())),
             wallets_path: Arc::new(std::env::temp_dir().join("traderclaw_test_wallets.json")),
+            strategy_runner: Arc::new(crate::strategy_runner::StrategyRunnerStore::new(std::env::temp_dir())),
+            poly_sync_progress: Arc::new(Mutex::new(Default::default())),
+            poly_sync_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            copy_orchestrator: Arc::new(copy_orchestrator::Orchestrator::new(
+                Arc::new(risk_manager::RiskGate::with_defaults()),
+                25_000.0,
+            )),
+            wallet_indexer: Arc::new(wallet_indexer::Indexer::new(&std::env::temp_dir()).unwrap()),
+            hyperliquid_client: None,
+            trading_risk_gate: None,
         };
 
         let headers = HeaderMap::new();
@@ -1697,20 +1962,22 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
-            whatsapp: None,
-            whatsapp_app_secret: None,
-            linq: None,
-            linq_signing_secret: None,
-            nextcloud_talk: None,
-            nextcloud_talk_webhook_secret: None,
-            wati: None,
-            observer: Arc::new(crate::observability::NoopObserver),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),            observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             wallets: Arc::new(Mutex::new(Vec::new())),
             wallets_path: Arc::new(std::env::temp_dir().join("traderclaw_test_wallets.json")),
+            strategy_runner: Arc::new(crate::strategy_runner::StrategyRunnerStore::new(std::env::temp_dir())),
+            poly_sync_progress: Arc::new(Mutex::new(Default::default())),
+            poly_sync_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            copy_orchestrator: Arc::new(copy_orchestrator::Orchestrator::new(
+                Arc::new(risk_manager::RiskGate::with_defaults()),
+                25_000.0,
+            )),
+            wallet_indexer: Arc::new(wallet_indexer::Indexer::new(&std::env::temp_dir()).unwrap()),
+            hyperliquid_client: None,
+            trading_risk_gate: None,
         };
 
         let response = handle_webhook(
@@ -1747,20 +2014,22 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
-            whatsapp: None,
-            whatsapp_app_secret: None,
-            linq: None,
-            linq_signing_secret: None,
-            nextcloud_talk: None,
-            nextcloud_talk_webhook_secret: None,
-            wati: None,
-            observer: Arc::new(crate::observability::NoopObserver),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),            observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             wallets: Arc::new(Mutex::new(Vec::new())),
             wallets_path: Arc::new(std::env::temp_dir().join("traderclaw_test_wallets.json")),
+            strategy_runner: Arc::new(crate::strategy_runner::StrategyRunnerStore::new(std::env::temp_dir())),
+            poly_sync_progress: Arc::new(Mutex::new(Default::default())),
+            poly_sync_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            copy_orchestrator: Arc::new(copy_orchestrator::Orchestrator::new(
+                Arc::new(risk_manager::RiskGate::with_defaults()),
+                25_000.0,
+            )),
+            wallet_indexer: Arc::new(wallet_indexer::Indexer::new(&std::env::temp_dir()).unwrap()),
+            hyperliquid_client: None,
+            trading_risk_gate: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -1802,20 +2071,22 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
-            whatsapp: None,
-            whatsapp_app_secret: None,
-            linq: None,
-            linq_signing_secret: None,
-            nextcloud_talk: None,
-            nextcloud_talk_webhook_secret: None,
-            wati: None,
-            observer: Arc::new(crate::observability::NoopObserver),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),            observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             wallets: Arc::new(Mutex::new(Vec::new())),
             wallets_path: Arc::new(std::env::temp_dir().join("traderclaw_test_wallets.json")),
+            strategy_runner: Arc::new(crate::strategy_runner::StrategyRunnerStore::new(std::env::temp_dir())),
+            poly_sync_progress: Arc::new(Mutex::new(Default::default())),
+            poly_sync_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            copy_orchestrator: Arc::new(copy_orchestrator::Orchestrator::new(
+                Arc::new(risk_manager::RiskGate::with_defaults()),
+                25_000.0,
+            )),
+            wallet_indexer: Arc::new(wallet_indexer::Indexer::new(&std::env::temp_dir()).unwrap()),
+            hyperliquid_client: None,
+            trading_risk_gate: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -1835,316 +2106,6 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
     }
-
-    fn compute_nextcloud_signature_hex(secret: &str, random: &str, body: &str) -> String {
-        use hmac::{Hmac, Mac};
-        use sha2::Sha256;
-
-        let payload = format!("{random}{body}");
-        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
-        mac.update(payload.as_bytes());
-        hex::encode(mac.finalize().into_bytes())
-    }
-
-    #[tokio::test]
-    async fn nextcloud_talk_webhook_returns_not_found_when_not_configured() {
-        let provider: Arc<dyn Provider> = Arc::new(MockProvider::default());
-        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
-
-        let state = AppState {
-            config: Arc::new(Mutex::new(Config::default())),
-            provider,
-            model: Arc::new(Mutex::new("test-model".into())),
-            temperature: Arc::new(Mutex::new(0.0)),
-            mem: memory,
-            auto_save: false,
-            webhook_secret_hash: None,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
-            trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
-            whatsapp: None,
-            whatsapp_app_secret: None,
-            linq: None,
-            linq_signing_secret: None,
-            nextcloud_talk: None,
-            nextcloud_talk_webhook_secret: None,
-            wati: None,
-            observer: Arc::new(crate::observability::NoopObserver),
-            tools_registry: Arc::new(Vec::new()),
-            cost_tracker: None,
-            event_tx: tokio::sync::broadcast::channel(16).0,
-            wallets: Arc::new(Mutex::new(Vec::new())),
-            wallets_path: Arc::new(std::env::temp_dir().join("traderclaw_test_wallets.json")),
-        };
-
-        let response = handle_nextcloud_talk_webhook(
-            State(state),
-            HeaderMap::new(),
-            Bytes::from_static(br#"{"type":"message"}"#),
-        )
-        .await
-        .into_response();
-
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn nextcloud_talk_webhook_rejects_invalid_signature() {
-        let provider_impl = Arc::new(MockProvider::default());
-        let provider: Arc<dyn Provider> = provider_impl.clone();
-        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
-
-        let channel = Arc::new(NextcloudTalkChannel::new(
-            "https://cloud.example.com".into(),
-            "app-token".into(),
-            vec!["*".into()],
-        ));
-
-        let secret = "nextcloud-test-secret";
-        let random = "seed-value";
-        let body = r#"{"type":"message","object":{"token":"room-token"},"message":{"actorType":"users","actorId":"user_a","message":"hello"}}"#;
-        let _valid_signature = compute_nextcloud_signature_hex(secret, random, body);
-        let invalid_signature = "deadbeef";
-
-        let state = AppState {
-            config: Arc::new(Mutex::new(Config::default())),
-            provider,
-            model: Arc::new(Mutex::new("test-model".into())),
-            temperature: Arc::new(Mutex::new(0.0)),
-            mem: memory,
-            auto_save: false,
-            webhook_secret_hash: None,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
-            trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
-            whatsapp: None,
-            whatsapp_app_secret: None,
-            linq: None,
-            linq_signing_secret: None,
-            nextcloud_talk: Some(channel),
-            nextcloud_talk_webhook_secret: Some(Arc::from(secret)),
-            wati: None,
-            observer: Arc::new(crate::observability::NoopObserver),
-            tools_registry: Arc::new(Vec::new()),
-            cost_tracker: None,
-            event_tx: tokio::sync::broadcast::channel(16).0,
-            wallets: Arc::new(Mutex::new(Vec::new())),
-            wallets_path: Arc::new(std::env::temp_dir().join("traderclaw_test_wallets.json")),
-        };
-
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "X-Nextcloud-Talk-Random",
-            HeaderValue::from_str(random).unwrap(),
-        );
-        headers.insert(
-            "X-Nextcloud-Talk-Signature",
-            HeaderValue::from_str(invalid_signature).unwrap(),
-        );
-
-        let response = handle_nextcloud_talk_webhook(State(state), headers, Bytes::from(body))
-            .await
-            .into_response();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
-    }
-
-    // ══════════════════════════════════════════════════════════
-    // WhatsApp Signature Verification Tests (CWE-345 Prevention)
-    // ══════════════════════════════════════════════════════════
-
-    fn compute_whatsapp_signature_hex(secret: &str, body: &[u8]) -> String {
-        use hmac::{Hmac, Mac};
-        use sha2::Sha256;
-
-        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
-        mac.update(body);
-        hex::encode(mac.finalize().into_bytes())
-    }
-
-    fn compute_whatsapp_signature_header(secret: &str, body: &[u8]) -> String {
-        format!("sha256={}", compute_whatsapp_signature_hex(secret, body))
-    }
-
-    #[test]
-    fn whatsapp_signature_valid() {
-        let app_secret = generate_test_secret();
-        let body = b"test body content";
-
-        let signature_header = compute_whatsapp_signature_header(&app_secret, body);
-
-        assert!(verify_whatsapp_signature(
-            &app_secret,
-            body,
-            &signature_header
-        ));
-    }
-
-    #[test]
-    fn whatsapp_signature_invalid_wrong_secret() {
-        let app_secret = generate_test_secret();
-        let wrong_secret = generate_test_secret();
-        let body = b"test body content";
-
-        let signature_header = compute_whatsapp_signature_header(&wrong_secret, body);
-
-        assert!(!verify_whatsapp_signature(
-            &app_secret,
-            body,
-            &signature_header
-        ));
-    }
-
-    #[test]
-    fn whatsapp_signature_invalid_wrong_body() {
-        let app_secret = generate_test_secret();
-        let original_body = b"original body";
-        let tampered_body = b"tampered body";
-
-        let signature_header = compute_whatsapp_signature_header(&app_secret, original_body);
-
-        // Verify with tampered body should fail
-        assert!(!verify_whatsapp_signature(
-            &app_secret,
-            tampered_body,
-            &signature_header
-        ));
-    }
-
-    #[test]
-    fn whatsapp_signature_missing_prefix() {
-        let app_secret = generate_test_secret();
-        let body = b"test body";
-
-        // Signature without "sha256=" prefix
-        let signature_header = "abc123def456";
-
-        assert!(!verify_whatsapp_signature(
-            &app_secret,
-            body,
-            signature_header
-        ));
-    }
-
-    #[test]
-    fn whatsapp_signature_empty_header() {
-        let app_secret = generate_test_secret();
-        let body = b"test body";
-
-        assert!(!verify_whatsapp_signature(&app_secret, body, ""));
-    }
-
-    #[test]
-    fn whatsapp_signature_invalid_hex() {
-        let app_secret = generate_test_secret();
-        let body = b"test body";
-
-        // Invalid hex characters
-        let signature_header = "sha256=not_valid_hex_zzz";
-
-        assert!(!verify_whatsapp_signature(
-            &app_secret,
-            body,
-            signature_header
-        ));
-    }
-
-    #[test]
-    fn whatsapp_signature_empty_body() {
-        let app_secret = generate_test_secret();
-        let body = b"";
-
-        let signature_header = compute_whatsapp_signature_header(&app_secret, body);
-
-        assert!(verify_whatsapp_signature(
-            &app_secret,
-            body,
-            &signature_header
-        ));
-    }
-
-    #[test]
-    fn whatsapp_signature_unicode_body() {
-        let app_secret = generate_test_secret();
-        let body = "Hello 🦀 World".as_bytes();
-
-        let signature_header = compute_whatsapp_signature_header(&app_secret, body);
-
-        assert!(verify_whatsapp_signature(
-            &app_secret,
-            body,
-            &signature_header
-        ));
-    }
-
-    #[test]
-    fn whatsapp_signature_json_payload() {
-        let app_secret = generate_test_secret();
-        let body = br#"{"entry":[{"changes":[{"value":{"messages":[{"from":"1234567890","text":{"body":"Hello"}}]}}]}]}"#;
-
-        let signature_header = compute_whatsapp_signature_header(&app_secret, body);
-
-        assert!(verify_whatsapp_signature(
-            &app_secret,
-            body,
-            &signature_header
-        ));
-    }
-
-    #[test]
-    fn whatsapp_signature_case_sensitive_prefix() {
-        let app_secret = generate_test_secret();
-        let body = b"test body";
-
-        let hex_sig = compute_whatsapp_signature_hex(&app_secret, body);
-
-        // Wrong case prefix should fail
-        let wrong_prefix = format!("SHA256={hex_sig}");
-        assert!(!verify_whatsapp_signature(&app_secret, body, &wrong_prefix));
-
-        // Correct prefix should pass
-        let correct_prefix = format!("sha256={hex_sig}");
-        assert!(verify_whatsapp_signature(
-            &app_secret,
-            body,
-            &correct_prefix
-        ));
-    }
-
-    #[test]
-    fn whatsapp_signature_truncated_hex() {
-        let app_secret = generate_test_secret();
-        let body = b"test body";
-
-        let hex_sig = compute_whatsapp_signature_hex(&app_secret, body);
-        let truncated = &hex_sig[..32]; // Only half the signature
-        let signature_header = format!("sha256={truncated}");
-
-        assert!(!verify_whatsapp_signature(
-            &app_secret,
-            body,
-            &signature_header
-        ));
-    }
-
-    #[test]
-    fn whatsapp_signature_extra_bytes() {
-        let app_secret = generate_test_secret();
-        let body = b"test body";
-
-        let hex_sig = compute_whatsapp_signature_hex(&app_secret, body);
-        let extended = format!("{hex_sig}deadbeef");
-        let signature_header = format!("sha256={extended}");
-
-        assert!(!verify_whatsapp_signature(
-            &app_secret,
-            body,
-            &signature_header
-        ));
-    }
-
     // ══════════════════════════════════════════════════════════
     // IdempotencyStore Edge-Case Tests
     // ══════════════════════════════════════════════════════════

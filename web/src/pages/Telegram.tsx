@@ -181,8 +181,8 @@ export default function Telegram() {
                 {[
                   { n: '1', text: <>Open Telegram and search for <span style={{ color: 'var(--color-accent)' }}>@BotFather</span>, or tap the link above.</> },
                   { n: '2', text: <>Send the command <code className="px-1 rounded" style={{ backgroundColor: 'var(--color-surface)', color: 'var(--color-accent)' }}>/newbot</code> to start the creation flow.</> },
-                  { n: '3', text: <>Choose a display name for your bot (e.g. <em>Trader Claw</em>).</> },
-                  { n: '4', text: <>Choose a unique username ending in <code className="px-1 rounded" style={{ backgroundColor: 'var(--color-surface)', color: 'var(--color-accent)' }}>bot</code> (e.g. <em>traderclaw_bot</em>).</> },
+                  { n: '3', text: <>Choose a display name for your bot (e.g. <em>Neko Vives</em>).</> },
+                  { n: '4', text: <>Choose a unique username ending in <code className="px-1 rounded" style={{ backgroundColor: 'var(--color-surface)', color: 'var(--color-accent)' }}>bot</code> (e.g. <em>nekovives_bot</em>).</> },
                   { n: '5', text: <>BotFather will reply with a token like <code className="px-1 rounded font-mono" style={{ backgroundColor: 'var(--color-surface)', color: 'var(--color-accent)' }}>123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcde</code>. Copy it and paste it below.</> },
                 ].map(({ n, text }) => (
                   <li key={n} className="flex gap-2">

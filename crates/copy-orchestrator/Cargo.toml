@@ -1,0 +1,18 @@
+[package]
+name = "copy-orchestrator"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+thiserror = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "time", "sync"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+tracing = "0.1"
+parking_lot = "0.12"
+risk-manager = { path = "../risk-manager" }
+wallet-tracker = { path = "../wallet-tracker" }
+wallet-indexer = { path = "../wallet-indexer" }
+polymarket-trader = { path = "../polymarket-trader" }

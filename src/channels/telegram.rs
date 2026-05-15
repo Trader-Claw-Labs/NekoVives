@@ -330,6 +330,13 @@ pub struct TelegramChannel {
     transcription: Option<crate::config::TranscriptionConfig>,
     voice_transcriptions: Mutex<std::collections::HashMap<String, String>>,
     workspace_dir: Option<std::path::PathBuf>,
+    /// Path to config.toml — when set, the first authorized private-chat message
+    /// will persist the sender's chat_id into [channels.telegram] chat_id so that
+    /// cron delivery targets resolve automatically without manual configuration.
+    config_path: Option<std::path::PathBuf>,
+    /// Set to true once we've persisted the chat_id for this session, so we
+    /// don't fire redundant writes on every message.
+    chat_id_saved: std::sync::atomic::AtomicBool,
 }
 
 impl TelegramChannel {
@@ -361,6 +368,8 @@ impl TelegramChannel {
             transcription: None,
             voice_transcriptions: Mutex::new(std::collections::HashMap::new()),
             workspace_dir: None,
+            config_path: None,
+            chat_id_saved: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -368,6 +377,89 @@ impl TelegramChannel {
     pub fn with_workspace_dir(mut self, dir: std::path::PathBuf) -> Self {
         self.workspace_dir = Some(dir);
         self
+    }
+
+    /// Provide the config path so the channel can auto-persist the chat_id
+    /// when the first authorized message is received.
+    pub fn with_config_path(mut self, path: std::path::PathBuf) -> Self {
+        self.config_path = Some(path);
+        self
+    }
+
+    /// Persist `chat_id` into [channels.telegram] in config.toml using line-based
+    /// editing — avoids re-parsing TOML so encrypted/special values are preserved.
+    /// Silently no-ops if already set or if no config_path is configured.
+    async fn maybe_persist_chat_id(&self, chat_id: &str) {
+        use std::sync::atomic::Ordering;
+
+        // chat_id from a group message includes the thread suffix (chat_id:thread_id).
+        // Strip the thread part — we only want the bare numeric chat_id.
+        let bare_chat_id = chat_id.split(':').next().unwrap_or(chat_id);
+
+        // Only run once per session — AtomicBool acts as a cheap gate.
+        if self.chat_id_saved.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let Some(ref path) = self.config_path else {
+            return;
+        };
+
+        let raw = match tokio::fs::read_to_string(path).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("Telegram: could not read config for chat_id persistence: {e}");
+                return;
+            }
+        };
+
+        // Check if chat_id is already set (non-empty value on chat_id line inside
+        // a [channels.telegram] or [telegram] section).
+        let already_set = {
+            let mut in_tg = false;
+            let mut found = false;
+            for line in raw.lines() {
+                let t = line.trim();
+                if t.starts_with('[') {
+                    in_tg = t == "[channels.telegram]" || t == "[telegram]";
+                    continue;
+                }
+                if !in_tg { continue; }
+                if let Some(rest) = t.strip_prefix("chat_id") {
+                    let val = rest.trim_start_matches('=').trim().trim_matches('"');
+                    if !val.is_empty() {
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            found
+        };
+
+        if already_set {
+            self.chat_id_saved.store(true, Ordering::Relaxed);
+            return;
+        }
+
+        // Insert or replace chat_id inside [channels.telegram] section.
+        let new_content = insert_or_replace_toml_key_in_section(
+            &raw,
+            &["[channels.telegram]", "[telegram]"],
+            "chat_id",
+            bare_chat_id,
+        );
+
+        match tokio::fs::write(path, new_content).await {
+            Ok(()) => {
+                tracing::info!(
+                    "Telegram: auto-saved chat_id={bare_chat_id} to config for cron delivery"
+                );
+                self.chat_id_saved.store(true, Ordering::Relaxed);
+            }
+            Err(e) => {
+                tracing::warn!("Telegram: failed to write chat_id to config: {e}");
+            }
+        }
     }
 
     /// Configure streaming mode for progressive draft updates.
@@ -2657,6 +2749,10 @@ Ensure only one `traderclaw` process is using this bot token."
                         continue;
                     };
 
+                    // Auto-persist the chat_id on first authorized message so cron
+                    // delivery targets work without manual configuration.
+                    self.maybe_persist_chat_id(&msg.reply_target).await;
+
                     if let Some((reaction_chat_id, reaction_message_id)) =
                         Self::extract_update_message_target(update)
                     {
@@ -4646,4 +4742,57 @@ mod tests {
         // the agent loop will return ProviderCapabilityError before calling
         // the provider, and the channel will send "⚠️ Error: ..." to the user.
     }
+}
+
+// ── TOML helper ──────────────────────────────────────────────────────────────
+
+/// Insert or replace a key=value pair inside the first matching TOML section.
+///
+/// Iterates through `raw` line by line. When it finds any header in `sections`,
+/// it enters that section and either replaces an existing `key = ...` line or
+/// appends the key/value just before the next section header (or at EOF).
+/// Returns the modified content.
+fn insert_or_replace_toml_key_in_section(
+    raw: &str,
+    sections: &[&str],
+    key: &str,
+    value: &str,
+) -> String {
+    let new_line = format!("{key} = \"{value}\"");
+    let mut lines: Vec<String> = raw.lines().map(str::to_string).collect();
+    let mut in_section = false;
+    let mut key_line_idx: Option<usize> = None;
+    let mut section_end_idx: Option<usize> = None;
+
+    for (i, line) in lines.iter().enumerate() {
+        let t = line.trim();
+        if t.starts_with('[') && !t.starts_with("[[") {
+            if in_section && section_end_idx.is_none() {
+                section_end_idx = Some(i);
+                in_section = false;
+            }
+            in_section = sections.iter().any(|s| *s == t);
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        if t.starts_with(key) && t[key.len()..].trim_start().starts_with('=') {
+            key_line_idx = Some(i);
+            break;
+        }
+    }
+
+    if let Some(idx) = key_line_idx {
+        lines[idx] = new_line;
+    } else {
+        let insert_at = section_end_idx.unwrap_or(lines.len());
+        lines.insert(insert_at, new_line);
+    }
+
+    let mut out = lines.join("\n");
+    if raw.ends_with('\n') {
+        out.push('\n');
+    }
+    out
 }

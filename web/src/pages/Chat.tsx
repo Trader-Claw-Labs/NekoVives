@@ -1,12 +1,17 @@
-import { useState, useRef, useEffect, useCallback, forwardRef, useImperativeHandle } from 'react'
+import { useState, useRef, useEffect, lazy, Suspense } from 'react'
+const NekoLogoCanvas = lazy(() => import('../components/NekoLogoCanvas'))
 import {
-  Plus, X, Wifi, WifiOff, Pencil, Send,
+  Plus, X, Wifi, WifiOff, Pencil, Send, Square,
   Zap, BarChart2, Search, Wallet, BookOpen, Settings2, Terminal,
-  ChevronDown, ChevronRight, AlertCircle,
+  ChevronDown, ChevronRight, AlertCircle, Paperclip, FlaskConical,
 } from 'lucide-react'
-import { useWebSocket, WsMessage } from '../hooks/useWebSocket'
+import type { WsMessage } from '../hooks/useWebSocket'
 import { apiPost } from '../hooks/useApi'
 import clsx from 'clsx'
+import { useChatContext } from '../context/ChatContext'
+import type { Message, Session, ToolEvent } from '../context/ChatContext'
+import { useBacktestState } from '../hooks/useBacktestState'
+import type { BacktestResult } from '../hooks/useBacktestState'
 
 // ── Slash commands ──────────────────────────────────────────────────
 
@@ -49,39 +54,7 @@ const QUICK_PROMPTS = [
   { label: 'Browse Polymarket', prompt: 'Show me the top 5 Polymarket prediction markets by volume with current prices', icon: <BarChart2 size={15} /> },
 ]
 
-// ── Types ────────────────────────────────────────────────────────────
-
-interface ToolEvent {
-  type: 'tool_call' | 'tool_result' | 'thinking' | 'executing'
-  name: string
-  summary?: string
-  args?: Record<string, unknown>
-  outputSnippet?: string
-  success?: boolean
-  iteration?: number
-  step?: number
-  totalSteps?: number
-  toolCount?: number
-  tools?: string[]
-  elapsedMs?: number
-  replanning?: boolean
-  toolsDone?: number
-}
-
-interface Message {
-  role: 'user' | 'assistant'
-  content: string
-  timestamp: number
-  streaming?: boolean
-  toolEvents?: ToolEvent[]
-  agentStartedAt?: number
-}
-
-interface Session {
-  id: string
-  label: string
-  messages: Message[]
-}
+// ── Local helpers ────────────────────────────────────────────────────
 
 function generateId(): string {
   return Math.random().toString(36).slice(2, 10)
@@ -245,7 +218,7 @@ function ThinkingRow({ round, replanning, active }: { round: number; replanning?
 }
 
 function ToolRow({ item }: { item: TimelineItem }) {
-  const [open, setOpen] = useState(false)
+  const [open, setOpen] = useState(true)
   const meta    = toolMeta(item.toolName ?? '')
   const label   = argsLabel(item.toolName ?? '', item.args)
   const failed  = item.success === false
@@ -387,7 +360,7 @@ function Timeline({ toolEvents, streaming }: { toolEvents: ToolEvent[]; streamin
 
 // Keep backward-compat alias used in MessageBubble for completed messages
 function ActionLog({ toolEvents }: { toolEvents: ToolEvent[] }) {
-  const [open, setOpen] = useState(false)
+  const [open, setOpen] = useState(true)
   const calls = toolEvents.filter(e => e.type === 'tool_call')
   if (calls.length === 0) return null
 
@@ -507,20 +480,35 @@ interface ChatWindowProps {
   send: (msg: WsMessage) => void
 }
 
-export interface ChatWindowHandle {
-  deliver: (msg: WsMessage) => void
+// ── Backtest attachment helpers ──────────────────────────────────────
+
+function formatBacktestAttachment(r: BacktestResult): string {
+  return `\n\n---\n**Attached Backtest Result** — ${r.script} (${r.symbol})\n` +
+    `- Return: ${r.total_return_pct >= 0 ? '+' : ''}${r.total_return_pct.toFixed(2)}%\n` +
+    `- Sharpe: ${r.sharpe_ratio?.toFixed(2) ?? 'N/A'}\n` +
+    `- Max Drawdown: ${r.max_drawdown_pct.toFixed(2)}%\n` +
+    `- Win Rate: ${r.win_rate_pct.toFixed(1)}%\n` +
+    `- Trades: ${r.total_trades}\n` +
+    (r.analysis ? `- Analysis: ${r.analysis}\n` : '') +
+    `---`
 }
 
-const ChatWindow = forwardRef<ChatWindowHandle, ChatWindowProps>(function ChatWindow(
-  { session, onUpdate, connected, send }, ref
-) {
-  const [input, setInput]     = useState('')
-  const [sending, setSending] = useState(false)
+function ChatWindow({ session, onUpdate, connected, send }: ChatWindowProps) {
+  const [input, setInput]       = useState('')
   const [cmdIndex, setCmdIndex] = useState(0)
+  const [showAttachMenu, setShowAttachMenu] = useState(false)
+  const [attachedResult, setAttachedResult] = useState<BacktestResult | null>(null)
   const bottomRef  = useRef<HTMLDivElement>(null)
   const inputRef   = useRef<HTMLTextAreaElement>(null)
-  const sessionRef = useRef(session)
-  useEffect(() => { sessionRef.current = session }, [session])
+  const isInitialRender = useRef(true)
+  const { scriptResults, result: latestResult } = useBacktestState()
+
+  useEffect(() => {
+    isInitialRender.current = true
+  }, [session.id])
+
+  // Derive sending from whether the last assistant message is still streaming
+  const sending = session.messages.some((m) => m.streaming)
 
   const slashMatch  = input.match(/^(\/\S*)/)
   const slashQuery  = slashMatch ? slashMatch[1].toLowerCase() : null
@@ -532,84 +520,13 @@ const ChatWindow = forwardRef<ChatWindowHandle, ChatWindowProps>(function ChatWi
   const showPalette = slashQuery !== null && filteredCmds.length > 0
   useEffect(() => { setCmdIndex(0) }, [slashQuery])
 
-  const onWsMessage = useCallback((msg: WsMessage) => {
-    const cur = sessionRef.current
-    if (msg.type === 'thinking') {
-      onUpdate({ ...cur, messages: cur.messages.map((m, i) =>
-        i === cur.messages.length - 1 && m.role === 'assistant' && m.streaming
-          ? { ...m, toolEvents: [...(m.toolEvents ?? []), {
-              type: 'thinking' as const, name: 'thinking',
-              iteration: Number(msg.iteration ?? 1),
-              replanning: Boolean(msg.replanning),
-              toolsDone: Number(msg.tools_done ?? 0),
-            }] }
-          : m
-      )})
-    } else if (msg.type === 'executing') {
-      onUpdate({ ...cur, messages: cur.messages.map((m, i) =>
-        i === cur.messages.length - 1 && m.role === 'assistant' && m.streaming
-          ? { ...m, toolEvents: [...(m.toolEvents ?? []), {
-              type: 'executing' as const, name: 'executing',
-              iteration: Number(msg.iteration ?? 1),
-              toolCount: Number(msg.tool_count ?? 0),
-              tools: Array.isArray(msg.tools) ? (msg.tools as string[]) : [],
-            }] }
-          : m
-      )})
-    } else if (msg.type === 'chunk' && typeof msg.content === 'string') {
-      onUpdate({ ...cur, messages: cur.messages.map((m, i) =>
-        i === cur.messages.length - 1 && m.role === 'assistant' && m.streaming
-          ? { ...m, content: m.content + msg.content }
-          : m
-      )})
-    } else if (msg.type === 'tool_call') {
-      const rawArgs = msg.args && typeof msg.args === 'object'
-        ? msg.args as Record<string, unknown>
-        : undefined
-      onUpdate({ ...cur, messages: cur.messages.map((m, i) =>
-        i === cur.messages.length - 1 && m.role === 'assistant' && m.streaming
-          ? { ...m, toolEvents: [...(m.toolEvents ?? []), {
-              type: 'tool_call' as const,
-              name: String(msg.name ?? ''),
-              summary: summariseArgs(msg.args),
-              args: rawArgs,
-              iteration: Number(msg.iteration ?? 1),
-              step: Number(msg.step ?? 1),
-              totalSteps: Number(msg.total_steps ?? 1),
-            }] }
-          : m
-      )})
-    } else if (msg.type === 'tool_result') {
-      onUpdate({ ...cur, messages: cur.messages.map((m, i) =>
-        i === cur.messages.length - 1 && m.role === 'assistant' && m.streaming
-          ? { ...m, toolEvents: [...(m.toolEvents ?? []), {
-              type: 'tool_result' as const,
-              name: String(msg.name ?? ''),
-              outputSnippet: String(msg.output_snippet ?? ''),
-              success: Boolean(msg.success ?? true),
-              elapsedMs: Number(msg.elapsed_ms ?? 0),
-              iteration: Number(msg.iteration ?? 1),
-            }] }
-          : m
-      )})
-    } else if (msg.type === 'done') {
-      const full = typeof msg.full_response === 'string' ? msg.full_response : undefined
-      onUpdate({ ...cur, messages: cur.messages.map((m) =>
-        m.streaming ? { ...m, content: full ?? m.content, streaming: false } : m
-      )})
-      setSending(false)
-    } else if (msg.type === 'error') {
-      onUpdate({ ...cur, messages: cur.messages.map((m) =>
-        m.streaming ? { ...m, content: `error: ${msg.message ?? 'unknown error'}`, streaming: false } : m
-      )})
-      setSending(false)
-    }
-  }, [onUpdate])
-
-  useImperativeHandle(ref, () => ({ deliver: onWsMessage }), [onWsMessage])
-
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+    if (isInitialRender.current) {
+      bottomRef.current?.scrollIntoView({ behavior: 'auto' })
+      isInitialRender.current = false
+    } else {
+      bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+    }
   }, [session.messages])
 
   useEffect(() => {
@@ -621,20 +538,21 @@ const ChatWindow = forwardRef<ChatWindowHandle, ChatWindowProps>(function ChatWi
 
   async function handleSend() {
     if (!input.trim() || sending) return
-    const userMsg: Message      = { role: 'user',      content: input.trim(), timestamp: Date.now() }
+    const fullContent = input.trim() + (attachedResult ? formatBacktestAttachment(attachedResult) : '')
+    const userMsg: Message      = { role: 'user',      content: fullContent, timestamp: Date.now() }
     const assistantMsg: Message = { role: 'assistant', content: '', timestamp: Date.now(),
       streaming: true, toolEvents: [], agentStartedAt: Date.now() }
     const updated: Session = { ...session, messages: [...session.messages, userMsg, assistantMsg] }
     onUpdate(updated)
-    setSending(true)
     setInput('')
+    setAttachedResult(null)
 
     if (connected) {
-      send({ type: 'message', content: input.trim(), session_id: session.id })
+      send({ type: 'message', content: fullContent, session_id: session.id })
     } else {
       try {
         const res = await apiPost<{ response?: string; content?: string }>(
-          '/api/chat', { session_id: session.id, message: input.trim() }
+          '/api/chat', { session_id: session.id, message: fullContent }
         )
         const text = res.response ?? res.content ?? 'No response'
         onUpdate({ ...updated, messages: updated.messages.map((m) =>
@@ -644,8 +562,6 @@ const ChatWindow = forwardRef<ChatWindowHandle, ChatWindowProps>(function ChatWi
         onUpdate({ ...updated, messages: updated.messages.map((m) =>
           m.streaming ? { ...m, content: `error: ${String(e)}`, streaming: false } : m
         )})
-      } finally {
-        setSending(false)
       }
     }
   }
@@ -680,21 +596,19 @@ const ChatWindow = forwardRef<ChatWindowHandle, ChatWindowProps>(function ChatWi
         {isEmpty ? (
           /* Empty state */
           <div className="flex flex-col items-center justify-center h-full gap-6 px-6 pb-16">
-            <div className="text-center">
-              <div
-                className="inline-flex items-center justify-center rounded-2xl mb-4"
-                style={{
-                  width: 48, height: 48,
-                  background: 'linear-gradient(135deg, var(--color-accent) 0%, #00b8ff 100%)',
-                }}
-              >
-                <span style={{ fontSize: 22 }}>🤖</span>
-              </div>
-              <h2 className="text-lg font-semibold mb-1" style={{ color: 'var(--color-text)' }}>
-                Trader Claw Agent
+            <div className="text-center flex flex-col items-center">
+              <Suspense fallback={
+                <div style={{ width: 140, height: 150, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  <span style={{ fontSize: 48 }}>🐾</span>
+                </div>
+              }>
+                <NekoLogoCanvas size={140} />
+              </Suspense>
+              <h2 className="text-lg font-semibold mt-3 mb-1" style={{ color: 'var(--color-text)', fontFamily: "'Press Start 2P', monospace", fontSize: 14, letterSpacing: 2 }}>
+                NEKO VIVES
               </h2>
               <p className="text-sm" style={{ color: 'var(--color-text-muted)' }}>
-                Markets · Strategies · Wallets · Backtesting
+                Your lucky cat in the markets 🍀
               </p>
             </div>
 
@@ -766,6 +680,51 @@ const ChatWindow = forwardRef<ChatWindowHandle, ChatWindowProps>(function ChatWi
 
       {/* ── Input bar ── */}
       <div className="px-4 pb-4 pt-2">
+        {/* Attached backtest pill */}
+        {attachedResult && (
+          <div className="flex items-center gap-2 mb-2 px-1">
+            <div className="flex items-center gap-1.5 text-xs px-2.5 py-1 rounded-full"
+              style={{ backgroundColor: 'rgba(74,222,128,0.12)', color: 'var(--color-accent)', border: '1px solid rgba(74,222,128,0.25)' }}>
+              <FlaskConical size={11} />
+              <span>{attachedResult.script} · {attachedResult.total_return_pct >= 0 ? '+' : ''}{attachedResult.total_return_pct.toFixed(2)}%</span>
+              <button onClick={() => setAttachedResult(null)} className="ml-1 hover:opacity-70">
+                <X size={10} />
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Attach menu (backtest results picker) */}
+        {showAttachMenu && (
+          <div className="mb-2 rounded-xl border overflow-hidden"
+            style={{ backgroundColor: 'var(--color-surface)', borderColor: 'var(--color-border)' }}>
+            <div className="px-3 py-2 text-xs font-semibold border-b flex items-center gap-2"
+              style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-muted)' }}>
+              <FlaskConical size={11} style={{ color: 'var(--color-accent)' }} />
+              Attach a backtest result
+            </div>
+            {latestResult || Object.keys(scriptResults).length > 0 ? (
+              <div className="max-h-40 overflow-y-auto">
+                {[...(latestResult ? [latestResult] : []),
+                  ...Object.values(scriptResults).filter(r => r.script !== latestResult?.script)
+                ].map(r => (
+                  <button key={r.script} className="w-full flex items-center justify-between px-3 py-2 text-xs hover:bg-white/5 text-left"
+                    onClick={() => { setAttachedResult(r); setShowAttachMenu(false) }}>
+                    <span className="font-mono truncate max-w-48">{r.script}</span>
+                    <span style={{ color: r.total_return_pct >= 0 ? 'var(--color-accent)' : 'var(--color-danger)', flexShrink: 0 }}>
+                      {r.total_return_pct >= 0 ? '+' : ''}{r.total_return_pct.toFixed(2)}%
+                    </span>
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <div className="px-3 py-3 text-xs" style={{ color: 'var(--color-text-muted)' }}>
+                No backtest results yet — run a backtest first
+              </div>
+            )}
+          </div>
+        )}
+
         <div
           className="flex items-end gap-2 rounded-2xl px-4 py-3 transition-shadow"
           style={{
@@ -782,6 +741,18 @@ const ChatWindow = forwardRef<ChatWindowHandle, ChatWindowProps>(function ChatWi
             el.style.border = '1px solid rgba(255,255,255,0.1)'
           }}
         >
+          <button
+            onClick={() => setShowAttachMenu(v => !v)}
+            className="flex-shrink-0 flex items-center justify-center rounded-lg transition-colors hover:bg-white/10 mb-0.5"
+            style={{
+              width: 28, height: 28,
+              color: showAttachMenu || attachedResult ? 'var(--color-accent)' : 'rgba(255,255,255,0.3)',
+            }}
+            title="Attach backtest result"
+            type="button"
+          >
+            <Paperclip size={14} />
+          </button>
           <textarea
             ref={inputRef}
             value={input}
@@ -799,25 +770,40 @@ const ChatWindow = forwardRef<ChatWindowHandle, ChatWindowProps>(function ChatWi
             disabled={sending}
             autoFocus
           />
-          <button
-            onClick={handleSend}
-            disabled={!input.trim() || sending}
-            className="flex-shrink-0 flex items-center justify-center rounded-xl transition-all"
-            style={{
-              width: 32, height: 32,
-              background: input.trim() && !sending ? 'var(--color-accent)' : 'rgba(255,255,255,0.08)',
-              color: input.trim() && !sending ? '#000' : 'rgba(255,255,255,0.25)',
-              cursor: input.trim() && !sending ? 'pointer' : 'not-allowed',
-              transition: 'background 0.15s, color 0.15s',
-            }}
-            title="Send (Enter)"
-          >
-            {sending ? (
-              <span className="agent-spinner" style={{ width: 12, height: 12 }} />
-            ) : (
+          {sending ? (
+            <button
+              onClick={() => send({ type: 'cancel' })}
+              className="flex-shrink-0 flex items-center justify-center rounded-xl transition-all"
+              style={{
+                width: 32, height: 32,
+                background: 'rgba(239,68,68,0.15)',
+                color: '#ef4444',
+                cursor: 'pointer',
+                border: '1px solid rgba(239,68,68,0.3)',
+                transition: 'background 0.15s',
+              }}
+              title="Stop agent (cancel)"
+              type="button"
+            >
+              <Square size={12} fill="currentColor" />
+            </button>
+          ) : (
+            <button
+              onClick={handleSend}
+              disabled={!input.trim()}
+              className="flex-shrink-0 flex items-center justify-center rounded-xl transition-all"
+              style={{
+                width: 32, height: 32,
+                background: input.trim() ? 'var(--color-accent)' : 'rgba(255,255,255,0.08)',
+                color: input.trim() ? '#000' : 'rgba(255,255,255,0.25)',
+                cursor: input.trim() ? 'pointer' : 'not-allowed',
+                transition: 'background 0.15s, color 0.15s',
+              }}
+              title="Send (Enter)"
+            >
               <Send size={14} />
-            )}
-          </button>
+            </button>
+          )}
         </div>
         <p className="text-center text-xs mt-1.5" style={{ color: 'var(--color-text-muted)', opacity: 0.3 }}>
           Enter to send · Shift+Enter for newline
@@ -825,7 +811,7 @@ const ChatWindow = forwardRef<ChatWindowHandle, ChatWindowProps>(function ChatWi
       </div>
     </div>
   )
-})
+}
 
 // ── Session tab ──────────────────────────────────────────────────────
 
@@ -914,14 +900,6 @@ function truncate(s: string, max: number): string {
   return s.length <= max ? s : s.slice(0, max) + '…'
 }
 
-function summariseArgs(args: unknown): string {
-  if (!args || typeof args !== 'object') return ''
-  const obj = args as Record<string, unknown>
-  const first = Object.values(obj)[0]
-  if (typeof first === 'string') return truncate(first, 80)
-  return ''
-}
-
 /** Extract the most meaningful single argument for a tool call — the thing the user cares about. */
 function argsLabel(toolName: string, args?: Record<string, unknown>): string | null {
   if (!args) return null
@@ -960,76 +938,13 @@ function argsLabel(toolName: string, args?: Record<string, unknown>): string | n
   return first ? truncate(first as string, 80) : null
 }
 
-// ── Persistence ──────────────────────────────────────────────────────
-
-const STORAGE_KEY = 'traderclaw_chat_sessions'
-const ACTIVE_KEY  = 'traderclaw_chat_active'
-
-function loadSessions(): Session[] {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY)
-    if (raw) {
-      const parsed = JSON.parse(raw) as Session[]
-      if (Array.isArray(parsed) && parsed.length > 0) {
-        return parsed.map((s) => ({
-          ...s,
-          messages: s.messages.map((m) => ({ ...m, streaming: false })),
-        }))
-      }
-    }
-  } catch { /* ignore */ }
-  return [{ id: generateId(), label: 'New chat', messages: [] }]
-}
-
-function loadActiveId(sessions: Session[]): string {
-  try {
-    const saved = localStorage.getItem(ACTIVE_KEY)
-    if (saved && sessions.some((s) => s.id === saved)) return saved
-  } catch { /* ignore */ }
-  return sessions[0].id
-}
-
 // ── Root ─────────────────────────────────────────────────────────────
 
 export default function Chat() {
-  const initial = loadSessions()
-  const [sessions, setSessions] = useState<Session[]>(initial)
-  const [activeId, setActiveId] = useState<string>(() => loadActiveId(initial))
-
-  const activeWindowRef = useRef<ChatWindowHandle>(null)
-  const { connected, send } = useWebSocket('/ws/chat', {
-    autoReconnect: true,
-    onMessage: (msg) => activeWindowRef.current?.deliver(msg),
-  })
-
-  useEffect(() => {
-    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(sessions)) } catch { /* quota */ }
-  }, [sessions])
-  useEffect(() => {
-    try { localStorage.setItem(ACTIVE_KEY, activeId) } catch { /* quota */ }
-  }, [activeId])
-
-  function addSession() {
-    const id = generateId()
-    const n  = sessions.length + 1
-    setSessions((s) => [...s, { id, label: `Chat ${n}`, messages: [] }])
-    setActiveId(id)
-  }
-
-  function removeSession(id: string) {
-    if (sessions.length === 1) return
-    const next = sessions.filter((s) => s.id !== id)
-    setSessions(next)
-    if (activeId === id) setActiveId(next[next.length - 1].id)
-  }
-
-  const updateSession = useCallback((updated: Session) => {
-    setSessions((s) => s.map((session) => session.id === updated.id ? updated : session))
-  }, [])
-
-  function renameSession(id: string, label: string) {
-    setSessions((s) => s.map((session) => session.id === id ? { ...session, label } : session))
-  }
+  const {
+    sessions, activeId, connected,
+    setActiveId, updateSession, addSession, removeSession, renameSession, send,
+  } = useChatContext()
 
   const activeSession = sessions.find((s) => s.id === activeId) ?? sessions[0]
 
@@ -1076,7 +991,6 @@ export default function Chat() {
       <div className="flex-1 overflow-hidden">
         <ChatWindow
           key={activeSession.id}
-          ref={activeWindowRef}
           session={activeSession}
           onUpdate={updateSession}
           connected={connected}

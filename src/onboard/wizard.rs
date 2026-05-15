@@ -178,6 +178,11 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         transcription: crate::config::TranscriptionConfig::default(),
         chains_rpc: crate::config::schema::ChainsRpcConfig::default(),
         polymarket: crate::config::schema::PolymarketConfig::default(),
+        chainlink: crate::config::schema::ChainlinkConfig::default(),
+        live_strategy: crate::config::schema::LiveStrategyConfig::default(),
+        copy_trading: crate::config::schema::CopyTradingConfig::default(),
+        hyperliquid: crate::config::schema::HyperliquidConfig::default(),
+        risk_trading: crate::config::schema::RiskTradingConfig::default(),
     };
 
     println!(
@@ -531,6 +536,11 @@ async fn run_quick_setup_with_home(
         transcription: crate::config::TranscriptionConfig::default(),
         chains_rpc: crate::config::schema::ChainsRpcConfig::default(),
         polymarket: crate::config::schema::PolymarketConfig::default(),
+        chainlink: crate::config::schema::ChainlinkConfig::default(),
+        live_strategy: crate::config::schema::LiveStrategyConfig::default(),
+        copy_trading: crate::config::schema::CopyTradingConfig::default(),
+        hyperliquid: crate::config::schema::HyperliquidConfig::default(),
+        risk_trading: crate::config::schema::RiskTradingConfig::default(),
     };
 
     config.save().await?;
@@ -3629,6 +3639,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     draft_update_interval_ms: 1000,
                     interrupt_on_new_message: false,
                     mention_only: false,
+                    chat_id: None,
                 });
             }
             ChannelMenuChoice::Discord => {

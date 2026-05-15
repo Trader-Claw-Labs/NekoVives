@@ -4,6 +4,7 @@ use crate::agent::dispatcher::{
 use crate::agent::memory_loader::{DefaultMemoryLoader, MemoryLoader};
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::config::Config;
+use crate::cost::CostTracker;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::providers::{self, ChatMessage, ChatRequest, ConversationMessage, Provider};
@@ -37,6 +38,7 @@ pub struct Agent {
     classification_config: crate::config::QueryClassificationConfig,
     available_hints: Vec<String>,
     route_model_by_hint: HashMap<String, String>,
+    cost_tracker: Option<Arc<CostTracker>>,
 }
 
 pub struct AgentBuilder {
@@ -58,6 +60,7 @@ pub struct AgentBuilder {
     classification_config: Option<crate::config::QueryClassificationConfig>,
     available_hints: Option<Vec<String>>,
     route_model_by_hint: Option<HashMap<String, String>>,
+    cost_tracker: Option<Arc<CostTracker>>,
 }
 
 impl AgentBuilder {
@@ -81,6 +84,7 @@ impl AgentBuilder {
             classification_config: None,
             available_hints: None,
             route_model_by_hint: None,
+            cost_tracker: None,
         }
     }
 
@@ -180,6 +184,11 @@ impl AgentBuilder {
         self
     }
 
+    pub fn cost_tracker(mut self, cost_tracker: Option<Arc<CostTracker>>) -> Self {
+        self.cost_tracker = cost_tracker;
+        self
+    }
+
     pub fn build(self) -> Result<Agent> {
         let tools = self
             .tools
@@ -223,6 +232,7 @@ impl AgentBuilder {
             classification_config: self.classification_config.unwrap_or_default(),
             available_hints: self.available_hints.unwrap_or_default(),
             route_model_by_hint: self.route_model_by_hint.unwrap_or_default(),
+            cost_tracker: self.cost_tracker,
         })
     }
 }
@@ -519,6 +529,23 @@ impl Agent {
                 Ok(resp) => resp,
                 Err(err) => return Err(err),
             };
+
+            // Record token usage if tracker is available
+            if let Some(ref tracker) = self.cost_tracker {
+                if let Some(ref usage) = response.usage {
+                    if let (Some(input), Some(output)) = (usage.input_tokens, usage.output_tokens) {
+                        // Use default pricing: $3/M input, $15/M output (Claude Sonnet 4 pricing)
+                        let cost_usage = crate::cost::TokenUsage::new(
+                            &effective_model,
+                            input,
+                            output,
+                            3.0,
+                            15.0,
+                        );
+                        let _ = tracker.record_usage(cost_usage);
+                    }
+                }
+            }
 
             let (text, calls) = self.tool_dispatcher.parse_response(&response);
             if calls.is_empty() {
@@ -884,6 +911,7 @@ mod tests {
             })
             .available_hints(vec!["fast".to_string()])
             .route_model_by_hint(route_model_by_hint)
+            .cost_tracker(None)
             .build()
             .expect("agent builder should succeed with valid config");
 

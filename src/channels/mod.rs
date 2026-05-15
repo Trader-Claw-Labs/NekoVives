@@ -16,6 +16,7 @@
 
 pub mod cli;
 pub mod poly_commands;
+pub mod strat_commands;
 pub mod telegram;
 pub mod traits;
 pub mod transcription;
@@ -1530,6 +1531,22 @@ async fn process_channel_message(
         return;
     }
 
+    // ── /strat commands ───────────────────────────────────────────────────────
+    if msg.content.trim_start().starts_with("/strat") {
+        if let Some(store) = strat_commands::runner_store() {
+            let result = strat_commands::handle_strat_command(&msg.content, true, store);
+            if let Some(channel) = target_channel.as_ref() {
+                let _ = channel
+                    .send(
+                        &SendMessage::new(result.message, &msg.reply_target)
+                            .in_thread(msg.thread_ts.clone()),
+                    )
+                    .await;
+            }
+        }
+        return;
+    }
+
     let history_key = conversation_history_key(&msg);
     let route = get_route_selection(ctx.as_ref(), &history_key);
     let runtime_defaults = runtime_defaults_snapshot(ctx.as_ref());
@@ -2647,18 +2664,19 @@ fn collect_configured_channels(config: &Config) -> Vec<ConfiguredChannel> {
     let mut channels = Vec::new();
 
     if let Some(ref tg) = config.channels_config.telegram {
+        let mut tg_channel = TelegramChannel::new(
+            tg.bot_token.clone(),
+            tg.allowed_users.clone(),
+            tg.mention_only,
+        )
+        .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
+        .with_transcription(config.transcription.clone())
+        .with_workspace_dir(config.workspace_dir.clone())
+        .with_config_path(config.config_path.clone());
+
         channels.push(ConfiguredChannel {
             display_name: "Telegram",
-            channel: Arc::new(
-                TelegramChannel::new(
-                    tg.bot_token.clone(),
-                    tg.allowed_users.clone(),
-                    tg.mention_only,
-                )
-                .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
-                .with_transcription(config.transcription.clone())
-                .with_workspace_dir(config.workspace_dir.clone()),
-            ),
+            channel: Arc::new(tg_channel),
         });
     }
 

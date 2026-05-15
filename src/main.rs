@@ -38,7 +38,7 @@ use dialoguer::{Input, Password};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use tracing::{info, warn};
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
     let t: f64 = s.parse().map_err(|e| format!("{e}"))?;
@@ -77,8 +77,11 @@ mod providers;
 mod runtime;
 mod security;
 mod service;
+mod engines;
 mod skillforge;
 mod skills;
+mod live_feed;
+mod strategy_runner;
 mod tools;
 mod tunnel;
 mod util;
@@ -463,6 +466,44 @@ Examples:
         #[arg(value_enum)]
         shell: CompletionShell,
     },
+
+    /// Sync historical Polymarket on-chain data for realistic backtesting.
+    #[command(long_about = "\
+Fetch real token prices and market resolutions from Polymarket's
+Gamma + CLOB APIs for accurate backtesting of recurring binary markets.
+
+Stores results in <workspace>/data/polymarket_historical/ as JSONL.
+
+Examples:
+  trader-claw backtest-sync --series btc_5m --from 2026-01-29 --to 2026-04-29
+  trader-claw backtest-sync --series eth_5m --from 2026-03-01 --to 2026-04-01")]
+    BacktestSync {
+        /// Series ID (e.g. btc_5m, eth_5m)
+        #[arg(long)]
+        series: String,
+        /// Start date (inclusive) YYYY-MM-DD
+        #[arg(long)]
+        from: String,
+        /// End date (inclusive) YYYY-MM-DD
+        #[arg(long)]
+        to: String,
+    },
+
+    /// Update trader-claw to the latest release from GitHub
+    #[command(long_about = "\
+Update trader-claw to the latest release.
+
+Downloads and replaces the current binary from the latest GitHub release.
+Use --prerelease to also consider pre-release versions.
+
+Examples:
+  trader-claw update
+  trader-claw update --prerelease")]
+    Update {
+        /// Also consider pre-release versions
+        #[arg(long)]
+        prerelease: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -699,15 +740,30 @@ async fn main() -> Result<()> {
     );
 
     // Initialize logging - respects RUST_LOG env var, defaults to INFO (or DEBUG with --debug)
-    let default_filter = if debug_mode { "debug" } else { "info" };
-    let subscriber = fmt::Subscriber::builder()
-        .with_env_filter(
+    // Writes to both stdout and a rolling log file under ~/.traderclaw/logs/
+    let default_filter = if debug_mode {
+        "debug".to_string()
+    } else {
+        "info,trader_claw::live_feed=warn,h2=warn,hyper_util=warn,hyper=warn".to_string()
+    };
+    let log_dir = directories::BaseDirs::new()
+        .map(|b| b.home_dir().to_path_buf())
+        .unwrap_or_else(std::env::temp_dir)
+        .join(".traderclaw")
+        .join("logs");
+    let _ = std::fs::create_dir_all(&log_dir);
+    let file_appender = tracing_appender::rolling::daily(&log_dir, "gateway");
+    let (non_blocking, _log_guard) = tracing_appender::non_blocking(file_appender);
+    let stdout_layer = fmt::layer().with_writer(std::io::stdout);
+    let file_layer = fmt::layer().with_writer(non_blocking).with_ansi(false);
+    tracing_subscriber::registry()
+        .with(
             EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| EnvFilter::new(default_filter)),
         )
-        .finish();
-
-    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
+        .with(stdout_layer)
+        .with(file_layer)
+        .init();
 
     if debug_mode {
         tracing::info!("Debug logging enabled — all agent loop, HTTP and tool events will be printed");
@@ -1045,6 +1101,20 @@ async fn main() -> Result<()> {
             peripherals::handle_command(peripheral_command.clone(), &config).await
         }
 
+        Commands::BacktestSync { series, from, to } => {
+            println!("Syncing historical Polymarket data for series={} from {} to {}...", series, from, to);
+            match tools::polymarket_historical::scrape_series(&series, &from, &to, &config.workspace_dir).await {
+                Ok(count) => {
+                    println!("Successfully synced {} market windows.", count);
+                    Ok(())
+                }
+                Err(e) => {
+                    eprintln!("Sync failed: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+
         Commands::Config { config_command } => match config_command {
             ConfigCommands::Schema => {
                 let schema = schemars::schema_for!(config::Config);
@@ -1055,7 +1125,42 @@ async fn main() -> Result<()> {
                 Ok(())
             }
         },
+
+        Commands::Update { prerelease } => run_update(prerelease).await,
     }
+}
+
+async fn run_update(_allow_prerelease: bool) -> Result<()> {
+    let current = env!("CARGO_PKG_VERSION");
+    println!("  Current version : v{current}");
+    println!("  Checking for updates...");
+
+    let status = tokio::task::spawn_blocking(move || {
+        self_update::backends::github::Update::configure()
+            .repo_owner("Trader-Claw-Labs")
+            .repo_name("Trader-Claw")
+            .bin_name("trader-claw")
+            .show_download_progress(true)
+            .current_version(current)
+            .build()
+            .and_then(|u| u.update())
+    })
+    .await
+    .context("update task panicked")?;
+
+    match status {
+        Ok(s) if s.updated() => {
+            println!("  \u{2713} Updated to v{}", s.version());
+            println!("  Restart trader-claw for changes to take effect.");
+        }
+        Ok(_) => {
+            println!("  \u{2713} Already on the latest version (v{current}).");
+        }
+        Err(e) => {
+            anyhow::bail!("Update failed: {e}");
+        }
+    }
+    Ok(())
 }
 
 fn handle_estop_command(

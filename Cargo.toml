@@ -8,6 +8,11 @@ members = [
     "crates/polymarket-trader",
     "crates/market-analyzer",
     "crates/claw-api",
+    "crates/risk-manager",
+    "crates/wallet-tracker",
+    "crates/wallet-indexer",
+    "crates/copy-orchestrator",
+    "crates/hyperliquid-trader",
 ]
 resolver = "2"
 
@@ -52,7 +57,8 @@ schemars = "1.2"
 
 # Logging - minimal
 tracing = { version = "0.1", default-features = false }
-tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "env-filter"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "env-filter", "registry", "std"] }
+tracing-appender = { version = "0.2" }
 
 # Observability - Prometheus metrics
 prometheus = { version = "0.14", default-features = false }
@@ -88,6 +94,9 @@ hex = "0.4"
 # CSPRNG for secure token generation
 rand = "0.10"
 
+# ZIP archive support (export/import)
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
 # Fast mutexes that don't poison on panic
 parking_lot = "0.12"
 
@@ -106,6 +115,13 @@ market-analyzer = { path = "crates/market-analyzer" }
 polymarket-trader = { path = "crates/polymarket-trader" }
 wallet-manager = { path = "crates/wallet-manager" }
 solana-trader = { path = "crates/solana-trader" }
+evm-trader = { path = "crates/evm-trader" }
+risk-manager = { path = "crates/risk-manager" }
+wallet-tracker = { path = "crates/wallet-tracker" }
+wallet-indexer = { path = "crates/wallet-indexer" }
+copy-orchestrator = { path = "crates/copy-orchestrator" }
+hyperliquid-trader = { path = "crates/hyperliquid-trader" }
+strategy-core = { path = "crates/strategy-core" }
 
 # Memory / persistence
 rusqlite = { version = "0.37", features = ["bundled"] }
@@ -113,9 +129,11 @@ postgres = { version = "0.19", features = ["with-chrono-0_4"], optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 chrono-tz = "0.10"
 cron = "0.15"
+gray_matter = "0.2"   # YAML/TOML frontmatter parsing for Obsidian-style session .md files
 
 # Interactive CLI prompts
 dialoguer = { version = "0.12", features = ["fuzzy-select"] }
+self_update = { version = "0.42", default-features = false, features = ["rustls"] }
 console = "0.16"
 
 # Hardware discovery (device path globbing)
@@ -219,7 +237,6 @@ panic = "abort"
 [dev-dependencies]
 tempfile = "3.14"
 criterion = { version = "0.8", features = ["async_tokio"] }
-wiremock = "0.6"
 scopeguard = "1.2"
 
 

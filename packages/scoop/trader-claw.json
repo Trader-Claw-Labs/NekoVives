@@ -1,0 +1,32 @@
+{
+  "version": "__VERSION__",
+  "description": "Rust crypto trading agent for EVM, Solana, TON, and Polymarket prediction markets.",
+  "homepage": "https://github.com/Trader-Claw-Labs/Trader-Claw",
+  "license": "MIT OR Apache-2.0",
+  "architecture": {
+    "64bit": {
+      "url": "https://github.com/Trader-Claw-Labs/Trader-Claw/releases/download/v__VERSION__/trader-claw-windows-x86_64.zip",
+      "hash": "__SHA256_WINDOWS_X86_64__"
+    }
+  },
+  "bin": "trader-claw.exe",
+  "checkver": {
+    "github": "https://github.com/Trader-Claw-Labs/Trader-Claw"
+  },
+  "autoupdate": {
+    "architecture": {
+      "64bit": {
+        "url": "https://github.com/Trader-Claw-Labs/Trader-Claw/releases/download/v$version/trader-claw-windows-x86_64.zip",
+        "hash": {
+          "url": "https://github.com/Trader-Claw-Labs/Trader-Claw/releases/download/v$version/checksums.txt",
+          "regex": "([a-fA-F0-9]{64})\\s+trader-claw-windows-x86_64.zip"
+        }
+      }
+    }
+  },
+  "notes": [
+    "Trader Claw requires a config file at %USERPROFILE%\\.traderclaw\\config.toml",
+    "To get started: trader-claw gateway",
+    "Web dashboard: http://localhost:42617"
+  ]
+}

@@ -1626,6 +1626,7 @@ impl Provider for OpenAiCompatibleProvider {
         };
 
         let url = self.chat_completions_url();
+        tracing::info!(provider = %self.name, url = %url, "LLM request URL");
         let client = self.http_client();
         let auth_header = self.auth_header.clone();
 

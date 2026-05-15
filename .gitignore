@@ -19,9 +19,12 @@ target/
 **/*.log
 
 .DS_Store
-.claude/settings.local.json
-/.claude
-.remember/tmp/save-session.pid
+.claude
 /web/dist
-.remember/tmp/save-session.pid
-.claude/settings.local.json
+.remember
+.firecrawl 
+CLAUDE.md
+strategy/config.json
+
+web/dist/
+web/node_modules/

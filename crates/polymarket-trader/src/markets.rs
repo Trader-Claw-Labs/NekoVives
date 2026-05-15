@@ -5,9 +5,19 @@ use anyhow::{anyhow, Result};
 #[derive(Default)]
 pub struct MarketFilter {
     pub category: Option<String>,
+    /// Gamma API tag_slug filter (e.g. "crypto")
+    pub tag: Option<String>,
     pub min_volume_usdc: Option<f64>,
     pub min_liquidity_usdc: Option<f64>,
     pub active_only: bool,
+    /// Free-text search (passed as `question_mid_partial` to Gamma API)
+    pub query: Option<String>,
+    /// Max number of results to return (default 50)
+    pub limit: Option<usize>,
+    /// Only include markets closing at least this many days from now
+    pub min_days: Option<u32>,
+    /// Only include markets closing at most this many days from now
+    pub max_days: Option<u32>,
 }
 
 /// Polymarket prediction market
@@ -58,6 +68,23 @@ struct ClobPriceResponse {
     price: String,
 }
 
+#[derive(Deserialize)]
+struct ClobMarketResponse {
+    condition_id: String,
+    tokens: Vec<ClobToken>,
+}
+
+#[derive(Deserialize)]
+struct ClobToken {
+    token_id: String,
+    outcome: String,
+}
+
+#[derive(Deserialize)]
+struct GammaEvent {
+    markets: Vec<GammaMarket>,
+}
+
 fn value_to_f64(v: &serde_json::Value) -> f64 {
     if let Some(n) = v.as_f64() {
         return n;
@@ -69,8 +96,12 @@ fn value_to_f64(v: &serde_json::Value) -> f64 {
 }
 
 fn gamma_to_market(g: GammaMarket) -> Option<Market> {
-    let yes_token = g.tokens.iter().find(|t| t.outcome.eq_ignore_ascii_case("Yes"))?;
-    let no_token = g.tokens.iter().find(|t| t.outcome.eq_ignore_ascii_case("No"))?;
+    let yes_token = g.tokens.iter().find(|t|
+        t.outcome.eq_ignore_ascii_case("Yes") || t.outcome.eq_ignore_ascii_case("Up")
+    )?;
+    let no_token = g.tokens.iter().find(|t|
+        t.outcome.eq_ignore_ascii_case("No") || t.outcome.eq_ignore_ascii_case("Down")
+    )?;
 
     Some(Market {
         condition_id: g.condition_id,
@@ -86,6 +117,7 @@ fn gamma_to_market(g: GammaMarket) -> Option<Market> {
 }
 
 fn apply_filter(markets: Vec<GammaMarket>, filter: &MarketFilter) -> Vec<Market> {
+    let now = chrono::Utc::now();
     markets
         .into_iter()
         .filter(|m| {
@@ -95,6 +127,29 @@ fn apply_filter(markets: Vec<GammaMarket>, filter: &MarketFilter) -> Vec<Market>
             if let Some(ref cat) = filter.category {
                 if m.category.as_deref().unwrap_or("") != cat.as_str() {
                     return false;
+                }
+            }
+            // Date-range filter: parse end_date_iso and check days until close
+            if filter.min_days.is_some() || filter.max_days.is_some() {
+                match m.end_date_iso.as_deref() {
+                    Some(s) => {
+                        let parsed = chrono::DateTime::parse_from_rfc3339(s)
+                            .ok()
+                            .map(|dt| dt.with_timezone(&chrono::Utc));
+                        match parsed {
+                            Some(end_dt) => {
+                                let days = (end_dt - now).num_days();
+                                if let Some(min_d) = filter.min_days {
+                                    if days < min_d as i64 { return false; }
+                                }
+                                if let Some(max_d) = filter.max_days {
+                                    if days > max_d as i64 { return false; }
+                                }
+                            }
+                            None => return false, // unparseable date — exclude
+                        }
+                    }
+                    None => return false, // no end date — exclude when date filter set
                 }
             }
             true
@@ -121,9 +176,19 @@ fn apply_filter(markets: Vec<GammaMarket>, filter: &MarketFilter) -> Vec<Market>
 /// Handles both flat `[...]` and paginated `{"data":[...]}` response shapes.
 pub async fn list_markets(filter: MarketFilter) -> Result<Vec<Market>> {
     let client = reqwest::Client::new();
-    let mut url = "https://gamma-api.polymarket.com/markets?limit=100&order=volume&ascending=false".to_string();
+    let limit = filter.limit.unwrap_or(50);
+    let mut url = format!("https://gamma-api.polymarket.com/markets?limit={limit}&order=volume&ascending=false");
     if filter.active_only {
         url.push_str("&active=true&closed=false");
+    }
+    if let Some(ref q) = filter.query {
+        if !q.is_empty() {
+            let encoded = q.replace(' ', "+");
+            url.push_str(&format!("&question_mid_partial={encoded}"));
+        }
+    }
+    if let Some(ref tag) = filter.tag {
+        url.push_str(&format!("&tag_slug={tag}"));
     }
 
     let bytes = client
@@ -151,6 +216,10 @@ pub async fn list_markets(filter: MarketFilter) -> Result<Vec<Market>> {
 
 /// Get a single market by slug.
 /// GET https://gamma-api.polymarket.com/markets?slug=<slug>
+///
+/// For recurring binary markets Gamma may return multiple entries (expired,
+/// current, future). We scan all results, keep only active ones with valid
+/// Yes/No tokens, and pick the best by liquidity + volume.
 pub async fn get_market(slug: &str) -> Result<Market> {
     let client = reqwest::Client::new();
     let url = format!("https://gamma-api.polymarket.com/markets?slug={}", slug);
@@ -163,12 +232,137 @@ pub async fn get_market(slug: &str) -> Result<Market> {
         .json()
         .await?;
 
-    let gamma = raw
+    let mut best = raw
         .into_iter()
-        .next()
-        .ok_or_else(|| anyhow!("No market found with slug: {}", slug))?;
+        .filter(|g| g.active && !g.closed)
+        .filter_map(gamma_to_market)
+        .filter(|m| !m.yes_token_id.trim().is_empty())
+        .max_by(|a, b| {
+            let av = a.liquidity + a.volume;
+            let bv = b.liquidity + b.volume;
+            av.partial_cmp(&bv).unwrap_or(std::cmp::Ordering::Equal)
+        });
 
-    gamma_to_market(gamma).ok_or_else(|| anyhow!("Market is missing Yes/No tokens"))
+    // For newer market types (NegRisk / recurrent binary), Gamma token IDs
+    // and CLOB token IDs differ. ALWAYS fetch CLOB tokens by condition_id
+    // and replace Gamma's tokens when CLOB returns valid ones.
+    if let Some(ref mut market) = best {
+        if !market.condition_id.is_empty() {
+            match fetch_clob_tokens(&client, &market.condition_id).await {
+                Ok(clob_tokens) => {
+                    if let Some(yes) = clob_tokens.iter().find(|t|
+                        t.outcome.eq_ignore_ascii_case("Yes") || t.outcome.eq_ignore_ascii_case("Up")
+                    ) {
+                        market.yes_token_id = yes.token_id.clone();
+                    }
+                    if let Some(no) = clob_tokens.iter().find(|t|
+                        t.outcome.eq_ignore_ascii_case("No") || t.outcome.eq_ignore_ascii_case("Down")
+                    ) {
+                        market.no_token_id = no.token_id.clone();
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "[POLY-MARKETS] CLOB token fetch failed for condition_id {}: {}. Keeping Gamma tokens.",
+                        market.condition_id, e
+                    );
+                }
+            }
+        }
+    }
+
+    // Fallback: if Gamma /markets returned nothing, try the /events endpoint.
+    if best.is_none() {
+        let event_url = format!("https://gamma-api.polymarket.com/events?slug={}", slug);
+        let events: Vec<GammaEvent> = client.get(&event_url).send().await?.json().await.unwrap_or_default();
+
+        if let Some(event) = events.into_iter().next() {
+            if let Some(mut m) = event.markets.into_iter().find(|m| m.slug == slug) {
+                if m.tokens.is_empty() && !m.condition_id.is_empty() {
+                    match fetch_clob_tokens(&client, &m.condition_id).await {
+                        Ok(tokens) => m.tokens = tokens,
+                        Err(e) => {
+                            tracing::warn!("[POLY-MARKETS] CLOB token fetch failed in events fallback: {}", e);
+                        }
+                    }
+                }
+
+                if let Some(market) = gamma_to_market(m) {
+                    if !market.yes_token_id.trim().is_empty() {
+                        best = Some(market);
+                    }
+                }
+            }
+        }
+    }
+
+    best.ok_or_else(|| anyhow!("No active market with valid tokens found for slug: {}", slug))
+}
+
+/// Fetch token IDs from the CLOB /markets/{condition_id} endpoint.
+/// Returns a list of GammaToken-style structs with the CLOB token IDs.
+async fn fetch_clob_tokens(client: &reqwest::Client, condition_id: &str) -> Result<Vec<GammaToken>> {
+    let clob_url = format!("https://clob.polymarket.com/markets/{}", condition_id);
+    tracing::info!("[POLY-MARKETS] CLOB token fetch: GET {}", clob_url);
+
+    let resp = client
+        .get(&clob_url)
+        .send()
+        .await
+        .map_err(|e| anyhow!("CLOB request failed: {}", e))?;
+
+    let status = resp.status();
+    let raw_body = resp.text().await.unwrap_or_default();
+    tracing::info!(
+        "[POLY-MARKETS] CLOB token fetch response: {} | {}",
+        status,
+        &raw_body[..raw_body.len().min(500)]
+    );
+
+    if !status.is_success() {
+        anyhow::bail!("CLOB returned non-success status: {}", status);
+    }
+
+    // Try the expected structured format first
+    if let Ok(clob_market) = serde_json::from_str::<ClobMarketResponse>(&raw_body) {
+        tracing::info!(
+            "[POLY-MARKETS] Parsed ClobMarketResponse with {} tokens",
+            clob_market.tokens.len()
+        );
+        return Ok(clob_market.tokens.into_iter().map(|t| GammaToken {
+            token_id: t.token_id,
+            outcome: t.outcome,
+        }).collect());
+    }
+
+    // Fallback: try to extract token IDs from generic JSON
+    let value: serde_json::Value = serde_json::from_str(&raw_body)
+        .map_err(|e| anyhow!("CLOB response is not valid JSON: {}", e))?;
+
+    if let Some(tokens) = value.get("tokens").and_then(|v| v.as_array()) {
+        tracing::info!(
+            "[POLY-MARKETS] Extracting {} tokens from generic JSON",
+            tokens.len()
+        );
+        let extracted: Vec<GammaToken> = tokens.iter().filter_map(|t| {
+            let token_id = t.get("token_id")
+                .or_else(|| t.get("tokenId"))
+                .or_else(|| t.get("asset_id"))
+                .and_then(|v| v.as_str())?;
+            let outcome = t.get("outcome")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            Some(GammaToken {
+                token_id: token_id.to_string(),
+                outcome: outcome.to_string(),
+            })
+        }).collect();
+        if !extracted.is_empty() {
+            return Ok(extracted);
+        }
+    }
+
+    anyhow::bail!("Could not extract tokens from CLOB response")
 }
 
 /// Get YES token price (0.0 to 1.0).

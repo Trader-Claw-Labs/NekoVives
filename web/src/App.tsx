@@ -3,18 +3,27 @@ import type { ReactNode } from 'react'
 import { Routes, Route } from 'react-router-dom'
 import Sidebar from './components/Sidebar'
 import PairingModal from './components/PairingModal'
+import StrategyWithChatLayout from './components/StrategyWithChatLayout'
 import OnboardingModal from './components/OnboardingModal'
 import Dashboard from './pages/Dashboard'
 import Wallets from './pages/Wallets'
 import Polymarket from './pages/Polymarket'
 import Telegram from './pages/Telegram'
-import Skills from './pages/Skills'
+import StrategyBuilder from './pages/StrategyBuilder'
+import ScheduledJobs from './pages/ScheduledJobs'
 import Chat from './pages/Chat'
+import { ChatProvider } from './context/ChatContext'
 import LLMSettings from './pages/LLMSettings'
 import Config from './pages/Config'
-import TradingViewPage from './pages/TradingView'
 import Backtesting from './pages/Backtesting'
-import { apiFetch, getAuthToken } from './hooks/useApi'
+import LiveStrategies from './pages/LiveStrategies'
+import CopyTrading from './pages/CopyTrading'
+import CopyDiscovery from './pages/CopyDiscovery'
+import SystemHealth from './pages/SystemHealth'
+import Logs from './pages/Logs'
+import Help from './pages/Help'
+import RiskCenter from './pages/RiskCenter'
+import { apiFetch, getAuthToken, setAuthErrorCallback } from './hooks/useApi'
 
 // ── Error boundary ────────────────────────────────────────────────
 class ErrorBoundary extends Component<
@@ -79,8 +88,10 @@ export default function App() {
   const [showPairing, setShowPairing] = useState(false)
   const [showOnboarding, setShowOnboarding] = useState(false)
 
-  // On mount: check pairing, then check onboarding
+  // On mount: register 401 handler, then check pairing + onboarding
   useEffect(() => {
+    setAuthErrorCallback(() => setShowPairing(true))
+
     fetch('/health')
       .then((r) => r.json())
       .then((data: { require_pairing?: boolean }) => {
@@ -127,18 +138,27 @@ export default function App() {
       <div className="flex h-screen overflow-hidden" style={{ backgroundColor: 'var(--color-base)' }}>
         <Sidebar />
         <main className="flex-1 overflow-auto">
+          <ChatProvider>
           <Routes>
             <Route path="/" element={<Dashboard />} />
             <Route path="/wallets" element={<Wallets />} />
             <Route path="/polymarket" element={<Polymarket />} />
             <Route path="/telegram" element={<Telegram />} />
-            <Route path="/skills" element={<Skills />} />
+            <Route path="/strategy-builder" element={<StrategyWithChatLayout><StrategyBuilder /></StrategyWithChatLayout>} />
+            <Route path="/scheduled-jobs" element={<StrategyWithChatLayout><ScheduledJobs /></StrategyWithChatLayout>} />
             <Route path="/chat" element={<Chat />} />
-            <Route path="/tradingview" element={<TradingViewPage />} />
-            <Route path="/backtesting" element={<Backtesting />} />
+            <Route path="/backtesting" element={<StrategyWithChatLayout><Backtesting /></StrategyWithChatLayout>} />
+            <Route path="/live" element={<StrategyWithChatLayout><LiveStrategies /></StrategyWithChatLayout>} />
+            <Route path="/copy-trading" element={<StrategyWithChatLayout><CopyTrading /></StrategyWithChatLayout>} />
+            <Route path="/copy-discovery" element={<StrategyWithChatLayout><CopyDiscovery /></StrategyWithChatLayout>} />
+            <Route path="/risk" element={<RiskCenter />} />
+            <Route path="/health" element={<SystemHealth />} />
+            <Route path="/logs" element={<Logs />} />
+            <Route path="/help" element={<Help />} />
             <Route path="/settings/llm" element={<LLMSettings />} />
             <Route path="/settings/config" element={<Config />} />
           </Routes>
+          </ChatProvider>
         </main>
 
         {showPairing && <PairingModal onPaired={handlePaired} />}

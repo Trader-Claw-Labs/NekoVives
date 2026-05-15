@@ -1,0 +1,64 @@
+[package]
+name = "polymarket_trading_agent"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Rhai scripting engine
+rhai = { version = "1.17", features = ["serde"] }
+
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# HTTP client para APIs
+reqwest = { version = "0.11", features = ["json"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# Date/Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Decimal para precisión en cálculos financieros
+rust_decimal = { version = "1.33", features = ["serde"] }
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Configuration
+config = "0.13"
+dotenv = "0.15"
+
+# Database (opcional, para persistencia)
+sqlx = { version = "0.7", features = ["runtime-tokio-native-tls", "sqlite"], optional = true }
+
+# WebSocket para datos en tiempo real
+tokio-tungstenite = "0.21"
+
+# Testing
+#[dev-dependencies]
+#mockito = "1.2"
+
+[features]
+default = ["database"]
+database = ["sqlx"]
+
+[[bin]]
+name = "trading_agent"
+path = "src/main.rs"
+
+[lib]
+name = "trading_agent_lib"
+path = "src/lib.rs"
+
+# Optimizaciones para release
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

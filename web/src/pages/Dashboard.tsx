@@ -4,6 +4,7 @@ import { apiFetch } from '../hooks/useApi'
 import {
   Wallet, Zap, Send, Brain, Activity, Clock, TrendingUp, Shield,
   BarChart2, MessageSquare, Settings, ChevronRight, Timer,
+  Briefcase, Bot,
 } from 'lucide-react'
 import clsx from 'clsx'
 
@@ -30,6 +31,28 @@ interface StatusData {
 interface CronData {
   jobs?: { id: string; name: string; enabled: boolean; next_run?: string }[]
   market_scanner?: { enabled: boolean; interval_seconds: number }
+}
+
+interface PolymarketConfig {
+  configured?: boolean
+  wallet_address?: string
+}
+
+interface LiveRunner {
+  config: { id: string; name: string; mode: string; market_type: string }
+  status: { status: string }
+  result?: {
+    total_trades?: number
+    win_rate_pct?: number
+    live_total_trades?: number
+    live_wins?: number
+    live_orders?: { pnl?: number }[]
+    all_trades?: { pnl?: number }[]
+  }
+}
+
+interface LiveListResponse {
+  runners: LiveRunner[]
 }
 
 interface StatCard {
@@ -89,6 +112,10 @@ function formatInterval(secs: number): string {
   return `${Math.floor(secs / 60)}m ${secs % 60}s`
 }
 
+function fmtUSD(v: number): string {
+  return v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+}
+
 export default function Dashboard() {
   const { data: status, isLoading, error } = useQuery<StatusData>({
     queryKey: ['status'],
@@ -102,25 +129,67 @@ export default function Dashboard() {
       apiFetch<{ wallets?: unknown[] }>('/api/wallets').catch(() => ({ wallets: [] })),
   })
 
+  const { data: pmConfig } = useQuery<PolymarketConfig>({
+    queryKey: ['polymarket-config'],
+    queryFn: (): Promise<PolymarketConfig> =>
+      apiFetch<PolymarketConfig>('/api/polymarket/configure').catch(() => ({})),
+  })
+
   const { data: cronData } = useQuery<CronData>({
     queryKey: ['skills'],
     queryFn: (): Promise<CronData> =>
       apiFetch<CronData>('/api/cron').catch(() => ({ jobs: [] })),
   })
 
-  const telegramConfigured = !!(status?.channels?.['telegram'])
-  const telegramHealth = status?.health?.components?.['channel:telegram']
-  const telegramOnline = telegramHealth?.status === 'ok'
-  const telegramDotStatus: 'online' | 'offline' | 'warning' = !telegramConfigured
-    ? 'offline'
-    : telegramHealth?.status === 'ok'
-    ? 'online'
-    : telegramHealth?.status === 'error'
-    ? 'offline'
-    : 'warning'
+  const { data: liveData } = useQuery<LiveListResponse>({
+    queryKey: ['live-strategies'],
+    queryFn: (): Promise<LiveListResponse> =>
+      apiFetch<LiveListResponse>('/api/live/strategies').catch(() => ({ runners: [] })),
+    refetchInterval: 10_000,
+  })
+
   const uptime = status?.health?.uptime_seconds ?? 0
-  const walletCount = wallets?.wallets?.length ?? 0
-  const skillCount = cronData?.jobs?.length ?? 0
+
+  // Wallets: Web3 + Polymarket
+  const web3WalletCount = wallets?.wallets?.length ?? 0
+  const hasPolyWallet = !!(pmConfig?.wallet_address && pmConfig.wallet_address.length > 0)
+  const walletCount = web3WalletCount + (hasPolyWallet ? 1 : 0)
+
+  // Live strategies
+  const runners = liveData?.runners ?? []
+  const liveCount = runners.length
+  const runningCount = runners.filter(r => r.status.status === 'running').length
+
+  // Live KPIs (only live mode strategies)
+  let liveTrades = 0
+  let liveWins = 0
+  let livePnl = 0
+  runners.forEach(r => {
+    if (r.config.mode !== 'live') return
+    if (r.config.market_type === 'polymarket_binary' && r.result?.live_orders) {
+      liveTrades += r.result.live_total_trades ?? 0
+      liveWins += r.result.live_wins ?? 0
+      livePnl += r.result.live_orders.reduce((s, o) => s + (o.pnl ?? 0), 0)
+    }
+  })
+  const liveWinRate = liveTrades > 0 ? `${((liveWins / liveTrades) * 100).toFixed(1)}%` : '—'
+
+  // Dry Run KPIs (only paper mode strategies)
+  let dryTrades = 0
+  let dryWins = 0
+  let dryPnl = 0
+  runners.forEach(r => {
+    if (r.config.mode === 'live') return
+    if (r.result?.all_trades) {
+      dryTrades += r.result.total_trades ?? 0
+      dryWins += Math.round((r.result.win_rate_pct ?? 0) / 100 * (r.result.total_trades ?? 0))
+      dryPnl += r.result.all_trades.reduce((s, t) => s + (t.pnl ?? 0), 0)
+    }
+  })
+  const dryWinRate = dryTrades > 0 ? `${((dryWins / dryTrades) * 100).toFixed(1)}%` : '—'
+
+  // Cron jobs
+  const jobCount = cronData?.jobs?.length ?? 0
   const scanInterval = cronData?.market_scanner?.interval_seconds
 
   const cards: StatCard[] = [
@@ -128,19 +197,21 @@ export default function Dashboard() {
       label: 'Connected Wallets',
       value: walletCount,
       icon: <Wallet size={16} />,
-      sub: walletCount > 0 ? `${walletCount} address${walletCount !== 1 ? 'es' : ''}` : 'No wallets yet',
+      sub: walletCount > 0
+        ? `${web3WalletCount} Web3${hasPolyWallet ? ' · 1 Polymarket' : ''}`
+        : 'No wallets yet',
     },
     {
       label: 'Active Strategies',
-      value: skillCount,
-      icon: <Zap size={16} />,
-      sub: skillCount > 0 ? `${skillCount} scheduled` : 'No crons configured',
+      value: liveCount,
+      icon: <Bot size={16} />,
+      sub: liveCount > 0 ? `${runningCount} running` : 'No strategies running',
     },
     {
-      label: 'Telegram',
-      value: !telegramConfigured ? 'Not set up' : telegramOnline ? 'Online' : telegramHealth?.status === 'error' ? 'Error' : 'Starting',
-      icon: <Send size={16} />,
-      status: telegramDotStatus,
+      label: 'Jobs',
+      value: jobCount,
+      icon: <Briefcase size={16} />,
+      sub: jobCount > 0 ? `${jobCount} scheduled` : 'No jobs configured',
     },
     {
       label: 'LLM Model',
@@ -148,6 +219,18 @@ export default function Dashboard() {
       icon: <Brain size={16} />,
       status: status?.provider ? 'online' : 'offline',
       sub: status?.provider ?? 'No provider',
+    },
+    {
+      label: 'Live KPIs',
+      value: liveTrades,
+      icon: <TrendingUp size={16} />,
+      sub: `${liveWinRate} WR · ${livePnl >= 0 ? '+' : ''}$${fmtUSD(livePnl)} P&L`,
+    },
+    {
+      label: 'Dry Run KPIs',
+      value: dryTrades,
+      icon: <TrendingUp size={16} />,
+      sub: `${dryWinRate} WR · ${dryPnl >= 0 ? '+' : ''}$${fmtUSD(dryPnl)} P&L`,
     },
   ]
 
@@ -162,16 +245,16 @@ export default function Dashboard() {
           className="text-xs leading-tight font-mono mb-3 select-none"
           style={{ color: 'var(--color-accent)', opacity: 0.85 }}
         >{`
-  ████████╗██████╗  █████╗ ██████╗ ███████╗██████╗      ██████╗██╗      █████╗ ██╗    ██╗
-  ╚══██╔══╝██╔══██╗██╔══██╗██╔══██╗██╔════╝██╔══██╗    ██╔════╝██║     ██╔══██╗██║    ██║
-     ██║   ██████╔╝███████║██║  ██║█████╗  ██████╔╝    ██║     ██║     ███████║██║ █╗ ██║
-     ██║   ██╔══██╗██╔══██║██║  ██║██╔══╝  ██╔══██╗    ██║     ██║     ██╔══██║██║███╗██║
-     ██║   ██║  ██║██║  ██║██████╔╝███████╗██║  ██║    ╚██████╗███████╗██║  ██║╚███╔███╔╝
-     ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═╝╚═════╝ ╚══════╝╚═╝  ╚═╝     ╚═════╝╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝ `}</pre>
+  ███╗   ██╗███████╗██╗  ██╗ ██████╗     ██╗   ██╗██╗██╗   ██╗███████╗███████╗
+  ████╗  ██║██╔════╝██║ ██╔╝██╔═══██╗    ██║   ██║██║██║   ██║██╔════╝██╔════╝
+  ██╔██╗ ██║█████╗  █████╔╝ ██║   ██║    ██║   ██║██║██║   ██║█████╗  ███████╗
+  ██║╚██╗██║██╔══╝  ██╔═██╗ ██║   ██║    ╚██╗ ██╔╝██║╚██╗ ██╔╝██╔══╝  ╚════██║
+  ██║ ╚████║███████╗██║  ██╗╚██████╔╝     ╚████╔╝ ██║ ╚████╔╝ ███████╗███████║
+  ╚═╝  ╚═══╝╚══════╝╚═╝  ╚═╝ ╚═════╝       ╚═══╝  ╚═╝  ╚═══╝  ╚══════╝╚══════╝`}</pre>
 
         <div className="flex items-center justify-between">
           <p className="text-xs" style={{ color: 'var(--color-text-muted)' }}>
-            Crypto Trading Agent Dashboard
+            VIVE TRADING CAT AGENT
           </p>
           <div className="flex items-center gap-2 text-xs" style={{ color: 'var(--color-text-muted)' }}>
             <Clock size={12} />
@@ -196,7 +279,7 @@ export default function Dashboard() {
       )}
 
       {/* Stat cards */}
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+      <div className="grid grid-cols-2 lg:grid-cols-5 gap-4 mb-6">
         {cards.map((card) => (
           <Card key={card.label} {...card} />
         ))}
@@ -325,7 +408,7 @@ export default function Dashboard() {
             </div>
             <div className="flex items-center justify-between">
               <span style={{ color: 'var(--color-text-muted)' }}>Active strategies</span>
-              <span className="font-mono" style={{ color: 'var(--color-text)' }}>{skillCount}</span>
+              <span className="font-mono" style={{ color: 'var(--color-text)' }}>{liveCount}</span>
             </div>
           </div>
         </div>

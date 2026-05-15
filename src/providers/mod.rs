@@ -1289,13 +1289,25 @@ pub fn create_resilient_provider_with_options(
 ) -> anyhow::Result<Box<dyn Provider>> {
     let mut providers: Vec<(String, Box<dyn Provider>)> = Vec::new();
 
-    let primary_provider = match primary_name {
-        "openai-codex" | "openai_codex" | "codex" => {
-            create_provider_with_options(primary_name, api_key, options)?
-        }
-        _ => create_provider_with_url_and_options(primary_name, api_key, api_url, options)?,
+    // Normalize bare "custom" or "anthropic-custom" when a separate api_url is present.
+    // Legacy configs saved before url-embedding support stored provider + api_url separately.
+    let owned_name: String;
+    let effective_name = if (primary_name == "custom" || primary_name == "anthropic-custom")
+        && api_url.map(|u| !u.trim().is_empty()).unwrap_or(false)
+    {
+        owned_name = format!("{}:{}", primary_name, api_url.unwrap().trim());
+        &owned_name
+    } else {
+        primary_name
     };
-    providers.push((primary_name.to_string(), primary_provider));
+
+    let primary_provider = match effective_name {
+        "openai-codex" | "openai_codex" | "codex" => {
+            create_provider_with_options(effective_name, api_key, options)?
+        }
+        _ => create_provider_with_url_and_options(effective_name, api_key, api_url, options)?,
+    };
+    providers.push((effective_name.to_string(), primary_provider));
 
     for fallback in &reliability.fallback_providers {
         if fallback == primary_name || providers.iter().any(|(name, _)| name == fallback) {

@@ -160,7 +160,33 @@ async fn run_agent_job(
     }
     let name = job.name.clone().unwrap_or_else(|| "cron-job".to_string());
     let prompt = job.prompt.clone().unwrap_or_default();
-    let prefixed_prompt = format!("[cron:{} {name}] {prompt}", job.id);
+
+    // If this job has a Telegram delivery target OR the global Telegram config
+    // has a default chat_id, include it so the agent can schedule follow-up
+    // cron jobs with the correct delivery.to value.
+    let telegram_hint = job
+        .delivery
+        .to
+        .as_deref()
+        .filter(|t| !t.is_empty())
+        .or_else(|| {
+            config
+                .channels_config
+                .telegram
+                .as_ref()
+                .and_then(|tg| tg.chat_id.as_deref())
+        })
+        .map(|chat_id| {
+            format!(
+                "\n\n[System: This cron job delivers to Telegram. \
+                 If you create or update any cron job with Telegram delivery, \
+                 use delivery={{\"mode\":\"announce\",\"channel\":\"telegram\",\
+                 \"to\":\"{chat_id}\"}}. Do NOT invent a different chat_id.]"
+            )
+        })
+        .unwrap_or_default();
+
+    let prefixed_prompt = format!("[cron:{} {name}] {prompt}{telegram_hint}", job.id);
     let model_override = job.model.clone();
 
     let run_result = match job.session_target {
@@ -289,10 +315,9 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
         .channel
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("delivery.channel is required for announce mode"))?;
-    let target = delivery
-        .to
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("delivery.to is required for announce mode"))?;
+    // delivery.to is optional — deliver_announcement will fall back to the
+    // channel's configured default (e.g. telegram.chat_id).
+    let target = delivery.to.as_deref().unwrap_or("");
 
     deliver_announcement(config, channel, target, output).await
 }
@@ -310,12 +335,33 @@ pub(crate) async fn deliver_announcement(
                 .telegram
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("telegram channel not configured"))?;
+
+            // Resolve the actual recipient: prefer the explicit delivery.to value,
+            // but fall back to the configured default chat_id so that cron jobs
+            // created without an explicit target still reach the user.
+            let resolved_target = if !target.is_empty() {
+                target.to_string()
+            } else if let Some(ref default_chat) = tg.chat_id {
+                tracing::debug!(
+                    "Telegram delivery: using configured default chat_id {}",
+                    default_chat
+                );
+                default_chat.clone()
+            } else {
+                anyhow::bail!(
+                    "Telegram delivery: no target specified and no default chat_id configured. \
+                     Set [channels.telegram] chat_id = \"<your_chat_id>\" in config.toml"
+                );
+            };
+
             let channel = TelegramChannel::new(
                 tg.bot_token.clone(),
                 tg.allowed_users.clone(),
                 tg.mention_only,
             );
-            channel.send(&SendMessage::new(output, target)).await?;
+            channel
+                .send(&SendMessage::new(output, resolved_target))
+                .await?;
         }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
     }
