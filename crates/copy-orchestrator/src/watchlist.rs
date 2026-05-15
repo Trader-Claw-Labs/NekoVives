@@ -69,4 +69,31 @@ impl Watchlist {
             false
         }
     }
+
+    /// Update mutable knobs on a leader. Returns true if the leader existed.
+    pub fn update(
+        &mut self,
+        address: &str,
+        size_factor: Option<f64>,
+        consensus_weight: Option<f64>,
+        category: Option<Option<String>>,
+        mirror_enabled: Option<bool>,
+    ) -> bool {
+        let Some(e) = self.entries.get_mut(address) else {
+            return false;
+        };
+        if let Some(v) = size_factor {
+            e.size_factor = v.clamp(0.0, 10.0);
+        }
+        if let Some(v) = consensus_weight {
+            e.consensus_weight = v.clamp(0.0, 10.0);
+        }
+        if let Some(c) = category {
+            e.category = c;
+        }
+        if let Some(v) = mirror_enabled {
+            e.mirror_enabled = v;
+        }
+        true
+    }
 }

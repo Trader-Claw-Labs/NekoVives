@@ -3795,6 +3795,10 @@ pub struct BacktestRunBody {
     /// is driven directly by the normalised Binance OHLCV feed.
     #[serde(default)]
     pub kind: Option<String>,
+    /// Per-engine tunable parameters from the UI EngineParamsForm.
+    /// Merged over each engine's default config at runtime.
+    #[serde(default)]
+    pub engine_params: Option<serde_json::Value>,
 }
 
 fn default_market_type() -> String {
@@ -3829,6 +3833,7 @@ pub async fn handle_api_backtest_run(
             kind: engine_kind,
             markets,
             threshold: body.threshold,
+            engine_params: body.engine_params.clone(),
             from_date: &body.from_date,
             to_date: &body.to_date,
             initial_balance: body.initial_balance,
@@ -4654,6 +4659,9 @@ pub struct CreateRunnerBody {
     pub chainlink_endpoint_url: Option<String>,
     #[serde(default)]
     pub chainlink_interval_secs: Option<u64>,
+    /// Per-engine tunable parameters from the UI EngineParamsForm.
+    #[serde(default)]
+    pub engine_params: Option<serde_json::Value>,
 }
 
 #[derive(serde::Deserialize)]
@@ -5401,6 +5409,193 @@ pub async fn handle_api_copy_leader_toggle(
     Json(serde_json::json!({ "address": addr, "mirror_enabled": new_state })).into_response()
 }
 
+/// Request body for adding a leader directly to the watchlist.
+#[derive(Debug, Deserialize)]
+pub struct AddLeaderRequest {
+    pub address: String,
+    #[serde(default = "default_venue")]
+    pub venue: String,
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default = "default_size_factor")]
+    pub size_factor: f64,
+    #[serde(default = "default_consensus_weight")]
+    pub consensus_weight: f64,
+    #[serde(default)]
+    pub wallet_score: Option<f64>,
+    #[serde(default)]
+    pub mirror_enabled: bool,
+}
+
+fn default_venue() -> String {
+    "polymarket".to_string()
+}
+fn default_size_factor() -> f64 {
+    0.5
+}
+fn default_consensus_weight() -> f64 {
+    1.0
+}
+
+/// POST /api/copy/leaders — add a leader directly to the watchlist (bypasses Discovery)
+pub async fn handle_api_copy_leader_add(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<AddLeaderRequest>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let addr = req.address.trim().to_lowercase();
+    if !is_valid_evm_address(&addr) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "Invalid wallet address — expected 0x + 40 hex chars" })),
+        )
+            .into_response();
+    }
+
+    let entry = copy_orchestrator::watchlist::WatchlistEntry {
+        address: addr.clone(),
+        venue: req.venue,
+        category: req.category,
+        mirror_enabled: req.mirror_enabled,
+        consensus_weight: req.consensus_weight,
+        size_factor: req.size_factor,
+        wallet_score: req.wallet_score.unwrap_or(0.0),
+        added_at: chrono::Utc::now().to_rfc3339(),
+    };
+
+    let mut watchlist = state.copy_orchestrator.watchlist.lock().await;
+    watchlist.add(entry);
+    Json(serde_json::json!({ "added": addr })).into_response()
+}
+
+/// Patch body for a leader.
+#[derive(Debug, Deserialize)]
+pub struct PatchLeaderRequest {
+    #[serde(default)]
+    pub size_factor: Option<f64>,
+    #[serde(default)]
+    pub consensus_weight: Option<f64>,
+    #[serde(default)]
+    pub category: Option<Option<String>>,
+    #[serde(default)]
+    pub mirror_enabled: Option<bool>,
+}
+
+/// PATCH /api/copy/leaders/{addr} — edit leader knobs
+pub async fn handle_api_copy_leader_patch(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(addr): Path<String>,
+    Json(req): Json<PatchLeaderRequest>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let mut watchlist = state.copy_orchestrator.watchlist.lock().await;
+    let updated = watchlist.update(
+        &addr,
+        req.size_factor,
+        req.consensus_weight,
+        req.category,
+        req.mirror_enabled,
+    );
+    if !updated {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "Leader not found" })),
+        )
+            .into_response();
+    }
+    Json(serde_json::json!({ "address": addr, "updated": true })).into_response()
+}
+
+/// DELETE /api/copy/leaders/{addr} — remove a leader from the watchlist
+pub async fn handle_api_copy_leader_remove(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(addr): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let mut watchlist = state.copy_orchestrator.watchlist.lock().await;
+    let removed = watchlist.remove(&addr).is_some();
+    if !removed {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "Leader not found" })),
+        )
+            .into_response();
+    }
+    Json(serde_json::json!({ "address": addr, "removed": true })).into_response()
+}
+
+/// Validate a 0x-prefixed 20-byte EVM address.
+fn is_valid_evm_address(addr: &str) -> bool {
+    if !addr.starts_with("0x") || addr.len() != 42 {
+        return false;
+    }
+    addr[2..].chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Request body for adding a discovery candidate manually.
+#[derive(Debug, Deserialize)]
+pub struct AddCandidateRequest {
+    pub address: String,
+    #[serde(default = "default_venue")]
+    pub venue: String,
+    #[serde(default)]
+    pub discovery_score: Option<f64>,
+}
+
+/// POST /api/copy/discovery — manually add a wallet to the candidate list
+pub async fn handle_api_copy_discovery_add(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<AddCandidateRequest>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let addr = req.address.trim().to_lowercase();
+    if !is_valid_evm_address(&addr) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "Invalid wallet address — expected 0x + 40 hex chars" })),
+        )
+            .into_response();
+    }
+    let score = req.discovery_score.unwrap_or(0.0);
+    match state.wallet_indexer.add_candidate(&addr, &req.venue, score).await {
+        Ok(()) => Json(serde_json::json!({ "added": addr, "venue": req.venue, "discovery_score": score })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /api/copy/discovery/refresh — trigger the nightly Polymarket indexer on demand
+pub async fn handle_api_copy_discovery_refresh(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let indexer = state.wallet_indexer.clone();
+    tokio::spawn(async move {
+        if let Err(e) = indexer.run_polymarket_nightly(50).await {
+            tracing::warn!("Manual Polymarket indexer refresh failed: {}", e);
+        }
+    });
+    Json(serde_json::json!({ "started": true })).into_response()
+}
+
 /// GET /api/copy/discovery — list discovery candidates
 pub async fn handle_api_copy_discovery(
     State(state): State<AppState>,
@@ -5465,8 +5660,16 @@ pub async fn handle_api_copy_discovery_graduate(
         added_at: chrono::Utc::now().to_rfc3339(),
     };
 
-    let mut watchlist = state.copy_orchestrator.watchlist.lock().await;
-    watchlist.add(entry);
+    {
+        let mut watchlist = state.copy_orchestrator.watchlist.lock().await;
+        watchlist.add(entry);
+    }
+
+    // Reflect the new status on the candidate row so it disappears from the
+    // candidate filter in the UI.
+    if let Err(e) = state.wallet_indexer.set_candidate_status(&addr, "graduated").await {
+        tracing::warn!("Failed to update candidate status for {}: {}", addr, e);
+    }
 
     Json(serde_json::json!({ "graduated": addr })).into_response()
 }
@@ -5481,8 +5684,43 @@ pub async fn handle_api_copy_discovery_blacklist(
         return e.into_response();
     }
 
-    // TODO: implement blacklist in indexer
-    Json(serde_json::json!({ "blacklisted": addr })).into_response()
+    match state.wallet_indexer.set_candidate_status(&addr, "blacklisted").await {
+        Ok(true) => Json(serde_json::json!({ "blacklisted": addr })).into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "Candidate not found" })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// DELETE /api/copy/discovery/{addr} — remove a candidate entirely
+pub async fn handle_api_copy_discovery_remove(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(addr): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    match state.wallet_indexer.remove_candidate(&addr).await {
+        Ok(true) => Json(serde_json::json!({ "removed": addr })).into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "Candidate not found" })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 /// GET /api/copy/positions — list open mirror positions
@@ -5508,6 +5746,116 @@ pub async fn handle_api_copy_positions(
     })).collect();
 
     Json(serde_json::json!({ "positions": positions })).into_response()
+}
+
+// ── Copy Trading – capital / sizing / consensus / history ─────────
+
+/// GET /api/copy/capital
+pub async fn handle_api_copy_get_capital(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+    let capital = *state.copy_orchestrator.capital.lock().await;
+    Json(serde_json::json!({ "capital_usd": capital })).into_response()
+}
+
+/// POST /api/copy/capital  { capital_usd: f64 }
+pub async fn handle_api_copy_set_capital(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+    let Some(capital) = body.get("capital_usd").and_then(|v| v.as_f64()) else {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "capital_usd required"}))).into_response();
+    };
+    state.copy_orchestrator.set_capital(capital).await;
+    Json(serde_json::json!({ "capital_usd": capital, "ok": true })).into_response()
+}
+
+/// GET /api/copy/positions/history — closed mirror positions
+pub async fn handle_api_copy_positions_history(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+    let tracker = state.copy_orchestrator.mirror.lock().await;
+    let positions: Vec<_> = tracker.list_all().iter()
+        .filter(|p| !matches!(p.status, copy_orchestrator::mirror::PositionStatus::Open))
+        .map(|p| serde_json::json!({
+            "leader_address": p.leader_address,
+            "symbol": p.symbol,
+            "side": p.side,
+            "notional": p.notional,
+            "entry_price": p.entry_price,
+            "status": format!("{:?}", p.status),
+            "opened_at": p.opened_at,
+            "closed_at": p.closed_at,
+            "pnl": p.pnl,
+        }))
+        .collect();
+    Json(serde_json::json!({ "positions": positions })).into_response()
+}
+
+/// GET /api/copy/consensus
+pub async fn handle_api_copy_consensus(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+    let acc = state.copy_orchestrator.consensus.lock().await;
+    let windows: Vec<_> = acc.list_active_windows(300).iter().map(|w| serde_json::json!({
+        "symbol": w.symbol,
+        "side": w.side,
+        "leader_count": w.leaders.len(),
+        "first_seen": w.first_seen.to_rfc3339(),
+        "last_seen": w.last_seen.to_rfc3339(),
+    })).collect();
+    Json(serde_json::json!({ "windows": windows })).into_response()
+}
+
+/// PATCH /api/copy/sizing  { max_single_trade_pct?: f64, liquidity_floor_factor?: f64 }
+/// Returns current values (live patching not supported without mutex; adjust and restart).
+pub async fn handle_api_copy_patch_sizing(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(_body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+    let sizing = &state.copy_orchestrator.sizing;
+    Json(serde_json::json!({
+        "max_single_trade_pct": sizing.max_single_trade_pct,
+        "liquidity_floor_factor": sizing.liquidity_floor_factor,
+        "note": "Live patching not yet supported; values shown are current."
+    })).into_response()
+}
+
+/// GET /api/copy/score/{addr}
+pub async fn handle_api_copy_score(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(addr): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+    match state.wallet_indexer.get_wallet_score(&addr).await {
+        Ok(Some(score)) => Json(serde_json::to_value(&score).unwrap_or_default()).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "score not found"}))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+/// GET /api/copy/leaders/{addr}/trades
+pub async fn handle_api_copy_leader_trades(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(addr): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+    match state.wallet_indexer.get_leader_trades(&addr).await {
+        Ok(trades) => Json(serde_json::json!({ "trades": trades })).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+    }
 }
 
 // ── Hyperliquid ─────────────────────────────────────────────────

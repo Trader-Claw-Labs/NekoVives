@@ -94,4 +94,15 @@ impl ConsensusAccumulator {
         let key = format!("{}|{}", symbol, side);
         self.windows.remove(&key);
     }
+
+    /// Return all active (non-expired) windows for the consensus monitor UI.
+    pub fn list_active_windows(&self, window_secs: i64) -> Vec<&SignalWindow> {
+        let now = chrono::Utc::now();
+        let cutoff = now - chrono::Duration::seconds(window_secs);
+        self.windows
+            .values()
+            .flatten()
+            .filter(|w| w.last_seen > cutoff)
+            .collect()
+    }
 }

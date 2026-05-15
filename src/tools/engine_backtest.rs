@@ -16,12 +16,12 @@
 //! 5. Convert to `BacktestMetrics` and return.
 
 use std::path::Path;
-use chrono::Utc;
+use chrono::{DateTime, TimeZone, Utc};
 use strategy_core::{
     engine::StrategyEngine,
     types::{CandleSnap, ExecutionMode, MarketSnapshot, Portfolio},
 };
-use crate::tools::backtest::{fetch_candles, BacktestMetrics};
+use crate::tools::backtest::{fetch_candles, AllTrade, BacktestMetrics};
 
 // ── Params ────────────────────────────────────────────────────────────────────
 
@@ -33,10 +33,33 @@ pub struct EngineBacktestParams<'a> {
     pub markets: Vec<String>,
     /// Edge / threshold parameter passed to the engine config.
     pub threshold: Option<f64>,
+    /// Per-engine UI overrides (merged over each engine's defaults).
+    pub engine_params: Option<serde_json::Value>,
     pub from_date: &'a str,
     pub to_date: &'a str,
     pub initial_balance: f64,
     pub workspace_dir: &'a Path,
+}
+
+/// Helper: merge UI engine_params into a typed config by round-tripping through
+/// JSON. Fields present in `params` override fields in `base`; missing fields
+/// keep the base default.
+fn merge_params<T: serde::Serialize + serde::de::DeserializeOwned>(
+    base: T,
+    overrides: Option<&serde_json::Value>,
+) -> T {
+    let Some(ov) = overrides else { return base };
+    let Ok(mut map) = serde_json::to_value(&base)
+        .map(|v| v.as_object().cloned().unwrap_or_default())
+    else {
+        return base;
+    };
+    if let Some(obj) = ov.as_object() {
+        for (k, v) in obj {
+            map.insert(k.clone(), v.clone());
+        }
+    }
+    serde_json::from_value(serde_json::Value::Object(map)).unwrap_or(base)
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -83,16 +106,16 @@ pub async fn run_engine_backtest(params: EngineBacktestParams<'_>) -> BacktestMe
     let threshold = params.threshold;
     let n_markets = markets.len().max(1);
 
-    // Run the engine via a trait-object so we don't repeat the tick loop.
+    // Run the engine; also collect per-candle balance snapshots for equity curve.
     macro_rules! run_engine {
         ($eng:expr) => {{
             let mut engine = $eng;
             if engine.initialize(ExecutionMode::Backtest, &portfolio).await.is_err() {
                 return err_metrics("Engine initialisation failed.");
             }
-            for (idx, (ts_ms, open, high, low, close, volume)) in candles.iter().enumerate() {
+            let mut snapshots: Vec<(i64, f64)> = Vec::with_capacity(candles.len());
+            for (ts_ms, open, high, low, close, volume) in candles.iter() {
                 for (m_idx, slug) in markets.iter().enumerate() {
-                    // Stagger per-market offsets so multi-market engines see divergent prices.
                     let offset = (m_idx as f64 - (n_markets as f64 - 1.0) / 2.0) * 0.06;
                     let yes = normalize(*close, offset);
                     let snap = MarketSnapshot {
@@ -110,49 +133,51 @@ pub async fn run_engine_backtest(params: EngineBacktestParams<'_>) -> BacktestMe
                         timestamp: Utc::now(),
                     };
                     let _ = engine.on_tick(&snap, &mut portfolio).await;
-                    let _ = idx; // suppress unused warning in some branches
                 }
+                snapshots.push((*ts_ms, portfolio.balance_usdc));
             }
-            engine.finalize(&portfolio).await
+            let metrics = engine.finalize(&portfolio).await;
+            (metrics, snapshots)
         }};
     }
 
-    let metrics = match kind {
+    let ov = params.engine_params.as_ref();
+    let (metrics, snapshots) = match kind {
         "arb_binary" => {
             use crate::engines::arb_binary::{ArbBinaryConfig, ArbBinaryEngine};
-            let cfg = ArbBinaryConfig {
+            let base = ArbBinaryConfig {
                 markets: markets.clone(),
                 min_edge_pct: threshold.unwrap_or(0.05),
                 max_position_usd: params.initial_balance * 0.25,
                 ..Default::default()
             };
-            run_engine!(ArbBinaryEngine::new(cfg))
+            run_engine!(ArbBinaryEngine::new(merge_params(base, ov)))
         }
         "fair_value" => {
             use crate::engines::fair_value::{FairValueConfig, FairValueEngine};
-            let cfg = FairValueConfig {
+            let base = FairValueConfig {
                 markets: markets.clone(),
                 edge_threshold: threshold.unwrap_or(0.005),
                 max_position_usd: params.initial_balance * 0.25,
                 ..Default::default()
             };
-            run_engine!(FairValueEngine::new(cfg))
+            run_engine!(FairValueEngine::new(merge_params(base, ov)))
         }
         "fv_momentum" => {
             use crate::engines::fv_momentum::{FvMomentumConfig, FvMomentumEngine};
             use crate::engines::fair_value::FairValueConfig;
-            let fv = FairValueConfig {
+            let fv_base = FairValueConfig {
                 markets: markets.clone(),
                 edge_threshold: threshold.unwrap_or(0.005),
                 max_position_usd: params.initial_balance * 0.25,
                 ..Default::default()
             };
-            let cfg = FvMomentumConfig { fv, ..Default::default() };
-            run_engine!(FvMomentumEngine::new(cfg))
+            let base = FvMomentumConfig { fv: fv_base, ..Default::default() };
+            run_engine!(FvMomentumEngine::new(merge_params(base, ov)))
         }
         "rotation_compounder" => {
             use crate::engines::rotation_compounder::{RotationConfig, RotationCompounderEngine};
-            let cfg = RotationConfig {
+            let base = RotationConfig {
                 markets: markets.clone(),
                 max_allocation_pct: 0.60,
                 switch_threshold: threshold.unwrap_or(0.001),
@@ -161,22 +186,22 @@ pub async fn run_engine_backtest(params: EngineBacktestParams<'_>) -> BacktestMe
                 poll_secs: 60,
                 sim_days_to_close: 15.0,
             };
-            run_engine!(RotationCompounderEngine::new(cfg))
+            run_engine!(RotationCompounderEngine::new(merge_params(base, ov)))
         }
         "arb_hedge" => {
             use crate::engines::arb_hedge::{ArbHedgeConfig, ArbHedgeEngine};
-            let cfg = ArbHedgeConfig {
+            let base = ArbHedgeConfig {
                 markets: markets.clone(),
                 min_arb_edge: threshold.unwrap_or(0.03),
                 hedge_trigger_pct: 0.20,
                 max_position_usd: params.initial_balance * 0.25,
                 poll_secs: 60,
             };
-            run_engine!(ArbHedgeEngine::new(cfg))
+            run_engine!(ArbHedgeEngine::new(merge_params(base, ov)))
         }
         "minting_mm" => {
             use crate::engines::minting_mm::{MintingMmConfig, MintingMmEngine};
-            let cfg = MintingMmConfig {
+            let base = MintingMmConfig {
                 markets: markets.clone(),
                 premium_cents: threshold.unwrap_or(0.03),
                 max_cycle_usd: params.initial_balance * 0.25,
@@ -186,12 +211,30 @@ pub async fn run_engine_backtest(params: EngineBacktestParams<'_>) -> BacktestMe
                 poll_secs: 60,
                 target_apy: 0.40,
             };
-            run_engine!(MintingMmEngine::new(cfg))
+            run_engine!(MintingMmEngine::new(merge_params(base, ov)))
         }
         other => {
             return err_metrics(&format!("Unknown engine kind '{other}'. Valid: arb_binary, fair_value, fv_momentum, rotation_compounder, arb_hedge, minting_mm"));
         }
     };
+
+    // Build equity-curve trades from per-candle balance snapshots.
+    let initial = params.initial_balance;
+    let all_trades: Vec<AllTrade> = snapshots
+        .into_iter()
+        .map(|(ts_ms, bal)| {
+            let dt: DateTime<Utc> = Utc.timestamp_millis_opt(ts_ms).single().unwrap_or_else(Utc::now);
+            AllTrade {
+                timestamp: dt.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                side: "equity".to_string(),
+                price: bal / initial,
+                size: 0.0,
+                pnl: bal - initial,
+                balance: bal,
+                debug: None,
+            }
+        })
+        .collect();
 
     BacktestMetrics {
         total_return_pct:             metrics.total_return_pct,
@@ -200,7 +243,7 @@ pub async fn run_engine_backtest(params: EngineBacktestParams<'_>) -> BacktestMe
         win_rate_pct:                 metrics.win_rate_pct,
         total_trades:                 metrics.total_trades,
         worst_trades:                 vec![],
-        all_trades:                   vec![],
+        all_trades,
         analysis:                     metrics.analysis,
         avg_token_price:              None,
         correct_direction_pct:        None,

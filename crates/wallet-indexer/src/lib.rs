@@ -143,6 +143,28 @@ impl Indexer {
         Ok(())
     }
 
+    /// Update a candidate's status (e.g. 'candidate', 'blacklisted', 'graduated').
+    pub async fn set_candidate_status(&self, address: &str, status: &str) -> Result<bool> {
+        let conn = self.conn.lock().await;
+        let changed = conn.execute(
+            "UPDATE candidate_list SET status = ?1,
+                    graduated_at = CASE WHEN ?1 = 'graduated' THEN ?2 ELSE graduated_at END
+             WHERE wallet_address = ?3",
+            params![status, Utc::now().to_rfc3339(), address],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Remove a candidate from the discovery list.
+    pub async fn remove_candidate(&self, address: &str) -> Result<bool> {
+        let conn = self.conn.lock().await;
+        let changed = conn.execute(
+            "DELETE FROM candidate_list WHERE wallet_address = ?1",
+            params![address],
+        )?;
+        Ok(changed > 0)
+    }
+
     /// List candidates by status.
     pub async fn list_candidates(
         &self,
@@ -185,6 +207,76 @@ impl Indexer {
         }
         Ok(records)
     }
+
+    /// Query score sub-fields for a specific address.
+    pub async fn get_wallet_score(&self, address: &str) -> Result<Option<WalletScoreRecord>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT address, venue, pnl_norm, winrate_score, drawdown_score,
+                    sharpe_score, consistency_score, diversity_score, wallet_score
+             FROM wallet_scores WHERE address = ?1 LIMIT 1"
+        )?;
+        let mut rows = stmt.query_map([address], |row| Ok(WalletScoreRecord {
+            address: row.get(0)?,
+            venue: row.get(1)?,
+            pnl_norm: row.get(2)?,
+            winrate_score: row.get(3)?,
+            drawdown_score: row.get(4)?,
+            sharpe_score: row.get(5)?,
+            consistency_score: row.get(6)?,
+            diversity_score: row.get(7)?,
+            wallet_score: row.get(8)?,
+        }))?;
+        Ok(rows.next().transpose()?)
+    }
+
+    /// List recent trades for a specific address (newest first, limit 100).
+    pub async fn get_leader_trades(&self, address: &str) -> Result<Vec<WalletTradeRecord>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT address, venue, market_id, side, notional, price, timestamp, pnl
+             FROM wallet_trades WHERE address = ?1
+             ORDER BY timestamp DESC LIMIT 100"
+        )?;
+        let rows = stmt.query_map([address], |row| Ok(WalletTradeRecord {
+            address: row.get(0)?,
+            venue: row.get(1)?,
+            market_id: row.get(2)?,
+            side: row.get(3)?,
+            notional: row.get(4)?,
+            price: row.get(5)?,
+            timestamp: row.get(6)?,
+            pnl: row.get(7)?,
+        }))?;
+        let mut records = Vec::new();
+        for r in rows { records.push(r?); }
+        Ok(records)
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WalletScoreRecord {
+    pub address: String,
+    pub venue: String,
+    pub pnl_norm: Option<f64>,
+    pub winrate_score: Option<f64>,
+    pub drawdown_score: Option<f64>,
+    pub sharpe_score: Option<f64>,
+    pub consistency_score: Option<f64>,
+    pub diversity_score: Option<f64>,
+    pub wallet_score: Option<f64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WalletTradeRecord {
+    pub address: String,
+    pub venue: String,
+    pub market_id: Option<String>,
+    pub side: Option<String>,
+    pub notional: Option<f64>,
+    pub price: Option<f64>,
+    pub timestamp: Option<String>,
+    pub pnl: Option<f64>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

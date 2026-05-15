@@ -1,12 +1,14 @@
 import { useState, useEffect, useRef } from 'react'
+import { useLocation } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch, apiPost, apiDelete, apiPatch } from '../hooks/useApi'
 import { type MarketSeries, POLY_BINARY_PRESETS } from '../hooks/useBacktestState'
+import EngineParamsForm, { defaultEngineParams } from '../components/EngineParamsForm'
 import { useProfitCelebration } from '../hooks/useProfitCelebration'
 import {
   Bot, Plus, Trash2, RefreshCw, X, StopCircle, RotateCcw,
   TrendingUp, TrendingDown, Activity, ChevronDown, ChevronUp, AlertCircle, ExternalLink, Copy,
-  Eye, EyeOff,
+  Eye, EyeOff, Zap,
 } from 'lucide-react'
 import clsx from 'clsx'
 
@@ -15,6 +17,7 @@ import clsx from 'clsx'
 interface RunnerConfig {
   id: string
   name: string
+  kind?: string
   script: string
   market_type: string
   symbol: string
@@ -630,14 +633,25 @@ function EngineMarketPicker({ selected, onChange }: EngineMarketPickerProps) {
   )
 }
 
+export interface BacktestPrefill {
+  kind?: string
+  script?: string
+  symbol?: string
+  market_type?: string
+  series_id?: string
+  engine_params?: Record<string, unknown>
+  mode?: 'paper' | 'live'
+}
+
 export interface CreateModalProps {
   scripts: BacktestScript[]
   onClose: () => void
   onCreated: () => void
   defaultScript?: string
+  prefill?: BacktestPrefill
 }
 
-export function CreateModal({ scripts, onClose, onCreated, defaultScript }: CreateModalProps) {
+export function CreateModal({ scripts, onClose, onCreated, defaultScript, prefill }: CreateModalProps) {
   // Load market series for polymarket_binary picker
   const { data: seriesData } = useQuery<{ series: MarketSeries[] }>({
     queryKey: ['backtest-series'],
@@ -647,17 +661,17 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript }: Crea
   const allSeries: MarketSeries[] = seriesData?.series ?? []
 
   const [form, setForm] = useState({
-    kind: 'rhai_candle' as string,
+    kind: (prefill?.kind ?? 'rhai_candle') as string,
     name: '',
-    script: defaultScript ?? scripts[0]?.path ?? '',
-    market_type: 'polymarket_binary',
-    symbol: 'BTCUSDT',
+    script: prefill?.script ?? defaultScript ?? scripts[0]?.path ?? '',
+    market_type: prefill?.market_type ?? 'polymarket_binary',
+    symbol: prefill?.symbol ?? 'BTCUSDT',
     interval: '5m',
-    mode: 'paper',
+    mode: prefill?.mode ?? 'paper',
     initial_balance: 1000,
     fee_pct: 1.5,
     warmup_days: 7,
-    series_id: 'btc_5m',
+    series_id: prefill?.series_id ?? 'btc_5m',
     resolution_logic: 'price_up',
     threshold: null as number | null,
     live_sizing_mode: 'percent' as 'fixed' | 'percent',
@@ -676,6 +690,7 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript }: Crea
     max_pos_pct: 15,
     funding_poll_secs: 60,
     fee_buffer_bps: 12,
+    engine_params: (prefill?.engine_params ?? {}) as Record<string, unknown>,
   })
 
   const isEngineKind = form.kind !== 'rhai_candle'
@@ -807,10 +822,8 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript }: Crea
 
   function onKindChange(newKind: string) {
     if (newKind === 'rhai_candle') {
-      // Restore crypto symbol when going back to Rhai
-      setForm(f => ({ ...f, kind: newKind, symbol: 'BTCUSDT' }))
+      setForm(f => ({ ...f, kind: newKind, symbol: 'BTCUSDT', engine_params: {} }))
     } else {
-      // Engine kinds always use polymarket_binary — clear symbol so user must enter a real slug
       setForm(f => ({
         ...f,
         kind: newKind,
@@ -818,6 +831,7 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript }: Crea
         mode: 'paper',
         symbol: '',
         series_id: '',
+        engine_params: defaultEngineParams(newKind),
       }))
     }
   }
@@ -862,6 +876,15 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript }: Crea
               </p>
             )}
           </div>
+
+          {/* Per-engine tunable parameters */}
+          {isEngineKind && (
+            <EngineParamsForm
+              kind={form.kind}
+              params={form.engine_params}
+              onChange={(p) => setForm(f => ({ ...f, engine_params: p }))}
+            />
+          )}
 
           {!isEngineKind && (
             <div>
@@ -1713,9 +1736,10 @@ interface RunnerCardProps {
   onToggleHidden: () => void
   onUpdateConfig?: (updates: { live_sizing_mode?: string; live_sizing_value?: number; max_entry_price?: number | null; max_spread_pct?: number | null; early_fire_secs?: number | null; allowed_hours?: number[]; rv_min_btc?: number | null }) => void
   isPatching?: boolean
+  onUpgradeToLive?: () => void
 }
 
-function RunnerCard({ runner, onStop, onRestart, onDelete, onToggleHidden, onUpdateConfig, isPatching }: RunnerCardProps) {
+function RunnerCard({ runner, onStop, onRestart, onDelete, onToggleHidden, onUpdateConfig, isPatching, onUpgradeToLive }: RunnerCardProps) {
   const [expanded, setExpanded] = useState(() => {
     try {
       const stored = localStorage.getItem(`runner-expanded-${runner.config.id}`)
@@ -1855,6 +1879,17 @@ function RunnerCard({ runner, onStop, onRestart, onDelete, onToggleHidden, onUpd
           </p>
         </div>
         <div className="flex items-center gap-1 flex-shrink-0">
+          {config.mode === 'paper' && onUpgradeToLive && (
+            <button
+              onClick={onUpgradeToLive}
+              title="Go Live"
+              className="flex items-center gap-1 px-2 py-1 rounded text-[10px] font-semibold"
+              style={{ backgroundColor: 'rgba(245,158,11,0.15)', color: 'var(--color-warning)' }}
+            >
+              <Zap size={11} />
+              Go Live
+            </button>
+          )}
           {isRunning ? (
             <button onClick={onStop} title="Stop"
               className="p-1.5 rounded hover:bg-white/5" style={{ color: 'var(--color-danger)' }}>
@@ -2467,7 +2502,10 @@ function RunnerCard({ runner, onStop, onRestart, onDelete, onToggleHidden, onUpd
 // ── Main Page ─────────────────────────────────────────────────────────
 
 export default function LiveStrategies() {
-  const [showCreate, setShowCreate] = useState(false)
+  const location = useLocation()
+  const routePrefill = (location.state as { prefill?: BacktestPrefill } | null)?.prefill
+  const [showCreate, setShowCreate] = useState(() => !!routePrefill)
+  const [upgradePrefill, setUpgradePrefill] = useState<BacktestPrefill | null>(null)
   const [showCelebrationSettings, setShowCelebrationSettings] = useState(false)
   const { settings, setSettings } = useProfitCelebration()
   const qc = useQueryClient()
@@ -2769,6 +2807,17 @@ export default function LiveStrategies() {
                   patchMutation.mutate({ id: runner.config.id, body: updates })
                 }
                 isPatching={patchMutation.isPending}
+                onUpgradeToLive={runner.config.mode === 'paper' ? () => {
+                  setUpgradePrefill({
+                    kind: runner.config.kind ?? 'rhai_candle',
+                    script: runner.config.script,
+                    symbol: runner.config.symbol,
+                    market_type: runner.config.market_type,
+                    series_id: runner.config.series_id,
+                    mode: 'live',
+                  })
+                  setShowCreate(true)
+                } : undefined}
               />
             ))}
           </div>
@@ -2811,8 +2860,9 @@ export default function LiveStrategies() {
       {showCreate && (
         <CreateModal
           scripts={scripts}
-          onClose={() => setShowCreate(false)}
-          onCreated={() => qc.invalidateQueries({ queryKey: ['live-strategies'] })}
+          onClose={() => { setShowCreate(false); setUpgradePrefill(null) }}
+          onCreated={() => { qc.invalidateQueries({ queryKey: ['live-strategies'] }); setUpgradePrefill(null) }}
+          prefill={upgradePrefill ?? routePrefill}
         />
       )}
       {deleteTarget && (

@@ -45,6 +45,8 @@ export const POLY_BINARY_PRESETS: PolyBinaryPreset[] = [
 
 export interface BacktestConfig {
   kind?: string
+  // Per-engine tunable parameters (only used when kind !== 'rhai_candle').
+  engine_params?: Record<string, unknown>
   script: string
   market_type: MarketType
   symbol: string
