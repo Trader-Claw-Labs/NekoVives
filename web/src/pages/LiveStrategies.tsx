@@ -680,6 +680,8 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript, prefil
     early_fire_secs: null as number | null,
     max_entry_price: 0.65 as number | null,
     max_spread_pct: 0.03 as number | null,
+    allowed_hours: [] as number[],
+    rv_min_btc: null as number | null,
     wallet_password: '',
     binance_api_key: '',
     binance_api_secret: '',
@@ -1293,6 +1295,110 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript, prefil
                 {form.max_spread_pct != null
                   ? `Skip windows when yes+no mids deviate >${(form.max_spread_pct * 100).toFixed(2)}% from 1.0 (type percentage: e.g. "2" = 2%) — avoids paper-fill optimism in wide books`
                   : 'Disabled — trades regardless of spread width'}
+              </p>
+            </div>
+          )}
+
+          {/* Hour Gate (Polymarket Binary only) */}
+          {form.market_type === 'polymarket_binary' && (
+            <div>
+              <label className="block text-[11px] font-medium mb-1 flex items-center gap-1.5" style={{ color: 'var(--color-text-muted)' }}>
+                Hour Gate (UTC)
+                <span
+                  className="px-1 rounded text-[9px]"
+                  style={{ backgroundColor: 'var(--color-surface-2)', color: 'var(--color-text-muted)' }}
+                  title="Skip windows outside these UTC hours. Empirically, certain hours show stronger drift signal."
+                >hot hours only</span>
+              </label>
+              <div className="flex items-center gap-2 mb-1.5">
+                <SegmentedToggle
+                  value={form.allowed_hours.length > 0}
+                  onChange={(v) => set('allowed_hours', v ? [0, 9, 11, 18, 21] : [])}
+                  leftLabel="Off"
+                  rightLabel="On"
+                  activeColor="#34d399"
+                />
+                <span className="text-[10px]" style={{ color: 'var(--color-text-muted)' }}>
+                  {form.allowed_hours.length > 0 ? 'Hot hours only' : 'No restriction (24/7)'}
+                </span>
+              </div>
+              {form.allowed_hours.length > 0 && (
+                <>
+                  <div className="flex flex-wrap gap-1 mb-1.5">
+                    {Array.from({ length: 24 }, (_, h) => {
+                      const active = form.allowed_hours.includes(h)
+                      return (
+                        <button
+                          key={h}
+                          type="button"
+                          onClick={() => {
+                            const next = active
+                              ? form.allowed_hours.filter(x => x !== h)
+                              : [...form.allowed_hours, h].sort((a, b) => a - b)
+                            set('allowed_hours', next)
+                          }}
+                          className="w-7 h-6 rounded text-[10px] font-mono transition-colors"
+                          style={{
+                            background: active ? '#059669' : 'var(--color-surface-2)',
+                            color: active ? '#fff' : 'var(--color-text-muted)',
+                            border: `1px solid ${active ? '#059669' : 'var(--color-border)'}`,
+                          }}
+                        >{String(h).padStart(2, '0')}</button>
+                      )
+                    })}
+                  </div>
+                  <div className="flex gap-2 text-[10px]" style={{ color: 'var(--color-text-muted)' }}>
+                    <button
+                      type="button"
+                      className="underline"
+                      onClick={() => set('allowed_hours', [0, 9, 11, 18, 21])}
+                    >Preset: hot hours</button>
+                    <button
+                      type="button"
+                      className="underline"
+                      onClick={() => set('allowed_hours', [])}
+                    >Clear</button>
+                    <span>Active: {form.allowed_hours.join(', ')} UTC</span>
+                  </div>
+                </>
+              )}
+            </div>
+          )}
+
+          {/* RV Floor (Polymarket Binary only) */}
+          {form.market_type === 'polymarket_binary' && (
+            <div>
+              <label className="block text-[11px] font-medium mb-1 flex items-center gap-1.5" style={{ color: 'var(--color-text-muted)' }}>
+                BTC RV Floor
+                <span
+                  className="px-1 rounded text-[9px]"
+                  style={{ backgroundColor: 'var(--color-surface-2)', color: 'var(--color-text-muted)' }}
+                  title="Skip windows when BTC 60-period realized vol is below this value. Flat markets degrade drift signal."
+                >flat-mkt filter</span>
+              </label>
+              <div className="flex items-center gap-2">
+                <input
+                  type="number"
+                  className="w-28 rounded border px-2 py-1 text-xs font-mono"
+                  style={{ background: 'var(--color-surface-2)', borderColor: 'var(--color-border)', color: 'var(--color-text)' }}
+                  min={0}
+                  step={0.000005}
+                  placeholder="0.00015"
+                  value={form.rv_min_btc != null ? form.rv_min_btc : ''}
+                  onChange={e => set('rv_min_btc', e.target.value === '' ? null : Number(e.target.value))}
+                />
+                <SegmentedToggle
+                  value={form.rv_min_btc != null && form.rv_min_btc > 0}
+                  onChange={(v) => set('rv_min_btc', v ? 0.00015 : null)}
+                  leftLabel="Off"
+                  rightLabel="On"
+                  activeColor="#34d399"
+                />
+              </div>
+              <p className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
+                {form.rv_min_btc != null && form.rv_min_btc > 0
+                  ? `Skip when BTC 1h RV < ${form.rv_min_btc.toFixed(5)} — filters flat consolidation`
+                  : 'Disabled — no RV filter applied'}
               </p>
             </div>
           )}
