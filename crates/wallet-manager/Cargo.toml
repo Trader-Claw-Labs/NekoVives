@@ -50,5 +50,5 @@ bs58 = "0.5"
 
 # PBKDF2 for TON key derivation; hmac + sha2 also used for Solana SLIP-0010 derivation
 pbkdf2 = "0.12"
-hmac = "0.12"
+hmac = "0.13"
 sha2 = "0.10"
