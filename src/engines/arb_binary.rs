@@ -456,8 +456,32 @@ pub async fn run_arb_binary_loop(
     let id = config.id.clone();
 
     // Parse engine config from RunnerConfig.
+    //
+    // When `series_id` is set, slugs are re-resolved each poll inside the
+    // loop below — this lets a single live runner ride consecutive 5m / 15m
+    // / 1h windows of a recurring Polymarket market.  When `series_id` is
+    // empty, we fall back to the historical comma-separated `symbol` field.
+    let initial_markets: Vec<String> = if let Some(sid) = config.series_id.as_deref() {
+        if !sid.is_empty() {
+            vec![] // resolved per-tick
+        } else {
+            config
+                .symbol
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        }
+    } else {
+        config
+            .symbol
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    };
     let arb_cfg = ArbBinaryConfig {
-        markets:           if config.symbol.is_empty() { vec![] } else { vec![config.symbol.clone()] },
+        markets:           initial_markets,
         min_edge_pct:      config.threshold.unwrap_or(0.005),
         max_position_usd:  config.initial_balance * config.live_sizing_value.max(0.01),
         liquidity_floor_usd: 100.0,
@@ -482,10 +506,23 @@ pub async fn run_arb_binary_loop(
     set_runner_status(&store, &id, "running");
 
     let poll = Duration::from_secs(arb_cfg.poll_secs);
+    let series_id = config.series_id.clone();
 
     loop {
+        // Re-resolve slugs each tick when the runner is bound to a recurring
+        // series (e.g. BTC 5m UP/DOWN); otherwise reuse the static list.
+        let active_markets: Vec<String> = if series_id.as_deref().map(|s| !s.is_empty()).unwrap_or(false) {
+            crate::engines::series_helper::engine_market_slugs(
+                series_id.as_deref(),
+                &config.symbol,
+            )
+            .await
+        } else {
+            arb_cfg.markets.clone()
+        };
+
         // For each configured market, fetch best-ask prices via REST API.
-        for slug in &arb_cfg.markets {
+        for slug in &active_markets {
             // Resolve token IDs (with cache).
             let (yes_id, no_id) = match engine.token_cache.get(slug) {
                 Some(ids) => ids.clone(),

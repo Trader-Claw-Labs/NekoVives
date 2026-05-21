@@ -452,6 +452,7 @@ pub async fn run_fair_value_loop(
     use crate::strategy_runner::{set_runner_error, set_runner_status};
 
     let id = config.id.clone();
+    // When series_id is set, slugs are re-resolved each poll inside the loop.
     let markets: Vec<String> = config.symbol.split(',')
         .map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
 
@@ -472,9 +473,19 @@ pub async fn run_fair_value_loop(
     set_runner_status(&store, &id, "running");
 
     let poll = Duration::from_secs(fv_cfg.poll_secs);
+    let series_id = config.series_id.clone();
 
     loop {
-        for slug in &markets.clone() {
+        let active_markets: Vec<String> = if series_id.as_deref().map(|s| !s.is_empty()).unwrap_or(false) {
+            crate::engines::series_helper::engine_market_slugs(
+                series_id.as_deref(),
+                &config.symbol,
+            )
+            .await
+        } else {
+            markets.clone()
+        };
+        for slug in &active_markets {
             let market = match polymarket_trader::markets::get_market(slug).await {
                 Ok(m)  => m,
                 Err(e) => { warn!("[fair_value] resolve {slug}: {e}"); continue; }

@@ -1,16 +1,19 @@
 import { useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch, apiPost, apiDelete } from '../hooks/useApi'
-import { BarChart2, Eye, EyeOff, RefreshCw, TrendingUp, X, CheckCircle, AlertCircle, Trash2 } from 'lucide-react'
+import { BarChart2, Eye, EyeOff, RefreshCw, TrendingUp, X, CheckCircle, AlertCircle, Trash2, Copy } from 'lucide-react'
 import PolymarketSetupWizard from '../components/PolymarketSetupWizard'
 
 interface Market {
   id?: string
+  slug?: string
   question?: string
   yes_price?: number
   volume?: number
+  liquidity?: number
   end_date?: string
   yes_token_id?: string
+  category?: string
 }
 
 interface MarketsResponse {
@@ -405,11 +408,35 @@ export default function Polymarket() {
   } | null>(null)
   const [showGuide, setShowGuide] = useState(false)
 
+  const [marketSort, setMarketSort] = useState<'volume' | 'liquidity'>('liquidity')
+  const [marketLimit, setMarketLimit] = useState<30 | 50 | 100>(50)
+  const [marketSearch, setMarketSearch] = useState('')
+  const [copiedSlug, setCopiedSlug] = useState<string | null>(null)
+
   const { data: marketsData, isLoading: marketsLoading, refetch, error: marketsError } = useQuery<MarketsResponse>({
-    queryKey: ['polymarket-markets'],
-    queryFn: () => apiFetch<MarketsResponse>('/api/polymarket/markets'),
+    queryKey: ['polymarket-markets', marketSort, marketLimit, marketSearch],
+    queryFn: () => {
+      const params = new URLSearchParams({
+        sort: marketSort,
+        limit: String(marketLimit),
+        // sort=liquidity surfaces deep books even when expiry < 1 day
+        min_days: marketSort === 'liquidity' ? '0' : '1',
+        max_days: '365',
+      })
+      const q = marketSearch.trim()
+      if (q) params.set('q', q)
+      return apiFetch<MarketsResponse>(`/api/polymarket/markets?${params.toString()}`)
+    },
     retry: 1,
+    placeholderData: prev => prev,
   })
+
+  function copySlug(slug: string) {
+    navigator.clipboard.writeText(slug).then(() => {
+      setCopiedSlug(slug)
+      setTimeout(() => setCopiedSlug(null), 1200)
+    })
+  }
 
   const { data: savedConfig } = useQuery<PolyConfigData>({
     queryKey: ['polymarket-config'],
@@ -693,21 +720,66 @@ export default function Polymarket() {
         style={{ backgroundColor: 'var(--color-surface)', borderColor: 'var(--color-border)' }}
       >
         <div
-          className="flex items-center justify-between px-5 py-3 border-b"
+          className="flex items-center justify-between gap-3 px-5 py-3 border-b flex-wrap"
           style={{ borderColor: 'var(--color-border)' }}
         >
           <div className="flex items-center gap-2">
             <TrendingUp size={14} style={{ color: 'var(--color-accent)' }} />
             <h2 className="text-sm font-semibold">Top Markets</h2>
+            <span className="text-[11px]" style={{ color: 'var(--color-text-muted)' }}>
+              ({markets.length} of top {marketLimit})
+            </span>
           </div>
-          <button
-            onClick={() => refetch()}
-            className="p-1.5 rounded hover:bg-white/5 transition-colors"
-            style={{ color: 'var(--color-text-muted)' }}
-            title="Refresh"
-          >
-            <RefreshCw size={13} className={marketsLoading ? 'animate-spin' : ''} />
-          </button>
+
+          <div className="flex items-center gap-2 flex-wrap">
+            <input
+              type="text"
+              value={marketSearch}
+              onChange={(e) => setMarketSearch(e.target.value)}
+              placeholder="Search question or slug…"
+              className="text-xs rounded px-2 py-1 w-44"
+              style={{ background: 'var(--color-surface)', border: '1px solid var(--color-border)' }}
+            />
+            <div className="flex items-center gap-1 text-[11px]">
+              <span style={{ color: 'var(--color-text-muted)' }}>Sort</span>
+              <button
+                onClick={() => setMarketSort('liquidity')}
+                className="px-1.5 py-0.5 rounded"
+                style={{
+                  background: marketSort === 'liquidity' ? 'var(--color-accent)' : 'transparent',
+                  color: marketSort === 'liquidity' ? '#000' : 'var(--color-text-muted)',
+                  border: '1px solid var(--color-border)',
+                }}
+              >liquidity</button>
+              <button
+                onClick={() => setMarketSort('volume')}
+                className="px-1.5 py-0.5 rounded"
+                style={{
+                  background: marketSort === 'volume' ? 'var(--color-accent)' : 'transparent',
+                  color: marketSort === 'volume' ? '#000' : 'var(--color-text-muted)',
+                  border: '1px solid var(--color-border)',
+                }}
+              >volume</button>
+            </div>
+            <select
+              value={marketLimit}
+              onChange={(e) => setMarketLimit(Number(e.target.value) as 30 | 50 | 100)}
+              className="text-[11px] rounded px-1.5 py-0.5"
+              style={{ background: 'var(--color-surface)', border: '1px solid var(--color-border)' }}
+            >
+              <option value={30}>Top 30</option>
+              <option value={50}>Top 50</option>
+              <option value={100}>Top 100</option>
+            </select>
+            <button
+              onClick={() => refetch()}
+              className="p-1.5 rounded hover:bg-white/5 transition-colors"
+              style={{ color: 'var(--color-text-muted)' }}
+              title="Refresh"
+            >
+              <RefreshCw size={13} className={marketsLoading ? 'animate-spin' : ''} />
+            </button>
+          </div>
         </div>
 
         {marketsLoading ? (
@@ -735,14 +807,45 @@ export default function Polymarket() {
         ) : (
           <div className="divide-y" style={{ borderColor: 'var(--color-border)' }}>
             {markets.map((m, i) => (
-              <div key={m.id ?? i} className="px-5 py-4">
+              <div key={m.id ?? m.slug ?? i} className="px-5 py-4">
                 <div className="flex items-start justify-between gap-4 mb-2">
-                  <p className="text-sm leading-snug flex-1">{m.question ?? 'Unknown market'}</p>
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm leading-snug">{m.question ?? 'Unknown market'}</p>
+                    {m.slug && (
+                      <div className="flex items-center gap-1.5 mt-1">
+                        <code
+                          className="text-[10px] font-mono px-1.5 py-0.5 rounded truncate max-w-full"
+                          style={{ background: 'rgba(255,255,255,0.04)', color: 'var(--color-text-muted)' }}
+                          title={m.slug}
+                        >
+                          {m.slug}
+                        </code>
+                        <button
+                          onClick={() => copySlug(m.slug!)}
+                          className="p-0.5 rounded hover:bg-white/10 shrink-0"
+                          title="Copy slug"
+                          style={{ color: copiedSlug === m.slug ? 'var(--color-accent)' : 'var(--color-text-muted)' }}
+                        >
+                          {copiedSlug === m.slug ? <CheckCircle size={11} /> : <Copy size={11} />}
+                        </button>
+                        <a
+                          href={`https://polymarket.com/event/${m.slug}`}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="text-[10px] underline shrink-0"
+                          style={{ color: 'var(--color-text-muted)' }}
+                        >
+                          open
+                        </a>
+                      </div>
+                    )}
+                  </div>
                   <div className="flex items-center gap-3 flex-shrink-0">
                     {m.yes_token_id && <Sparkline tokenId={m.yes_token_id} />}
-                    <span className="text-xs" style={{ color: 'var(--color-text-muted)' }}>
-                      {formatVolume(m.volume)}
-                    </span>
+                    <div className="text-right text-[10px]" style={{ color: 'var(--color-text-muted)' }}>
+                      <div>vol {formatVolume(m.volume)}</div>
+                      <div>liq {formatVolume(m.liquidity)}</div>
+                    </div>
                   </div>
                 </div>
                 <PriceBar yes={m.yes_price ?? 0.5} />

@@ -423,9 +423,19 @@ pub async fn run_fv_momentum_loop(
     set_runner_status(&store, &id, "running");
 
     let poll = Duration::from_secs(fvm_cfg.fv.poll_secs);
+    let series_id = config.series_id.clone();
 
     loop {
-        for slug in &markets.clone() {
+        let active_markets: Vec<String> = if series_id.as_deref().map(|s| !s.is_empty()).unwrap_or(false) {
+            crate::engines::series_helper::engine_market_slugs(
+                series_id.as_deref(),
+                &config.symbol,
+            )
+            .await
+        } else {
+            markets.clone()
+        };
+        for slug in &active_markets {
             let market = match polymarket_trader::markets::get_market(slug).await {
                 Ok(m)  => m,
                 Err(e) => { warn!("[fv_momentum] resolve {slug}: {e}"); continue; }

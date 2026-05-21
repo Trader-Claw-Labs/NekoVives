@@ -709,6 +709,44 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         tracing::info!("Restarted {} strategy runner(s) from disk", restarted);
     }
 
+    // ── Copy-trading: spawn Polymarket fill dispatch loop ─────────────
+    //
+    // The dispatch loop subscribes to leader-fill events from the
+    // PolymarketTracker, runs them through the dispatcher (mirror /
+    // consensus / shadow-discovery), and logs the outcome.  Without it,
+    // wallets added to the watchlist or discovery candidate list are never
+    // polled and the user sees no activity.  See [crates/copy-orchestrator/src/lib.rs:spawn_polymarket_dispatch_loop].
+    if config.copy_trading.enabled {
+        let mirror_globally = config.copy_trading.default_mode == "mirror";
+        copy_orchestrator::spawn_polymarket_dispatch_loop(
+            Arc::clone(&state.copy_orchestrator),
+            config.copy_trading.consensus_window_seconds,
+            config.copy_trading.consensus_n,
+            config.copy_trading.consensus_m,
+            mirror_globally,
+        );
+
+        // Seed the tracker with current watchlist + candidate addresses so
+        // wallets added before the gateway restarted are immediately polled.
+        let orchestrator = Arc::clone(&state.copy_orchestrator);
+        let indexer = Arc::clone(&state.wallet_indexer);
+        tokio::spawn(async move {
+            let candidates = match indexer.list_candidates(None).await {
+                Ok(c) => c
+                    .into_iter()
+                    .filter(|c| c.venue.eq_ignore_ascii_case("polymarket"))
+                    .filter(|c| c.status == "candidate" || c.status == "graduated")
+                    .map(|c| c.wallet_address)
+                    .collect::<Vec<_>>(),
+                Err(e) => {
+                    tracing::warn!("Failed to seed tracker from indexer: {e}");
+                    Vec::new()
+                }
+            };
+            orchestrator.refresh_polymarket_tracker(candidates).await;
+        });
+    }
+
     // Config PUT needs larger body limit (1MB)
     let config_put_router = Router::new()
         .route("/api/config", put(api::handle_api_config_put))

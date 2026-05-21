@@ -1316,6 +1316,10 @@ pub struct PolymarketsQuery {
     pub max_days: Option<u32>,
     /// Gamma API tag_slug filter (e.g. "crypto")
     pub tag: Option<String>,
+    /// "volume" (default) ranks by 24h notional traded; "liquidity" ranks by
+    /// current order-book depth and surfaces the deepest markets even when
+    /// they closed yesterday — handy for engines that need fillable books.
+    pub sort: Option<String>,
 }
 
 /// GET /api/polymarket/markets — fetch markets from Gamma API, optional ?q=search
@@ -1340,7 +1344,16 @@ pub async fn handle_api_polymarket_markets(
     match polymarket_trader::markets::list_markets(filter).await {
         Ok(markets) => {
             let mut sorted = markets;
-            sorted.sort_by(|a, b| b.volume.partial_cmp(&a.volume).unwrap_or(std::cmp::Ordering::Equal));
+            let by_liq = matches!(params.sort.as_deref(), Some("liquidity"));
+            if by_liq {
+                sorted.sort_by(|a, b| {
+                    b.liquidity.partial_cmp(&a.liquidity).unwrap_or(std::cmp::Ordering::Equal)
+                });
+            } else {
+                sorted.sort_by(|a, b| {
+                    b.volume.partial_cmp(&a.volume).unwrap_or(std::cmp::Ordering::Equal)
+                });
+            }
             let top: Vec<_> = sorted.into_iter().take(limit).collect();
 
             // Fetch YES prices in parallel (best-effort — ignore failures)
@@ -4600,9 +4613,14 @@ pub async fn handle_api_backtest_polymarket_historical_status(
 #[derive(serde::Deserialize)]
 pub struct CreateRunnerBody {
     pub name: Option<String>,
+    #[serde(default)]
     pub script: String,
     pub market_type: String,
+    /// Comma-separated Polymarket slugs OR a CEX symbol. Optional when
+    /// `series_id` is provided — engines resolve the slug per-window then.
+    #[serde(default)]
     pub symbol: String,
+    #[serde(default)]
     pub interval: String,
     pub mode: String,
     pub initial_balance: f64,
@@ -5466,8 +5484,11 @@ pub async fn handle_api_copy_leader_add(
         added_at: chrono::Utc::now().to_rfc3339(),
     };
 
-    let mut watchlist = state.copy_orchestrator.watchlist.lock().await;
-    watchlist.add(entry);
+    {
+        let mut watchlist = state.copy_orchestrator.watchlist.lock().await;
+        watchlist.add(entry);
+    }
+    refresh_polymarket_tracker(&state).await;
     Json(serde_json::json!({ "added": addr })).into_response()
 }
 
@@ -5521,8 +5542,10 @@ pub async fn handle_api_copy_leader_remove(
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
-    let mut watchlist = state.copy_orchestrator.watchlist.lock().await;
-    let removed = watchlist.remove(&addr).is_some();
+    let removed = {
+        let mut watchlist = state.copy_orchestrator.watchlist.lock().await;
+        watchlist.remove(&addr).is_some()
+    };
     if !removed {
         return (
             StatusCode::NOT_FOUND,
@@ -5530,6 +5553,7 @@ pub async fn handle_api_copy_leader_remove(
         )
             .into_response();
     }
+    refresh_polymarket_tracker(&state).await;
     Json(serde_json::json!({ "address": addr, "removed": true })).into_response()
 }
 
@@ -5539,6 +5563,28 @@ fn is_valid_evm_address(addr: &str) -> bool {
         return false;
     }
     addr[2..].chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Re-seed the Polymarket wallet tracker from the current watchlist + the
+/// SQLite candidate list.  Call this after any add/remove on either store so
+/// that the background poller picks up the change on its next tick.
+async fn refresh_polymarket_tracker(state: &AppState) {
+    let candidates = match state.wallet_indexer.list_candidates(None).await {
+        Ok(c) => c
+            .into_iter()
+            .filter(|c| c.venue.eq_ignore_ascii_case("polymarket"))
+            .filter(|c| c.status == "candidate" || c.status == "graduated")
+            .map(|c| c.wallet_address)
+            .collect::<Vec<_>>(),
+        Err(e) => {
+            tracing::warn!("[copy] tracker refresh: failed to list candidates: {e}");
+            Vec::new()
+        }
+    };
+    state
+        .copy_orchestrator
+        .refresh_polymarket_tracker(candidates)
+        .await;
 }
 
 /// Request body for adding a discovery candidate manually.
@@ -5570,7 +5616,10 @@ pub async fn handle_api_copy_discovery_add(
     }
     let score = req.discovery_score.unwrap_or(0.0);
     match state.wallet_indexer.add_candidate(&addr, &req.venue, score).await {
-        Ok(()) => Json(serde_json::json!({ "added": addr, "venue": req.venue, "discovery_score": score })).into_response(),
+        Ok(()) => {
+            refresh_polymarket_tracker(&state).await;
+            Json(serde_json::json!({ "added": addr, "venue": req.venue, "discovery_score": score })).into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": e.to_string() })),
@@ -5671,6 +5720,7 @@ pub async fn handle_api_copy_discovery_graduate(
         tracing::warn!("Failed to update candidate status for {}: {}", addr, e);
     }
 
+    refresh_polymarket_tracker(&state).await;
     Json(serde_json::json!({ "graduated": addr })).into_response()
 }
 
@@ -5685,7 +5735,10 @@ pub async fn handle_api_copy_discovery_blacklist(
     }
 
     match state.wallet_indexer.set_candidate_status(&addr, "blacklisted").await {
-        Ok(true) => Json(serde_json::json!({ "blacklisted": addr })).into_response(),
+        Ok(true) => {
+            refresh_polymarket_tracker(&state).await;
+            Json(serde_json::json!({ "blacklisted": addr })).into_response()
+        }
         Ok(false) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": "Candidate not found" })),
@@ -5709,7 +5762,10 @@ pub async fn handle_api_copy_discovery_remove(
         return e.into_response();
     }
     match state.wallet_indexer.remove_candidate(&addr).await {
-        Ok(true) => Json(serde_json::json!({ "removed": addr })).into_response(),
+        Ok(true) => {
+            refresh_polymarket_tracker(&state).await;
+            Json(serde_json::json!({ "removed": addr })).into_response()
+        }
         Ok(false) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": "Candidate not found" })),

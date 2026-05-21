@@ -522,24 +522,41 @@ function fmtVol(v: number): string {
 }
 
 interface EngineMarketPickerProps {
-  selected: string[]          // array of slugs
+  /// Array of fixed slugs (used when seriesId is empty).
+  selected: string[]
   onChange: (slugs: string[]) => void
+  /// Built-in recurring series (BTC 5m, ETH 5m, …) loaded from /api/backtest/series.
+  series: MarketSeries[]
+  /// Currently selected recurring-series id (empty = fixed-slug mode).
+  seriesId: string
+  onSeriesChange: (seriesId: string) => void
 }
 
-function EngineMarketPicker({ selected, onChange }: EngineMarketPickerProps) {
+function EngineMarketPicker({
+  selected,
+  onChange,
+  series,
+  seriesId,
+  onSeriesChange,
+}: EngineMarketPickerProps) {
+  const mode: 'series' | 'slugs' = seriesId ? 'series' : 'slugs'
   const [search, setSearch] = useState('')
   const [open, setOpen] = useState(false)
+  const [sortMode, setSortMode] = useState<'volume' | 'liquidity'>('volume')
   const containerRef = useRef<HTMLDivElement>(null)
 
   const { data, isFetching } = useQuery<{ markets: PolyMarket[] }>({
-    queryKey: ['engine-markets', search],
+    queryKey: ['engine-markets', search, sortMode],
     queryFn: () => {
       const q = search.trim()
-      const base = '/api/polymarket/markets?min_days=1&max_days=180&limit=80'
+      // sort=liquidity returns Top-N by deepest book; sort=volume keeps the
+      // legacy "trending volume" ranking that surfaces 1–180 day events.
+      const base = `/api/polymarket/markets?min_days=${sortMode === 'liquidity' ? 0 : 1}&max_days=180&limit=80&sort=${sortMode}`
       return apiFetch(q ? `${base}&q=${encodeURIComponent(q)}` : `${base}&tag=crypto`)
     },
     staleTime: 5 * 60 * 1000,
     placeholderData: prev => prev,
+    enabled: mode === 'slugs',
   })
 
   const markets = data?.markets ?? []
@@ -559,76 +576,163 @@ function EngineMarketPicker({ selected, onChange }: EngineMarketPickerProps) {
     onChange(selected.includes(slug) ? selected.filter(s => s !== slug) : [...selected, slug])
   }
 
+  function pickMode(m: 'series' | 'slugs') {
+    if (m === 'series') {
+      // Default to BTC 5m if available; clears fixed slug list.
+      const first = series.find(s => s.id === 'btc_5m') ?? series[0]
+      onSeriesChange(first?.id ?? 'btc_5m')
+      onChange([])
+    } else {
+      onSeriesChange('')
+    }
+  }
+
   return (
     <div ref={containerRef} className="relative">
       <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>
-        Market Slugs <span style={{ color: 'var(--color-danger)' }}>*</span>
+        Market <span style={{ color: 'var(--color-danger)' }}>*</span>
       </label>
 
-      {/* Selected chips */}
-      {selected.length > 0 && (
-        <div className="flex flex-wrap gap-1 mb-1.5">
-          {selected.map(slug => (
-            <span
-              key={slug}
-              className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-mono"
-              style={{ background: 'var(--color-accent)', color: '#000' }}
-            >
-              {slug}
-              <button onClick={() => toggle(slug)} className="opacity-60 hover:opacity-100">×</button>
-            </span>
-          ))}
-        </div>
-      )}
-
-      {/* Search input */}
-      <div className="relative">
-        <input
-          className="w-full rounded px-3 py-2 text-sm pr-8"
-          placeholder={selected.length ? 'Add another market…' : 'Search crypto markets or paste slug…'}
-          value={search}
-          onChange={e => { setSearch(e.target.value); setOpen(true) }}
-          onFocus={() => setOpen(true)}
-          autoFocus
-        />
-        {isFetching && (
-          <span className="absolute right-2 top-1/2 -translate-y-1/2 text-[10px]"
-            style={{ color: 'var(--color-text-muted)' }}>…</span>
-        )}
+      {/* Mode toggle */}
+      <div className="flex gap-1 mb-2 text-[11px]">
+        <button
+          type="button"
+          onClick={() => pickMode('series')}
+          className="px-2 py-1 rounded"
+          style={{
+            background: mode === 'series' ? 'var(--color-accent)' : 'var(--color-surface)',
+            color: mode === 'series' ? '#000' : 'var(--color-text-muted)',
+            border: '1px solid var(--color-border)',
+          }}
+        >
+          Recurring series (BTC/ETH 5m…)
+        </button>
+        <button
+          type="button"
+          onClick={() => pickMode('slugs')}
+          className="px-2 py-1 rounded"
+          style={{
+            background: mode === 'slugs' ? 'var(--color-accent)' : 'var(--color-surface)',
+            color: mode === 'slugs' ? '#000' : 'var(--color-text-muted)',
+            border: '1px solid var(--color-border)',
+          }}
+        >
+          Fixed market slugs
+        </button>
       </div>
 
-      {/* Dropdown */}
-      {open && markets.length > 0 && (
-        <div
-          className="absolute z-50 w-full mt-1 rounded border overflow-auto max-h-56 shadow-lg"
-          style={{ background: 'var(--color-surface)', borderColor: 'var(--color-border)' }}
-        >
-          {markets.map(m => {
-            const isSelected = selected.includes(m.slug)
-            return (
-              <button
-                key={m.slug}
-                onClick={() => { toggle(m.slug); setSearch('') }}
-                className="w-full text-left px-3 py-2 text-xs flex items-start justify-between gap-2 hover:bg-white/5"
-                style={isSelected ? { background: 'rgba(0,200,100,0.08)' } : undefined}
-              >
-                <span className="flex-1 min-w-0">
-                  <span className="block truncate" style={{ color: 'var(--color-text)' }}>{m.question}</span>
-                  <span className="font-mono text-[10px]" style={{ color: 'var(--color-text-muted)' }}>{m.slug}</span>
-                </span>
-                <span className="shrink-0 text-right text-[10px]" style={{ color: 'var(--color-text-muted)' }}>
-                  <span className="block">{daysUntil(m.end_date)}</span>
-                  <span className="block">{fmtVol(m.volume)}</span>
-                </span>
-              </button>
-            )
-          })}
+      {mode === 'series' ? (
+        <div>
+          <select
+            className="w-full rounded px-3 py-2 text-sm"
+            value={seriesId}
+            onChange={e => onSeriesChange(e.target.value)}
+          >
+            {series.length === 0 && <option value="">(loading…)</option>}
+            {series.map(s => (
+              <option key={s.id} value={s.id}>{s.label}</option>
+            ))}
+          </select>
+          <p className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
+            El runner resolverá automáticamente el slug de la ventana actual cada poll
+            (BTC 5m → <span className="font-mono">btc-updown-5m-&lt;timestamp&gt;</span>).
+          </p>
         </div>
-      )}
+      ) : (
+        <>
+          {/* Selected chips */}
+          {selected.length > 0 && (
+            <div className="flex flex-wrap gap-1 mb-1.5">
+              {selected.map(slug => (
+                <span
+                  key={slug}
+                  className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-mono"
+                  style={{ background: 'var(--color-accent)', color: '#000' }}
+                >
+                  {slug}
+                  <button onClick={() => toggle(slug)} className="opacity-60 hover:opacity-100">×</button>
+                </span>
+              ))}
+            </div>
+          )}
 
-      <p className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
-        Mercados activos de Polymarket (1–180 días). Puedes seleccionar varios para engines multi-mercado.
-      </p>
+          {/* Sort toggle */}
+          <div className="flex items-center gap-2 mb-1 text-[10px]">
+            <span style={{ color: 'var(--color-text-muted)' }}>Sort:</span>
+            <button
+              type="button"
+              onClick={() => setSortMode('volume')}
+              className="px-1.5 py-0.5 rounded"
+              style={{
+                background: sortMode === 'volume' ? 'var(--color-accent)' : 'transparent',
+                color: sortMode === 'volume' ? '#000' : 'var(--color-text-muted)',
+                border: '1px solid var(--color-border)',
+              }}
+            >volume</button>
+            <button
+              type="button"
+              onClick={() => setSortMode('liquidity')}
+              className="px-1.5 py-0.5 rounded"
+              style={{
+                background: sortMode === 'liquidity' ? 'var(--color-accent)' : 'transparent',
+                color: sortMode === 'liquidity' ? '#000' : 'var(--color-text-muted)',
+                border: '1px solid var(--color-border)',
+              }}
+            >top liquidity</button>
+          </div>
+
+          {/* Search input */}
+          <div className="relative">
+            <input
+              className="w-full rounded px-3 py-2 text-sm pr-8"
+              placeholder={selected.length ? 'Add another market…' : 'Search markets or paste slug…'}
+              value={search}
+              onChange={e => { setSearch(e.target.value); setOpen(true) }}
+              onFocus={() => setOpen(true)}
+              autoFocus
+            />
+            {isFetching && (
+              <span className="absolute right-2 top-1/2 -translate-y-1/2 text-[10px]"
+                style={{ color: 'var(--color-text-muted)' }}>…</span>
+            )}
+          </div>
+
+          {/* Dropdown */}
+          {open && markets.length > 0 && (
+            <div
+              className="absolute z-50 w-full mt-1 rounded border overflow-auto max-h-56 shadow-lg"
+              style={{ background: 'var(--color-surface)', borderColor: 'var(--color-border)' }}
+            >
+              {markets.map(m => {
+                const isSelected = selected.includes(m.slug)
+                return (
+                  <button
+                    key={m.slug}
+                    onClick={() => { toggle(m.slug); setSearch('') }}
+                    className="w-full text-left px-3 py-2 text-xs flex items-start justify-between gap-2 hover:bg-white/5"
+                    style={isSelected ? { background: 'rgba(0,200,100,0.08)' } : undefined}
+                  >
+                    <span className="flex-1 min-w-0">
+                      <span className="block truncate" style={{ color: 'var(--color-text)' }}>{m.question}</span>
+                      <span className="font-mono text-[10px]" style={{ color: 'var(--color-text-muted)' }}>{m.slug}</span>
+                    </span>
+                    <span className="shrink-0 text-right text-[10px]" style={{ color: 'var(--color-text-muted)' }}>
+                      <span className="block">{daysUntil(m.end_date)}</span>
+                      <span className="block">
+                        {sortMode === 'liquidity' ? `liq ${fmtVol(m.liquidity)}` : fmtVol(m.volume)}
+                      </span>
+                    </span>
+                  </button>
+                )
+              })}
+            </div>
+          )}
+
+          <p className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
+            Mercados activos de Polymarket. <b>Top liquidity</b> ordena por book depth y permite ventanas &lt; 1 día.
+          </p>
+        </>
+      )}
     </div>
   )
 }
@@ -914,6 +1018,14 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript, prefil
               <EngineMarketPicker
                 selected={form.symbol ? form.symbol.split(',').map(s => s.trim()).filter(Boolean) : []}
                 onChange={slugs => set('symbol', slugs.join(','))}
+                series={allSeries}
+                seriesId={form.series_id}
+                onSeriesChange={(sid) => {
+                  // When a recurring series is chosen, drop any pasted fixed
+                  // slugs and let the runner resolve the current window's
+                  // slug automatically each poll (see series_helper.rs).
+                  setForm(f => ({ ...f, series_id: sid, symbol: sid ? '' : f.symbol }))
+                }}
               />
               <div>
                 <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>Threshold / Edge</label>
@@ -1427,17 +1539,35 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript, prefil
         </div>
 
         <div className="p-4 border-t flex gap-2" style={{ borderColor: 'var(--color-border)' }}>
-          <button
-            onClick={() => mutation.mutate()}
-            disabled={
-              !form.script || !form.symbol || mutation.isPending ||
-              (form.mode === 'live' && form.market_type !== 'polymarket_binary' && form.market_type !== 'funding_arb')
-            }
-            className="flex-1 py-2 rounded text-sm font-medium disabled:opacity-50"
-            style={{ backgroundColor: 'var(--color-accent)', color: '#000' }}
-          >
-            {mutation.isPending ? 'Starting...' : form.mode === 'live' ? 'Start Live Strategy' : 'Start Dry Run'}
-          </button>
+          {(() => {
+            // For engine strategies the user can pick EITHER a fixed slug list
+            // (form.symbol) OR a recurring series (form.series_id) — the
+            // runner resolves the slug per-window in the latter case.  The
+            // legacy Rhai path still requires `form.script` + `form.symbol`.
+            const hasMarketTarget = isEngineKind
+              ? Boolean(form.symbol || form.series_id)
+              : Boolean(form.symbol)
+            const needsScript = !isEngineKind && !form.script
+            const liveMarketSupported =
+              form.mode !== 'live' ||
+              form.market_type === 'polymarket_binary' ||
+              form.market_type === 'funding_arb'
+            const disabled =
+              needsScript ||
+              !hasMarketTarget ||
+              mutation.isPending ||
+              !liveMarketSupported
+            return (
+              <button
+                onClick={() => mutation.mutate()}
+                disabled={disabled}
+                className="flex-1 py-2 rounded text-sm font-medium disabled:opacity-50"
+                style={{ backgroundColor: 'var(--color-accent)', color: '#000' }}
+              >
+                {mutation.isPending ? 'Starting...' : form.mode === 'live' ? 'Start Live Strategy' : 'Start Dry Run'}
+              </button>
+            )
+          })()}
           <button onClick={onClose} className="px-4 py-2 rounded text-sm border hover:bg-white/5"
             style={{ borderColor: 'var(--color-border)' }}>Cancel</button>
         </div>

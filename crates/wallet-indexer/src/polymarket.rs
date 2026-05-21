@@ -19,7 +19,7 @@ pub async fn fetch_leaderboard(
     limit: usize,
 ) -> Result<Vec<LeaderboardEntry>> {
     let url = format!(
-        "https://data.polymarket.com/leaderboard?limit={}",
+        "https://data-api.polymarket.com/leaderboard?limit={}",
         limit
     );
     let resp = client.get(&url).send().await?;
@@ -31,18 +31,28 @@ pub async fn fetch_leaderboard(
 }
 
 /// Fetch recent trades for a specific wallet.
+///
+/// Mirrors the live Polymarket Data API shape (https://data-api.polymarket.com/trades).
 #[derive(Debug, Deserialize)]
 pub struct TradeEntry {
-    #[serde(rename = "id")]
-    pub trade_id: String,
-    #[serde(rename = "takerSide")]
+    #[serde(rename = "proxyWallet", default)]
+    pub proxy_wallet: String,
+    #[serde(default)]
     pub side: String,
-    #[serde(rename = "marketSlug")]
+    #[serde(default)]
+    pub asset: String,
+    #[serde(rename = "conditionId", default)]
+    pub condition_id: Option<String>,
+    #[serde(default)]
+    pub size: f64,
+    #[serde(default)]
+    pub price: f64,
+    #[serde(default)]
+    pub timestamp: i64,
+    #[serde(rename = "slug", default)]
     pub market_slug: String,
-    pub size: String,
-    pub price: String,
-    #[serde(rename = "createdAt")]
-    pub created_at: String,
+    #[serde(rename = "transactionHash", default)]
+    pub transaction_hash: Option<String>,
 }
 
 pub async fn fetch_wallet_trades(
@@ -51,7 +61,7 @@ pub async fn fetch_wallet_trades(
     limit: usize,
 ) -> Result<Vec<TradeEntry>> {
     let url = format!(
-        "https://data.polymarket.com/trades?user={}&limit={}",
+        "https://data-api.polymarket.com/trades?user={}&limit={}",
         address, limit
     );
     let resp = client.get(&url).send().await?;

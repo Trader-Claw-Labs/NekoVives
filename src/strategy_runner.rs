@@ -2518,7 +2518,32 @@ async fn polymarket_runner_loop(
                                 // Update matching order with result and P&L
                                 for order in live_orders.iter_mut() {
                                     if order.window_ts == prev_window && !order.stop_loss_triggered {
-                                        let ep = order.entry_price.unwrap_or(0.5).max(0.001);
+                                        // Settle floor: 0.02. If entry_price is below
+                                        // this we treat the fill as suspect (CLOB feed
+                                        // returned 0 / market closed) and refuse to
+                                        // book the phantom payout. The trade is marked
+                                        // ERROR, PnL=0, and live_total_trades is
+                                        // already incremented above — KPIs stay honest.
+                                        let raw_ep = order.entry_price.unwrap_or(0.5);
+                                        if raw_ep < 0.02 {
+                                            tracing::warn!(
+                                                "[RUNNER {id}] Window {} settle: entry_price {:.4} below trust floor; marking ERROR with pnl=0",
+                                                prev_window, raw_ep
+                                            );
+                                            append_runner_log(
+                                                &store, &id,
+                                                &format!(
+                                                    "Window {}: entry_price {:.4} below trust floor — booked as ERROR (no phantom payout)",
+                                                    prev_window, raw_ep
+                                                ),
+                                            );
+                                            order.result = Some("ERROR".to_string());
+                                            order.pnl = Some(0.0);
+                                            // Don't count this as a win even if direction was right
+                                            if won { live_wins = live_wins.saturating_sub(1); }
+                                            continue;
+                                        }
+                                        let ep = raw_ep.max(0.02);
                                         order.result = Some(result.to_string());
                                         order.pnl = Some(if won {
                                             order.amount_usdc * (1.0 / ep - 1.0)
@@ -3295,6 +3320,26 @@ async fn execute_live_polymarket_signal(
     };
 
     let ep = if signal.starts_with("yes") { yes_token_price } else { no_token_price };
+
+    // Reject if either side of the book is zero. CLOB returning 0 means the
+    // price endpoint failed or the book was momentarily empty. Filling at
+    // limit_price=$0.01 (engine floor) and resolving as WIN would compute a
+    // ~100x phantom payout. Skip the window and wait for a real quote.
+    const MIN_VALID_PRICE: f64 = 0.02;
+    if yes_token_price < MIN_VALID_PRICE || no_token_price < MIN_VALID_PRICE {
+        tracing::warn!(
+            "[RUNNER {id}] Skipped: price feed unreliable (yes={:.4} no={:.4})",
+            yes_token_price, no_token_price
+        );
+        append_runner_log(
+            store, id,
+            &format!(
+                "Skipped: price feed unreliable (yes={:.4} no={:.4}); window {}",
+                yes_token_price, no_token_price, window_ts
+            ),
+        );
+        return (None, None);
+    }
 
     // Skip trade if entry price exceeds the configured maximum
     if let Some(max_ep) = config.max_entry_price {
