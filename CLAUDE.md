@@ -10,8 +10,10 @@ Full specifications are in: trader_agent_research.docx
 
 ## Live Strategies stats
 
-To generate new strategies, always read the strategy/BTC_UPDOWN_5M_FINDINGS.md file, it contains the stats & findings on Live Strategies.
-
+To generate new strategies, always read the files 
+strategy/BTC_UPDOWN_5M_FINDINGS.md 
+strategy/POLYMARKET_UPDOWN_5M_CROSS_ASSET.md
+it contains the stats & findings on Live Strategies & logic
 
 ## Build & Test
 ```bash
