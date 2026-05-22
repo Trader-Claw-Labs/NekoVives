@@ -7,6 +7,12 @@ Polymarket prediction markets.
 
 Full specifications are in: trader_agent_research.docx
 
+
+## Live Strategies stats
+
+To generate new strategies, always read the strategy/BTC_UPDOWN_5M_FINDINGS.md file, it contains the stats & findings on Live Strategies.
+
+
 ## Build & Test
 ```bash
 # Full build (embeds web/dist into binary)

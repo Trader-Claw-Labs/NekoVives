@@ -30,3 +30,5 @@ web/dist/
 web/node_modules/
 
 node_modules/
+strategy/
+strategy/claude_code_blueprint.md
