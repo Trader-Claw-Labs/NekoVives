@@ -3405,11 +3405,29 @@ pub struct LiveSignalResult {
     pub debug: std::collections::HashMap<String, f64>,
     /// Updated kv state after the call — persist across windows to carry avg_vol etc.
     pub kv_state: std::collections::HashMap<String, f64>,
+    /// Oracle comparison: Binance spot price at decision time (0 if not available).
+    pub binance_mark: f64,
+    /// Oracle comparison: Chainlink price at decision time (0 if not available).
+    pub chainlink_mark: f64,
+    /// Oracle lag in seconds: wall-clock age of the Chainlink price (0 if not configured).
+    pub oracle_lag_secs: f64,
+    /// Minutes before the window close at which this signal was evaluated.
+    /// 0 = evaluated at the last candle (minute 4 for a 5-min window).
+    /// 1 = evaluated one minute early (minute 3), 2 = two minutes early, etc.
+    pub minute_offset: i64,
 }
 
 /// Evaluate the live trading signal for the *current* (incomplete) window.
 /// Runs the Rhai script on the decision candle and returns "yes", "no", or "flat".
 /// This does NOT compute P&L — it only extracts the directional signal.
+///
+/// `oracle_data` is an optional tuple of `(binance_price, chainlink_price, oracle_lag_secs)`
+/// that is injected as `ctx.binance_mark`, `ctx.chainlink_mark`, `ctx.oracle_lag_secs`.
+/// Pass `None` if Binance/Chainlink feeds are not configured.
+///
+/// `minute_offset` is the number of minutes before the window close that this signal
+/// is being evaluated (0 = last candle / standard; 1 = one minute early, etc.).
+/// It is injected as `ctx.minute_offset`.
 pub fn run_polymarket_live_signal(
     script_content: &str,
     candles: Vec<Candle>,
@@ -3420,6 +3438,8 @@ pub fn run_polymarket_live_signal(
     price_mode: &str,
     kv_seed: &std::collections::HashMap<String, f64>,
     prev_yes_token_price: f64,
+    oracle_data: Option<(f64, f64, f64)>, // (binance_price, chainlink_price, oracle_lag_secs)
+    minute_offset: i64,
 ) -> anyhow::Result<LiveSignalResult> {
     use rhai::{Engine, Scope};
     use std::sync::{Arc, Mutex};
@@ -3686,6 +3706,16 @@ pub fn run_polymarket_live_signal(
     ctx_map.insert("token_price_prev".into(), rhai::Dynamic::from(prev_yes_token_price));
     ctx_map.insert("token_drift".into(),      rhai::Dynamic::from(token_drift));
 
+    // ── Oracle comparison fields (Idea 3) ─────────────────────────────────────
+    let (binance_mark, chainlink_mark, oracle_lag_secs) = oracle_data.unwrap_or((0.0, 0.0, 0.0));
+    ctx_map.insert("binance_mark".into(),     rhai::Dynamic::from(binance_mark));
+    ctx_map.insert("chainlink_mark".into(),   rhai::Dynamic::from(chainlink_mark));
+    ctx_map.insert("oracle_lag_secs".into(),  rhai::Dynamic::from(oracle_lag_secs));
+
+    // ── Early-fire minute offset (Idea 2) ─────────────────────────────────────
+    // 0 = standard (last candle); N = N minutes before window close.
+    ctx_map.insert("minute_offset".into(),    rhai::Dynamic::from(minute_offset));
+
     let mut scope = Scope::new();
     engine.call_fn::<()>(&mut scope, &ast, "on_candle", (rhai::Dynamic::from_map(ctx_map),))
         .map_err(|e| anyhow::anyhow!("Script runtime error: {e}"))?;
@@ -3706,6 +3736,10 @@ pub fn run_polymarket_live_signal(
         size: s.size,
         debug,
         kv_state: kv_final,
+        binance_mark,
+        chainlink_mark,
+        oracle_lag_secs,
+        minute_offset,
     })
 }
 
@@ -4022,6 +4056,10 @@ pub fn run_polymarket_bt_signal_preview(
             size: s.size,
             debug: s.kv.clone(),
             kv_state: s.kv.clone(),
+            binance_mark: 0.0,
+            chainlink_mark: 0.0,
+            oracle_lag_secs: 0.0,
+            minute_offset: 0,
         });
     };
 
@@ -4087,6 +4125,11 @@ pub fn run_polymarket_bt_signal_preview(
     };
     ctx_map.insert("token_price_prev".into(), rhai::Dynamic::from(prev_yes_token_price));
     ctx_map.insert("token_drift".into(),      rhai::Dynamic::from(token_drift));
+    // BT preview doesn't have live oracle data — zero out so scripts handle gracefully.
+    ctx_map.insert("binance_mark".into(),     rhai::Dynamic::from(0.0_f64));
+    ctx_map.insert("chainlink_mark".into(),   rhai::Dynamic::from(0.0_f64));
+    ctx_map.insert("oracle_lag_secs".into(),  rhai::Dynamic::from(0.0_f64));
+    ctx_map.insert("minute_offset".into(),    rhai::Dynamic::from(0i64));
 
     let mut scope = Scope::new();
     engine.call_fn::<()>(&mut scope, &ast, "on_candle", (rhai::Dynamic::from_map(ctx_map),))
@@ -4105,6 +4148,10 @@ pub fn run_polymarket_bt_signal_preview(
         size: s.size,
         debug: s.kv.clone(),
         kv_state: s.kv.clone(),
+        binance_mark: 0.0,
+        chainlink_mark: 0.0,
+        oracle_lag_secs: 0.0,
+        minute_offset: 0,
     })
 }
 

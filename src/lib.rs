@@ -69,6 +69,7 @@ pub(crate) mod skills;
 pub mod engines;
 pub mod live_feed;
 pub mod strategy_runner;
+pub mod tick_recorder;
 pub mod tools;
 pub(crate) mod tunnel;
 pub(crate) mod util;

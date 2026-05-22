@@ -82,6 +82,7 @@ Key routes:
 ## Backtesting Engine
 - `<workspace>/scripts/`  — .rhai strategy files (agent-written + bundled defaults)
 - `<workspace>/data/`     — candle cache (JSON, auto-fetched from Binance or Polymarket CLOB)
+- `<workspace>/data/ticks/<slug>/` — 1-Hz Polymarket tick JSONL (see Tick Recorder below)
 - Engine: `src/tools/backtest.rs` — real Rhai execution, no stubs
 - Data sources: Binance REST (`/api/v3/klines`, paginated) for crypto; Polymarket CLOB
   (`/prices-history`) for prediction markets
@@ -94,6 +95,16 @@ Key routes:
 |------|-----|-------------|
 | `polymarket_4min.rhai` | ctx-based | Polymarket 4-min strategy v2: RSI + 4-candle momentum + volume (3-of-4), ATR stop/take |
 | `strategy_reference.rhai` | array-based (reference) | Original strategy.rhai — documents the 2-param `on_candle(candle_data, capital)` pattern |
+| `polymarket_btc_updown_5m_drift_v2_combo.rhai` | ctx-based | BTC 5m UP/DOWN: §1 mid-band drift fade (setups 1-8), §2 extreme zones with RSI+win_pct |
+| `polymarket_eth_updown_5m_btcproxy.rhai` | ctx-based | ETH 5m: BTC-proxy drift, setups 2(0.5×)/4/6/8/9 |
+| `polymarket_sol_updown_5m_favorite_fade.rhai` | ctx-based | SOL 5m: NO-only, setups 2/4/8/10(1.5×) — bear-tilted asset |
+| `polymarket_xrp_updown_5m_lowvol_drift.rhai` | ctx-based | XRP 5m: low-vol drift, setups 1/4/8/10 all at 0.7× stake |
+| `polymarket_doge_updown_5m_meanrev.rhai` | ctx-based | DOGE 5m: mean-reversion, 2× thresholds, spike-fade setups 11/12 |
+| `polymarket_hype_updown_5m_thinmkt.rhai` | ctx-based | HYPE 5m: drift-only (no Binance candles), setup 7 unique to HYPE |
+| `polymarket_all_updown_5m_adaptive.rhai` | ctx-based | Universal ATR-adaptive, NO-side-only (setup 9 YES disabled after dry-run) |
+
+Cross-asset analysis and setup-by-setup edge tables:
+`src/tools/scripts/POLYMARKET_UPDOWN_5M_CROSS_ASSET.md`
 
 ### Rhai script APIs
 
@@ -119,6 +130,21 @@ fn on_candle(ctx) {
 
     // Key-value persistence across candles
     ctx.set("key", val)   ctx.get("key", default)
+
+    // Polymarket binary market fields (live signal only)
+    ctx.token_price       // YES token price P4 (0-1), real CLOB ask
+    ctx.token_price_prev  // YES token price P3 (60s before), or 0 if unavailable
+    ctx.token_drift       // P4 - P3 drift signal
+    ctx.window_open       // underlying asset price at window open
+    ctx.window_minutes    // window duration in minutes (5 for UP/DOWN 5m)
+
+    // Oracle comparison (live signal only; 0 in backtests)
+    ctx.binance_mark      // Binance spot price via miniTicker WS at decision time
+    ctx.chainlink_mark    // Chainlink oracle price (0 if not configured)
+    ctx.oracle_lag_secs   // seconds since Chainlink last updated
+
+    // Early-fire support (live signal only)
+    ctx.minute_offset     // 0 = standard decision; N = N minutes before window close
 }
 ```
 
@@ -129,6 +155,48 @@ balance, position`.
 **Note on 2-param array API** (`on_candle(candle_data, capital)`): Rhai functions cannot
 access module-level `let` variables (bot_state, config), so this pattern cannot run as-is
 in the backtester. Use the ctx-based API for new strategies.
+
+## Live Strategy Runner (Polymarket)
+`src/strategy_runner.rs` → `polymarket_runner_loop()`
+
+Key fields in `RunnerConfig`:
+- `chainlink_endpoint_url` — optional Chainlink REST endpoint for oracle comparison
+- `chainlink_api_key`      — optional Bearer token for Chainlink endpoint
+- `chainlink_interval_secs` — Chainlink poll interval (default 5s)
+- `early_fire_secs`         — fire order N seconds before decision candle closes (0 = disabled)
+
+At each decision candle the runner injects into ctx:
+- `ctx.binance_mark` from Binance miniTicker WS (live, ~1s updates)
+- `ctx.chainlink_mark` / `ctx.oracle_lag_secs` from configured Chainlink endpoint
+- `ctx.minute_offset` = 0 for standard fire; >0 for early-fire
+
+Every resolved trade is auto-recorded to the dynamic asset selector
+(`src/tools/asset_selector.rs`) for rolling WR tracking.
+
+## Tick Recorder (`src/tick_recorder.rs`)
+1-Hz recorder for Polymarket binary markets. Writes JSONL rows to
+`<workspace>/data/ticks/<slug>/<YYYY-MM-DD>.jsonl` (7-day retention).
+
+Each row: `ts_ms, yes_bid, yes_ask, no_bid, no_ask, yes_mid, binance_price,
+chainlink_price, oracle_lag_ms, window_ts, window_secs_left`
+
+Global registry accessible from any tool. Tool: `tick_recorder`
+- `action=start slug=btc_5m condition_id=0x... binance_symbol=BTCUSDT`
+- `action=stop  slug=btc_5m`
+- `action=status`
+- `action=read  slug=btc_5m last_n=60`
+
+## Dynamic Asset Selector (`src/tools/asset_selector.rs`)
+Rolling 30-day win-rate tracker per (script × symbol). Automatically records
+every resolved live trade. Capital allocation weights are proportional to rolling WR.
+
+Storage: `<workspace>/data/asset_selector_stats.json`
+
+Tool: `asset_selector`
+- `action=summary`          — performance table for all tracked pairs
+- `action=weights`          — normalized allocation weights (min_trades=10)
+- `action=record`           — manually record a trade outcome
+- `action=clear`            — reset all history
 
 ## Pairing / Auth
 Gateway requires pairing when `require_pairing = true` in config.
