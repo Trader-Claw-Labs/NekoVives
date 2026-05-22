@@ -82,6 +82,7 @@ mod skillforge;
 mod skills;
 mod live_feed;
 mod strategy_runner;
+mod tick_recorder;
 mod tools;
 mod tunnel;
 mod util;

@@ -1986,11 +1986,15 @@ async fn polymarket_runner_loop(
         });
 
     // ─ Binance 1s miniTicker — updates displayed price every second
+    // Also kept in a shared atomic for oracle-comparison injection into ctx.
+    let latest_binance_price = std::sync::Arc::new(std::sync::RwLock::new(0f64));
+    let lbp_write = latest_binance_price.clone();
     let mut ticker_rx = crate::live_feed::spawn_binance_ticker_feed(binance_sym.clone());
     let store_for_ticker = store.clone();
     let id_for_ticker = id.clone();
     tokio::spawn(async move {
         while let Some(price) = ticker_rx.recv().await {
+            *lbp_write.write().unwrap() = price;
             let mut map = store_for_ticker.runners.lock().unwrap();
             if let Some(r) = map.get_mut(&id_for_ticker) {
                 if let Some(ref mut result) = r.result {
@@ -2536,6 +2540,23 @@ async fn polymarket_runner_loop(
                                     &store, &id,
                                     &format!("Window {}: {} | Position {} → {}", prev_window, outcome, pos, result),
                                 );
+
+                                // ── Auto-record to dynamic asset selector ──────────────────
+                                // Compute rough P&L for the asset selector (use order if available)
+                                let sel_pnl = live_orders.iter()
+                                    .find(|o| o.window_ts == prev_window && !o.stop_loss_triggered)
+                                    .and_then(|o| o.pnl)
+                                    .unwrap_or(if won { 1.0 } else { -1.0 });
+                                let script_name = config.script
+                                    .rsplit('/').next().unwrap_or(&config.script).to_string();
+                                let ws_for_sel = workspace_dir.clone();
+                                let sym_for_sel = config.symbol.clone();
+                                tokio::spawn(async move {
+                                    crate::tools::asset_selector::record_trade(
+                                        &ws_for_sel, &script_name, &sym_for_sel,
+                                        prev_window, won, sel_pnl,
+                                    ).await;
+                                });
                             }
                         }
 
@@ -2729,6 +2750,40 @@ async fn polymarket_runner_loop(
             } else {
                 0.0
             };
+            // ── Build oracle comparison data for ctx injection ────────────────
+            let binance_now = *latest_binance_price.read().unwrap();
+            let (chainlink_now, oracle_lag_secs) = if let Some(ref cl) = chainlink_price {
+                let cl_val = *cl.read().await;
+                let lag = if cl_val.is_some() && binance_now > 0.0 {
+                    // Estimate lag as the configured poll interval (worst-case staleness)
+                    config.chainlink_interval_secs as f64
+                } else {
+                    0.0
+                };
+                (cl_val.unwrap_or(0.0), lag)
+            } else {
+                (0.0, 0.0)
+            };
+            let oracle_data = if binance_now > 0.0 {
+                Some((binance_now, chainlink_now, oracle_lag_secs))
+            } else {
+                None
+            };
+            // minute_offset: 0 = standard decision candle; >0 = early fire (minutes before window close)
+            let cur_signal_minute_offset: i64 = if early_fired {
+                // Fired early: offset = how many minutes before the last candle
+                (window_minutes as i64) - 1 - decision_minute
+            } else {
+                0
+            };
+            if binance_now > 0.0 || chainlink_now > 0.0 {
+                append_runner_log(
+                    &store, &id,
+                    &format!("Oracle: binance=${:.2} chainlink=${:.2} lag={:.0}s offset={}m",
+                        binance_now, chainlink_now, oracle_lag_secs, cur_signal_minute_offset),
+                );
+            }
+
             let live_result = match crate::tools::backtest::run_polymarket_live_signal(
                 &script_content,
                 buffer.iter().cloned().collect(),
@@ -2739,6 +2794,8 @@ async fn polymarket_runner_loop(
                 price_mode,
                 &live_kv_state,
                 drift_prev,
+                oracle_data,
+                cur_signal_minute_offset,
             ) {
                 Ok(res) => res,
                 Err(e) => {
@@ -2749,6 +2806,10 @@ async fn polymarket_runner_loop(
                         size: 0.0,
                         debug: std::collections::HashMap::new(),
                         kv_state: std::collections::HashMap::new(),
+                        binance_mark: 0.0,
+                        chainlink_mark: 0.0,
+                        oracle_lag_secs: 0.0,
+                        minute_offset: 0,
                     }
                 }
             };

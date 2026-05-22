@@ -87,3 +87,69 @@ cp src/tools/scripts/polymarket_sol_updown_5m_favorite_fade.rhai \
 All six scripts are bundled in the binary (see `DEFAULT_SCRIPTS` in
 `src/tools/backtest.rs`) and will appear automatically in the dashboard
 strategy picker after `cargo build`.
+
+## 6. Implemented improvements (2026-05-21)
+
+### Idea B — Disabled YES side on ALL adaptive
+`polymarket_all_updown_5m_adaptive.rhai` setup 9 removed.
+Dry-run data showed 628 bets at 10.8% WR across SOL/ETH/DOGE (−$1,500+).
+The script is now NO-token-only. Setup 9 code remains commented out so it
+can be re-enabled after the 1Hz tick data produces a recalibrated threshold.
+
+### Idea 1 — 1Hz Tick Recorder (`src/tick_recorder.rs`)
+Records every second: Polymarket YES/NO bid/ask + mid-price, Binance spot
+price (miniTicker WebSocket), optional Chainlink oracle price, oracle lag,
+window_ts, window_secs_left. Data written to JSONL (daily rotation, 7-day
+retention) under `<workspace>/data/ticks/<slug>/<YYYY-MM-DD>.jsonl`.
+
+Tool: `tick_recorder` with actions `start | stop | status | read`.
+
+Example:
+```
+tick_recorder action=start slug=btc_5m condition_id=0x... binance_symbol=BTCUSDT
+tick_recorder action=read  slug=btc_5m last_n=60
+tick_recorder action=stop  slug=btc_5m
+```
+
+### Idea 3 — Binance WebSocket + Chainlink oracle in ctx (`src/live_feed.rs`)
+Already implemented feeds, now exposed in the Rhai decision context:
+- `ctx.binance_mark`     — live Binance spot price at decision time
+- `ctx.chainlink_mark`   — Chainlink oracle price (0 if not configured)
+- `ctx.oracle_lag_secs`  — seconds since Chainlink last updated
+
+Configure in `live_strategies.json`:
+```json
+"chainlink_endpoint_url": "https://your-chainlink-rest-url",
+"chainlink_api_key": "optional-bearer-token",
+"chainlink_interval_secs": 1
+```
+
+### Idea A — Dynamic asset selector (`src/tools/asset_selector.rs`)
+Rolling 30-day win-rate tracker per (script × symbol). Auto-records every
+resolved trade. Weights are proportional to rolling WR.
+
+Tool: `asset_selector` with actions `record | weights | summary | clear`.
+
+Example:
+```
+asset_selector action=summary
+asset_selector action=weights min_trades=10
+```
+
+### Idea 2 — `ctx.minute_offset` (early-fire support)
+`ctx.minute_offset` is now injected in every live signal call:
+- `0` = evaluated at the standard decision candle (minute 4 for 5m window)
+- `1` = evaluated 1 minute early (minute 3)
+- `N` = evaluated N minutes before window close
+
+Scripts can use this to apply tighter conditions when firing early:
+```rhai
+// Only allow strong signal when firing early
+let min_drift = if ctx.minute_offset > 0 { 0.08 } else { 0.05 };
+if dft >= min_drift { ctx.sell(1.0); }
+```
+
+Configure early fire in the runner config:
+```json
+"early_fire_secs": 30
+```

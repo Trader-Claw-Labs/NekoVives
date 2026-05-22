@@ -53,6 +53,8 @@ pub mod hardware_memory_read;
 pub mod http_request;
 pub mod image_info;
 pub mod live_strategies;
+pub mod tick_recorder_tool;
+pub mod asset_selector;
 pub mod memory_forget;
 pub mod memory_recall;
 pub mod memory_store;
@@ -95,6 +97,8 @@ pub use hardware_memory_read::HardwareMemoryReadTool;
 pub use http_request::HttpRequestTool;
 pub use image_info::ImageInfoTool;
 pub use live_strategies::LiveStrategiesListTool;
+pub use tick_recorder_tool::TickRecorderTool;
+pub use asset_selector::AssetSelectorTool;
 pub use memory_forget::MemoryForgetTool;
 pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
@@ -250,6 +254,8 @@ pub fn all_tools_with_runtime(
         Arc::new(BacktestListScriptsTool::new(workspace_dir.to_path_buf())),
         Arc::new(BacktestRunTool::new(workspace_dir.to_path_buf())),
         Arc::new(LiveStrategiesListTool::new(workspace_dir.to_path_buf())),
+        Arc::new(TickRecorderTool { workspace_dir: workspace_dir.to_path_buf() }),
+        Arc::new(AssetSelectorTool { workspace_dir: workspace_dir.to_path_buf() }),
         Arc::new(MarketScanTool),
         Arc::new(PolymarketScanTool),
         Arc::new(PolymarketBalanceTool { config: config.clone() }),

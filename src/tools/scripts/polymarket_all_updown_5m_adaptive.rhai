@@ -23,13 +23,17 @@
 //   Setup 2  — P4 0.50-0.68 + drift >= 0.05 → sell NO
 //                only when atr_pct < 0.08 (skips DOGE / high-vol regimes
 //                where mid-band positive-drift fades fail)
-//   Setup 9  — P4 0.05-0.18 + win_pct > -band + RSI < 44 → buy YES
-//                ATR-scaled win_pct band
 //   Setup 10 — P4 0.82-0.95 + win_pct <  band + RSI > 56 → sell NO
 //                ATR-scaled win_pct band
 //
 // REMOVED globally (negative ROI on ≥3 of 6):
 //   Setups 1, 3, 5, 6, 7  (over-fit to BTC microstructure or HYPE-only).
+//
+// DISABLED — Setup 9 (YES side):
+//   Setup 9  — P4 0.05-0.18 + win_pct > -band + RSI < 44 → buy YES
+//   Dry-run data: 628 bets, 10.8% WR across SOL/ETH/DOGE/BNB → -$1,500+
+//   The model mis-estimates YES token prices in extreme zones vs real CLOB ask.
+//   This script is now NO-side-only (all bets sell NO tokens).
 
 fn on_candle(ctx) {
     if ctx.open_positions > 0 { return; }
@@ -100,14 +104,17 @@ fn on_candle(ctx) {
     ctx.set("debug_win_pct", win_pct);
     ctx.set("debug_rsi", rsi);
 
-    // Setup 9 — deep cheap YES underdog continuation
-    if p4 >= 0.05 && p4 <= 0.18 {
-        if win_pct > -band && rsi < 44.0 {
-            ctx.set("debug_setup", 9.0);
-            ctx.buy(1.0);
-            return;
-        }
-    }
+    // Setup 9 — DISABLED: YES underdog (628 bets, 10.8% WR in dry-run → net loss).
+    // Real CLOB ask prices in extreme zones are much higher than model estimates.
+    // Uncomment only after collecting 1Hz tick data to re-calibrate the YES threshold.
+    //
+    // if p4 >= 0.05 && p4 <= 0.18 {
+    //     if win_pct > -band && rsi < 44.0 {
+    //         ctx.set("debug_setup", 9.0);
+    //         ctx.buy(1.0);
+    //         return;
+    //     }
+    // }
 
     // Setup 10 — deep expensive YES → favorite fade
     if p4 >= 0.82 && p4 <= 0.95 {
