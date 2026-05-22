@@ -480,7 +480,7 @@ pub async fn run_arb_binary_loop(
             .filter(|s| !s.is_empty())
             .collect()
     };
-    let arb_cfg = ArbBinaryConfig {
+    let arb_cfg_base = ArbBinaryConfig {
         markets:           initial_markets,
         min_edge_pct:      config.threshold.unwrap_or(0.005),
         max_position_usd:  config.initial_balance * config.live_sizing_value.max(0.01),
@@ -489,6 +489,10 @@ pub async fn run_arb_binary_loop(
         poll_secs:         60,
         max_concurrent:    5,
     };
+    let arb_cfg = crate::tools::engine_backtest::merge_params(
+        arb_cfg_base,
+        config.engine_params.as_ref(),
+    );
 
     let mode = match config.mode.as_str() {
         "live" => ExecutionMode::Live,

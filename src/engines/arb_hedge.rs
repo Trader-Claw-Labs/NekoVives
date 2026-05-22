@@ -501,12 +501,16 @@ pub async fn run_arb_hedge_loop(
     let markets: Vec<String> = config.symbol.split(',')
         .map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
 
-    let arb_cfg = ArbHedgeConfig {
+    let arb_cfg_base = ArbHedgeConfig {
         markets:          markets.clone(),
         min_arb_edge:     config.threshold.unwrap_or(0.03),
         max_position_usd: config.initial_balance * config.live_sizing_value.max(0.05),
         ..Default::default()
     };
+    let arb_cfg = crate::tools::engine_backtest::merge_params(
+        arb_cfg_base,
+        config.engine_params.as_ref(),
+    );
 
     let mode = match config.mode.as_str() { "live" => ExecutionMode::Live, _ => ExecutionMode::DryRun };
     let mut engine    = ArbHedgeEngine::new(arb_cfg.clone());

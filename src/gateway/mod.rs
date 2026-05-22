@@ -900,6 +900,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/copy/sizing", patch(api::handle_api_copy_patch_sizing))
         .route("/api/copy/score/{addr}", get(api::handle_api_copy_score))
         .route("/api/copy/leaders/{addr}/trades", get(api::handle_api_copy_leader_trades))
+        .route("/api/copy/tracker/activity", get(api::handle_api_copy_tracker_activity))
         // ── Hyperliquid ──
         .route(
             "/api/health/hyperliquid",

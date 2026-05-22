@@ -44,11 +44,26 @@ interface MirrorPosition {
   opened_at: string
 }
 
+interface TrackerActivity {
+  timestamp: string
+  venue: string
+  leader: string
+  side: string
+  slug: string
+  price: number
+  notional: number
+  market_id: string | null
+  leader_fill_id: string
+  result: string
+  in_watchlist: boolean
+  wallet_score: number | null
+}
+
 // ── Components ────────────────────────────────────────────────────────
 
 export default function CopyTrading() {
   const queryClient = useQueryClient()
-  const [activeTab, setActiveTab] = useState<'leaders' | 'positions' | 'history' | 'consensus'>('leaders')
+  const [activeTab, setActiveTab] = useState<'leaders' | 'positions' | 'history' | 'consensus' | 'activity'>('leaders')
   const [showAdd, setShowAdd] = useState(false)
   const [editing, setEditing] = useState<string | null>(null)
   const [editSize, setEditSize] = useState('')
@@ -99,6 +114,13 @@ export default function CopyTrading() {
   const { data: capitalData } = useQuery({
     queryKey: ['copy-capital'],
     queryFn: () => apiFetch<{ capital_usd: number }>('/api/copy/capital'),
+  })
+
+  const { data: activityData } = useQuery({
+    queryKey: ['copy-tracker-activity'],
+    queryFn: () => apiFetch<{ activity: TrackerActivity[] }>('/api/copy/tracker/activity'),
+    enabled: activeTab === 'activity',
+    refetchInterval: 5_000,
   })
 
   const { data: scoreData } = useQuery({
@@ -295,6 +317,7 @@ export default function CopyTrading() {
           { id: 'positions', label: 'Mirror Positions' },
           { id: 'history', label: 'Closed Positions' },
           { id: 'consensus', label: 'Consensus' },
+          { id: 'activity', label: 'Tracker Activity' },
         ] as const).map((tab) => (
           <button
             key={tab.id}
@@ -876,6 +899,63 @@ export default function CopyTrading() {
           )}
         </div>
       )}
+      {/* Tracker Activity Tab */}
+      {activeTab === 'activity' && (
+        <div>
+          <p className="text-xs mb-3" style={{ color: 'var(--color-text-muted)' }}>
+            Live feed of every Polymarket fill the tracker observes for any wallet you have added (Leaders + Discovery candidates). Refreshes every 5 s.
+          </p>
+          {(activityData?.activity ?? []).length === 0 ? (
+            <div className="rounded-xl border p-8 text-center" style={{ backgroundColor: 'var(--color-surface)', borderColor: 'var(--color-border)' }}>
+              <Activity size={32} className="mx-auto mb-3" style={{ color: 'var(--color-text-muted)' }} />
+              <p className="text-sm font-medium mb-1" style={{ color: 'var(--color-text)' }}>No tracker activity yet</p>
+              <p className="text-xs" style={{ color: 'var(--color-text-muted)' }}>
+                Either no fills have happened on the wallets you are watching, or the tracker has not started polling. Check the gateway logs for <code>[PolymarketTracker] polling loop started</code>.
+              </p>
+            </div>
+          ) : (
+            <div className="rounded-xl border overflow-hidden" style={{ backgroundColor: 'var(--color-surface)', borderColor: 'var(--color-border)' }}>
+              <table className="w-full text-xs">
+                <thead>
+                  <tr style={{ color: 'var(--color-text-muted)', backgroundColor: 'var(--color-base)' }}>
+                    <th className="text-left px-3 py-2">Time</th>
+                    <th className="text-left px-3 py-2">Leader</th>
+                    <th className="text-left px-3 py-2">Slug</th>
+                    <th className="text-left px-3 py-2">Side</th>
+                    <th className="text-right px-3 py-2">Notional</th>
+                    <th className="text-right px-3 py-2">Price</th>
+                    <th className="text-right px-3 py-2">Score</th>
+                    <th className="text-left px-3 py-2">Result</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {activityData!.activity.map((row) => {
+                    const dropped = row.result.startsWith('dropped:') || row.result === 'not_in_watchlist'
+                    const mirrored = row.result.startsWith('mirrored:') || row.result.startsWith('consensus:')
+                    return (
+                      <tr key={row.leader_fill_id} className="border-t" style={{ borderColor: 'var(--color-border)' }}>
+                        <td className="px-3 py-1.5 font-mono" style={{ color: 'var(--color-text-muted)' }}>{new Date(row.timestamp).toLocaleTimeString()}</td>
+                        <td className="px-3 py-1.5 font-mono" style={{ color: 'var(--color-text)' }} title={row.leader}>{row.leader.slice(0, 6)}…{row.leader.slice(-4)}</td>
+                        <td className="px-3 py-1.5 font-mono truncate max-w-[200px]" style={{ color: 'var(--color-text)' }} title={row.slug}>{row.slug}</td>
+                        <td className="px-3 py-1.5 font-semibold" style={{ color: row.side === 'buy' ? '#22c55e' : '#ef4444' }}>{row.side.toUpperCase()}</td>
+                        <td className="px-3 py-1.5 text-right font-mono" style={{ color: 'var(--color-text)' }}>${row.notional.toFixed(2)}</td>
+                        <td className="px-3 py-1.5 text-right font-mono" style={{ color: 'var(--color-text-muted)' }}>{row.price.toFixed(4)}</td>
+                        <td className="px-3 py-1.5 text-right font-mono" style={{ color: 'var(--color-text-muted)' }}>{row.wallet_score != null ? row.wallet_score.toFixed(1) : '—'}</td>
+                        <td className="px-3 py-1.5 font-mono"
+                            style={{ color: mirrored ? '#22c55e' : dropped ? '#ef4444' : 'var(--color-text-muted)' }}
+                            title={!row.in_watchlist ? 'Wallet is in Discovery — graduate it (or set wallet_score ≥ 65) to enable mirror/consensus.' : undefined}>
+                          {row.result}
+                        </td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Score Breakdown Modal */}
       {scoreAddr && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" onClick={() => setScoreAddr(null)}>

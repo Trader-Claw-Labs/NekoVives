@@ -146,6 +146,12 @@ pub struct RunnerConfig {
     /// continue to work unchanged because of the serde default.
     #[serde(default)]
     pub kind: Option<String>,
+    /// Per-engine tunable parameters (UI EngineParamsForm).  Merged over
+    /// each engine's defaults at runner start so the live loop honours the
+    /// edge / threshold / sizing knobs the user picked. JSON-shaped so we
+    /// don't couple this struct to engine-specific config types.
+    #[serde(default)]
+    pub engine_params: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

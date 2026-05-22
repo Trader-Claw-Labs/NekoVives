@@ -5055,6 +5055,7 @@ pub async fn handle_api_live_create(
         funding_poll_secs: body.funding_poll_secs.unwrap_or(60),
         fee_buffer_bps: body.fee_buffer_bps.unwrap_or(12.0),
         kind: body.kind,
+        engine_params: body.engine_params,
     };
 
     // Populate Binance credentials if provided (live mode only, never persisted)
@@ -5912,6 +5913,21 @@ pub async fn handle_api_copy_leader_trades(
         Ok(trades) => Json(serde_json::json!({ "trades": trades })).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
     }
+}
+
+/// GET /api/copy/tracker/activity — recent fills observed by the Polymarket
+/// tracker plus their dispatch outcome.  Surfaces Discovery activity so the
+/// user can confirm wallets are being polled even when the dispatcher drops
+/// the fill due to a low score / not-in-watchlist.
+pub async fn handle_api_copy_tracker_activity(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let entries = state.copy_orchestrator.recent_activity(200).await;
+    Json(serde_json::json!({ "activity": entries })).into_response()
 }
 
 // ── Hyperliquid ─────────────────────────────────────────────────

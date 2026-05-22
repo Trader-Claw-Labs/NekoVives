@@ -630,7 +630,7 @@ pub async fn run_minting_mm_loop(
 
     let id = config.id.clone();
 
-    let mm_cfg = MintingMmConfig {
+    let mm_cfg_base = MintingMmConfig {
         markets:       if config.symbol.is_empty() { vec![] } else { vec![config.symbol.clone()] },
         premium_cents: config.threshold.unwrap_or(0.02),
         max_cycle_usd: config.initial_balance * 0.20,
@@ -640,6 +640,10 @@ pub async fn run_minting_mm_loop(
         poll_secs:     30,
         collateral:    "usdc_e".to_string(),
     };
+    let mm_cfg = crate::tools::engine_backtest::merge_params(
+        mm_cfg_base,
+        config.engine_params.as_ref(),
+    );
 
     let mode = match config.mode.as_str() {
         "live" => ExecutionMode::Live,

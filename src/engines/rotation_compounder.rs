@@ -653,7 +653,7 @@ pub async fn run_rotation_compounder_loop(
         .filter(|s| !s.is_empty())
         .collect();
 
-    let rot_cfg = RotationConfig {
+    let rot_cfg_base = RotationConfig {
         markets:           markets.clone(),
         max_allocation_pct: config.live_sizing_value.max(0.10),
         switch_threshold:  config.threshold.unwrap_or(0.05),
@@ -662,6 +662,10 @@ pub async fn run_rotation_compounder_loop(
         poll_secs:         60,
         sim_days_to_close: 15.0,
     };
+    let rot_cfg = crate::tools::engine_backtest::merge_params(
+        rot_cfg_base,
+        config.engine_params.as_ref(),
+    );
 
     let mode = match config.mode.as_str() {
         "live" => ExecutionMode::Live,

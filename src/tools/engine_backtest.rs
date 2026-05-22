@@ -44,7 +44,7 @@ pub struct EngineBacktestParams<'a> {
 /// Helper: merge UI engine_params into a typed config by round-tripping through
 /// JSON. Fields present in `params` override fields in `base`; missing fields
 /// keep the base default.
-fn merge_params<T: serde::Serialize + serde::de::DeserializeOwned>(
+pub fn merge_params<T: serde::Serialize + serde::de::DeserializeOwned>(
     base: T,
     overrides: Option<&serde_json::Value>,
 ) -> T {

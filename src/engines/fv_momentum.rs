@@ -403,7 +403,7 @@ pub async fn run_fv_momentum_loop(
     let markets: Vec<String> = config.symbol.split(',')
         .map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
 
-    let fvm_cfg = FvMomentumConfig {
+    let fvm_cfg_base = FvMomentumConfig {
         fv: FairValueConfig {
             markets:          markets.clone(),
             edge_threshold:   config.threshold.unwrap_or(0.05),
@@ -412,6 +412,10 @@ pub async fn run_fv_momentum_loop(
         },
         ..Default::default()
     };
+    let fvm_cfg = crate::tools::engine_backtest::merge_params(
+        fvm_cfg_base,
+        config.engine_params.as_ref(),
+    );
 
     let mode = match config.mode.as_str() { "live" => ExecutionMode::Live, _ => ExecutionMode::DryRun };
     let mut engine    = FvMomentumEngine::new(fvm_cfg.clone());

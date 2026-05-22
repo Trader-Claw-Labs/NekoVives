@@ -456,12 +456,16 @@ pub async fn run_fair_value_loop(
     let markets: Vec<String> = config.symbol.split(',')
         .map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
 
-    let fv_cfg = FairValueConfig {
+    let fv_cfg_base = FairValueConfig {
         markets:          markets.clone(),
         edge_threshold:   config.threshold.unwrap_or(0.05),
         max_position_usd: config.initial_balance * config.live_sizing_value.max(0.05),
         ..Default::default()
     };
+    let fv_cfg = crate::tools::engine_backtest::merge_params(
+        fv_cfg_base,
+        config.engine_params.as_ref(),
+    );
 
     let mode = match config.mode.as_str() { "live" => ExecutionMode::Live, _ => ExecutionMode::DryRun };
     let mut engine    = FairValueEngine::new(fv_cfg.clone());

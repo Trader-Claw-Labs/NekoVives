@@ -4,6 +4,23 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch, apiPost, apiDelete, apiPatch } from '../hooks/useApi'
 import { type MarketSeries, POLY_BINARY_PRESETS } from '../hooks/useBacktestState'
 import EngineParamsForm, { defaultEngineParams } from '../components/EngineParamsForm'
+
+const ENGINE_KIND_LABELS: Record<string, string> = {
+  arb_binary: 'Arb Binary',
+  fair_value: 'Fair Value',
+  fv_momentum: 'FV + Momentum',
+  rotation_compounder: 'Rotation Compounder',
+  arb_hedge: 'Arb + Hedge Overlay',
+  minting_mm: 'Minting MM',
+}
+
+function strategyDisplayLabel(config: { kind?: string; script?: string }): string {
+  const kind = config.kind ?? 'rhai_candle'
+  if (kind !== 'rhai_candle' && ENGINE_KIND_LABELS[kind]) {
+    return ENGINE_KIND_LABELS[kind]
+  }
+  return config.script?.split('/').pop() ?? kind
+}
 import { useProfitCelebration } from '../hooks/useProfitCelebration'
 import {
   Bot, Plus, Trash2, RefreshCw, X, StopCircle, RotateCcw,
@@ -850,6 +867,12 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript, prefil
         force_close_diff: form.force_close_diff != null ? form.force_close_diff / 100 : undefined,
         max_pos_pct: form.max_pos_pct != null ? form.max_pos_pct / 100 : undefined,
       }
+      // Engine kinds (arb_binary, fair_value, …) ignore the Rhai script and
+      // are driven directly by their typed config. Stripping `script` keeps
+      // RunnerCard from displaying a misleading filename.
+      if (form.kind && form.kind !== 'rhai_candle') {
+        delete payload.script
+      }
       // Remove undefined values so serde deserializes them as absent (triggering defaults)
       Object.keys(payload).forEach((k) => {
         if (payload[k] === undefined || payload[k] === '') delete payload[k]
@@ -928,7 +951,13 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript, prefil
 
   function onKindChange(newKind: string) {
     if (newKind === 'rhai_candle') {
-      setForm(f => ({ ...f, kind: newKind, symbol: 'BTCUSDT', engine_params: {} }))
+      setForm(f => ({
+        ...f,
+        kind: newKind,
+        symbol: 'BTCUSDT',
+        script: defaultScript ?? scripts[0]?.path ?? '',
+        engine_params: {},
+      }))
     } else {
       setForm(f => ({
         ...f,
@@ -937,6 +966,9 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript, prefil
         mode: 'paper',
         symbol: '',
         series_id: '',
+        // Engine kinds do NOT execute a Rhai script — clear it so it does
+        // not leak into the payload and confuse the runner-card display.
+        script: '',
         engine_params: defaultEngineParams(newKind),
       }))
     }
@@ -2071,7 +2103,7 @@ function RunnerCard({ runner, onStop, onRestart, onDelete, onToggleHidden, onUpd
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 mb-0.5">
             <span className={clsx('status-dot', statusDot(status.status))} />
-            <h3 className="text-sm font-semibold truncate">{config.name || config.script.split('/').pop()}</h3>
+            <h3 className="text-sm font-semibold truncate">{config.name || strategyDisplayLabel(config)}</h3>
             <span
               className="text-xs px-1.5 py-0.5 rounded flex-shrink-0"
               style={{ backgroundColor: 'var(--color-base)', color: statusColor(status.status) }}
@@ -2097,7 +2129,7 @@ function RunnerCard({ runner, onStop, onRestart, onDelete, onToggleHidden, onUpd
             )}
           </div>
           <p className="text-xs font-mono truncate" style={{ color: 'var(--color-text-muted)' }}>
-            {config.script.split('/').pop()} · {config.symbol} · {config.interval} · {config.mode === 'paper' ? 'dry run' : config.mode}
+            {strategyDisplayLabel(config)} · {config.series_id || config.symbol || '—'} · {config.interval || '—'} · {config.mode === 'paper' ? 'dry run' : config.mode}
             {config.market_type === 'funding_arb' ? ' · funding arb' : ''}
             {config.market_type === 'polymarket_binary' ? ` · ${config.resolution_logic ?? 'price_up'}${config.threshold !== undefined && config.threshold !== null ? `(${config.threshold})` : ''}` : ''}
             {config.market_type === 'polymarket_binary' && config.live_sizing_mode
