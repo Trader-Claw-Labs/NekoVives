@@ -137,6 +137,33 @@ impl LeaderActivityStream for PolymarketTracker {
     }
 }
 
+/// Deserialize a JSON value that may be either a number or a numeric string into f64.
+/// The Polymarket Data API sometimes returns `size` and `price` as JSON strings.
+fn deser_f64_or_str<'de, D>(d: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{Error, Unexpected, Visitor};
+    struct Visitor64;
+    impl<'de> Visitor<'de> for Visitor64 {
+        type Value = f64;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a float or a float-as-string")
+        }
+        fn visit_f64<E: Error>(self, v: f64) -> Result<f64, E> { Ok(v) }
+        fn visit_i64<E: Error>(self, v: i64) -> Result<f64, E> { Ok(v as f64) }
+        fn visit_u64<E: Error>(self, v: u64) -> Result<f64, E> { Ok(v as f64) }
+        fn visit_str<E: Error>(self, v: &str) -> Result<f64, E> {
+            v.trim().parse::<f64>().map_err(|_| {
+                E::invalid_value(Unexpected::Str(v), &"a numeric string")
+            })
+        }
+    }
+    d.deserialize_any(Visitor64)
+}
+
+fn default_f64() -> f64 { 0.0 }
+
 /// Trade record from Polymarket Data API (https://data-api.polymarket.com/trades).
 ///
 /// The public Data API does NOT expose a stable `id` field; we synthesise a
@@ -151,10 +178,10 @@ struct ApiTrade {
     asset: String,
     #[serde(rename = "conditionId", default)]
     condition_id: Option<String>,
-    /// Numeric size & price (Data API returns JSON numbers, not strings).
-    #[serde(default)]
+    /// Size and price can arrive as JSON numbers or numeric strings.
+    #[serde(deserialize_with = "deser_f64_or_str", default = "default_f64")]
     size: f64,
-    #[serde(default)]
+    #[serde(deserialize_with = "deser_f64_or_str", default = "default_f64")]
     price: f64,
     #[serde(default)]
     timestamp: i64,

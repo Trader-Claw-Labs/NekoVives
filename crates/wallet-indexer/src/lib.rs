@@ -230,6 +230,27 @@ impl Indexer {
         Ok(rows.next().transpose()?)
     }
 
+    /// Persist a fill observed by the tracker to the `wallet_trades` table.
+    /// Called from the dispatch loop for every new event so Fill Audit is populated.
+    pub async fn record_fill(
+        &self,
+        address: &str,
+        venue: &str,
+        market_id: Option<&str>,
+        side: &str,
+        notional: f64,
+        price: f64,
+        timestamp: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO wallet_trades (address, venue, market_id, side, notional, price, timestamp, pnl)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)",
+            params![address, venue, market_id, side, notional, price, timestamp],
+        )?;
+        Ok(())
+    }
+
     /// List recent trades for a specific address (newest first, limit 100).
     pub async fn get_leader_trades(&self, address: &str) -> Result<Vec<WalletTradeRecord>> {
         let conn = self.conn.lock().await;
