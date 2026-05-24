@@ -919,6 +919,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             "/api/copy/discovery/{addr}/blacklist",
             post(api::handle_api_copy_discovery_blacklist),
         )
+        .route(
+            "/api/copy/discovery/{addr}/stats",
+            get(api::handle_api_copy_discovery_stats),
+        )
         .route("/api/copy/positions", get(api::handle_api_copy_positions))
         .route("/api/copy/positions/history", get(api::handle_api_copy_positions_history))
         .route("/api/copy/capital", get(api::handle_api_copy_get_capital).post(api::handle_api_copy_set_capital))

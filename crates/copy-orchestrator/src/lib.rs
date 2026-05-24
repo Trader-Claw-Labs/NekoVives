@@ -181,6 +181,7 @@ pub fn spawn_polymarket_dispatch_loop(
                         event.notional,
                         event.price,
                         &event.timestamp.to_rfc3339(),
+                        &event.leader_fill_id,
                     ).await {
                         tracing::warn!("[Orchestrator] failed to persist fill for {}: {e}", event.leader);
                     }

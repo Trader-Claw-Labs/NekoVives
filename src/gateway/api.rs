@@ -5869,6 +5869,26 @@ pub async fn handle_api_copy_discovery_remove(
     }
 }
 
+/// GET /api/copy/discovery/{addr}/stats — tracked trade stats + recent fills for a candidate.
+/// Powers the Discovery page per-wallet detail panel.
+pub async fn handle_api_copy_discovery_stats(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(addr): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    match state.wallet_indexer.get_discovery_stats(&addr, 10).await {
+        Ok(stats) => Json(serde_json::to_value(&stats).unwrap_or_default()).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
 /// GET /api/copy/positions — list open mirror positions
 pub async fn handle_api_copy_positions(
     State(state): State<AppState>,

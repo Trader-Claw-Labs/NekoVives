@@ -231,7 +231,8 @@ impl Indexer {
     }
 
     /// Persist a fill observed by the tracker to the `wallet_trades` table.
-    /// Called from the dispatch loop for every new event so Fill Audit is populated.
+    /// `fill_id` is the dedup key (txhash:asset:timestamp); duplicate fill_ids
+    /// are silently ignored via the UNIQUE index so restarts don't re-insert.
     pub async fn record_fill(
         &self,
         address: &str,
@@ -241,14 +242,71 @@ impl Indexer {
         notional: f64,
         price: f64,
         timestamp: &str,
+        fill_id: &str,
     ) -> Result<()> {
         let conn = self.conn.lock().await;
         conn.execute(
-            "INSERT INTO wallet_trades (address, venue, market_id, side, notional, price, timestamp, pnl)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)",
-            params![address, venue, market_id, side, notional, price, timestamp],
+            "INSERT OR IGNORE INTO wallet_trades
+             (address, venue, market_id, side, notional, price, timestamp, pnl, fill_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8)",
+            params![address, venue, market_id, side, notional, price, timestamp, fill_id],
         )?;
         Ok(())
+    }
+
+    /// Stats + last N trades for the Discovery page.
+    pub async fn get_discovery_stats(
+        &self,
+        address: &str,
+        limit: usize,
+    ) -> Result<DiscoveryStats> {
+        let conn = self.conn.lock().await;
+        // Aggregate stats (only unique fills via fill_id; fall back to all rows for old data)
+        let stats: (i64, i64, f64, f64, Option<String>) = conn.query_row(
+            "SELECT
+               COUNT(*) as trade_count,
+               SUM(CASE WHEN side = 'buy'  THEN 1 ELSE 0 END) as buy_count,
+               AVG(notional)  as avg_notional,
+               SUM(notional)  as total_notional,
+               MAX(timestamp) as last_trade_at
+             FROM wallet_trades
+             WHERE address = ?1",
+            params![address],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2).unwrap_or(0.0), r.get(3).unwrap_or(0.0), r.get(4)?)),
+        ).unwrap_or((0, 0, 0.0, 0.0, None));
+
+        // Recent trades
+        let mut stmt = conn.prepare(
+            "SELECT side, notional, price, market_id, timestamp
+             FROM wallet_trades
+             WHERE address = ?1
+             ORDER BY timestamp DESC
+             LIMIT ?2",
+        )?;
+        let trades = stmt.query_map(params![address, limit as i64], |r| {
+            Ok(WalletTradeRecord {
+                address: address.to_string(),
+                venue: String::new(),
+                market_id: r.get(3)?,
+                side: r.get(0)?,
+                notional: r.get(1)?,
+                price: r.get(2)?,
+                timestamp: r.get(4)?,
+                pnl: None,
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect::<Vec<_>>();
+
+        Ok(DiscoveryStats {
+            trade_count: stats.0,
+            buy_count: stats.1,
+            sell_count: stats.0 - stats.1,
+            avg_notional: stats.2,
+            total_notional: stats.3,
+            last_trade_at: stats.4,
+            recent_trades: trades,
+        })
     }
 
     /// List recent trades for a specific address (newest first, limit 100).
@@ -298,6 +356,17 @@ pub struct WalletTradeRecord {
     pub price: Option<f64>,
     pub timestamp: Option<String>,
     pub pnl: Option<f64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DiscoveryStats {
+    pub trade_count: i64,
+    pub buy_count: i64,
+    pub sell_count: i64,
+    pub avg_notional: f64,
+    pub total_notional: f64,
+    pub last_trade_at: Option<String>,
+    pub recent_trades: Vec<WalletTradeRecord>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
