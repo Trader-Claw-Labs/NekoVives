@@ -124,6 +124,7 @@ impl Orchestrator {
 /// background task is running.
 pub fn spawn_polymarket_dispatch_loop(
     orchestrator: Arc<Orchestrator>,
+    indexer: Arc<wallet_indexer::Indexer>,
     consensus_window_secs: i64,
     consensus_n: usize,
     consensus_m: usize,
@@ -167,6 +168,22 @@ pub fn spawn_polymarket_dispatch_loop(
                         "[Orchestrator] dispatched fill leader={} slug={} result={:?} in_watchlist={}",
                         event.leader, event.symbol, result, in_watchlist
                     );
+                    // Persist the fill to wallet_trades so Fill Audit is populated.
+                    let side_str = match event.side {
+                        wallet_tracker::traits::Side::Buy => "buy",
+                        wallet_tracker::traits::Side::Sell => "sell",
+                    };
+                    if let Err(e) = indexer.record_fill(
+                        &event.leader,
+                        &event.venue.to_string(),
+                        event.market_id.as_deref(),
+                        side_str,
+                        event.notional,
+                        event.price,
+                        &event.timestamp.to_rfc3339(),
+                    ).await {
+                        tracing::warn!("[Orchestrator] failed to persist fill for {}: {e}", event.leader);
+                    }
                     orchestrator
                         .record_activity(activity_entry(&event, &result, in_watchlist, wallet_score))
                         .await;

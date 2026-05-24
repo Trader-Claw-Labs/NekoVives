@@ -720,6 +720,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         let mirror_globally = config.copy_trading.default_mode == "mirror";
         copy_orchestrator::spawn_polymarket_dispatch_loop(
             Arc::clone(&state.copy_orchestrator),
+            Arc::clone(&state.wallet_indexer),
             config.copy_trading.consensus_window_seconds,
             config.copy_trading.consensus_n,
             config.copy_trading.consensus_m,
@@ -728,22 +729,47 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
 
         // Seed the tracker with current watchlist + candidate addresses so
         // wallets added before the gateway restarted are immediately polled.
+        // Also restore graduated candidates into the in-memory watchlist so
+        // the dispatcher can mirror/consensus them correctly after a restart.
         let orchestrator = Arc::clone(&state.copy_orchestrator);
         let indexer = Arc::clone(&state.wallet_indexer);
         tokio::spawn(async move {
-            let candidates = match indexer.list_candidates(None).await {
+            let all_candidates = match indexer.list_candidates(None).await {
                 Ok(c) => c
                     .into_iter()
                     .filter(|c| c.venue.eq_ignore_ascii_case("polymarket"))
                     .filter(|c| c.status == "candidate" || c.status == "graduated")
-                    .map(|c| c.wallet_address)
                     .collect::<Vec<_>>(),
                 Err(e) => {
                     tracing::warn!("Failed to seed tracker from indexer: {e}");
                     Vec::new()
                 }
             };
-            orchestrator.refresh_polymarket_tracker(candidates).await;
+
+            // Restore graduated wallets into the in-memory watchlist so fills
+            // dispatched after a restart are correctly mirrored/consensused.
+            {
+                let mut watchlist = orchestrator.watchlist.lock().await;
+                for c in all_candidates.iter().filter(|c| c.status == "graduated") {
+                    watchlist.add(copy_orchestrator::watchlist::WatchlistEntry {
+                        address: c.wallet_address.clone(),
+                        venue: c.venue.clone(),
+                        category: None,
+                        mirror_enabled: false,
+                        consensus_weight: 1.0,
+                        size_factor: 0.5,
+                        wallet_score: c.discovery_score,
+                        added_at: c.discovered_at.clone(),
+                    });
+                }
+                tracing::info!(
+                    "[copy] restored {} graduated leader(s) into watchlist on startup",
+                    watchlist.list().len()
+                );
+            }
+
+            let addrs = all_candidates.into_iter().map(|c| c.wallet_address).collect::<Vec<_>>();
+            orchestrator.refresh_polymarket_tracker(addrs).await;
         });
     }
 
