@@ -32,19 +32,34 @@ const BTC_OPT_V15_BB_MEAN_REV_SCRIPT: &str = include_str!("scripts/btc_opt_v15_b
 const POLY_BTC_HYBRID_SCRIPT: &str = include_str!("scripts/polymarket_btc_updown_5m_hybrid.rhai");
 const POLY_BTC_HYBRID_V2_SCRIPT: &str = include_str!("scripts/polymarket_btc_updown_5m_hybrid_v2.rhai");
 
+// ── Polymarket UP/DOWN 5m per-asset scripts ───────────────────────────────────
+const POLY_ETH_BTCPROXY_SCRIPT:  &str = include_str!("scripts/polymarket_eth_updown_5m_btcproxy.rhai");
+const POLY_SOL_FAVORITE_SCRIPT:  &str = include_str!("scripts/polymarket_sol_updown_5m_favorite_fade.rhai");
+const POLY_XRP_LOWVOL_SCRIPT:    &str = include_str!("scripts/polymarket_xrp_updown_5m_lowvol_drift.rhai");
+const POLY_DOGE_MEANREV_SCRIPT:  &str = include_str!("scripts/polymarket_doge_updown_5m_meanrev.rhai");
+const POLY_HYPE_THINMKT_SCRIPT:  &str = include_str!("scripts/polymarket_hype_updown_5m_thinmkt.rhai");
+const POLY_ALL_ADAPTIVE_SCRIPT:  &str = include_str!("scripts/polymarket_all_updown_5m_adaptive.rhai");
+
 // ── Classic Indicators ────────────────────────────────────────────────────────
 const RSI_STRATEGY_SCRIPT: &str = include_str!("scripts/rsi_strategy.rhai");
 
 /// Write bundled default scripts to `<workspace>/scripts/` if they don't exist yet.
 /// Called by both backtest tools so the scripts are always available on first run.
 /// All bundled default scripts as (filename, content) pairs.
-const DEFAULT_SCRIPTS: [(&str, &str); 17] = [
+const DEFAULT_SCRIPTS: [(&str, &str); 23] = [
     // ── Polymarket binary ──────────────────────────────────────────────────────
     ("polymarket_btc_binary.rhai",              POLYMARKET_BTC_BINARY_SCRIPT),
     ("polymarket_5min.rhai",                    POLYMARKET_5MIN_SCRIPT),
     ("polymarket_btc_updown_5m_hybrid.rhai",    POLY_BTC_HYBRID_SCRIPT),
     ("polymarket_btc_updown_5m_hybrid_v2.rhai", POLY_BTC_HYBRID_V2_SCRIPT),
     ("weather_binary.rhai",                     WEATHER_BINARY_SCRIPT),
+    // ── Polymarket UP/DOWN 5m per-asset (calibrated to each asset's microstructure) ──
+    ("polymarket_eth_updown_5m_btcproxy.rhai",       POLY_ETH_BTCPROXY_SCRIPT),
+    ("polymarket_sol_updown_5m_favorite_fade.rhai",  POLY_SOL_FAVORITE_SCRIPT),
+    ("polymarket_xrp_updown_5m_lowvol_drift.rhai",   POLY_XRP_LOWVOL_SCRIPT),
+    ("polymarket_doge_updown_5m_meanrev.rhai",        POLY_DOGE_MEANREV_SCRIPT),
+    ("polymarket_hype_updown_5m_thinmkt.rhai",        POLY_HYPE_THINMKT_SCRIPT),
+    ("polymarket_all_updown_5m_adaptive.rhai",        POLY_ALL_ADAPTIVE_SCRIPT),
     // ── BTC OPT series ────────────────────────────────────────────────────────
     ("btc_opt_v15_bb_mean_rev.rhai",            BTC_OPT_V15_BB_MEAN_REV_SCRIPT),
     // ── Classic indicators ────────────────────────────────────────────────────
