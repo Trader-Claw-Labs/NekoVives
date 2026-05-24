@@ -4265,7 +4265,7 @@ pub fn list_tick_slugs(workspace_dir: &std::path::Path) -> Vec<(String, Vec<Stri
 
 /// Load ticks from JSONL files for a slug between from_date and to_date (inclusive).
 /// Dates are "YYYY-MM-DD" strings matching the file names.
-fn load_ticks_for_range(
+pub fn load_ticks_for_range(
     workspace_dir: &std::path::Path,
     slug: &str,
     from_date: &str,

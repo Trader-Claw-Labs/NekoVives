@@ -307,6 +307,7 @@ impl StrategyRunnerStore {
                     if was_running {
                         r.status.status = if r.config.auto_restart { "starting" } else { "stopped" }.to_string();
                     }
+                    backfill_engine_series_id(&mut r.config);
                     map.insert(r.config.id.clone(), r);
                 }
             }
@@ -561,14 +562,56 @@ impl StrategyRunnerStore {
     }
 }
 
+/// Repair runners persisted before the engine kinds learned to consume
+/// `series_id`. Older configs were saved with `kind=arb_binary, symbol="BTCUSDT",
+/// series_id=""`; the engine then tries to resolve "BTCUSDT" as a Polymarket
+/// slug every poll and logs `No active market with valid tokens for slug:
+/// BTCUSDT`. If the symbol matches a built-in series we backfill `series_id`
+/// in-place so the engine resolves the current window slug instead.
+fn backfill_engine_series_id(config: &mut RunnerConfig) {
+    let kind = config.kind.as_deref().unwrap_or("rhai_candle");
+    if kind == "rhai_candle" || kind.is_empty() {
+        return;
+    }
+    let needs_backfill = config
+        .series_id
+        .as_deref()
+        .map(str::is_empty)
+        .unwrap_or(true);
+    if !needs_backfill {
+        return;
+    }
+    // Match symbol → cadence to a builtin series (default to 5m when symbol
+    // alone is ambiguous, since that's the cadence every engine kind targets).
+    let symbol_upper = config.symbol.split(',').next().unwrap_or("").trim().to_uppercase();
+    if symbol_upper.is_empty() {
+        return;
+    }
+    let cadence = if config.interval.is_empty() { "5m" } else { config.interval.as_str() };
+    if let Some(series) = crate::tools::series::builtin_series()
+        .into_iter()
+        .find(|s| s.symbol.eq_ignore_ascii_case(&symbol_upper) && s.cadence == cadence)
+        .or_else(|| crate::tools::series::builtin_series()
+            .into_iter()
+            .find(|s| s.symbol.eq_ignore_ascii_case(&symbol_upper)))
+    {
+        tracing::info!(
+            "[RUNNER {}] Backfilled series_id='{}' for engine kind '{}' (symbol={}, was empty)",
+            config.id, series.id, kind, symbol_upper
+        );
+        config.series_id = Some(series.id);
+    }
+}
+
 // ── Start a new runner ───────────────────────────────────────────────────────
 
 pub fn start_runner(
     store: Arc<StrategyRunnerStore>,
-    config: RunnerConfig,
+    mut config: RunnerConfig,
     workspace_dir: PathBuf,
     config_path: Option<PathBuf>,
 ) -> StoredRunner {
+    backfill_engine_series_id(&mut config);
     let id = config.id.clone();
     let now = chrono::Utc::now().to_rfc3339();
 

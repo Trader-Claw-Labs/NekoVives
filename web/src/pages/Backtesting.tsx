@@ -7,9 +7,11 @@ import { apiFetch, apiPost, apiDelete } from '../hooks/useApi'
 import { useBacktestState, type BacktestConfig, type ProgressState, type MarketType, type BacktestResult, type TradeLog, type MarketSeries, POLY_BINARY_PRESETS } from '../hooks/useBacktestState'
 import { CreateModal } from './LiveStrategies'
 import EngineParamsForm, { defaultEngineParams } from '../components/EngineParamsForm'
+import EngineKindInfoCard from '../components/EngineKindInfoCard'
+import { ENGINE_KINDS, engineKindOptionLabel } from '../components/engineKindMeta'
 import {
   FlaskConical, Play, FileCode2, BarChart2, TrendingDown,
-  AlertCircle, ChevronDown, ChevronRight, RefreshCw, Trash2,
+  AlertCircle, AlertTriangle, ChevronDown, ChevronRight, RefreshCw, Trash2,
   Pencil, Save, X, FolderOpen, Activity, Check, Eye, Code2,
   Info, Zap, ArrowUpDown, ListChecks, Database, TrendingUp,
   Download, CloudDownload,
@@ -659,34 +661,62 @@ function ResultPanel({
       {/* Promote to live/paper */}
       {(onRunPaper || onRunLive) && (
         <div
-          className="flex items-center gap-3 pt-1"
-          style={{ borderTop: '1px solid var(--color-border)', paddingTop: '0.75rem' }}
+          className="pt-3 space-y-2"
+          style={{ borderTop: '1px solid var(--color-border)' }}
         >
-          <span className="text-xs" style={{ color: 'var(--color-text-muted)', marginRight: 'auto' }}>
-            Deploy this strategy:
-          </span>
-          {onRunPaper && (
-            <button
-              type="button"
-              onClick={onRunPaper}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-semibold"
-              style={{ backgroundColor: 'var(--color-surface-2)', border: '1px solid var(--color-border)', color: 'var(--color-text)' }}
-            >
-              <Play size={11} />
-              Run in Paper
-            </button>
-          )}
-          {onRunLive && (
-            <button
-              type="button"
-              onClick={onRunLive}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-semibold"
-              style={{ backgroundColor: 'var(--color-accent)', color: '#000' }}
-            >
-              <Zap size={11} />
-              Run Live
-            </button>
-          )}
+          <div
+            className="flex items-start gap-2 rounded px-3 py-2 text-[11px] leading-snug"
+            style={{
+              backgroundColor: 'rgba(245,158,11,0.08)',
+              border: '1px solid rgba(245,158,11,0.35)',
+              color: 'var(--color-text)',
+            }}
+          >
+            <AlertTriangle size={14} style={{ color: 'var(--color-warning)', flexShrink: 0, marginTop: 2 }} />
+            <div>
+              <span className="font-semibold">Backtest results don't guarantee live performance.</span>{' '}
+              Backtests assume mid-price fills with no slippage; the real CLOB has wider spreads, partial fills and depth limits.
+              <span className="block mt-1" style={{ color: 'var(--color-text-muted)' }}>
+                Always start in <span className="font-semibold" style={{ color: '#818cf8' }}>Dry Run</span> for at least a day before promoting to Live, and re-tune <span className="font-mono">max_position_usd</span> / <span className="font-mono">edge_threshold</span> for live conditions.
+              </span>
+            </div>
+          </div>
+          <div className="flex items-center gap-3">
+            <span className="text-xs" style={{ color: 'var(--color-text-muted)', marginRight: 'auto' }}>
+              Deploy this strategy:
+            </span>
+            {onRunPaper && (
+              <button
+                type="button"
+                onClick={onRunPaper}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-semibold"
+                style={{ backgroundColor: 'var(--color-accent)', color: '#000' }}
+                title="Recommended — run with simulated funds first."
+              >
+                <Play size={11} />
+                Run in Dry Run (recommended)
+              </button>
+            )}
+            {onRunLive && (
+              <button
+                type="button"
+                onClick={() => {
+                  const ok = window.confirm(
+                    'Promoting straight to Live will place real orders with real funds.\n\n' +
+                    'Recommended: run in Dry Run first for at least 24h to validate the strategy under live conditions.\n\n' +
+                    'Continue to Live anyway?'
+                  )
+                  if (ok) onRunLive()
+                }}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-semibold"
+                style={{ backgroundColor: 'var(--color-surface-2)', border: '1px solid var(--color-warning)', color: 'var(--color-warning)' }}
+                title="Skip Dry Run and place real orders."
+              >
+                <Zap size={11} />
+                Run Live
+              </button>
+            )}
+          </div>
         </div>
       )}
     </div>
@@ -1391,6 +1421,28 @@ export default function Backtesting() {
 
   const scripts = scriptsData?.scripts ?? []
 
+  // Start the CLOB tick recorder for a built-in series — auto-resolves the
+  // current condition_id from Polymarket so a non-expert never has to copy
+  // a hex condition_id by hand.
+  const startTickRecorderMutation = useMutation({
+    mutationFn: async (seriesId: string) => {
+      const series = allSeries.find(s => s.id === seriesId)
+      if (!series) throw new Error(`Unknown series '${seriesId}'`)
+      const active = await apiFetch<{ condition_id?: string }>(`/api/polymarket/active-token?series_id=${encodeURIComponent(seriesId)}`)
+      if (!active?.condition_id) throw new Error('No active Polymarket window for this series right now — try again in a minute.')
+      return apiPost('/api/tick-recorder/start', {
+        slug: seriesId,
+        condition_id: active.condition_id,
+        binance_symbol: series.symbol,
+      })
+    },
+    onSuccess: () => {
+      // Recorder is now writing JSONL — refresh the slug list so the picker
+      // shows it (will report 0 ticks until enough seconds elapse).
+      setTimeout(() => refetchTickSlugs(), 5_000)
+    },
+  })
+
   // Delete script mutation
   const deleteMutation = useMutation({
     mutationFn: (path: string) => {
@@ -1577,7 +1629,7 @@ export default function Backtesting() {
             Strategy Backtesting
           </h1>
           <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
-            Run .rhai strategies against historical data · powered by Rhai + Rayon
+            Run Rhai scripts or strategy-core engines against historical data
           </p>
         </div>
       </div>
@@ -1606,12 +1658,34 @@ export default function Backtesting() {
                 value={config.kind ?? 'rhai_candle'}
                 onChange={(e) => {
                   const k = e.target.value
+                  if (k === 'rhai_candle') {
+                    setFullConfig({
+                      ...config,
+                      kind: k,
+                      engine_params: undefined,
+                    })
+                    return
+                  }
+                  // Engine kinds backtest against a Polymarket recurring series.
+                  // Default to btc_5m (matches the live runner's default) and keep
+                  // symbol/interval in sync with the series so the synthetic
+                  // backtester fetches the right Binance candles for normalization.
+                  const seriesId = config.series_id ?? 'btc_5m'
+                  const series = allSeries.find(s => s.id === seriesId)
+                  const preset = POLY_BINARY_PRESETS.find(p => p.id === seriesId) ?? POLY_BINARY_PRESETS[0]
                   setFullConfig({
                     ...config,
                     kind: k,
                     market_type: 'polymarket_binary',
-                    engine_params: k !== 'rhai_candle' ? defaultEngineParams(k) : undefined,
-                    ...(k !== 'rhai_candle' ? { script: '' } : {}),
+                    engine_params: defaultEngineParams(k),
+                    script: '',
+                    series_id: series?.id ?? preset.id,
+                    poly_binary_preset: series?.id ?? preset.id,
+                    symbol: series?.symbol ?? preset.symbol,
+                    interval: series?.cadence ?? preset.defaultInterval,
+                    resolution_logic: series?.resolution_logic ?? 'price_up',
+                    threshold: series?.threshold ?? undefined,
+                    fee_pct: 1.5,
                   })
                 }}
                 className="w-full rounded px-2 py-2 text-sm"
@@ -1622,16 +1696,16 @@ export default function Backtesting() {
                 }}
               >
                 <option value="rhai_candle">Rhai Script (default)</option>
-                <option value="arb_binary">Arb Binary — synthetic arb YES+NO</option>
-                <option value="fair_value">Fair Value — FV edge estimator</option>
-                <option value="fv_momentum">FV + Momentum — AND-gate FV &amp; trend</option>
-                <option value="rotation_compounder">Rotation Compounder — Kelly scoring</option>
-                <option value="arb_hedge">Arb + Hedge Overlay — HYB-02</option>
-                <option value="minting_mm">Minting MM — CTF mint/merge cycle</option>
+                {ENGINE_KINDS.map((e) => (
+                  <option key={e.id} value={e.id}>{engineKindOptionLabel(e.id)}</option>
+                ))}
               </select>
+              {isEngineKind && <EngineKindInfoCard kind={config.kind ?? ''} />}
               {isEngineKind && (
-                <p className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
-                  Engine backtests use Binance BTCUSDT candles normalized to probability space. No Rhai script needed.
+                <p className="text-[10px] mt-1.5" style={{ color: 'var(--color-text-muted)' }}>
+                  {config.market_type === 'clob_1hz'
+                    ? 'Engine replays the recorded YES/NO order-book ticks for the selected slug — no Rhai script needed.'
+                    : 'Engine simulates the selected Polymarket series using Binance candles as the underlying signal — no Rhai script needed.'}
                 </p>
               )}
             </div>
@@ -1658,11 +1732,13 @@ export default function Backtesting() {
                     poly_binary_preset: preset.id,
                   })
                 } else if (newType === 'clob_1hz') {
+                  // CLOB 1 HZ supports both Rhai on_tick scripts AND
+                  // strategy-core engine kinds (arb_binary, fair_value, etc.)
+                  // — preserve whichever kind the user has selected.
                   setFullConfig({
                     ...config,
                     market_type: newType,
                     fee_pct: 1.5,
-                    kind: 'rhai_candle', // ensure rhai engine is selected
                   })
                   refetchTickSlugs()
                 } else {
@@ -1742,25 +1818,51 @@ export default function Backtesting() {
             </div>
           )}
 
-          {/* Markets + Threshold — shown for engine kinds */}
+          {/* Market Series + Threshold — shown for engine kinds. We reuse the
+              recurring-series picker (the same data the live runner uses) so
+              the backend can resolve `series_id` → current Polymarket window
+              slug. CLOB 1 HZ mode uses the recorded-tick slug picker rendered
+              below instead. */}
           {isEngineKind && (
             <>
-              <div className="col-span-2 lg:col-span-3">
-                <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>
-                  Market Slugs
-                </label>
-                <input
-                  value={config.symbol}
-                  onChange={(e) => set('symbol', e.target.value)}
-                  placeholder="btc-usd-winner,eth-usd-winner"
-                  className="w-full rounded px-3 py-2 text-sm font-mono"
-                  style={{
-                    backgroundColor: 'var(--color-surface-2)',
-                    border: '1px solid var(--color-border)',
-                    color: 'var(--color-text)',
-                  }}
-                />
-              </div>
+              {config.market_type !== 'clob_1hz' && (
+                <div className="col-span-2 lg:col-span-3">
+                  <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>
+                    Market Series
+                  </label>
+                  <select
+                    value={config.series_id ?? 'btc_5m'}
+                    onChange={(e) => {
+                      const sid = e.target.value
+                      const s = allSeries.find(x => x.id === sid)
+                      const preset = POLY_BINARY_PRESETS.find(p => p.id === sid) ?? POLY_BINARY_PRESETS[0]
+                      setFullConfig({
+                        ...config,
+                        series_id: sid,
+                        poly_binary_preset: sid,
+                        symbol: s?.symbol ?? preset.symbol,
+                        interval: s?.cadence ?? preset.defaultInterval,
+                        resolution_logic: s?.resolution_logic ?? 'price_up',
+                        threshold: s?.threshold ?? undefined,
+                      })
+                    }}
+                    className="w-full rounded px-2 py-2 text-sm"
+                    style={{
+                      backgroundColor: 'var(--color-surface-2)',
+                      border: '1px solid var(--color-border)',
+                      color: 'var(--color-text)',
+                    }}
+                  >
+                    {(allSeries.length ? allSeries : POLY_BINARY_PRESETS).map(s => (
+                      <option key={s.id} value={s.id}>{s.label}</option>
+                    ))}
+                  </select>
+                  <p className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
+                    Backtest resolves to the current Polymarket window slug
+                    (e.g. <span className="font-mono">btc-updown-5m-&lt;ts&gt;</span>) — same as the live runner.
+                  </p>
+                </div>
+              )}
               <div className="lg:col-span-2">
                 <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>
                   Threshold / Edge
@@ -1793,23 +1895,61 @@ export default function Backtesting() {
             </div>
           )}
 
-          {/* Symbol / Market selector — adapts to market type (hidden for engine kinds; they use Markets input above) */}
-          {!isEngineKind && config.market_type === 'clob_1hz' ? (
+          {/* Symbol / Market selector — adapts to market type. For CLOB 1 Hz we
+              always show the recorded-tick slug picker (Rhai on_tick scripts
+              and engine kinds both consume the same recorded ticks). */}
+          {config.market_type === 'clob_1hz' ? (
             <div className="col-span-2 lg:col-span-4">
               <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>Tick Slug</label>
               {tickSlugs.length === 0 ? (
                 <div
-                  className="rounded px-3 py-2 text-xs"
+                  className="rounded px-3 py-2 text-xs space-y-2"
                   style={{
                     backgroundColor: 'var(--color-surface-2)',
                     border: '1px solid var(--color-border)',
                     color: 'var(--color-text-muted)',
                   }}
                 >
-                  No tick data found — start the tick recorder first:
-                  <code className="ml-1 text-[10px]" style={{ color: 'var(--color-accent)' }}>
-                    tick_recorder action=start slug=btc_5m condition_id=0x…
-                  </code>
+                  <div>
+                    <span className="font-semibold" style={{ color: 'var(--color-text)' }}>No tick data yet.</span>{' '}
+                    CLOB 1 Hz backtests replay 1-second order-book snapshots from <code className="text-[10px]" style={{ color: 'var(--color-accent)' }}>data/ticks/&lt;slug&gt;/</code>.
+                    Pick a recurring series below and click <span className="font-semibold">Start recorder</span> — the dashboard will auto-resolve the current Polymarket window for you. Let it run for at least an hour before backtesting.
+                  </div>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <select
+                      defaultValue="btc_5m"
+                      id="clob1hz-bootstrap-series"
+                      className="rounded px-2 py-1 text-xs"
+                      style={{ backgroundColor: 'var(--color-base)', border: '1px solid var(--color-border)', color: 'var(--color-text)' }}
+                    >
+                      {(allSeries.length ? allSeries : POLY_BINARY_PRESETS).map(s => (
+                        <option key={s.id} value={s.id}>{s.label}</option>
+                      ))}
+                    </select>
+                    <button
+                      type="button"
+                      disabled={startTickRecorderMutation.isPending}
+                      onClick={() => {
+                        const sel = document.getElementById('clob1hz-bootstrap-series') as HTMLSelectElement | null
+                        const seriesId = sel?.value || 'btc_5m'
+                        startTickRecorderMutation.mutate(seriesId)
+                      }}
+                      className="px-3 py-1 rounded text-xs font-semibold disabled:opacity-50"
+                      style={{ backgroundColor: 'var(--color-accent)', color: '#000' }}
+                    >
+                      {startTickRecorderMutation.isPending ? 'Starting…' : 'Start recorder'}
+                    </button>
+                    {startTickRecorderMutation.isSuccess && (
+                      <span style={{ color: 'var(--color-accent)' }}>
+                        Recorder started — slug will appear here once enough ticks accumulate.
+                      </span>
+                    )}
+                    {startTickRecorderMutation.isError && (
+                      <span style={{ color: 'var(--color-danger)' }}>
+                        {(startTickRecorderMutation.error as Error)?.message ?? 'Failed to start recorder.'}
+                      </span>
+                    )}
+                  </div>
                 </div>
               ) : (
                 <select
@@ -1844,7 +1984,9 @@ export default function Backtesting() {
                 <p className="text-[10px] mt-1" style={{ color: 'var(--color-text-muted)' }}>
                   {tickSlugs.find(s => s.slug === config.clob_slug)!.tick_count.toLocaleString()} ticks recorded
                   · {tickSlugs.find(s => s.slug === config.clob_slug)!.dates.length} day(s)
-                  · Script must use <code style={{ color: 'var(--color-accent)' }}>on_tick(ctx)</code>
+                  {isEngineKind
+                    ? <> · Engine receives recorded YES/NO order book ticks</>
+                    : <> · Script must use <code style={{ color: 'var(--color-accent)' }}>on_tick(ctx)</code></>}
                 </p>
               )}
             </div>

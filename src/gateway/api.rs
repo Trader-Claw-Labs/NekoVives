@@ -3862,11 +3862,75 @@ pub async fn handle_api_backtest_run(
     // ── Strategy-core engine backtest (non-Rhai path) ─────────────────────────
     let engine_kind = body.kind.as_deref().unwrap_or("rhai_candle");
     if engine_kind != "rhai_candle" && !engine_kind.is_empty() {
-        let markets: Vec<String> = body.symbol
-            .split(',')
-            .map(|s| s.trim().to_string())
+        // CLOB 1 HZ tick replay: route engine kinds to the recorded-tick
+        // backtester so they get real Polymarket YES/NO order book data
+        // instead of synthetic candles.
+        if body.market_type == "clob_1hz" {
+            let slug = body.symbol.trim();
+            if slug.is_empty() {
+                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                    "error": "clob_1hz market type requires a tick slug in `symbol` (e.g. btc_5m)."
+                }))).into_response();
+            }
+            let params = crate::tools::engine_backtest::EngineClobBacktestParams {
+                kind: engine_kind,
+                slug,
+                threshold: body.threshold,
+                engine_params: body.engine_params.clone(),
+                from_date: &body.from_date,
+                to_date: &body.to_date,
+                initial_balance: body.initial_balance,
+                fee_pct: body.fee_pct,
+                workspace_dir: &workspace_dir,
+            };
+            let metrics = crate::tools::engine_backtest::run_engine_clob_1hz_backtest(params).await;
+            let all_trades: Vec<serde_json::Value> = metrics.all_trades.iter().map(|t| {
+                serde_json::json!({
+                    "timestamp": t.timestamp,
+                    "side":      t.side,
+                    "price":     t.price,
+                    "size":      t.size,
+                    "pnl":       t.pnl,
+                    "balance":   t.balance,
+                })
+            }).collect();
+            return Json(serde_json::json!({
+                "script":           format!("engine:{engine_kind}"),
+                "market_type":      "clob_1hz",
+                "symbol":           slug,
+                "total_return_pct": metrics.total_return_pct,
+                "sharpe_ratio":     metrics.sharpe_ratio,
+                "max_drawdown_pct": metrics.max_drawdown_pct,
+                "win_rate_pct":     metrics.win_rate_pct,
+                "total_trades":     metrics.total_trades,
+                "analysis":         metrics.analysis,
+                "markets_tested":   metrics.markets_tested,
+                "worst_trades":     serde_json::Value::Array(vec![]),
+                "all_trades":       all_trades,
+            })).into_response();
+        }
+
+        // For engine kinds we accept either a recurring `series_id` (preferred:
+        // resolves to the current Polymarket window slug) or a comma-separated
+        // legacy `symbol` field. The synthetic backtester only uses the slug
+        // as a label so falling back to `series_id` itself is safe when Gamma
+        // doesn't have an active window yet.
+        let markets: Vec<String> = if let Some(sid) = body.series_id
+            .as_deref()
+            .map(|s| s.trim())
             .filter(|s| !s.is_empty())
-            .collect();
+        {
+            match crate::engines::series_helper::resolve_current_slug(sid).await {
+                Ok(slug) => vec![slug],
+                Err(_) => vec![sid.to_string()],
+            }
+        } else {
+            body.symbol
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        };
         let params = crate::tools::engine_backtest::EngineBacktestParams {
             kind: engine_kind,
             markets,

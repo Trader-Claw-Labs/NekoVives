@@ -4,6 +4,8 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch, apiPost, apiDelete, apiPatch } from '../hooks/useApi'
 import { type MarketSeries, POLY_BINARY_PRESETS } from '../hooks/useBacktestState'
 import EngineParamsForm, { defaultEngineParams } from '../components/EngineParamsForm'
+import EngineKindInfoCard from '../components/EngineKindInfoCard'
+import { ENGINE_KINDS, engineKindOptionLabel } from '../components/engineKindMeta'
 
 const ENGINE_KIND_LABELS: Record<string, string> = {
   arb_binary: 'Arb Binary',
@@ -562,14 +564,18 @@ function EngineMarketPicker({
   const [sortMode, setSortMode] = useState<'volume' | 'liquidity'>('volume')
   const containerRef = useRef<HTMLDivElement>(null)
 
-  const { data, isFetching } = useQuery<{ markets: PolyMarket[] }>({
-    queryKey: ['engine-markets', search, sortMode],
+  // Gamma's `question_mid_partial` filter returns 0 results for single-letter
+  // queries, so we only forward `q` once the user has typed >= 2 chars; for
+  // shorter input we fetch the default crypto-tagged list instead.
+  const effectiveQuery = search.trim().length >= 2 ? search.trim() : ''
+  const { data, isFetching, error } = useQuery<{ markets: PolyMarket[] }>({
+    queryKey: ['engine-markets', effectiveQuery, sortMode],
     queryFn: () => {
-      const q = search.trim()
-      // sort=liquidity returns Top-N by deepest book; sort=volume keeps the
-      // legacy "trending volume" ranking that surfaces 1–180 day events.
-      const base = `/api/polymarket/markets?min_days=${sortMode === 'liquidity' ? 0 : 1}&max_days=180&limit=80&sort=${sortMode}`
-      return apiFetch(q ? `${base}&q=${encodeURIComponent(q)}` : `${base}&tag=crypto`)
+      // min_days=0 so short-lived markets (UP/DOWN 5m, daily temperature
+      // markets, etc.) surface here too — engines run on whatever slug the
+      // user picks, including ones closing today.
+      const base = `/api/polymarket/markets?min_days=0&max_days=180&limit=80&sort=${sortMode}`
+      return apiFetch(effectiveQuery ? `${base}&q=${encodeURIComponent(effectiveQuery)}` : `${base}&tag=crypto`)
     },
     staleTime: 5 * 60 * 1000,
     placeholderData: prev => prev,
@@ -599,8 +605,12 @@ function EngineMarketPicker({
       const first = series.find(s => s.id === 'btc_5m') ?? series[0]
       onSeriesChange(first?.id ?? 'btc_5m')
       onChange([])
+      setOpen(false)
     } else {
       onSeriesChange('')
+      // Reveal the default list immediately so the user sees there *are* markets
+      // to pick — without this the dropdown only appears after typing.
+      setOpen(true)
     }
   }
 
@@ -651,8 +661,8 @@ function EngineMarketPicker({
             ))}
           </select>
           <p className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
-            El runner resolverá automáticamente el slug de la ventana actual cada poll
-            (BTC 5m → <span className="font-mono">btc-updown-5m-&lt;timestamp&gt;</span>).
+            The runner auto-resolves the current window slug each poll
+            (BTC 5m → <span className="font-mono">btc-updown-5m-&lt;timestamp&gt;</span>) — no need to paste a slug.
           </p>
         </div>
       ) : (
@@ -714,34 +724,49 @@ function EngineMarketPicker({
             )}
           </div>
 
-          {/* Dropdown */}
-          {open && markets.length > 0 && (
+          {/* Dropdown — always rendered while open so the user sees loading,
+              empty and error states explicitly instead of staring at nothing. */}
+          {open && (
             <div
               className="absolute z-50 w-full mt-1 rounded border overflow-auto max-h-56 shadow-lg"
               style={{ background: 'var(--color-surface)', borderColor: 'var(--color-border)' }}
             >
-              {markets.map(m => {
-                const isSelected = selected.includes(m.slug)
-                return (
-                  <button
-                    key={m.slug}
-                    onClick={() => { toggle(m.slug); setSearch('') }}
-                    className="w-full text-left px-3 py-2 text-xs flex items-start justify-between gap-2 hover:bg-white/5"
-                    style={isSelected ? { background: 'rgba(0,200,100,0.08)' } : undefined}
-                  >
-                    <span className="flex-1 min-w-0">
-                      <span className="block truncate" style={{ color: 'var(--color-text)' }}>{m.question}</span>
-                      <span className="font-mono text-[10px]" style={{ color: 'var(--color-text-muted)' }}>{m.slug}</span>
-                    </span>
-                    <span className="shrink-0 text-right text-[10px]" style={{ color: 'var(--color-text-muted)' }}>
-                      <span className="block">{daysUntil(m.end_date)}</span>
-                      <span className="block">
-                        {sortMode === 'liquidity' ? `liq ${fmtVol(m.liquidity)}` : fmtVol(m.volume)}
+              {error ? (
+                <div className="px-3 py-2 text-xs" style={{ color: 'var(--color-danger)' }}>
+                  Polymarket API error: {(error as Error).message}
+                </div>
+              ) : markets.length === 0 ? (
+                <div className="px-3 py-2 text-xs" style={{ color: 'var(--color-text-muted)' }}>
+                  {isFetching
+                    ? 'Loading markets…'
+                    : search.trim().length === 1
+                      ? 'Type at least 2 characters to search.'
+                      : 'No markets matched. Try a different search or switch sort to "top liquidity".'}
+                </div>
+              ) : (
+                markets.map(m => {
+                  const isSelected = selected.includes(m.slug)
+                  return (
+                    <button
+                      key={m.slug}
+                      onClick={() => { toggle(m.slug); setSearch('') }}
+                      className="w-full text-left px-3 py-2 text-xs flex items-start justify-between gap-2 hover:bg-white/5"
+                      style={isSelected ? { background: 'rgba(0,200,100,0.08)' } : undefined}
+                    >
+                      <span className="flex-1 min-w-0">
+                        <span className="block truncate" style={{ color: 'var(--color-text)' }}>{m.question}</span>
+                        <span className="font-mono text-[10px]" style={{ color: 'var(--color-text-muted)' }}>{m.slug}</span>
                       </span>
-                    </span>
-                  </button>
-                )
-              })}
+                      <span className="shrink-0 text-right text-[10px]" style={{ color: 'var(--color-text-muted)' }}>
+                        <span className="block">{daysUntil(m.end_date)}</span>
+                        <span className="block">
+                          {sortMode === 'liquidity' ? `liq ${fmtVol(m.liquidity)}` : fmtVol(m.volume)}
+                        </span>
+                      </span>
+                    </button>
+                  )
+                })
+              )}
             </div>
           )}
 
@@ -997,15 +1022,19 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript, prefil
         engine_params: {},
       }))
     } else {
+      // Default to the BTC 5m recurring series so the engine picks up the
+      // current window slug each poll. Without a series_id the engine would
+      // try to resolve config.symbol ("BTCUSDT") as a Polymarket slug and
+      // fail with "No active market with valid tokens for slug: BTCUSDT".
+      const defaultSeries = allSeries.find(s => s.id === 'btc_5m') ?? allSeries[0]
       setForm(f => ({
         ...f,
         kind: newKind,
         market_type: 'polymarket_binary',
         mode: 'paper',
-        symbol: '',
-        series_id: '',
-        // Engine kinds do NOT execute a Rhai script — clear it so it does
-        // not leak into the payload and confuse the runner-card display.
+        symbol: defaultSeries?.symbol ?? '',
+        series_id: defaultSeries?.id ?? 'btc_5m',
+        interval: defaultSeries?.cadence ?? '5m',
         script: '',
         engine_params: defaultEngineParams(newKind),
       }))
@@ -1039,16 +1068,14 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript, prefil
             <select className="w-full rounded px-3 py-2 text-sm" value={form.kind}
               onChange={e => onKindChange(e.target.value)}>
               <option value="rhai_candle">Rhai Script (default)</option>
-              <option value="arb_binary">Arb Binary — synthetic arb YES+NO</option>
-              <option value="fair_value">Fair Value — FV edge estimator</option>
-              <option value="fv_momentum">FV + Momentum — AND-gate FV &amp; trend</option>
-              <option value="rotation_compounder">Rotation Compounder — Kelly scoring</option>
-              <option value="arb_hedge">Arb + Hedge Overlay — HYB-02</option>
-              <option value="minting_mm">Minting MM — CTF mint/merge cycle</option>
+              {ENGINE_KINDS.map((e) => (
+                <option key={e.id} value={e.id}>{engineKindOptionLabel(e.id)}</option>
+              ))}
             </select>
+            {isEngineKind && <EngineKindInfoCard kind={form.kind} />}
             {isEngineKind && (
-              <p className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
-                Engine strategies run on Polymarket Binary markets. Dry Run mode is fully supported.
+              <p className="text-[10px] mt-1.5" style={{ color: 'var(--color-text-muted)' }}>
+                Engine strategies run on Polymarket Binary markets. Start in <span className="font-semibold">Dry Run</span> first — you can promote to Live once you trust the simulated PnL.
               </p>
             )}
           </div>
@@ -2291,12 +2318,21 @@ function RunnerCard({ runner, onStop, onRestart, onDelete, onToggleHidden, onUpd
                 {uptime}
               </span>
             )}
-            {config.mode === 'live' && (
+            {config.mode === 'live' ? (
               <span
                 className="text-xs px-1.5 py-0.5 rounded flex-shrink-0 font-semibold"
                 style={{ backgroundColor: 'rgba(245,158,11,0.15)', color: 'var(--color-warning)' }}
+                title="Live mode — orders are placed with real funds."
               >
                 LIVE
+              </span>
+            ) : (
+              <span
+                className="text-xs px-1.5 py-0.5 rounded flex-shrink-0 font-semibold"
+                style={{ backgroundColor: 'rgba(129,140,248,0.18)', color: '#818cf8' }}
+                title="Dry Run — paper-traded simulation. No real funds at risk; CLOB slippage and partial fills are not modeled."
+              >
+                DRY RUN
               </span>
             )}
           </div>
@@ -2737,50 +2773,62 @@ function RunnerCard({ runner, onStop, onRestart, onDelete, onToggleHidden, onUpd
         </div>
       )}
 
-      {/* Live mode summary — live trades + signal (polymarket_binary in any mode) */}
-      {config.market_type === 'polymarket_binary' && (
-        <div className="grid grid-cols-5 gap-2 px-4 pb-3 text-xs">
-          <div>
-            <div style={{ color: 'var(--color-text-muted)' }}>Last Signal</div>
-            <div className="font-semibold"
-              style={{ color: result?.last_signal === 'buy' ? 'var(--color-accent)' : result?.last_signal === 'sell' ? 'var(--color-danger)' : 'var(--color-text-muted)' }}>
-              {result?.last_signal || 'waiting...'}
+      {/* Polymarket binary trade summary — same metrics for paper and live, but
+          paper-mode metrics are clearly labeled "(simulated)" so a non-expert
+          doesn't confuse a green dry-run PnL with a real one. */}
+      {config.market_type === 'polymarket_binary' && (() => {
+        const isPaper = config.mode === 'paper'
+        const pnlLabel = isPaper ? 'Simulated P&L' : 'P&L'
+        const tradesLabel = isPaper ? 'Simulated Trades' : 'Total Trades'
+        return (
+          <div className="grid grid-cols-5 gap-2 px-4 pb-3 text-xs">
+            <div>
+              <div style={{ color: 'var(--color-text-muted)' }}>Last Signal</div>
+              <div className="font-semibold"
+                style={{ color: result?.last_signal === 'buy' ? 'var(--color-accent)' : result?.last_signal === 'sell' ? 'var(--color-danger)' : 'var(--color-text-muted)' }}>
+                {result?.last_signal || 'waiting...'}
+              </div>
+            </div>
+            <div>
+              <div style={{ color: 'var(--color-text-muted)' }} title={isPaper ? 'Paper trades — recorded by the runner but never sent to the exchange.' : undefined}>
+                {tradesLabel}
+              </div>
+              <div className="font-semibold">{result?.live_total_trades ?? 0}</div>
+            </div>
+            <div>
+              <div style={{ color: 'var(--color-text-muted)' }}>Win Rate</div>
+              <div className="font-semibold">
+                {(() => {
+                  const total = result?.live_total_trades ?? 0
+                  const wins = result?.live_wins ?? 0
+                  return total > 0 ? `${((wins / total) * 100).toFixed(1)}%` : '—'
+                })()}
+              </div>
+            </div>
+            <div>
+              <div style={{ color: 'var(--color-text-muted)' }} title={isPaper ? 'Paper PnL: assumes mid-price fills with no slippage and instant order entry. Real CLOB execution may differ.' : undefined}>
+                {pnlLabel}
+              </div>
+              <div className="font-semibold" style={{
+                color: (result?.live_orders?.reduce((s, o) => s + (o.pnl ?? 0), 0) ?? 0) >= 0
+                  ? (isPaper ? '#818cf8' : 'var(--color-accent)')
+                  : 'var(--color-danger)'
+              }}>
+                {(() => {
+                  const pnl = result?.live_orders?.reduce((s, o) => s + (o.pnl ?? 0), 0) ?? 0
+                  return `${pnl >= 0 ? '+' : ''}$${fmtUSD(pnl)}`
+                })()}
+              </div>
+            </div>
+            <div>
+              <div style={{ color: 'var(--color-text-muted)' }}>Next Tick</div>
+              <div className="font-semibold" style={{ color: 'var(--color-text-muted)' }}>
+                {status.next_tick_at ? fmt(status.next_tick_at) : '—'}
+              </div>
             </div>
           </div>
-          <div>
-            <div style={{ color: 'var(--color-text-muted)' }}>Total Trades</div>
-            <div className="font-semibold">{result?.live_total_trades ?? 0}</div>
-          </div>
-          <div>
-            <div style={{ color: 'var(--color-text-muted)' }}>Win Rate</div>
-            <div className="font-semibold">
-              {(() => {
-                const total = result?.live_total_trades ?? 0
-                const wins = result?.live_wins ?? 0
-                return total > 0 ? `${((wins / total) * 100).toFixed(1)}%` : '—'
-              })()}
-            </div>
-          </div>
-          <div>
-            <div style={{ color: 'var(--color-text-muted)' }}>P&L</div>
-            <div className="font-semibold" style={{
-              color: (result?.live_orders?.reduce((s, o) => s + (o.pnl ?? 0), 0) ?? 0) >= 0
-                ? 'var(--color-accent)' : 'var(--color-danger)'
-            }}>
-              {(() => {
-                const pnl = result?.live_orders?.reduce((s, o) => s + (o.pnl ?? 0), 0) ?? 0
-                return `${pnl >= 0 ? '+' : ''}$${fmtUSD(pnl)}`
-              })()}
-            </div>
-          </div>
-          <div>
-            <div style={{ color: 'var(--color-text-muted)' }}>Next Tick</div>
-            <div className="font-semibold" style={{ color: 'var(--color-text-muted)' }}>
-              {status.next_tick_at ? fmt(status.next_tick_at) : '—'}
-            </div>
-          </div>
-        </div>
-      )}
+        )
+      })()}
 
       {expanded && (
         <>

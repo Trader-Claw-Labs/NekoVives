@@ -630,8 +630,22 @@ pub async fn run_minting_mm_loop(
 
     let id = config.id.clone();
 
+    // When `series_id` is set, slugs are resolved per-poll inside the loop
+    // below (so a single runner rides consecutive 5m / 15m windows). When it
+    // is empty, fall back to splitting `symbol` like the other engines.
+    let initial_markets: Vec<String> = if config.series_id.as_deref().map(|s| !s.is_empty()).unwrap_or(false) {
+        vec![]
+    } else {
+        config
+            .symbol
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    };
+
     let mm_cfg_base = MintingMmConfig {
-        markets:       if config.symbol.is_empty() { vec![] } else { vec![config.symbol.clone()] },
+        markets:       initial_markets,
         premium_cents: config.threshold.unwrap_or(0.02),
         max_cycle_usd: config.initial_balance * 0.20,
         cycle_hours:   24,
@@ -661,9 +675,19 @@ pub async fn run_minting_mm_loop(
     set_runner_status(&store, &id, "running");
 
     let poll = Duration::from_secs(mm_cfg.poll_secs);
+    let series_id = config.series_id.clone();
 
     loop {
-        for slug in &mm_cfg.markets.clone() {
+        let active_markets: Vec<String> = if series_id.as_deref().map(|s| !s.is_empty()).unwrap_or(false) {
+            crate::engines::series_helper::engine_market_slugs(
+                series_id.as_deref(),
+                &config.symbol,
+            )
+            .await
+        } else {
+            mm_cfg.markets.clone()
+        };
+        for slug in &active_markets {
             // Resolve token IDs.
             let market = match polymarket_trader::markets::get_market(slug).await {
                 Ok(m)  => m,

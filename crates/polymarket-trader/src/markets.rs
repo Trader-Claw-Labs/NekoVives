@@ -172,23 +172,39 @@ fn apply_filter(markets: Vec<GammaMarket>, filter: &MarketFilter) -> Vec<Market>
         .collect()
 }
 
+/// Map a friendly tag slug to the numeric `tag_id` Gamma actually filters on.
+/// Gamma's `tag_slug` query param is silently ignored — only `tag_id` works.
+fn tag_slug_to_id(slug: &str) -> Option<u32> {
+    match slug.to_ascii_lowercase().as_str() {
+        "crypto" => Some(21),
+        _ => None,
+    }
+}
+
 /// List markets from Gamma API.
-/// Handles both flat `[...]` and paginated `{"data":[...]}` response shapes.
+///
+/// Gamma's filter params are unreliable: `tag_slug`, `question_mid_partial`,
+/// `q` and `category` are silently ignored, and `order=volume` is not honored.
+/// We therefore over-fetch by `tag_id` (when supplied) or by recent
+/// `startDate`, then filter and rank locally on `question` / `slug` /
+/// volume / liquidity. This keeps results stable across Gamma's quirks.
 pub async fn list_markets(filter: MarketFilter) -> Result<Vec<Market>> {
     let client = reqwest::Client::new();
     let limit = filter.limit.unwrap_or(50);
-    let mut url = format!("https://gamma-api.polymarket.com/markets?limit={limit}&order=volume&ascending=false");
+    // Always over-fetch so the local filter has enough material; cap at the
+    // Gamma soft limit to avoid abusing the endpoint.
+    let fetch_limit = (limit * 4).clamp(100, 500);
+
+    // tag_id wins over slug because Gamma drops slug-based filters silently.
+    let tag_id = filter.tag.as_deref().and_then(tag_slug_to_id);
+    let mut url = format!(
+        "https://gamma-api.polymarket.com/markets?limit={fetch_limit}&order=startDate&ascending=false"
+    );
     if filter.active_only {
-        url.push_str("&active=true&closed=false");
+        url.push_str("&active=true&closed=false&archived=false");
     }
-    if let Some(ref q) = filter.query {
-        if !q.is_empty() {
-            let encoded = q.replace(' ', "+");
-            url.push_str(&format!("&question_mid_partial={encoded}"));
-        }
-    }
-    if let Some(ref tag) = filter.tag {
-        url.push_str(&format!("&tag_slug={tag}"));
+    if let Some(id) = tag_id {
+        url.push_str(&format!("&tag_id={id}"));
     }
 
     let bytes = client
@@ -211,7 +227,27 @@ pub async fn list_markets(filter: MarketFilter) -> Result<Vec<Market>> {
             .map_err(|e| anyhow::anyhow!("Gamma API parse error: {e}\nBody: {}", String::from_utf8_lossy(&bytes[..bytes.len().min(300)])))?
     };
 
-    Ok(apply_filter(raw, &filter))
+    let mut filtered = apply_filter(raw, &filter);
+
+    // Local keyword filter on question + slug. Case-insensitive substring match
+    // is more reliable than Gamma's broken `question_mid_partial`.
+    if let Some(q) = filter.query.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
+        let needle = q.to_ascii_lowercase();
+        filtered.retain(|m| {
+            m.question.to_ascii_lowercase().contains(&needle)
+                || m.slug.to_ascii_lowercase().contains(&needle)
+        });
+    }
+
+    // Sort newest first by end date when available (active short-lived markets
+    // surface above expired or far-future ones); ties fall back to volume.
+    filtered.sort_by(|a, b| {
+        b.end_date_iso.cmp(&a.end_date_iso)
+            .then_with(|| b.volume.partial_cmp(&a.volume).unwrap_or(std::cmp::Ordering::Equal))
+    });
+
+    filtered.truncate(limit);
+    Ok(filtered)
 }
 
 /// Get a single market by slug.
