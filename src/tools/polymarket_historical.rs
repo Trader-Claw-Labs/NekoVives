@@ -353,14 +353,31 @@ async fn fetch_single_window(
     let yes_price = fetch_price_at_time(client, &yes_token_id, decision_ts).await.ok();
     let no_price = fetch_price_at_time(client, &no_token_id, decision_ts).await.ok();
 
-    // 4. Fetch BTC open/close to determine resolution (UP or DOWN)
-    let (btc_open, btc_close, resolution) =
+    // 4. Determine resolution.
+    //    a) Always fetch BTC open/close — kept for diagnostic columns even if
+    //       we trust Polymarket for the actual outcome.
+    //    b) Prefer Polymarket Gamma `outcomePrices` (chain-truth, Chainlink-
+    //       backed for UP/DOWN markets). Fall back to Binance candle inference
+    //       only if the market hasn't resolved yet on Polymarket.
+    let (btc_open, btc_close) =
         match fetch_btc_window_prices(client, window_open_ts, window_close_ts).await {
-            Some((o, c)) => {
-                let res = if c > o { "up" } else { "down" };
-                (Some(o), Some(c), Some(res.to_string()))
-            }
-            None => (None, None, market.resolution),
+            Some((o, c)) => (Some(o), Some(c)),
+            None => (None, None),
+        };
+    let resolution: Option<String> =
+        match polymarket_trader::markets::get_market_resolution(slug).await {
+            Ok(r) => match r.yes_won {
+                Some(true)  => Some("up".to_string()),
+                Some(false) => Some("down".to_string()),
+                None => match (btc_open, btc_close) {
+                    (Some(o), Some(c)) => Some(if c > o { "up".to_string() } else { "down".to_string() }),
+                    _ => None,
+                },
+            },
+            Err(_) => match (btc_open, btc_close) {
+                (Some(o), Some(c)) => Some(if c > o { "up".to_string() } else { "down".to_string() }),
+                _ => market.resolution,
+            },
         };
 
     // 5. Build record

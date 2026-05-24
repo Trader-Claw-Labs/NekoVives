@@ -5,7 +5,7 @@ use std::str::FromStr as _;
 
 use polymarket_client_sdk_v2::POLYGON;
 use polymarket_client_sdk_v2::auth::{Credentials as SdkCredentials, LocalSigner, Signer, Uuid};
-use polymarket_client_sdk_v2::clob::types::request::OrdersRequest;
+use polymarket_client_sdk_v2::clob::types::request::{OrdersRequest, TradesRequest};
 use polymarket_client_sdk_v2::clob::types::{Amount, AssetType, OrderType, Side as SdkSide, SignatureType};
 use polymarket_client_sdk_v2::clob::{Client as SdkClient, Config as SdkConfig};
 use polymarket_client_sdk_v2::clob::types::request::BalanceAllowanceRequest;
@@ -51,6 +51,42 @@ impl Side {
 pub struct OrderResponse {
     pub order_id: String,
     pub status: String,
+}
+
+/// A historical trade fill returned by GET /data/trades.
+///
+/// All numeric fields are pre-converted to f64 for ergonomic use by the
+/// strategy runner / backfill tools — callers don't have to deal with `Decimal`
+/// or `U256`. `price` is the **real on-chain fill price**, not the orderbook
+/// midpoint at decision time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TradeFill {
+    /// Polymarket trade ID.
+    pub id: String,
+    /// The order that triggered this fill (matches our `order_id`).
+    pub taker_order_id: String,
+    /// Market condition_id (0x… 32-byte hex).
+    pub market: String,
+    /// ERC-1155 token id (decimal string — same shape as our LiveOrder.token_id).
+    pub asset_id: String,
+    /// "BUY" or "SELL".
+    pub side: String,
+    /// Number of outcome shares filled.
+    pub size: f64,
+    /// Real fill price in [0, 1].
+    pub price: f64,
+    /// Trade status: MATCHED / MINED / CONFIRMED / RETRYING / FAILED.
+    pub status: String,
+    /// Match time as unix-seconds.
+    pub match_time_secs: i64,
+    /// "Yes" or "No" (the outcome side this trade hit).
+    pub outcome: String,
+    /// Polygon transaction hash.
+    pub transaction_hash: String,
+    /// "TAKER" or "MAKER".
+    pub trader_side: String,
+    /// Fee rate in basis points.
+    pub fee_rate_bps: f64,
 }
 
 /// Open order from GET /orders
@@ -400,6 +436,136 @@ impl ClobClient {
         Ok(orders)
     }
 
+    /// GET /data/trades — issued manually so we can be lenient about per-row
+    /// parse errors. The SDK's `trades()` rejects the entire page when any
+    /// single row has a malformed Decimal/U256 (Polymarket has shipped trades
+    /// with empty strings in `fee_rate_bps`); we just skip those rows here.
+    ///
+    /// Uses the same L2 HMAC scheme: `signature = HMAC-SHA256(base64-decoded
+    /// secret, "{ts}GET{path}{body}")` on the URL path with no body.
+    async fn get_trade_history_lenient(
+        &self,
+        condition_id: Option<&str>,
+        after_secs: Option<i64>,
+        before_secs: Option<i64>,
+    ) -> Result<Vec<TradeFill>> {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE};
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        type HmacSha256 = Hmac<Sha256>;
+
+        // POLY_ADDRESS is always the EOA signer address — the same one used
+        // when the API key was created. The funder/proxy is implicit in the
+        // API key registration, not in the per-request header.
+        let address = {
+            let pk_hex = self.creds.private_key.as_deref()
+                .ok_or_else(|| anyhow::anyhow!("private_key required for /data/trades"))?;
+            let signer = LocalSigner::from_str(pk_hex)?.with_chain_id(Some(POLYGON));
+            signer.address()
+        };
+
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()?;
+
+        let mut out: Vec<TradeFill> = Vec::new();
+        let mut next_cursor: Option<String> = None;
+        loop {
+            let mut query: Vec<(String, String)> = Vec::new();
+            if let Some(cid) = condition_id {
+                query.push(("market".to_string(), cid.to_string()));
+            }
+            if let Some(a) = after_secs { query.push(("after".to_string(), a.to_string())); }
+            if let Some(b) = before_secs { query.push(("before".to_string(), b.to_string())); }
+            if let Some(c) = next_cursor.as_deref() {
+                query.push(("next_cursor".to_string(), c.to_string()));
+            }
+            let qs = if query.is_empty() {
+                String::new()
+            } else {
+                let pairs: Vec<String> = query.iter()
+                    .map(|(k, v)| format!("{k}={}", urlencoding_encode(v)))
+                    .collect();
+                format!("?{}", pairs.join("&"))
+            };
+            let path = "/data/trades";
+            let url  = format!("{CLOB_BASE_URL}{path}{qs}");
+
+            let ts = chrono::Utc::now().timestamp();
+            let message = format!("{ts}GET{path}");
+            let decoded_secret = URL_SAFE.decode(self.creds.secret.as_bytes())
+                .map_err(|e| anyhow::anyhow!("Invalid base64 CLOB secret: {e}"))?;
+            let mut mac = HmacSha256::new_from_slice(&decoded_secret)
+                .map_err(|e| anyhow::anyhow!("HMAC init failed: {e}"))?;
+            mac.update(message.as_bytes());
+            let signature = URL_SAFE.encode(mac.finalize().into_bytes());
+
+            let resp = http.get(&url)
+                .header("POLY_ADDRESS",    address.to_checksum(None))
+                .header("POLY_API_KEY",    &self.creds.api_key)
+                .header("POLY_PASSPHRASE", &self.creds.passphrase)
+                .header("POLY_SIGNATURE",  signature)
+                .header("POLY_TIMESTAMP",  ts.to_string())
+                .send()
+                .await?;
+
+            let status = resp.status();
+            let bytes  = resp.bytes().await?;
+            if !status.is_success() {
+                anyhow::bail!(
+                    "/data/trades returned {} — body: {}",
+                    status,
+                    String::from_utf8_lossy(&bytes[..bytes.len().min(400)])
+                );
+            }
+
+            let json: serde_json::Value = serde_json::from_slice(&bytes)
+                .map_err(|e| anyhow::anyhow!("Invalid JSON from /data/trades: {e}"))?;
+
+            // Both flat-array and { data, next_cursor } shapes are observed.
+            let (rows, cursor): (Vec<serde_json::Value>, Option<String>) = if let Some(arr) = json.as_array() {
+                (arr.clone(), None)
+            } else {
+                let rows = json.get("data").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                let cur  = json.get("next_cursor").and_then(|v| v.as_str()).map(str::to_string);
+                (rows, cur)
+            };
+
+            for row in &rows {
+                if let Some(fill) = parse_trade_row_lenient(row) {
+                    out.push(fill);
+                }
+            }
+
+            match cursor {
+                Some(c) if !c.is_empty() && c != "LTE=" => { next_cursor = Some(c); }
+                _ => break,
+            }
+        }
+        Ok(out)
+    }
+
+    /// GET /data/trades — paginated history of the authenticated user's
+    /// executed trades. Each entry includes the **real on-chain fill price**,
+    /// match time, and transaction hash — the data we need to correct the
+    /// midpoint-based entry prices saved by the live runner.
+    ///
+    /// `condition_id` (optional, 0x-prefixed hex) filters to a single market.
+    /// `after_secs` / `before_secs` (optional, unix seconds) bound the time
+    /// range. The function paginates through all pages internally and returns
+    /// a flat `Vec<TradeFill>` — caller doesn't deal with cursors.
+    pub async fn get_trade_history(
+        &self,
+        condition_id: Option<&str>,
+        after_secs: Option<i64>,
+        before_secs: Option<i64>,
+    ) -> Result<Vec<TradeFill>> {
+        // Delegate to the lenient HTTP path: the SDK's trades() rejects an
+        // entire page when one row has e.g. an empty fee_rate_bps Decimal.
+        // We only need price/size/order-id, so it's safe to skip bad rows.
+        self.get_trade_history_lenient(condition_id, after_secs, before_secs).await
+    }
+
     /// GET /balance — reads USDC.e balance directly from Polygon RPC.
     /// When a proxy address is configured, reads the proxy balance (the funder).
     pub async fn get_balance(&self) -> Result<f64> {
@@ -459,6 +625,69 @@ impl ClobClient {
 
         token
     }
+}
+
+// ── /data/trades lenient parsing ────────────────────────────────────────────
+
+/// Parse a single Polymarket trade JSON row. Returns None when the row is so
+/// malformed that we can't extract the order_id+price+size we actually use.
+/// Empty/missing fee fields, malformed transaction hashes, etc. just collapse
+/// to defaults — better partial data than no data.
+fn parse_trade_row_lenient(row: &serde_json::Value) -> Option<TradeFill> {
+    let str_field = |k: &str| -> String {
+        row.get(k).and_then(|v| v.as_str()).map(str::to_string).unwrap_or_default()
+    };
+    let f64_field = |k: &str| -> f64 {
+        row.get(k)
+            .map(|v| match v {
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
+                serde_json::Value::String(s) => s.parse::<f64>().unwrap_or(0.0),
+                _ => 0.0,
+            })
+            .unwrap_or(0.0)
+    };
+    let taker_order_id = str_field("taker_order_id");
+    let id = str_field("id");
+    if taker_order_id.is_empty() && id.is_empty() {
+        return None;
+    }
+    Some(TradeFill {
+        id,
+        taker_order_id,
+        market: str_field("market"),
+        asset_id: str_field("asset_id"),
+        side: str_field("side"),
+        size: f64_field("size"),
+        price: f64_field("price"),
+        status: str_field("status"),
+        match_time_secs: row.get("match_time")
+            .map(|v| match v {
+                serde_json::Value::Number(n) => n.as_i64().unwrap_or(0),
+                serde_json::Value::String(s) => s.parse::<i64>().unwrap_or(0),
+                _ => 0,
+            })
+            .unwrap_or(0),
+        outcome: str_field("outcome"),
+        transaction_hash: str_field("transaction_hash"),
+        trader_side: str_field("trader_side"),
+        fee_rate_bps: f64_field("fee_rate_bps"),
+    })
+}
+
+/// Minimal x-www-form-urlencoded encoder for the few characters that show up
+/// in Polymarket query params (cursors are URL-safe-base64). Avoids pulling in
+/// the `urlencoding` crate just for this one call site.
+fn urlencoding_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
 }
 
 // ── Polygon RPC balance fetcher ─────────────────────────────────────────────

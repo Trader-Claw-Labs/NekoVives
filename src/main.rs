@@ -490,6 +490,51 @@ Examples:
         to: String,
     },
 
+    /// Reconcile live_strategies.json against the real Polymarket CLOB &
+    /// Gamma APIs: replaces midpoint entry_price with on-chain VWAP fill
+    /// price, replaces Binance-derived outcomes with Polymarket
+    /// outcomePrices, and recomputes P&L for every historical order.
+    #[command(long_about = "\
+Backfill historical Polymarket orders with real on-chain fill prices and
+Polymarket-resolved outcomes. Targets <workspace>/live_strategies.json.
+
+Use --dry-run to preview changes without writing the file. Use --runner-id
+to limit the backfill to a single runner.
+
+Examples:
+  trader-claw backfill-strategies --dry-run
+  trader-claw backfill-strategies
+  trader-claw backfill-strategies --runner-id abc-123")]
+    BackfillStrategies {
+        /// Don't write the file; just print what would change.
+        #[arg(long)]
+        dry_run: bool,
+        /// Limit backfill to a single runner ID.
+        #[arg(long)]
+        runner_id: Option<String>,
+        /// Re-reconcile orders that were already backfilled.
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Re-resolve every cached historical Polymarket window via Gamma
+    /// `outcomePrices`, overwriting Binance-derived "up"/"down" labels with
+    /// chain-truth (Chainlink-backed for UP/DOWN markets). Targets every
+    /// `<workspace>/data/polymarket_historical/<series>.jsonl`.
+    #[command(long_about = "\
+Re-resolve historical Polymarket windows with real Gamma outcomes.
+Reads each cached series JSONL, queries Polymarket Gamma per window, and
+overwrites only the `resolution` field. Token prices and timestamps are
+preserved. Use --dry-run to count how many windows would change.")]
+    BackfillHistorical {
+        /// Don't write files; just print how many resolutions would flip.
+        #[arg(long)]
+        dry_run: bool,
+        /// Limit to one series id (e.g. `btc_5m`). Default: all series.
+        #[arg(long)]
+        series: Option<String>,
+    },
+
     /// Update trader-claw to the latest release from GitHub
     #[command(long_about = "\
 Update trader-claw to the latest release.
@@ -1114,6 +1159,14 @@ async fn main() -> Result<()> {
                     std::process::exit(1);
                 }
             }
+        }
+
+        Commands::BackfillStrategies { dry_run, runner_id, force } => {
+            tools::strategies_backfill::run_backfill(&config, dry_run, runner_id.as_deref(), force).await
+        }
+
+        Commands::BackfillHistorical { dry_run, series } => {
+            tools::historical_backfill::run_backfill(&config, dry_run, series.as_deref()).await
         }
 
         Commands::Config { config_command } => match config_command {

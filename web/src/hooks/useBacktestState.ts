@@ -3,7 +3,7 @@ import { apiPost, apiFetch } from './useApi'
 
 // ── Types ─────────────────────────────────────────────────────
 
-export type MarketType = 'crypto' | 'polymarket' | 'polymarket_binary'
+export type MarketType = 'crypto' | 'polymarket' | 'polymarket_binary' | 'clob_1hz'
 
 // A recurring Polymarket binary market series (loaded from /api/backtest/series)
 export interface MarketSeries {
@@ -79,6 +79,8 @@ export interface BacktestConfig {
   allowed_hours?: number[]
   // RV floor: skip windows where BTC 1h realized-vol < this value. 0/undefined = disabled.
   rv_min_btc?: number
+  // CLOB 1 HZ: tick slug to replay (e.g. "btc_5m"). Used as `symbol` in the backtest request.
+  clob_slug?: string
 }
 
 export interface TradeLog {
@@ -287,7 +289,9 @@ export function useBacktestState() {
       updateState({
         progress: {
           step: 'fetching',
-          message: cfg.market_type === 'polymarket_binary'
+          message: cfg.market_type === 'clob_1hz'
+            ? `Loading CLOB 1 Hz tick data for '${cfg.clob_slug ?? cfg.symbol}' (${cfg.from_date} → ${cfg.to_date})…`
+            : cfg.market_type === 'polymarket_binary'
             ? `Fetching ${cfg.symbol} 1m candles from Binance (${cfg.from_date} → ${cfg.to_date})…`
             : `Fetching ${cfg.symbol} ${cfg.interval} candles (${cfg.from_date} → ${cfg.to_date})…`,
           startTime: fetchStart,

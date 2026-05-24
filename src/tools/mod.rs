@@ -28,6 +28,8 @@ pub mod polymarket_balance;
 pub mod polymarket_historical;
 pub mod polymarket_historical_types;
 pub mod polymarket_scan;
+pub mod strategies_backfill;
+pub mod historical_backfill;
 pub mod shell_exec;
 pub mod trade_swap;
 pub mod wallet_balance;

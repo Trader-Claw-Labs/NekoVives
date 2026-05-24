@@ -104,6 +104,7 @@ Key routes:
 | `polymarket_doge_updown_5m_meanrev.rhai` | ctx-based | DOGE 5m: mean-reversion, 2× thresholds, spike-fade setups 11/12 |
 | `polymarket_hype_updown_5m_thinmkt.rhai` | ctx-based | HYPE 5m: drift-only (no Binance candles), setup 7 unique to HYPE |
 | `polymarket_all_updown_5m_adaptive.rhai` | ctx-based | Universal ATR-adaptive, NO-side-only (setup 9 YES disabled after dry-run) |
+| `clob_1hz_spread_scalper.rhai` | on_tick-based | CLOB 1 HZ: spread fade — bets NO/YES at extreme prices in final 60 s of each window |
 
 Cross-asset analysis and setup-by-setup edge tables:
 `src/tools/scripts/POLYMARKET_UPDOWN_5M_CROSS_ASSET.md`
@@ -150,6 +151,30 @@ fn on_candle(ctx) {
 }
 ```
 
+**CLOB 1 HZ API** (`on_tick(ctx)`) — for tick-replay backtesting from recorded JSONL data:
+```rhai
+fn on_tick(ctx) {
+    ctx.ts_ms             // Unix timestamp of this tick (ms)
+    ctx.yes_bid / ctx.yes_ask / ctx.yes_mid  // YES token bid/ask/mid (0-1)
+    ctx.no_bid  / ctx.no_ask               // NO token bid/ask (0-1)
+    ctx.spread_pct        // (yes_ask - yes_bid) × 100 (in ¢)
+    ctx.binance_price     // Binance spot price at this tick
+    ctx.window_ts         // UNIX ts of current window open
+    ctx.window_secs_left  // seconds until window resolves
+    ctx.second_in_window  // seconds elapsed in current window (0 = first tick)
+    ctx.balance / ctx.position / ctx.entry_price
+
+    ctx.bet_yes(size)     // size = fraction of balance (0-1). Enters YES bet at yes_ask.
+    ctx.bet_no(size)      // Enters NO bet at no_ask.
+
+    ctx.set("key", val)   // Key-value persistence across ticks
+    ctx.get("key", def)
+}
+```
+Resolution: at `window_secs_left == 0`, compare `binance_price` to `window_open_price`.
+If price went up → YES wins → payout = stake/entry_price; else NO wins (or vice versa).
+Positions auto-resolve each window; only one open position allowed per window.
+
 **Legacy signal-based API** — script sets `signal = "buy"/"sell"/"hold"` as a variable;
 pre-injected scope vars: `open, high, low, close, volume, rsi, macd, signal, macd_hist,
 balance, position`.
@@ -187,6 +212,24 @@ Global registry accessible from any tool. Tool: `tick_recorder`
 - `action=stop  slug=btc_5m`
 - `action=status`
 - `action=read  slug=btc_5m last_n=60`
+
+## CLOB 1 HZ Backtesting (`market_type = "clob_1hz"`)
+Replays recorded tick JSONL files through `on_tick(ctx)` Rhai scripts.
+Enables testing of intra-window strategies (spread scalping, timing, entry windows) that
+the 1m-candle engine cannot evaluate.
+
+**Workflow:**
+1. Record ticks with `tick_recorder action=start slug=btc_5m condition_id=0x...`
+2. Let it run for at least 1 day
+3. In the Backtesting page, select **Market = "CLOB 1 Hz (tick replay)"**
+4. Pick the slug from the dropdown (auto-loaded from `GET /api/backtest/tick-slugs`)
+5. Select a script that uses `on_tick(ctx)` (e.g. `clob_1hz_spread_scalper.rhai`)
+6. Run — engine replays every recorded tick and resolves each 5m window
+
+**Key functions:** `run_clob_1hz_backtest()`, `list_tick_slugs()`,
+`run_clob_1hz_backtest_from_files()` in `src/tools/backtest.rs`
+
+**Gateway API:** `GET /api/backtest/tick-slugs` — returns available slugs with date ranges.
 
 ## Dynamic Asset Selector (`src/tools/asset_selector.rs`)
 Rolling 30-day win-rate tracker per (script × symbol). Automatically records

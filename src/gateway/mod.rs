@@ -920,6 +920,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/tradingview/scan", get(api::handle_api_tradingview_scan))
         // ── Backtesting ──
         .route("/api/backtest/series", get(api::handle_api_backtest_series))
+        .route("/api/backtest/tick-slugs", get(api::handle_api_backtest_tick_slugs))
         .route("/api/backtest/scripts", get(api::handle_api_backtest_scripts).delete(api::handle_api_backtest_scripts_delete))
         .route("/api/backtest/scripts/rename", post(api::handle_api_backtest_scripts_rename))
         .route("/api/backtest/scripts/description", post(api::handle_api_backtest_scripts_description))
@@ -955,6 +956,11 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/live/strategies/{id}", get(api::handle_api_live_get).patch(api::handle_api_live_patch).delete(api::handle_api_live_delete))
         .route("/api/live/strategies/{id}/stop", post(api::handle_api_live_stop))
         .route("/api/live/strategies/{id}/restart", post(api::handle_api_live_restart))
+        // ── Tick Recorder ──
+        .route("/api/tick-recorder/start",  post(api::handle_api_tick_recorder_start))
+        .route("/api/tick-recorder/stop",   post(api::handle_api_tick_recorder_stop))
+        .route("/api/tick-recorder/status", get(api::handle_api_tick_recorder_status))
+        .route("/api/polymarket/active-token", get(api::handle_api_polymarket_active_token))
         // ── SSE event stream (no timeout — long-lived) ──
         .route("/api/export", get(api::handle_api_export))
         .route("/api/import", post(api::handle_api_import))

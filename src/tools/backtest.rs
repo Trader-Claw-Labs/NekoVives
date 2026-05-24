@@ -39,6 +39,10 @@ const POLY_XRP_LOWVOL_SCRIPT:    &str = include_str!("scripts/polymarket_xrp_upd
 const POLY_DOGE_MEANREV_SCRIPT:  &str = include_str!("scripts/polymarket_doge_updown_5m_meanrev.rhai");
 const POLY_HYPE_THINMKT_SCRIPT:  &str = include_str!("scripts/polymarket_hype_updown_5m_thinmkt.rhai");
 const POLY_ALL_ADAPTIVE_SCRIPT:  &str = include_str!("scripts/polymarket_all_updown_5m_adaptive.rhai");
+const POLY_BTC_DRIFT_V4_SAFE_SCRIPT: &str = include_str!("scripts/polymarket_btc_updown_5m_drift_v4_safe.rhai");
+
+// ── CLOB 1 HZ tick-based scripts ─────────────────────────────────────────────
+const CLOB_1HZ_SPREAD_SCALPER_SCRIPT: &str = include_str!("scripts/clob_1hz_spread_scalper.rhai");
 
 // ── Classic Indicators ────────────────────────────────────────────────────────
 const RSI_STRATEGY_SCRIPT: &str = include_str!("scripts/rsi_strategy.rhai");
@@ -46,7 +50,7 @@ const RSI_STRATEGY_SCRIPT: &str = include_str!("scripts/rsi_strategy.rhai");
 /// Write bundled default scripts to `<workspace>/scripts/` if they don't exist yet.
 /// Called by both backtest tools so the scripts are always available on first run.
 /// All bundled default scripts as (filename, content) pairs.
-const DEFAULT_SCRIPTS: [(&str, &str); 23] = [
+const DEFAULT_SCRIPTS: [(&str, &str); 25] = [
     // ── Polymarket binary ──────────────────────────────────────────────────────
     ("polymarket_btc_binary.rhai",              POLYMARKET_BTC_BINARY_SCRIPT),
     ("polymarket_5min.rhai",                    POLYMARKET_5MIN_SCRIPT),
@@ -60,6 +64,7 @@ const DEFAULT_SCRIPTS: [(&str, &str); 23] = [
     ("polymarket_doge_updown_5m_meanrev.rhai",        POLY_DOGE_MEANREV_SCRIPT),
     ("polymarket_hype_updown_5m_thinmkt.rhai",        POLY_HYPE_THINMKT_SCRIPT),
     ("polymarket_all_updown_5m_adaptive.rhai",        POLY_ALL_ADAPTIVE_SCRIPT),
+    ("polymarket_btc_updown_5m_drift_v4_safe.rhai",   POLY_BTC_DRIFT_V4_SAFE_SCRIPT),
     // ── BTC OPT series ────────────────────────────────────────────────────────
     ("btc_opt_v15_bb_mean_rev.rhai",            BTC_OPT_V15_BB_MEAN_REV_SCRIPT),
     // ── Classic indicators ────────────────────────────────────────────────────
@@ -74,6 +79,8 @@ const DEFAULT_SCRIPTS: [(&str, &str); 23] = [
     ("event_driven.rhai",                       EVENT_DRIVEN_SCRIPT),
     ("correlation_arb.rhai",                    CORRELATION_ARB_SCRIPT),
     ("liquidation_hunt.rhai",                   LIQUIDATION_HUNT_SCRIPT),
+    // ── CLOB 1 HZ tick-based strategies ──────────────────────────────────────
+    ("clob_1hz_spread_scalper.rhai",            CLOB_1HZ_SPREAD_SCALPER_SCRIPT),
     // ── Reference & templates ─────────────────────────────────────────────────
     ("strategy.rhai",                           STRATEGY_SCRIPT),
 ];
@@ -3125,6 +3132,15 @@ pub async fn run_backtest_engine(
         }
     };
 
+    // ── clob_1hz: tick-level backtest from recorded JSONL files ─────────────────
+    // `symbol` is used as the tick slug (e.g. "btc_5m").
+    if market_type == "clob_1hz" {
+        return run_clob_1hz_backtest_from_files(
+            script_path, symbol, from_date, to_date,
+            initial_balance, fee_pct, workspace_dir,
+        ).await;
+    }
+
     // ── polymarket_binary: slug-aligned binary engine ────────────────────────────────
     // Data source determined by resolution_logic:
     //   price_up      -> Binance 1m candles
@@ -4207,6 +4223,499 @@ pub fn run_polymarket_binary_on_candle_buffer(
         analysis: format!("Polymarket strategy error: {e}"),
         ..Default::default()
     })
+}
+
+// ── CLOB 1 HZ backtesting ─────────────────────────────────────────────────────
+
+/// List available tick slugs and their date coverage.
+/// Returns vec of (slug, dates, tick_count).
+pub fn list_tick_slugs(workspace_dir: &std::path::Path) -> Vec<(String, Vec<String>, usize)> {
+    let ticks_dir = workspace_dir.join("data").join("ticks");
+    let mut result = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&ticks_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() { continue; }
+            let slug = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+            if slug.is_empty() { continue; }
+            let mut dates = Vec::new();
+            let mut total_ticks = 0usize;
+            if let Ok(files) = std::fs::read_dir(&path) {
+                let mut file_list: Vec<_> = files.flatten()
+                    .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("jsonl"))
+                    .collect();
+                file_list.sort_by_key(|e| e.file_name());
+                for f in &file_list {
+                    let stem = f.path().file_stem().and_then(|n| n.to_str()).unwrap_or("").to_string();
+                    if let Ok(content) = std::fs::read_to_string(f.path()) {
+                        let count = content.lines().filter(|l| !l.trim().is_empty()).count();
+                        total_ticks += count;
+                        if count > 0 { dates.push(stem); }
+                    }
+                }
+            }
+            if !dates.is_empty() {
+                result.push((slug, dates, total_ticks));
+            }
+        }
+    }
+    result.sort_by(|a, b| a.0.cmp(&b.0));
+    result
+}
+
+/// Load ticks from JSONL files for a slug between from_date and to_date (inclusive).
+/// Dates are "YYYY-MM-DD" strings matching the file names.
+fn load_ticks_for_range(
+    workspace_dir: &std::path::Path,
+    slug: &str,
+    from_date: &str,
+    to_date: &str,
+) -> anyhow::Result<Vec<crate::tick_recorder::Tick>> {
+    let ticks_dir = workspace_dir.join("data").join("ticks").join(slug);
+    if !ticks_dir.exists() {
+        anyhow::bail!("No tick data directory for slug '{}'. Run the tick recorder first.", slug);
+    }
+    let mut all_ticks = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&ticks_dir) {
+        let mut file_list: Vec<_> = entries.flatten()
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("jsonl"))
+            .collect();
+        file_list.sort_by_key(|e| e.file_name());
+        for f in file_list {
+            let stem = f.path().file_stem()
+                .and_then(|n| n.to_str()).unwrap_or("").to_string();
+            // Include file if its date is within range
+            if stem.as_str() < from_date || stem.as_str() > to_date { continue; }
+            let content = std::fs::read_to_string(f.path())?;
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() { continue; }
+                match serde_json::from_str::<crate::tick_recorder::Tick>(line) {
+                    Ok(t) => all_ticks.push(t),
+                    Err(e) => tracing::warn!("[CLOB1HZ] Parse error in {}: {e}", f.path().display()),
+                }
+            }
+        }
+    }
+    tracing::info!("[CLOB1HZ] Loaded {} ticks for slug '{}' ({} → {})", all_ticks.len(), slug, from_date, to_date);
+    Ok(all_ticks)
+}
+
+/// CLOB 1 HZ backtest: runs `on_tick(ctx)` for every recorded second of Polymarket CLOB data.
+///
+/// Position mechanics:
+/// - `ctx.bet_yes(size)` / `ctx.bet_no(size)`: place a binary bet (size = fraction of balance).
+///   Entry at the current ask price; only ONE open position per window allowed.
+/// - At `window_secs_left == 0`: the window closes. If `binance_price > window_open_price`
+///   the YES side wins; otherwise the NO side wins. Open positions are settled and P&L recorded.
+/// - Fee is deducted from the stake at entry (taker fee model).
+pub fn run_clob_1hz_backtest(
+    script_content: &str,
+    ticks: Vec<crate::tick_recorder::Tick>,
+    initial_balance: f64,
+    fee_pct: f64,
+) -> anyhow::Result<BacktestMetrics> {
+    use rhai::{Dynamic, Engine};
+    use std::sync::{Arc, Mutex};
+
+    if ticks.is_empty() {
+        anyhow::bail!("No ticks loaded — record data first with the tick_recorder tool.");
+    }
+
+    // Compile and validate script
+    let engine_check = Engine::new();
+    let ast_check = engine_check.compile(script_content)
+        .map_err(|e| anyhow::anyhow!("Script compile error: {e}"))?;
+    if !ast_check.iter_functions().any(|f| f.name == "on_tick") {
+        anyhow::bail!("CLOB 1 HZ strategy requires an `on_tick(ctx)` function. \
+            Use `ctx.bet_yes(size)` / `ctx.bet_no(size)` to place bets.");
+    }
+
+    // Shared simulation state
+    #[derive(Clone)]
+    struct Sim {
+        balance:          f64,
+        position:         i64,   // 0 = flat, 1 = YES bet, -1 = NO bet
+        entry_price:      f64,   // ask price paid per token
+        stake:            f64,   // dollar amount staked
+        window_open_price: f64,  // binance_price at start of current window
+        current_window_ts: i64,  // ts of window we're tracking
+        trades:           Vec<Trade>,
+        kv:               std::collections::HashMap<String, f64>,
+        pending_yes:      Option<f64>,  // size to bet YES (set by script)
+        pending_no:       Option<f64>,  // size to bet NO
+    }
+
+    let sim = Arc::new(Mutex::new(Sim {
+        balance: initial_balance,
+        position: 0,
+        entry_price: 0.0,
+        stake: 0.0,
+        window_open_price: 0.0,
+        current_window_ts: 0,
+        trades: Vec::new(),
+        kv: std::collections::HashMap::new(),
+        pending_yes: None,
+        pending_no: None,
+    }));
+
+    let mut portfolio_values: Vec<f64> = vec![initial_balance];
+    let mut peak = initial_balance;
+    let mut max_dd = 0.0_f64;
+    let _fee_factor = 1.0 - fee_pct / 100.0; // captured inside closures per tick
+
+    for (tick_idx, tick) in ticks.iter().enumerate() {
+        // Track window-open price (first tick of each new window)
+        {
+            let mut s = sim.lock().unwrap();
+            if tick.window_ts != s.current_window_ts {
+                // New window: resolve any carry-over (shouldn't happen in clean data, but guard)
+                s.current_window_ts = tick.window_ts;
+                s.window_open_price = tick.binance_price;
+            }
+            if s.window_open_price <= 0.0 && tick.binance_price > 0.0 {
+                s.window_open_price = tick.binance_price;
+            }
+        }
+
+        // ── Resolve at window close ──────────────────────────────────────────
+        if tick.window_secs_left == 0 {
+            let mut s = sim.lock().unwrap();
+            if s.position != 0 {
+                let open_p  = s.window_open_price;
+                let close_p = tick.binance_price;
+                let yes_won = close_p > open_p;
+
+                let (won, side_label) = match s.position {
+                    1  => (yes_won,  "bet_yes"),
+                    -1 => (!yes_won, "bet_no"),
+                    _  => (false,    "flat"),
+                };
+
+                let ts = chrono::DateTime::from_timestamp_millis(tick.ts_ms)
+                    .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+                    .unwrap_or_else(|| tick.ts_ms.to_string());
+
+                let pnl = if won {
+                    // Payout = stake / entry_price (token pays $1 on win)
+                    let payout = s.stake / s.entry_price;
+                    let net = payout - s.stake;
+                    s.balance += payout;
+                    net
+                } else {
+                    // Loss = full stake
+                    -s.stake
+                };
+
+                let entry_p = s.entry_price;
+                let stake_s = s.stake;
+                s.trades.push(Trade {
+                    timestamp: ts,
+                    side: side_label.to_string(),
+                    price: entry_p,
+                    size: stake_s,
+                    pnl,
+                    debug: None,
+                });
+
+                s.position = 0;
+                s.entry_price = 0.0;
+                s.stake = 0.0;
+            }
+            // Reset for next window
+            s.window_open_price = 0.0;
+        }
+
+        // ── Run on_tick(ctx) ─────────────────────────────────────────────────
+        let (cur_balance, cur_position, cur_entry_price) = {
+            let s = sim.lock().unwrap();
+            (s.balance, s.position, s.entry_price)
+        };
+
+        let spread_pct = if tick.yes_bid > 0.0 && tick.yes_ask > 0.0 {
+            (tick.yes_ask - tick.yes_bid) * 100.0
+        } else {
+            0.0
+        };
+        let second_in_window = if tick.window_secs_left >= 0 {
+            300_i64.saturating_sub(tick.window_secs_left)
+        } else {
+            0
+        };
+
+        // Register native functions with captured tick data
+        let mut eng = Engine::new();
+        eng.set_max_operations(200_000);
+        eng.set_max_call_levels(32);
+
+        let sim_yes = sim.clone();
+        let yes_ask_cap = tick.yes_ask;
+        let yes_stake = cur_balance;
+        let fee_yes = fee_pct;
+        eng.register_fn("bet_yes_impl", move |size: f64| {
+            let mut s = sim_yes.lock().unwrap();
+            if s.position != 0 { return; }  // already in a trade
+            if yes_ask_cap <= 0.0 || yes_ask_cap >= 1.0 { return; }
+            let frac = size.clamp(0.0, 1.0);
+            let stake_amt = yes_stake * frac * (1.0 - fee_yes / 100.0);
+            if stake_amt <= 0.01 { return; }
+            s.balance -= stake_amt;
+            s.position = 1;
+            s.entry_price = yes_ask_cap;
+            s.stake = stake_amt;
+            s.pending_yes = None;
+        });
+
+        let sim_no = sim.clone();
+        let no_ask_cap = tick.no_ask;
+        let no_stake = cur_balance;
+        let fee_no = fee_pct;
+        eng.register_fn("bet_no_impl", move |size: f64| {
+            let mut s = sim_no.lock().unwrap();
+            if s.position != 0 { return; }
+            if no_ask_cap <= 0.0 || no_ask_cap >= 1.0 { return; }
+            let frac = size.clamp(0.0, 1.0);
+            let stake_amt = no_stake * frac * (1.0 - fee_no / 100.0);
+            if stake_amt <= 0.01 { return; }
+            s.balance -= stake_amt;
+            s.position = -1;
+            s.entry_price = no_ask_cap;
+            s.stake = stake_amt;
+            s.pending_no = None;
+        });
+
+        let sim_set = sim.clone();
+        eng.register_fn("set_impl", move |key: String, val: rhai::Dynamic| {
+            if let Some(f) = dynamic_to_f64(&val) {
+                sim_set.lock().unwrap().kv.insert(key, f);
+            }
+        });
+
+        let sim_get = sim.clone();
+        eng.register_fn("get_impl", move |key: String, default: rhai::Dynamic| -> f64 {
+            let def = dynamic_to_f64(&default).unwrap_or(0.0);
+            sim_get.lock().unwrap().kv.get(&key).copied().unwrap_or(def)
+        });
+
+        // Patch ctx.* → *_impl(
+        let patched = script_content
+            .replace("ctx.bet_yes(", "bet_yes_impl(")
+            .replace("ctx.bet_no(",  "bet_no_impl(")
+            .replace("ctx.set(",     "set_impl(")
+            .replace("ctx.get(",     "get_impl(");
+
+        let full_script = format!(r#"
+{patched}
+
+let ctx = #{{}};
+ctx.ts_ms            = {ts_ms};
+ctx.yes_bid          = {yes_bid};
+ctx.yes_ask          = {yes_ask};
+ctx.yes_mid          = {yes_mid};
+ctx.no_bid           = {no_bid};
+ctx.no_ask           = {no_ask};
+ctx.spread_pct       = {spread_pct};
+ctx.binance_price    = {binance_price};
+ctx.window_ts        = {window_ts};
+ctx.window_secs_left = {window_secs_left};
+ctx.second_in_window = {second_in_window};
+ctx.balance          = {balance};
+ctx.position         = {position};
+ctx.entry_price      = {entry_price};
+on_tick(ctx);
+"#,
+            patched          = patched,
+            ts_ms            = tick.ts_ms,
+            yes_bid          = tick.yes_bid,
+            yes_ask          = tick.yes_ask,
+            yes_mid          = tick.yes_mid,
+            no_bid           = tick.no_bid,
+            no_ask           = tick.no_ask,
+            spread_pct       = spread_pct,
+            binance_price    = tick.binance_price,
+            window_ts        = tick.window_ts,
+            window_secs_left = tick.window_secs_left,
+            second_in_window = second_in_window,
+            balance          = cur_balance,
+            position         = cur_position,
+            entry_price      = cur_entry_price,
+        );
+
+        match eng.compile(&full_script) {
+            Ok(ast) => {
+                let mut scope = rhai::Scope::new();
+                if let Err(e) = eng.eval_ast_with_scope::<Dynamic>(&mut scope, &ast) {
+                    if tick_idx < 5 {
+                        tracing::warn!("[CLOB1HZ] on_tick error at tick {tick_idx}: {e}");
+                    }
+                }
+            }
+            Err(e) => {
+                if tick_idx == 0 {
+                    tracing::error!("[CLOB1HZ] Script compile error: {e}");
+                    return Err(anyhow::anyhow!("Script compile error: {e}"));
+                }
+            }
+        }
+
+        // Track portfolio equity
+        let cur_bal = sim.lock().unwrap().balance;
+        portfolio_values.push(cur_bal);
+        if cur_bal > peak { peak = cur_bal; }
+        let dd = (peak - cur_bal) / peak * 100.0;
+        if dd > max_dd { max_dd = dd; }
+    }
+
+    // Force-close any open position at end of data (no resolution price → count as loss)
+    {
+        let mut s = sim.lock().unwrap();
+        if s.position != 0 {
+            let stake = s.stake;
+            let entry_p = s.entry_price;
+            let last_ts = ticks.last().map(|t|
+                chrono::DateTime::from_timestamp_millis(t.ts_ms)
+                    .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+                    .unwrap_or_default()
+            ).unwrap_or_default();
+            s.trades.push(Trade {
+                timestamp: last_ts,
+                side: "expired".to_string(),
+                price: entry_p,
+                size: stake,
+                pnl: -stake,
+                debug: None,
+            });
+            s.position = 0;
+            s.stake = 0.0;
+        }
+    }
+
+    let s = sim.lock().unwrap();
+    let final_balance = s.balance;
+    let trades = s.trades.clone();
+    let kv_state = s.kv.clone();
+    drop(s);
+
+    let total_return_pct = (final_balance / initial_balance - 1.0) * 100.0;
+    let total_trades = trades.len() as u32;
+
+    // Win rate
+    let winners = trades.iter().filter(|t| t.pnl > 0.0).count();
+    let win_rate_pct = if total_trades == 0 {
+        0.0
+    } else {
+        winners as f64 / total_trades as f64 * 100.0
+    };
+
+    // Worst trades
+    let mut sorted = trades.clone();
+    sorted.sort_by(|a, b| a.pnl.partial_cmp(&b.pnl).unwrap_or(std::cmp::Ordering::Equal));
+    let worst_trades: Vec<WorstTrade> = sorted.iter().take(5).map(|t| WorstTrade {
+        timestamp: t.timestamp.clone(),
+        side: t.side.clone(),
+        price: t.price,
+        pnl: t.pnl,
+    }).collect();
+
+    let all_trades: Vec<AllTrade> = {
+        let mut bal = initial_balance;
+        trades.iter().map(|t| {
+            bal += t.pnl;
+            AllTrade {
+                timestamp: t.timestamp.clone(),
+                side: t.side.clone(),
+                price: t.price,
+                size: t.size,
+                pnl: t.pnl,
+                balance: bal,
+                debug: None,
+            }
+        }).collect()
+    };
+
+    // Sharpe ratio (annualized, based on per-tick portfolio snapshots)
+    let sharpe = if portfolio_values.len() > 1 {
+        let returns: Vec<f64> = portfolio_values.windows(2)
+            .map(|w| w[1] / w[0] - 1.0)
+            .collect();
+        let mean = returns.iter().sum::<f64>() / returns.len() as f64;
+        let variance = returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / returns.len() as f64;
+        let std_dev = variance.sqrt();
+        // Annualize: ticks/year ≈ 86400 × 365 seconds
+        if std_dev > 0.0 { (mean / std_dev) * (86400.0_f64 * 365.0).sqrt() } else { 0.0 }
+    } else {
+        0.0
+    };
+
+    let analysis = format!(
+        "CLOB 1 HZ backtest: {} ticks, {} trades. \
+        Win rate {:.1}%, return {:.2}%, Sharpe {:.2}, max drawdown {:.2}%.\n\
+        Strategy: on_tick() API — positions resolved each time window_secs_left = 0.\n\
+        P&L computed assuming $1 payout per YES/NO token at resolution.",
+        ticks.len(),
+        total_trades,
+        win_rate_pct,
+        total_return_pct,
+        sharpe,
+        max_dd,
+    );
+
+    Ok(BacktestMetrics {
+        total_return_pct,
+        sharpe_ratio: sharpe,
+        max_drawdown_pct: max_dd,
+        win_rate_pct,
+        total_trades,
+        worst_trades,
+        all_trades,
+        analysis,
+        kv_state,
+        ..Default::default()
+    })
+}
+
+/// Async entry point called from the gateway: reads tick files then runs the backtest.
+pub async fn run_clob_1hz_backtest_from_files(
+    script_path: &std::path::Path,
+    slug: &str,
+    from_date: &str,
+    to_date: &str,
+    initial_balance: f64,
+    fee_pct: f64,
+    workspace_dir: &std::path::Path,
+) -> BacktestMetrics {
+    let script_content = match std::fs::read_to_string(script_path) {
+        Ok(s) => s,
+        Err(e) => return BacktestMetrics {
+            analysis: format!("Error reading script: {e}"),
+            ..Default::default()
+        },
+    };
+
+    let ticks = match load_ticks_for_range(workspace_dir, slug, from_date, to_date) {
+        Ok(t) => t,
+        Err(e) => return BacktestMetrics {
+            analysis: e.to_string(),
+            ..Default::default()
+        },
+    };
+
+    let script_for_task = script_content.clone();
+    let initial_bal = initial_balance;
+    let fee = fee_pct;
+    match tokio::task::spawn_blocking(move || {
+        run_clob_1hz_backtest(&script_for_task, ticks, initial_bal, fee)
+    }).await {
+        Ok(Ok(m))  => m,
+        Ok(Err(e)) => BacktestMetrics {
+            analysis: format!("CLOB 1 HZ backtest error: {e}"),
+            ..Default::default()
+        },
+        Err(e) => BacktestMetrics {
+            analysis: format!("Task join error: {e}"),
+            ..Default::default()
+        },
+    }
 }
 
 #[cfg(test)]

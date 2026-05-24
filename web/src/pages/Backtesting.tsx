@@ -1036,7 +1036,7 @@ function ScriptItem({ script, isSelected, isRunning, isChecked, onSelect, onTogg
 
 const RHAI_API = [
   {
-    category: 'Candle data',
+    category: 'Candle data (on_candle)',
     items: [
       { name: 'ctx.close', desc: 'Close price of current candle' },
       { name: 'ctx.open', desc: 'Open price' },
@@ -1059,10 +1059,10 @@ const RHAI_API = [
   {
     category: 'Indicators',
     items: [
-      { name: 'rsi(ctx, n)', desc: 'RSI over last n candles' },
-      { name: 'ema(ctx, n)', desc: 'Exponential MA (n candles)' },
-      { name: 'sma(ctx, n)', desc: 'Simple MA (n candles)' },
-      { name: 'atr(ctx, n)', desc: 'Average True Range (n candles)' },
+      { name: 'ctx.rsi(n)', desc: 'RSI over last n candles' },
+      { name: 'ctx.ema(n)', desc: 'Exponential MA (n candles)' },
+      { name: 'ctx.sma(n)', desc: 'Simple MA (n candles)' },
+      { name: 'ctx.atr(n)', desc: 'Average True Range (n candles)' },
     ],
   },
   {
@@ -1076,10 +1076,24 @@ const RHAI_API = [
   {
     category: 'Binary market extras',
     items: [
-      { name: 'yes_price', desc: 'YES token market price (0-1)' },
-      { name: 'no_price', desc: 'NO token market price (0-1)' },
-      { name: 'btc_price', desc: 'Current BTC/USD spot price' },
-      { name: 'window_secs_left', desc: 'Seconds until market resolves' },
+      { name: 'ctx.token_price', desc: 'YES token price P4 (0-1)' },
+      { name: 'ctx.token_drift', desc: 'P4 – P3 drift signal' },
+      { name: 'ctx.window_secs_left', desc: 'Seconds until market resolves' },
+      { name: 'ctx.binance_mark', desc: 'Binance spot at decision time' },
+    ],
+  },
+  {
+    category: 'CLOB 1 Hz (on_tick)',
+    items: [
+      { name: 'ctx.yes_bid / yes_ask', desc: 'YES best bid / ask (0-1)' },
+      { name: 'ctx.yes_mid', desc: 'YES mid price' },
+      { name: 'ctx.no_bid / no_ask', desc: 'NO best bid / ask (0-1)' },
+      { name: 'ctx.spread_pct', desc: '(yes_ask−yes_bid)×100 in ¢' },
+      { name: 'ctx.binance_price', desc: 'Binance spot at this tick' },
+      { name: 'ctx.window_secs_left', desc: 'Seconds until window closes' },
+      { name: 'ctx.second_in_window', desc: 'Seconds elapsed (0 = first tick)' },
+      { name: 'ctx.bet_yes(size)', desc: 'Bet YES (size = fraction of balance)' },
+      { name: 'ctx.bet_no(size)', desc: 'Bet NO (size = fraction of balance)' },
     ],
   },
 ]
@@ -1327,6 +1341,22 @@ export default function Backtesting() {
   const allSeries: MarketSeries[] = seriesData?.series ?? []
   const currentSeries = allSeries.find(s => s.id === (config.series_id ?? config.poly_binary_preset))
 
+  // Load available CLOB 1 HZ tick slugs
+  interface TickSlugInfo {
+    slug: string
+    dates: string[]
+    tick_count: number
+    from_date: string
+    to_date: string
+  }
+  const { data: tickSlugsData, refetch: refetchTickSlugs } = useQuery<{ slugs: TickSlugInfo[] }>({
+    queryKey: ['backtest-tick-slugs'],
+    queryFn: () => apiFetch('/api/backtest/tick-slugs'),
+    staleTime: 30 * 1000,
+    enabled: config.market_type === 'clob_1hz',
+  })
+  const tickSlugs: TickSlugInfo[] = tickSlugsData?.slugs ?? []
+
   // Migrate stale 'polymarket' CLOB state to 'polymarket_binary'
   useEffect(() => {
     if ((config.market_type as string) === 'polymarket') {
@@ -1456,7 +1486,8 @@ export default function Backtesting() {
   const isEngineKind = (config.kind ?? 'rhai_candle') !== 'rhai_candle'
 
   const isBatchMode = selectedScripts.length > 1
-  const canRun = (isBatchMode || !!config.script || isEngineKind) && !isRunning && !batchProgress
+  const hasClob1HzSlug = config.market_type !== 'clob_1hz' || !!(config.clob_slug ?? config.symbol)
+  const canRun = (isBatchMode || !!config.script || isEngineKind) && hasClob1HzSlug && !isRunning && !batchProgress
 
   // Sort scripts by selected metric descending
   const sortedScripts = [...scripts].sort((a, b) => {
@@ -1626,6 +1657,14 @@ export default function Backtesting() {
                     fee_pct: 1.5,
                     poly_binary_preset: preset.id,
                   })
+                } else if (newType === 'clob_1hz') {
+                  setFullConfig({
+                    ...config,
+                    market_type: newType,
+                    fee_pct: 1.5,
+                    kind: 'rhai_candle', // ensure rhai engine is selected
+                  })
+                  refetchTickSlugs()
                 } else {
                   setFullConfig({
                     ...config,
@@ -1646,6 +1685,7 @@ export default function Backtesting() {
             >
               <option value="crypto">Crypto</option>
               <option value="polymarket_binary">Polymarket Binary</option>
+              <option value="clob_1hz">CLOB 1 Hz (tick replay)</option>
             </select>
           </div>
 
@@ -1754,7 +1794,61 @@ export default function Backtesting() {
           )}
 
           {/* Symbol / Market selector — adapts to market type (hidden for engine kinds; they use Markets input above) */}
-          {!isEngineKind && config.market_type === 'crypto' ? (
+          {!isEngineKind && config.market_type === 'clob_1hz' ? (
+            <div className="col-span-2 lg:col-span-4">
+              <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>Tick Slug</label>
+              {tickSlugs.length === 0 ? (
+                <div
+                  className="rounded px-3 py-2 text-xs"
+                  style={{
+                    backgroundColor: 'var(--color-surface-2)',
+                    border: '1px solid var(--color-border)',
+                    color: 'var(--color-text-muted)',
+                  }}
+                >
+                  No tick data found — start the tick recorder first:
+                  <code className="ml-1 text-[10px]" style={{ color: 'var(--color-accent)' }}>
+                    tick_recorder action=start slug=btc_5m condition_id=0x…
+                  </code>
+                </div>
+              ) : (
+                <select
+                  value={config.clob_slug ?? config.symbol ?? ''}
+                  onChange={(e) => {
+                    const slug = e.target.value
+                    const info = tickSlugs.find(s => s.slug === slug)
+                    setFullConfig({
+                      ...config,
+                      clob_slug: slug,
+                      symbol: slug,
+                      from_date: info?.from_date ?? config.from_date,
+                      to_date: info?.to_date ?? config.to_date,
+                    })
+                  }}
+                  className="w-full rounded px-2 py-2 text-sm font-mono"
+                  style={{
+                    backgroundColor: 'var(--color-surface-2)',
+                    border: '1px solid var(--color-border)',
+                    color: 'var(--color-text)',
+                  }}
+                >
+                  <option value="">Select a slug…</option>
+                  {tickSlugs.map(s => (
+                    <option key={s.slug} value={s.slug}>
+                      {s.slug} — {s.tick_count.toLocaleString()} ticks ({s.from_date} → {s.to_date})
+                    </option>
+                  ))}
+                </select>
+              )}
+              {config.clob_slug && tickSlugs.find(s => s.slug === config.clob_slug) && (
+                <p className="text-[10px] mt-1" style={{ color: 'var(--color-text-muted)' }}>
+                  {tickSlugs.find(s => s.slug === config.clob_slug)!.tick_count.toLocaleString()} ticks recorded
+                  · {tickSlugs.find(s => s.slug === config.clob_slug)!.dates.length} day(s)
+                  · Script must use <code style={{ color: 'var(--color-accent)' }}>on_tick(ctx)</code>
+                </p>
+              )}
+            </div>
+          ) : !isEngineKind && config.market_type === 'crypto' ? (
             <div className="lg:col-span-3">
               <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>Symbol</label>
               <input
@@ -1829,8 +1923,8 @@ export default function Backtesting() {
             </div>
           ) : null}
 
-          {/* Interval / Window — hidden for engine kinds (5m fixed internally) */}
-          {!isEngineKind && <div className={config.market_type === 'crypto' ? 'lg:col-span-3' : 'lg:col-span-2'}>
+          {/* Interval / Window — hidden for engine kinds and CLOB 1 HZ (tick-level data, no candle interval) */}
+          {!isEngineKind && config.market_type !== 'clob_1hz' && <div className={config.market_type === 'crypto' ? 'lg:col-span-3' : 'lg:col-span-2'}>
             <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>
               {config.market_type === 'polymarket_binary' ? 'Window' : 'Interval'}
             </label>
@@ -2054,7 +2148,7 @@ export default function Backtesting() {
                 <button
                   type="button"
                   className="underline"
-                  onClick={() => set('allowed_hours', [0, 9, 11, 18, 21])}
+                  onClick={() => set('allowed_hours', [0, 1, 6, 18, 21, 23])}
                 >Preset: hot hours</button>
                 <button
                   type="button"

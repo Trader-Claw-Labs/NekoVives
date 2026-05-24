@@ -365,6 +365,113 @@ async fn fetch_clob_tokens(client: &reqwest::Client, condition_id: &str) -> Resu
     anyhow::bail!("Could not extract tokens from CLOB response")
 }
 
+/// Resolution outcome for a binary Polymarket market.
+///
+/// Polymarket reports the final outcome via Gamma's `outcomePrices` array:
+/// `["1","0"]` means YES won, `["0","1"]` means NO won. For 5-min UP/DOWN
+/// markets this is exactly the data the protocol used to settle the market —
+/// derived from Chainlink (or whichever oracle the market is tied to), not
+/// from Binance candles. Using this for backtest/backfill ensures our P&L
+/// matches what actually happened on chain.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MarketResolution {
+    pub slug: String,
+    pub condition_id: String,
+    /// True when the market has resolved (Gamma `closed=true`).
+    pub closed: bool,
+    /// True when the YES/UP outcome won. None if the market hasn't resolved
+    /// yet or the outcomePrices field is missing/malformed.
+    pub yes_won: Option<bool>,
+    /// ISO-8601 close timestamp from Gamma.
+    pub end_date_iso: Option<String>,
+    /// Raw outcomePrices array as Polymarket reported it (for diagnostics).
+    pub outcome_prices_raw: Option<Vec<String>>,
+}
+
+/// Fetch a single market's resolution via Gamma `/markets?slug=`.
+///
+/// Returns Ok with `closed=false, yes_won=None` if the market exists but
+/// hasn't settled yet. Returns Err only on transport/parse failure.
+pub async fn get_market_resolution(slug: &str) -> Result<MarketResolution> {
+    #[derive(Deserialize)]
+    struct ResolvableGamma {
+        #[serde(rename = "conditionId", default)]
+        condition_id: String,
+        slug: String,
+        #[serde(default)]
+        closed: bool,
+        #[serde(rename = "endDateIso", default)]
+        end_date_iso: Option<String>,
+        /// Gamma sends this as a JSON-encoded *string* (e.g. `"[\"1\",\"0\"]"`),
+        /// not a JSON array. Capture as raw value, parse below.
+        #[serde(rename = "outcomePrices", default)]
+        outcome_prices: Option<serde_json::Value>,
+    }
+
+    let client = reqwest::Client::new();
+    // Gamma defaults to closed=false. The recurring 5m UP/DOWN markets archive
+    // ~minutes after resolution, so for backfill / settlement we have to query
+    // both active and closed states. We try active first (cheap), then closed.
+    let mut market: Option<ResolvableGamma> = None;
+    for closed_filter in [None, Some(true)] {
+        let url = match closed_filter {
+            None    => format!("https://gamma-api.polymarket.com/markets?slug={slug}"),
+            Some(b) => format!("https://gamma-api.polymarket.com/markets?slug={slug}&closed={b}"),
+        };
+        let raw: Vec<ResolvableGamma> = client
+            .get(&url)
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        if let Some(m) = raw.into_iter().find(|m| m.slug == slug) {
+            market = Some(m);
+            break;
+        }
+    }
+    let market = market.ok_or_else(|| anyhow!("No Gamma market found for slug: {slug}"))?;
+
+    // outcomePrices is a stringified JSON array; sometimes a real array.
+    // Normalise to Vec<String>.
+    let outcome_prices_raw: Option<Vec<String>> = match market.outcome_prices {
+        Some(serde_json::Value::String(s)) => serde_json::from_str::<Vec<String>>(&s).ok(),
+        Some(serde_json::Value::Array(a)) => Some(
+            a.into_iter()
+                .map(|v| v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()))
+                .collect(),
+        ),
+        _ => None,
+    };
+
+    let yes_won: Option<bool> = match outcome_prices_raw.as_deref() {
+        Some([yes, no]) => {
+            let y = yes.parse::<f64>().unwrap_or(0.0);
+            let n = no.parse::<f64>().unwrap_or(0.0);
+            // Only trust resolved (1/0) markets; partial values mean the market
+            // is still mid-flight or had a UMA dispute.
+            if (y - 1.0).abs() < 1e-6 && n.abs() < 1e-6 {
+                Some(true)
+            } else if y.abs() < 1e-6 && (n - 1.0).abs() < 1e-6 {
+                Some(false)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+
+    Ok(MarketResolution {
+        slug: market.slug,
+        condition_id: market.condition_id,
+        closed: market.closed,
+        yes_won,
+        end_date_iso: market.end_date_iso,
+        outcome_prices_raw,
+    })
+}
+
 /// Get YES token price (0.0 to 1.0).
 /// GET https://clob.polymarket.com/price?token_id=<token_id>&side=buy
 pub async fn get_market_price(token_id: &str) -> Result<f64> {

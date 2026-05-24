@@ -3751,7 +3751,7 @@ pub async fn handle_api_backtest_scripts(
     Json(serde_json::json!({ "scripts": scripts })).into_response()
 }
 
-/// GET /api/backtest/series u2014 list all built-in (and future user-defined) recurring market series
+/// GET /api/backtest/series — list all built-in (and future user-defined) recurring market series
 pub async fn handle_api_backtest_series(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3761,6 +3761,31 @@ pub async fn handle_api_backtest_series(
     }
     let series = crate::tools::series::builtin_series();
     Json(serde_json::json!({ "series": series })).into_response()
+}
+
+/// GET /api/backtest/tick-slugs — list available CLOB 1 HZ tick slugs with date coverage.
+///
+/// Returns slugs that have at least one JSONL file under `data/ticks/<slug>/`.
+/// Each entry includes the slug name, available dates, and total tick count.
+pub async fn handle_api_backtest_tick_slugs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let slugs = crate::tools::backtest::list_tick_slugs(&workspace_dir);
+    let response: Vec<serde_json::Value> = slugs.into_iter().map(|(slug, dates, tick_count)| {
+        serde_json::json!({
+            "slug": slug,
+            "dates": dates,
+            "tick_count": tick_count,
+            "from_date": dates.first().cloned().unwrap_or_default(),
+            "to_date": dates.last().cloned().unwrap_or_default(),
+        })
+    }).collect();
+    Json(serde_json::json!({ "slugs": response })).into_response()
 }
 
 #[derive(serde::Deserialize)]
@@ -6756,4 +6781,154 @@ mod tests {
         assert_eq!(windows_exact[1], exact + 300);
         assert_eq!(windows_exact[2], exact - 300);
     }
+}
+
+// ── Active Polymarket token lookup ────────────────────────────────────────────
+
+/// GET /api/polymarket/active-token?series_id=btc_5m
+///
+/// Returns the YES token condition_id, yes_token_id, and no_token_id for the
+/// currently-active window of the given market series. Used by the UI to
+/// auto-populate the condition_id field in the tick recorder form.
+pub async fn handle_api_polymarket_active_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+
+    let series_id = params.get("series_id").map(|s| s.as_str());
+
+    let sid = match series_id {
+        Some(s) => s,
+        None => return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "series_id query param required" })),
+        ).into_response(),
+    };
+
+    let series = crate::tools::series::builtin_series()
+        .into_iter()
+        .find(|s| s.id == sid);
+
+    let series = match series {
+        Some(s) => s,
+        None => return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("Unknown series_id '{sid}'") })),
+        ).into_response(),
+    };
+
+    let seconds: u64 = match series.cadence.as_str() {
+        "1m" => 60, "5m" => 300, "15m" => 900, "1h" => 3600, _ => 300,
+    };
+
+    let now_secs = chrono::Utc::now().timestamp() as u64;
+    let windows = calculate_resolution_windows(now_secs, seconds);
+    let slug_prefix = &series.slug_prefix;
+
+    for ts in &windows {
+        let target_slug = format!("{slug_prefix}-{ts}");
+        match polymarket_trader::markets::get_market(&target_slug).await {
+            Ok(m) if !m.yes_token_id.trim().is_empty() => {
+                return Json(serde_json::json!({
+                    "ok": true,
+                    "series_id": sid,
+                    "slug": target_slug,
+                    "condition_id": m.condition_id,
+                    "yes_token_id": m.yes_token_id,
+                    "no_token_id": m.no_token_id,
+                    "window_ts": ts,
+                })).into_response();
+            }
+            _ => continue,
+        }
+    }
+
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({
+            "error": format!("No active market found for series '{sid}' right now. Try again in a moment.")
+        })),
+    ).into_response()
+}
+
+// ── Tick Recorder REST API ────────────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+pub struct TickRecorderStartBody {
+    pub slug: String,
+    pub condition_id: String,
+    #[serde(default = "default_binance_symbol")]
+    pub binance_symbol: String,
+    pub chainlink_url: Option<String>,
+}
+
+fn default_binance_symbol() -> String { "BTCUSDT".to_string() }
+
+/// POST /api/tick-recorder/start — start a 1-Hz CLOB tick recorder for a market.
+/// Body: { slug, condition_id, binance_symbol?, chainlink_url? }
+pub async fn handle_api_tick_recorder_start(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<TickRecorderStartBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let mut cfg = crate::tick_recorder::TickRecorderConfig::new(
+        &body.slug,
+        &body.condition_id,
+        &body.binance_symbol,
+        &workspace_dir,
+    );
+    cfg.chainlink_url = body.chainlink_url;
+
+    crate::tick_recorder::start_recorder(cfg).await;
+
+    Json(serde_json::json!({
+        "ok": true,
+        "slug": body.slug,
+        "message": format!(
+            "Tick recorder started for '{}'. Writing to {}/data/ticks/{}/",
+            body.slug, workspace_dir.display(), body.slug
+        ),
+    })).into_response()
+}
+
+#[derive(serde::Deserialize)]
+pub struct TickRecorderSlugBody {
+    pub slug: String,
+}
+
+/// POST /api/tick-recorder/stop — stop a running tick recorder.
+/// Body: { slug }
+pub async fn handle_api_tick_recorder_stop(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<TickRecorderSlugBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+
+    let stopped = crate::tick_recorder::stop_recorder(&body.slug).await;
+    Json(serde_json::json!({
+        "ok": true,
+        "stopped": stopped,
+        "message": if stopped {
+            format!("Tick recorder for '{}' stopped.", body.slug)
+        } else {
+            format!("No active tick recorder found for '{}'.", body.slug)
+        },
+    })).into_response()
+}
+
+/// GET /api/tick-recorder/status — list all running tick recorders.
+pub async fn handle_api_tick_recorder_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+
+    let running = crate::tick_recorder::running_recorders().await;
+    Json(serde_json::json!({ "running": running })).into_response()
 }

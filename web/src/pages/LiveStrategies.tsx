@@ -821,6 +821,29 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript, prefil
   const [showMissingApiKeyModal, setShowMissingApiKeyModal] = useState(false)
   const [showMissingPrivateKeyModal, setShowMissingPrivateKeyModal] = useState(false)
 
+  // Tick recorder fields (only relevant for polymarket_binary)
+  const [tickRecord, setTickRecord] = useState(false)
+  const [tickConditionId, setTickConditionId] = useState('')
+  const [tickDetecting, setTickDetecting] = useState(false)
+  const [tickDetectError, setTickDetectError] = useState('')
+  const slug = form.series_id ?? form.symbol?.toLowerCase().replace('usdt', '_5m') ?? ''
+
+  function autoDetectConditionIdModal(seriesId: string) {
+    if (!seriesId) return
+    setTickDetecting(true)
+    setTickDetectError('')
+    apiFetch(`/api/polymarket/active-token?series_id=${encodeURIComponent(seriesId)}`)
+      .then((data: any) => {
+        if (data?.condition_id) {
+          setTickConditionId(data.condition_id)
+        } else {
+          setTickDetectError('No active market found — enter manually')
+        }
+      })
+      .catch(() => setTickDetectError('Detection failed — enter manually'))
+      .finally(() => setTickDetecting(false))
+  }
+
   function friendlyCreateError(message: string) {
     const m = message.toLowerCase()
     if (m.includes('wallet_address')) {
@@ -879,7 +902,22 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript, prefil
       })
       return apiPost('/api/live/strategies', payload)
     },
-    onSuccess: () => { onCreated(); onClose() },
+    onSuccess: async () => {
+      // Auto-start tick recorder if requested
+      if (tickRecord && tickConditionId.trim() && form.market_type === 'polymarket_binary') {
+        try {
+          await apiPost('/api/tick-recorder/start', {
+            slug: slug || form.series_id || 'market',
+            condition_id: tickConditionId.trim(),
+            binance_symbol: form.symbol || 'BTCUSDT',
+          })
+        } catch {
+          // Non-fatal — recorder can be started manually later
+        }
+      }
+      onCreated()
+      onClose()
+    },
     onError: (e: Error) => setError(friendlyCreateError(e.message)),
   })
 
@@ -1457,7 +1495,7 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript, prefil
               <div className="flex items-center gap-2 mb-1.5">
                 <SegmentedToggle
                   value={form.allowed_hours.length > 0}
-                  onChange={(v) => set('allowed_hours', v ? [0, 9, 11, 18, 21] : [])}
+                  onChange={(v) => set('allowed_hours', v ? [0, 1, 6, 18, 21, 23] : [])}
                   leftLabel="Off"
                   rightLabel="On"
                   activeColor="#34d399"
@@ -1495,7 +1533,7 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript, prefil
                     <button
                       type="button"
                       className="underline"
-                      onClick={() => set('allowed_hours', [0, 9, 11, 18, 21])}
+                      onClick={() => set('allowed_hours', [0, 1, 6, 18, 21, 23])}
                     >Preset: hot hours</button>
                     <button
                       type="button"
@@ -1544,6 +1582,91 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript, prefil
                   ? `Skip when BTC 1h RV < ${form.rv_min_btc.toFixed(5)} — filters flat consolidation`
                   : 'Disabled — no RV filter applied'}
               </p>
+            </div>
+          )}
+
+          {/* Tick Recorder — shown for Polymarket Binary only */}
+          {form.market_type === 'polymarket_binary' && (
+            <div
+              className="rounded border px-3 py-2.5 space-y-2"
+              style={{ borderColor: tickRecord ? 'var(--color-accent)' : 'var(--color-border)', backgroundColor: 'var(--color-surface-2)' }}
+            >
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Activity size={13} style={{ color: tickRecord ? 'var(--color-accent)' : 'var(--color-text-muted)' }} />
+                  <span className="text-xs font-medium" style={{ color: 'var(--color-text)' }}>
+                    Record CLOB ticks (1 Hz)
+                  </span>
+                  {tickRecord && (
+                    <span className="text-[10px] px-1.5 py-0.5 rounded font-semibold animate-pulse"
+                      style={{ backgroundColor: 'rgba(34,197,94,0.15)', color: 'var(--color-accent)' }}>
+                      WILL RECORD
+                    </span>
+                  )}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const next = !tickRecord
+                    setTickRecord(next)
+                    if (next && form.series_id && !tickConditionId) {
+                      autoDetectConditionIdModal(form.series_id)
+                    }
+                  }}
+                  className={`relative w-9 h-5 rounded-full transition-colors ${tickRecord ? 'bg-[var(--color-accent)]' : 'bg-[var(--color-border)]'}`}
+                >
+                  <span className={`absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform ${tickRecord ? 'translate-x-4' : 'translate-x-0'}`} />
+                </button>
+              </div>
+              {tickRecord && (
+                <div className="space-y-1.5">
+                  <div>
+                    <div className="flex items-center justify-between mb-0.5">
+                      <label className="text-[10px]" style={{ color: 'var(--color-text-muted)' }}>
+                        Condition ID (YES token hex) <span style={{ color: 'var(--color-danger)' }}>*</span>
+                      </label>
+                      {form.series_id && (
+                        <button
+                          type="button"
+                          onClick={() => autoDetectConditionIdModal(form.series_id)}
+                          disabled={tickDetecting}
+                          className="text-[10px] px-1.5 py-0.5 rounded disabled:opacity-50"
+                          style={{ color: 'var(--color-accent)', backgroundColor: 'rgba(34,197,94,0.1)' }}
+                        >
+                          {tickDetecting ? '⏳ Detecting…' : '⚡ Auto-detect'}
+                        </button>
+                      )}
+                    </div>
+                    <input
+                      className="w-full rounded px-2 py-1.5 text-xs font-mono"
+                      style={{
+                        backgroundColor: 'var(--color-surface)',
+                        border: `1px solid ${tickDetecting ? 'var(--color-accent)' : 'var(--color-border)'}`,
+                        color: 'var(--color-text)',
+                        opacity: tickDetecting ? 0.6 : 1,
+                      }}
+                      placeholder={tickDetecting ? 'Detecting from Polymarket API…' : '0x1234abcd...'}
+                      value={tickConditionId}
+                      onChange={e => setTickConditionId(e.target.value)}
+                      disabled={tickDetecting}
+                    />
+                    {tickDetectError && (
+                      <p className="text-[10px] mt-0.5" style={{ color: 'var(--color-warning)' }}>{tickDetectError}</p>
+                    )}
+                  </div>
+                  <p className="text-[10px]" style={{ color: 'var(--color-text-muted)' }}>
+                    {form.series_id
+                      ? <>Auto-detect resolves the current window from Polymarket. Saves YES/NO bid-ask every second to{' '}<code style={{ color: 'var(--color-accent)' }}>data/ticks/{slug}/</code>.</>
+                      : <>Saves YES/NO bid-ask + Binance price every second to{' '}<code style={{ color: 'var(--color-accent)' }}>data/ticks/{slug}/</code>. Find the condition_id on the Polymarket market page.</>
+                    }
+                  </p>
+                </div>
+              )}
+              {!tickRecord && (
+                <p className="text-[10px]" style={{ color: 'var(--color-text-muted)' }}>
+                  Enable to record live CLOB prices at 1 Hz — required for CLOB 1 Hz backtesting.
+                </p>
+              )}
             </div>
           )}
 
@@ -2007,6 +2130,29 @@ interface RunnerCardProps {
   onUpgradeToLive?: () => void
 }
 
+function useTickRecorder(slug: string) {
+  const { data, refetch } = useQuery<{ running: string[] }>({
+    queryKey: ['tick-recorder-status'],
+    queryFn: () => apiFetch('/api/tick-recorder/status'),
+    refetchInterval: 10_000,
+    staleTime: 5_000,
+  })
+  const isRecording = (data?.running ?? []).includes(slug)
+
+  const startMutation = useMutation({
+    mutationFn: (body: { slug: string; condition_id: string; binance_symbol: string }) =>
+      apiPost('/api/tick-recorder/start', body),
+    onSuccess: () => refetch(),
+  })
+
+  const stopMutation = useMutation({
+    mutationFn: (s: string) => apiPost('/api/tick-recorder/stop', { slug: s }),
+    onSuccess: () => refetch(),
+  })
+
+  return { isRecording, startMutation, stopMutation, isLoading: startMutation.isPending || stopMutation.isPending }
+}
+
 function RunnerCard({ runner, onStop, onRestart, onDelete, onToggleHidden, onUpdateConfig, isPatching, onUpgradeToLive }: RunnerCardProps) {
   const [expanded, setExpanded] = useState(() => {
     try {
@@ -2039,6 +2185,32 @@ function RunnerCard({ runner, onStop, onRestart, onDelete, onToggleHidden, onUpd
   const prevTradesRef = useRef<number>(-1)
   const { config, status, result } = runner
   const isRunning = status.status === 'running' || status.status === 'starting'
+
+  // Tick recorder (Polymarket binary only)
+  const tickSlug = config.series_id ?? config.symbol?.toLowerCase().replace('usdt', '_5m') ?? ''
+  const { isRecording, startMutation, stopMutation, isLoading: tickLoading } = useTickRecorder(
+    config.market_type === 'polymarket_binary' ? tickSlug : ''
+  )
+  const [showTickForm, setShowTickForm] = useState(false)
+  const [tickConditionId, setTickConditionId] = useState('')
+  const [tickDetecting, setTickDetecting] = useState(false)
+  const [tickDetectError, setTickDetectError] = useState('')
+
+  function autoDetectConditionId(seriesId: string) {
+    if (!seriesId) return
+    setTickDetecting(true)
+    setTickDetectError('')
+    apiFetch(`/api/polymarket/active-token?series_id=${encodeURIComponent(seriesId)}`)
+      .then((data: any) => {
+        if (data?.condition_id) {
+          setTickConditionId(data.condition_id)
+        } else {
+          setTickDetectError('No active market found — enter manually')
+        }
+      })
+      .catch(() => setTickDetectError('Detection failed — enter manually'))
+      .finally(() => setTickDetecting(false))
+  }
 
   // Tick every 30s so the uptime label refreshes without waiting for the
   // outer 5s polling cycle to swap status props.
@@ -2147,6 +2319,32 @@ function RunnerCard({ runner, onStop, onRestart, onDelete, onToggleHidden, onUpd
           </p>
         </div>
         <div className="flex items-center gap-1 flex-shrink-0">
+          {/* Tick recorder button — Polymarket Binary only */}
+          {config.market_type === 'polymarket_binary' && (
+            <button
+              onClick={() => {
+                if (isRecording) {
+                  stopMutation.mutate(tickSlug)
+                } else {
+                  const next = !showTickForm
+                  setShowTickForm(next)
+                  if (next && config.series_id && !tickConditionId) {
+                    autoDetectConditionId(config.series_id)
+                  }
+                }
+              }}
+              disabled={tickLoading}
+              title={isRecording ? `Stop tick recorder (${tickSlug})` : 'Start tick recorder'}
+              className="flex items-center gap-1 px-2 py-1 rounded text-[10px] font-semibold transition-opacity disabled:opacity-50"
+              style={{
+                backgroundColor: isRecording ? 'rgba(34,197,94,0.15)' : 'rgba(99,102,241,0.12)',
+                color: isRecording ? 'var(--color-accent)' : 'var(--color-text-muted)',
+              }}
+            >
+              <Activity size={11} className={isRecording ? 'animate-pulse' : ''} />
+              {isRecording ? 'Recording' : 'Record'}
+            </button>
+          )}
           {config.mode === 'paper' && onUpgradeToLive && (
             <button
               onClick={onUpgradeToLive}
@@ -2185,6 +2383,85 @@ function RunnerCard({ runner, onStop, onRestart, onDelete, onToggleHidden, onUpd
           </button>
         </div>
       </div>
+
+      {/* Tick recorder inline form — appears when "Record" is clicked and not yet recording */}
+      {config.market_type === 'polymarket_binary' && showTickForm && !isRecording && (
+        <div className="px-4 py-3 border-b flex flex-col gap-2" style={{ borderColor: 'var(--color-border)', backgroundColor: 'rgba(99,102,241,0.06)' }}>
+          <div className="flex items-center gap-2">
+            <Activity size={12} style={{ color: 'var(--color-accent)' }} />
+            <span className="text-xs font-semibold" style={{ color: 'var(--color-text)' }}>Start CLOB 1 Hz recorder</span>
+            <span className="text-[10px] font-mono px-1.5 py-0.5 rounded" style={{ backgroundColor: 'var(--color-surface-2)', color: 'var(--color-text-muted)' }}>
+              slug: {tickSlug}
+            </span>
+          </div>
+          <div className="flex gap-2 items-end">
+            <div className="flex-1">
+              <div className="flex items-center justify-between mb-0.5">
+                <label className="text-[10px]" style={{ color: 'var(--color-text-muted)' }}>
+                  YES token Condition ID (hex)
+                </label>
+                {config.series_id && (
+                  <button
+                    type="button"
+                    onClick={() => autoDetectConditionId(config.series_id!)}
+                    disabled={tickDetecting}
+                    className="text-[10px] px-1.5 py-0.5 rounded disabled:opacity-50 transition-opacity"
+                    style={{ color: 'var(--color-accent)', backgroundColor: 'rgba(34,197,94,0.1)' }}
+                  >
+                    {tickDetecting ? '⏳ Detecting…' : '⚡ Auto-detect'}
+                  </button>
+                )}
+              </div>
+              <input
+                className="w-full rounded border px-2 py-1.5 text-xs font-mono"
+                style={{
+                  background: 'var(--color-surface-2)',
+                  borderColor: tickDetecting ? 'var(--color-accent)' : 'var(--color-border)',
+                  color: 'var(--color-text)',
+                  opacity: tickDetecting ? 0.6 : 1,
+                }}
+                placeholder={tickDetecting ? 'Detecting from Polymarket API…' : '0xabc123...'}
+                value={tickConditionId}
+                onChange={e => setTickConditionId(e.target.value)}
+                disabled={tickDetecting}
+              />
+              {tickDetectError && (
+                <p className="text-[10px] mt-0.5" style={{ color: 'var(--color-warning)' }}>{tickDetectError}</p>
+              )}
+            </div>
+            <button
+              onClick={() => {
+                if (!tickConditionId.trim()) return
+                startMutation.mutate({
+                  slug: tickSlug,
+                  condition_id: tickConditionId.trim(),
+                  binance_symbol: config.symbol || 'BTCUSDT',
+                })
+                setShowTickForm(false)
+              }}
+              disabled={!tickConditionId.trim() || tickLoading || tickDetecting}
+              className="flex items-center gap-1 px-3 py-1.5 rounded text-xs font-semibold disabled:opacity-50"
+              style={{ backgroundColor: 'var(--color-accent)', color: '#000' }}
+            >
+              <Activity size={11} />
+              Start
+            </button>
+            <button
+              onClick={() => setShowTickForm(false)}
+              className="px-3 py-1.5 rounded text-xs border"
+              style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-muted)' }}
+            >
+              Cancel
+            </button>
+          </div>
+          <p className="text-[10px]" style={{ color: 'var(--color-text-muted)' }}>
+            {config.series_id
+              ? <>Auto-detect resolves the current window's condition_id from Polymarket. Saves YES/NO bid-ask every second to{' '}<code style={{ color: 'var(--color-accent)' }}>data/ticks/{tickSlug}/</code>.</>
+              : <>Find the condition ID on the Polymarket market page. Saves YES/NO bid-ask prices every second to{' '}<code style={{ color: 'var(--color-accent)' }}>data/ticks/{tickSlug}/</code>.</>
+            }
+          </p>
+        </div>
+      )}
 
       {/* Sizing config editor — visible when stopped so user can adjust before restart */}
       {!isRunning && onUpdateConfig && (
@@ -2334,7 +2611,7 @@ function RunnerCard({ runner, onStop, onRestart, onDelete, onToggleHidden, onUpd
                 <div className="flex items-center gap-1">
                   <SegmentedToggle
                     value={(config.allowed_hours ?? []).length > 0}
-                    onChange={(v) => onUpdateConfig({ allowed_hours: v ? [0, 9, 11, 18, 21] : [] })}
+                    onChange={(v) => onUpdateConfig({ allowed_hours: v ? [0, 1, 6, 18, 21, 23] : [] })}
                     leftLabel="Off"
                     rightLabel="On"
                     activeColor="#34d399"
@@ -2524,19 +2801,13 @@ function RunnerCard({ runner, onStop, onRestart, onDelete, onToggleHidden, onUpd
       )}
 
       {/* Equity Chart for polymarket_binary live_orders.
-          In live mode, anchor the curve to the real Polymarket wallet balance
-          instead of the (paper) config.initial_balance, so the displayed
-          balance matches the wallet. */}
+          Each runner tracks its own P&L from its own live_orders — completely
+          independent of the shared wallet balance. Using wallet balance here
+          would corrupt the chart when multiple runners share the same wallet. */}
       {config.market_type === 'polymarket_binary' && result?.live_orders && result.live_orders.length > 0 && (() => {
         const cumPnl = runnerPnlUSD(runner)
-        const isLive = config.mode === 'live'
-        const liveWallet = result.wallet_balance_usdc
-        const startBalance = isLive && typeof liveWallet === 'number'
-          ? Math.max(0, liveWallet - cumPnl)
-          : config.initial_balance
-        const currentBalance = isLive && typeof liveWallet === 'number'
-          ? liveWallet
-          : config.initial_balance + cumPnl
+        const startBalance = config.initial_balance
+        const currentBalance = startBalance + cumPnl
         return (
           <div className="px-4 pb-2 border-t pt-3" style={{ borderColor: 'var(--color-border)' }}>
             <div className="flex items-center justify-between mb-1.5">
@@ -2545,6 +2816,9 @@ function RunnerCard({ runner, onStop, onRestart, onDelete, onToggleHidden, onUpd
               </span>
               <span className="text-xs" style={{ color: 'var(--color-text-muted)' }}>
                 {result.live_orders.filter(o => o.pnl != null).length} trades · ${fmtUSD(currentBalance)}
+                {config.mode === 'live' && typeof result.wallet_balance_usdc === 'number' && (
+                  <> (wallet: ${fmtUSD(result.wallet_balance_usdc)})</>
+                )}
               </span>
             </div>
             <LiveEquityChart trades={liveOrdersToTrades(result.live_orders, startBalance)} initialBalance={startBalance} />
@@ -2715,10 +2989,23 @@ function RunnerCard({ runner, onStop, onRestart, onDelete, onToggleHidden, onUpd
                 <span>${fmtUSD(result?.balance)}</span>
               </div>
             )}
+            {config.mode === 'live' && result?.live_orders && result.live_orders.length > 0 && (
+              <div className="flex justify-between">
+                <span style={{ color: 'var(--color-text-muted)' }}>Runner P&L</span>
+                {(() => {
+                  const pnl = result.live_orders.reduce((s, o) => s + (o.pnl ?? 0), 0)
+                  return (
+                    <span style={{ color: pnl >= 0 ? 'var(--color-accent)' : 'var(--color-danger)', fontWeight: 600 }}>
+                      {pnl >= 0 ? '+' : ''}${fmtUSD(pnl)}
+                    </span>
+                  )
+                })()}
+              </div>
+            )}
             {config.mode === 'live' && (
               typeof result?.wallet_balance_usdc === 'number' ? (
                 <div className="flex justify-between">
-                  <span style={{ color: 'var(--color-text-muted)' }}>Wallet Balance</span>
+                  <span style={{ color: 'var(--color-text-muted)' }}>Wallet Balance (shared)</span>
                   <span style={{ color: result.wallet_balance_usdc < 10 ? 'var(--color-warning)' : 'inherit' }}>
                     ${fmtUSD(result.wallet_balance_usdc)}
                   </span>
