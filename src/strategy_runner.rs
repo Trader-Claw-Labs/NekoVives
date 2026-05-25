@@ -2615,9 +2615,14 @@ async fn polymarket_runner_loop(
                                 &format!("Window {}: {} | Position FLAT", prev_window, outcome),
                             );
                         } else {
-                            // Only count this as a trade if a MATCHED order exists for this window.
-                            // Orders with status "LIVE" were never filled (no tokens received).
-                            let has_order = live_orders.iter().any(|o| o.window_ts == prev_window && o.status == "MATCHED");
+                            // Only count this as a trade if a real fill exists for this window.
+                            // On-chain orders count when status == "MATCHED" (CLOB confirmed
+                            // fill). Paper orders are simulated as filled at decision-time
+                            // entry_price, so they always count regardless of status.
+                            let has_order = live_orders.iter().any(|o| {
+                                o.window_ts == prev_window
+                                    && (o.status == "MATCHED" || o.order_id.starts_with("paper-"))
+                            });
                             if !has_order {
                                 tracing::info!(
                                     "[RUNNER {id}] Window {} resolved {}. Signal={} but NO ORDER PLACED",
@@ -2642,8 +2647,11 @@ async fn polymarket_runner_loop(
                                         order.resolution_yes_won = Some(went_up);
                                         order.resolution_source = Some(resolution_source_str.to_string());
 
-                                        // Skip LIVE (unfilled) orders — they never received tokens.
-                                        if order.status != "MATCHED" {
+                                        // Skip LIVE (unfilled) on-chain orders — they never
+                                        // received tokens. Paper orders (id prefix "paper-")
+                                        // are simulated and always settle at entry_price.
+                                        let is_paper = order.order_id.starts_with("paper-");
+                                        if !is_paper && order.status != "MATCHED" {
                                             tracing::warn!(
                                                 "[RUNNER {id}] Window {} settle: order status='{}' (not MATCHED); skipping P&L",
                                                 prev_window, order.status

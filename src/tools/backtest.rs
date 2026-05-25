@@ -40,6 +40,9 @@ const POLY_DOGE_MEANREV_SCRIPT:  &str = include_str!("scripts/polymarket_doge_up
 const POLY_HYPE_THINMKT_SCRIPT:  &str = include_str!("scripts/polymarket_hype_updown_5m_thinmkt.rhai");
 const POLY_ALL_ADAPTIVE_SCRIPT:  &str = include_str!("scripts/polymarket_all_updown_5m_adaptive.rhai");
 const POLY_BTC_DRIFT_V4_SAFE_SCRIPT: &str = include_str!("scripts/polymarket_btc_updown_5m_drift_v4_safe.rhai");
+const POLY_BTC_V5_COMBO_YES_ONLY_SCRIPT: &str = include_str!("scripts/polymarket_btc_updown_5m_v5_combo_yes_only.rhai");
+const POLY_BTC_V5_STRICT_HOURS_SCRIPT:   &str = include_str!("scripts/polymarket_btc_updown_5m_v5_strict_hours.rhai");
+const POLY_BTC_V5_ENSEMBLE_SCRIPT:       &str = include_str!("scripts/polymarket_btc_updown_5m_v5_ensemble.rhai");
 
 // ── CLOB 1 HZ tick-based scripts ─────────────────────────────────────────────
 const CLOB_1HZ_SPREAD_SCALPER_SCRIPT: &str = include_str!("scripts/clob_1hz_spread_scalper.rhai");
@@ -50,7 +53,7 @@ const RSI_STRATEGY_SCRIPT: &str = include_str!("scripts/rsi_strategy.rhai");
 /// Write bundled default scripts to `<workspace>/scripts/` if they don't exist yet.
 /// Called by both backtest tools so the scripts are always available on first run.
 /// All bundled default scripts as (filename, content) pairs.
-const DEFAULT_SCRIPTS: [(&str, &str); 25] = [
+const DEFAULT_SCRIPTS: [(&str, &str); 28] = [
     // ── Polymarket binary ──────────────────────────────────────────────────────
     ("polymarket_btc_binary.rhai",              POLYMARKET_BTC_BINARY_SCRIPT),
     ("polymarket_5min.rhai",                    POLYMARKET_5MIN_SCRIPT),
@@ -65,6 +68,9 @@ const DEFAULT_SCRIPTS: [(&str, &str); 25] = [
     ("polymarket_hype_updown_5m_thinmkt.rhai",        POLY_HYPE_THINMKT_SCRIPT),
     ("polymarket_all_updown_5m_adaptive.rhai",        POLY_ALL_ADAPTIVE_SCRIPT),
     ("polymarket_btc_updown_5m_drift_v4_safe.rhai",   POLY_BTC_DRIFT_V4_SAFE_SCRIPT),
+    ("polymarket_btc_updown_5m_v5_combo_yes_only.rhai", POLY_BTC_V5_COMBO_YES_ONLY_SCRIPT),
+    ("polymarket_btc_updown_5m_v5_strict_hours.rhai",   POLY_BTC_V5_STRICT_HOURS_SCRIPT),
+    ("polymarket_btc_updown_5m_v5_ensemble.rhai",       POLY_BTC_V5_ENSEMBLE_SCRIPT),
     // ── BTC OPT series ────────────────────────────────────────────────────────
     ("btc_opt_v15_bb_mean_rev.rhai",            BTC_OPT_V15_BB_MEAN_REV_SCRIPT),
     // ── Classic indicators ────────────────────────────────────────────────────
