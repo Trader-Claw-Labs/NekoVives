@@ -595,6 +595,403 @@ def cmd_analyze_local(args: argparse.Namespace) -> None:
         print(json.dumps({"error": str(e), "trace": traceback.format_exc()}))
 
 
+# ── Binance price helper ───────────────────────────────────────────────────────
+
+def fetch_binance_prices(symbol: str, start_ts_ms: int, end_ts_ms: int) -> dict:
+    """
+    Fetch 1-minute Binance klines for `symbol` over the given range.
+    Returns {ts_s: close_price} — every second within each minute gets the same close.
+    Handles pagination (max 1000 candles per request ≈ ~16 hours).
+    Falls back silently on errors (backtest will see binance_price=0 for those gaps).
+    """
+    url_base = "https://api.binance.com/api/v3/klines"
+    prices: dict = {}
+    cur = start_ts_ms
+    while cur < end_ts_ms:
+        end_chunk = min(cur + 999 * 60_000, end_ts_ms)
+        req_url = (f"{url_base}?symbol={symbol}&interval=1m"
+                   f"&startTime={cur}&endTime={end_chunk}&limit=1000")
+        req = urllib.request.Request(req_url, headers={"User-Agent": "orderbook-parser/1.0"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                candles = json.loads(resp.read())
+        except Exception as e:
+            print(f"[binance] fetch error ({symbol}): {e}", file=sys.stderr)
+            break
+        if not candles:
+            break
+        for c in candles:
+            open_ts_s = c[0] // 1000
+            close_price = float(c[4])
+            for s in range(60):
+                prices[open_ts_s + s] = close_price
+        last_open_ms = candles[-1][0]
+        cur = last_open_ms + 60_000
+        if len(candles) < 2:
+            break
+    return prices
+
+
+# ── Historical JSONL helper ─────────────────────────────────────────────────────
+
+def load_markets_from_historical_jsonl(
+    slug: str,
+    start_ts: int,
+    end_ts: int,
+    workspace_dir: "Path | None" = None,
+) -> list[dict]:
+    """
+    Load condition IDs and YES token IDs for a series from the scraped
+    historical JSONL at <workspace>/data/polymarket_historical/<slug>.jsonl.
+
+    These files are produced by `trader-claw backtest-sync --series <slug>`
+    and contain one JSON object per 5-minute window with fields:
+      window_open_ts, window_close_ts, condition_id, yes_token_id, no_token_id, ...
+
+    Returns list of {condition_id, yes_token_id, no_token_id, end_ts} dicts.
+    """
+    if workspace_dir is None:
+        workspace_dir = Path.home() / ".traderclaw" / "workspace"
+
+    jsonl_path = workspace_dir / "data" / "polymarket_historical" / f"{slug}.jsonl"
+
+    if not jsonl_path.exists():
+        print(f"[historical] {slug}: JSONL not found at {jsonl_path}", file=sys.stderr)
+        return []
+
+    markets: list[dict] = []
+    seen_cids: set[str] = set()
+
+    with open(jsonl_path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                m = json.loads(line)
+                wts = m.get("window_open_ts", 0)
+                # Only include windows within the parquet date range
+                if not (start_ts <= wts <= end_ts):
+                    continue
+                cid  = m.get("condition_id", "")
+                ytid = m.get("yes_token_id", "")
+                ntid = m.get("no_token_id", "")
+                end_ts_win = m.get("window_close_ts", wts + 300)
+                if cid and cid not in seen_cids:
+                    seen_cids.add(cid)
+                    markets.append({
+                        "condition_id": cid,
+                        "yes_token_id": ytid,
+                        "no_token_id":  ntid,
+                        "end_ts":       end_ts_win,
+                    })
+            except Exception:
+                continue
+
+    print(f"[historical] {slug}: {len(markets)} unique condition IDs "
+          f"from {jsonl_path.name}", file=sys.stderr)
+    return markets
+
+
+# ── Gamma API helpers ──────────────────────────────────────────────────────────
+
+def fetch_gamma_markets_via_events(
+    prefix: str,
+    start_ts: int,
+    end_ts: int,
+    window_minutes: int = 5,
+) -> list[dict]:
+    """
+    Fetch condition IDs and YES token IDs from Gamma /events?slug= endpoint.
+
+    Unlike /markets?slug=, the /events endpoint serves closed/resolved markets
+    so it works for recent historical timestamps (days to weeks old).
+
+    Generates all 5-min boundary slugs between start_ts and end_ts,
+    looks each one up concurrently, returns found markets.
+    """
+    import concurrent.futures
+
+    window_secs = window_minutes * 60
+    base = "https://gamma-api.polymarket.com"
+    ua = {"User-Agent": "orderbook-parser/1.0"}
+
+    # Generate all window timestamps in range
+    cur = int(start_ts)
+    cur = (cur // window_secs) * window_secs
+    end_aligned = int(end_ts)
+    slugs: list[str] = []
+    while cur <= end_aligned:
+        slugs.append(f"{prefix}-{cur}")
+        cur += window_secs
+
+    print(f"[gamma-events] {prefix}: checking {len(slugs)} slug timestamps via /events...",
+          file=sys.stderr)
+
+    def lookup(slug: str) -> "dict | None":
+        url = f"{base}/events?slug={slug}"
+        try:
+            req = urllib.request.Request(url, headers=ua)
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                events = json.loads(resp.read())
+            for evt in events:
+                for m in evt.get("markets", []):
+                    cid = m.get("conditionId", "")
+                    if not cid:
+                        continue
+                    raw_ids = m.get("clobTokenIds", [])
+                    if isinstance(raw_ids, str):
+                        try:
+                            raw_ids = json.loads(raw_ids)
+                        except Exception:
+                            raw_ids = []
+                    try:
+                        ts = int(slug.split("-")[-1])
+                        end_ts_win = ts + window_secs
+                    except Exception:
+                        end_ts_win = 0
+                    return {
+                        "condition_id": cid,
+                        "yes_token_id": raw_ids[0] if raw_ids else "",
+                        "no_token_id":  raw_ids[1] if len(raw_ids) > 1 else "",
+                        "end_ts":       end_ts_win,
+                    }
+        except Exception:
+            pass
+        return None
+
+    results: list[dict] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as ex:
+        for r in ex.map(lookup, slugs):
+            if r:
+                results.append(r)
+
+    print(f"[gamma-events] {prefix}: found {len(results)} markets", file=sys.stderr)
+    return results
+
+
+# Known recurring series: Gamma slug prefix → (tick slug, Binance symbol)
+MULTI_SERIES: list[dict] = [
+    {"prefix": "btc-updown-5m",  "slug": "btc_5m",  "binance": "BTCUSDT"},
+    {"prefix": "eth-updown-5m",  "slug": "eth_5m",  "binance": "ETHUSDT"},
+    {"prefix": "sol-updown-5m",  "slug": "sol_5m",  "binance": "SOLUSDT"},
+    {"prefix": "xrp-updown-5m",  "slug": "xrp_5m",  "binance": "XRPUSDT"},
+    {"prefix": "bnb-updown-5m",  "slug": "bnb_5m",  "binance": "BNBUSDT"},
+    {"prefix": "doge-updown-5m", "slug": "doge_5m", "binance": "DOGEUSDT"},
+    {"prefix": "hype-updown-5m", "slug": "hype_5m", "binance": "HYPEUSDT"},
+]
+
+
+def fetch_gamma_markets_for_prefix(prefix: str, start_date_str: str, end_date_str: str) -> list[dict]:
+    """
+    Query the Gamma API /markets endpoint to find all condition IDs + YES token IDs
+    for a given slug prefix within a date range.
+
+    Returns list of {condition_id, yes_token_id, end_ts} dicts.
+    Falls back to slug-generation if the API filter isn't supported.
+    """
+    import concurrent.futures
+
+    base = "https://gamma-api.polymarket.com"
+    all_markets: list[dict] = []
+    offset = 0
+    limit = 500
+    ua = {"User-Agent": "orderbook-parser/1.0"}
+
+    # Try paginated /markets?slug_prefix=... query
+    while True:
+        url = (f"{base}/markets?limit={limit}&offset={offset}"
+               f"&slug_prefix={prefix}"
+               f"&start_date_min={start_date_str}&end_date_max={end_date_str}")
+        try:
+            req = urllib.request.Request(url, headers=ua)
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                data = json.loads(resp.read())
+        except Exception as e:
+            print(f"[gamma] {prefix} page {offset // limit}: {e}", file=sys.stderr)
+            break
+
+        if not data:
+            break
+
+        for m in data:
+            cid = m.get("conditionId", "")
+            if not cid:
+                continue
+            # clobTokenIds may be JSON string or list
+            raw_ids = m.get("clobTokenIds", [])
+            if isinstance(raw_ids, str):
+                try:
+                    raw_ids = json.loads(raw_ids)
+                except Exception:
+                    raw_ids = []
+            end_iso = m.get("endDateIso") or m.get("endDate") or ""
+            end_ts = 0
+            if end_iso:
+                try:
+                    from datetime import timezone as _tz
+                    dt = datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
+                    end_ts = int(dt.timestamp())
+                except Exception:
+                    pass
+            all_markets.append({
+                "condition_id":  cid,
+                "yes_token_id":  raw_ids[0] if raw_ids else "",
+                "no_token_id":   raw_ids[1] if len(raw_ids) > 1 else "",
+                "end_ts":        end_ts,
+            })
+
+        if len(data) < limit:
+            break
+        offset += limit
+        time.sleep(0.05)
+
+    if all_markets:
+        print(f"[gamma] {prefix}: {len(all_markets)} markets via API", file=sys.stderr)
+        return all_markets
+
+    # ── Fallback: generate expected slugs from timestamps ──────────────────────
+    # If the API doesn't support slug_prefix, generate all 5-min boundary slugs
+    # and look up each condition ID individually via /markets?slug=...
+    print(f"[gamma] {prefix}: API filter not supported, generating slugs...", file=sys.stderr)
+
+    try:
+        start_dt = datetime.fromisoformat(start_date_str).replace(tzinfo=timezone.utc)
+        end_dt   = datetime.fromisoformat(end_date_str).replace(tzinfo=timezone.utc)
+    except Exception:
+        return []
+
+    # Generate all 5-min boundary timestamps in range
+    window_secs = 300
+    cur_ts = int(start_dt.timestamp())
+    cur_ts = (cur_ts // window_secs) * window_secs  # align to 5-min boundary
+    end_ts_limit = int(end_dt.timestamp())
+    slugs_to_check: list[str] = []
+    while cur_ts <= end_ts_limit:
+        slugs_to_check.append(f"{prefix}-{cur_ts}")
+        cur_ts += window_secs
+
+    print(f"[gamma] {prefix}: checking {len(slugs_to_check)} slug timestamps...", file=sys.stderr)
+
+    def lookup_slug(slug: str) -> dict | None:
+        url = f"{base}/markets?slug={slug}"
+        try:
+            req = urllib.request.Request(url, headers=ua)
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read())
+            if data:
+                m = data[0]
+                cid = m.get("conditionId", "")
+                raw_ids = m.get("clobTokenIds", [])
+                if isinstance(raw_ids, str):
+                    try:
+                        raw_ids = json.loads(raw_ids)
+                    except Exception:
+                        raw_ids = []
+                # end_ts from slug name (last part is the unix timestamp of window START)
+                try:
+                    end_ts = int(slug.split("-")[-1]) + window_secs
+                except Exception:
+                    end_ts = 0
+                if cid:
+                    return {"condition_id": cid, "yes_token_id": raw_ids[0] if raw_ids else "",
+                            "no_token_id": raw_ids[1] if len(raw_ids) > 1 else "", "end_ts": end_ts}
+        except Exception:
+            pass
+        return None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as ex:
+        futures = list(ex.map(lookup_slug, slugs_to_check))
+    results = [r for r in futures if r]
+    print(f"[gamma] {prefix}: found {len(results)} markets via slug lookup", file=sys.stderr)
+    return results
+
+
+# ── 1Hz tick builder (shared by to-ticks and to-ticks-multi) ──────────────────
+
+def build_ticks_from_df(
+    df: pd.DataFrame,
+    yes_token_ids: set,
+    window_minutes: int,
+    binance_prices: dict,
+) -> pd.DataFrame:
+    """
+    Given a DataFrame of price_change events for one or many markets,
+    build a 1-Hz tick table.
+
+    `yes_token_ids`: set of asset_ids that are the YES token for their respective market.
+    `binance_prices`: {ts_s: float} lookup for Binance spot price.
+    Returns DataFrame with all tick fields ready to serialize as JSONL.
+    """
+    window_secs = window_minutes * 60
+
+    if yes_token_ids:
+        yes_df = df[df["asset_id"].isin(yes_token_ids)].copy()
+    else:
+        # Fallback: pick most-active asset_id globally
+        counts = df.groupby("asset_id").size()
+        yes_df = df[df["asset_id"] == counts.idxmax()].copy()
+
+    if yes_df.empty:
+        return pd.DataFrame()
+
+    yes_df["ts_s"] = yes_df["ts_ms"] // 1000
+    yes_1hz = yes_df.groupby("ts_s").last().reset_index()
+
+    t_min = int(yes_1hz["ts_s"].min())
+    t_max = int(yes_1hz["ts_s"].max())
+    all_secs = pd.DataFrame({"ts_s": range(t_min, t_max + 1)})
+    yes_1hz = all_secs.merge(yes_1hz, on="ts_s", how="left").ffill()
+
+    yes_1hz["yes_bid"] = yes_1hz["yes_bid"].fillna(0.0)
+    yes_1hz["yes_ask"] = yes_1hz["yes_ask"].fillna(0.0)
+    yes_1hz["yes_mid"] = (yes_1hz["yes_bid"] + yes_1hz["yes_ask"]) / 2
+    yes_1hz["no_bid"]  = (1.0 - yes_1hz["yes_ask"]).clip(0, 1)
+    yes_1hz["no_ask"]  = (1.0 - yes_1hz["yes_bid"]).clip(0, 1)
+    yes_1hz["ts_ms_out"] = yes_1hz["ts_s"] * 1000
+
+    # Binance price lookup
+    yes_1hz["binance_price"] = yes_1hz["ts_s"].map(
+        lambda s: binance_prices.get(int(s), 0.0)
+    )
+
+    # Window fields
+    yes_1hz["window_ts"]        = (yes_1hz["ts_s"] // window_secs * window_secs).astype(int)
+    yes_1hz["window_secs_left"] = (window_secs - (yes_1hz["ts_s"] - yes_1hz["window_ts"])).clip(0).astype(int)
+
+    yes_1hz["date"] = pd.to_datetime(yes_1hz["ts_s"], unit="s", utc=True).dt.date
+    return yes_1hz
+
+
+def write_ticks_jsonl(yes_1hz: pd.DataFrame, out_dir: Path) -> int:
+    """Write a 1Hz tick DataFrame to per-day JSONL files. Returns total row count."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    total = 0
+    for date in sorted(yes_1hz["date"].unique()):
+        day_df = yes_1hz[yes_1hz["date"] == date]
+        date_str = str(date)
+        out_file = out_dir / f"{date_str}.jsonl"
+        rows = []
+        for _, row in day_df.iterrows():
+            rows.append(json.dumps({
+                "ts_ms":            int(row["ts_ms_out"]),
+                "yes_bid":          round(float(row["yes_bid"]), 6),
+                "yes_ask":          round(float(row["yes_ask"]), 6),
+                "no_bid":           round(float(row["no_bid"]),  6),
+                "no_ask":           round(float(row["no_ask"]),  6),
+                "yes_mid":          round(float(row["yes_mid"]), 6),
+                "binance_price":    round(float(row["binance_price"]), 4),
+                "chainlink_price":  0.0,
+                "oracle_lag_ms":    0,
+                "window_ts":        int(row["window_ts"]),
+                "window_secs_left": int(row["window_secs_left"]),
+            }))
+        out_file.write_text("\n".join(rows) + "\n")
+        total += len(rows)
+        print(f"  {date_str} → {len(rows):,} rows", file=sys.stderr)
+    return total
+
+
 def cmd_to_ticks(args: argparse.Namespace) -> None:
     """
     Convert local Parquet files into CLOB 1Hz JSONL ticks compatible with the
@@ -604,18 +1001,16 @@ def cmd_to_ticks(args: argparse.Namespace) -> None:
       ts_ms, yes_bid, yes_ask, no_bid, no_ask, yes_mid,
       binance_price, chainlink_price, oracle_lag_ms,
       window_ts, window_secs_left
-
-    Window logic: assumes a 5-minute UP/DOWN market. Each 5-min UTC-aligned
-    interval is a window (300 seconds). window_secs_left counts down from 300.
     """
-    import math
-
-    data_dir = Path(args.dir)
+    # Support both --in (new) and --dir (legacy)
+    input_dir_str = getattr(args, "input_dir", None) or getattr(args, "dir", None)
+    data_dir = Path(input_dir_str)
     out_dir = Path(args.out)
     market_id = args.market
-    window_minutes = args.window_minutes
+    window_minutes = getattr(args, "window_minutes", 5)
     window_secs = window_minutes * 60
     slug = args.slug
+    binance_symbol = getattr(args, "binance_symbol", None)
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -628,10 +1023,8 @@ def cmd_to_ticks(args: argparse.Namespace) -> None:
 
     con = get_con()
     file_list = "[" + ", ".join(f"'{f}'" for f in files) + "]"
-
     where = f"event_type = 'price_change' AND CAST(market AS VARCHAR) = '{market_id}'"
 
-    # Load all price_change events for this market, sorted by time
     df = con.execute(f"""
     SELECT
         CAST(epoch_ms(timestamp_received) AS BIGINT) AS ts_ms,
@@ -648,88 +1041,329 @@ def cmd_to_ticks(args: argparse.Namespace) -> None:
         print(json.dumps({"error": f"No price_change events found for market {market_id}"}))
         return
 
-    print(f"[to-ticks] Loaded {len(df):,} price_change events. Resampling to 1 Hz...", file=sys.stderr)
+    print(f"[to-ticks] {len(df):,} price_change events. Resampling to 1 Hz...", file=sys.stderr)
 
-    # Determine YES asset_id: take the asset_id whose avg price is closer to 0.5
-    # (or simply the one with more events — more stable)
+    # YES asset = most events
     asset_counts = df.groupby("asset_id").size()
     yes_asset = asset_counts.idxmax()
-    print(f"[to-ticks] Using YES asset_id={yes_asset[:20]}... ({asset_counts[yes_asset]:,} events)", file=sys.stderr)
+    print(f"[to-ticks] YES asset_id={yes_asset[:20]}... ({asset_counts[yes_asset]:,} events)", file=sys.stderr)
 
-    yes_df = df[df["asset_id"] == yes_asset].copy()
-    yes_df["ts_s"] = yes_df["ts_ms"] // 1000  # second-level bucket
+    # Binance prices (optional)
+    binance_prices: dict = {}
+    if binance_symbol:
+        ts_min = int(df["ts_ms"].min())
+        ts_max = int(df["ts_ms"].max())
+        print(f"[to-ticks] Fetching {binance_symbol} prices from Binance...", file=sys.stderr)
+        binance_prices = fetch_binance_prices(binance_symbol, ts_min, ts_max + 60_000)
+        print(f"[to-ticks] {len(binance_prices):,} Binance price points", file=sys.stderr)
 
-    # Resample: take last event per second (most recent quote)
-    yes_1hz = yes_df.groupby("ts_s").last().reset_index()
+    yes_1hz = build_ticks_from_df(df, {yes_asset}, window_minutes, binance_prices)
+    if yes_1hz.empty:
+        print(json.dumps({"error": "Failed to build tick table"}))
+        return
 
-    # Forward-fill bid/ask across missing seconds
-    t_min = int(yes_1hz["ts_s"].min())
-    t_max = int(yes_1hz["ts_s"].max())
-    all_secs = pd.DataFrame({"ts_s": range(t_min, t_max + 1)})
-    yes_1hz = all_secs.merge(yes_1hz, on="ts_s", how="left").ffill()
+    total_rows = write_ticks_jsonl(yes_1hz, out_dir)
 
-    yes_1hz["yes_bid"]  = yes_1hz["yes_bid"].fillna(0.0)
-    yes_1hz["yes_ask"]  = yes_1hz["yes_ask"].fillna(0.0)
-    yes_1hz["yes_mid"]  = (yes_1hz["yes_bid"] + yes_1hz["yes_ask"]) / 2
-    # NO token = 1 - YES (CLOB invariant for binary markets)
-    yes_1hz["no_bid"]   = (1.0 - yes_1hz["yes_ask"]).clip(0, 1)
-    yes_1hz["no_ask"]   = (1.0 - yes_1hz["yes_bid"]).clip(0, 1)
-    yes_1hz["ts_ms_out"] = yes_1hz["ts_s"] * 1000
-
-    # Window fields: UTC-aligned window_minutes-min windows
-    def window_ts(ts_s: int) -> int:
-        return int(ts_s // window_secs) * window_secs
-
-    def window_secs_left_fn(ts_s: int) -> int:
-        wt = window_ts(ts_s)
-        return max(0, window_secs - (ts_s - wt))
-
-    yes_1hz["window_ts"]        = yes_1hz["ts_s"].apply(window_ts)
-    yes_1hz["window_secs_left"] = yes_1hz["ts_s"].apply(window_secs_left_fn)
-
-    # Group by date and write one JSONL file per day
-    yes_1hz["date"] = pd.to_datetime(yes_1hz["ts_s"], unit="s", utc=True).dt.date
-    dates = yes_1hz["date"].unique()
-
-    total_rows = 0
-    for date in sorted(dates):
-        day_df = yes_1hz[yes_1hz["date"] == date]
-        date_str = str(date)
-        out_file = out_dir / f"{date_str}.jsonl"
-        rows = []
-        for _, row in day_df.iterrows():
-            rows.append(json.dumps({
-                "ts_ms":            int(row["ts_ms_out"]),
-                "yes_bid":          round(float(row["yes_bid"]), 6),
-                "yes_ask":          round(float(row["yes_ask"]), 6),
-                "no_bid":           round(float(row["no_bid"]),  6),
-                "no_ask":           round(float(row["no_ask"]),  6),
-                "yes_mid":          round(float(row["yes_mid"]), 6),
-                "binance_price":    0.0,
-                "chainlink_price":  0.0,
-                "oracle_lag_ms":    0,
-                "window_ts":        int(row["window_ts"]),
-                "window_secs_left": int(row["window_secs_left"]),
-            }))
-        out_file.write_text("\n".join(rows) + "\n")
-        total_rows += len(rows)
-        print(f"[to-ticks] {date_str} → {len(rows):,} rows", file=sys.stderr)
-
-    result = {
+    print(json.dumps({
         "ok": True,
         "slug": slug,
         "market": market_id,
         "yes_asset_id": yes_asset,
         "total_rows": total_rows,
-        "days": len(dates),
+        "days": int(yes_1hz["date"].nunique()),
         "out_dir": str(out_dir),
         "next_step": (
             f"Files written to {out_dir}. "
-            f"In the Backtesting page, select Market = 'CLOB 1 Hz (tick replay)' "
-            f"and slug = '{slug}' to backtest with on_tick(ctx) scripts."
+            f"In Backtesting, select 'Orderbook Archive (on_tick)' or "
+            f"'Orderbook Archive (on_candle)' and slug='{slug}'."
         ),
-    }
-    print(json.dumps(result))
+    }))
+
+
+def cmd_to_ticks_multi(args: argparse.Namespace) -> None:
+    """
+    Convert all recurring 5-min UP/DOWN markets (BTC, ETH, SOL, XRP, BNB, DOGE, HYPE)
+    from local Parquet files to 1-Hz JSONL ticks with real Binance prices.
+
+    Condition IDs are sourced from the scraped historical JSONL files at:
+      <workspace>/data/polymarket_historical/<slug>.jsonl
+    (produced by `trader-claw backtest-sync --series <slug>`).
+    Falls back to the Gamma API for any series missing a local JSONL file.
+
+    Writes:
+      <out>/btc_5m/YYYY-MM-DD.jsonl
+      <out>/eth_5m/YYYY-MM-DD.jsonl
+      ...
+
+    Slugs for backtesting: btc_5m, eth_5m, sol_5m, xrp_5m, bnb_5m, doge_5m, hype_5m
+    """
+    data_dir  = Path(args.input_dir)
+    out_base  = Path(args.out)
+    slugs_arg = args.slugs  # e.g. "btc_5m,eth_5m" or None (= all)
+    workspace_dir = Path(args.workspace) if getattr(args, "workspace", None) else None
+    window_minutes = 5
+
+    files = sorted(data_dir.glob("*.parquet"))
+    if not files:
+        print(json.dumps({"error": f"No .parquet files in {data_dir}"}))
+        return
+
+    # Determine date range from file names (YYYY-MM-DDTHH.parquet)
+    def parse_file_ts(f: Path) -> "datetime | None":
+        try:
+            return datetime.strptime(f.stem, "%Y-%m-%dT%H").replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+
+    file_dts = [dt for f in files if (dt := parse_file_ts(f))]
+    if not file_dts:
+        print(json.dumps({"error": "Cannot parse timestamps from filenames"}))
+        return
+
+    range_start = min(file_dts)
+    range_end   = max(file_dts) + timedelta(hours=1)
+    start_ts    = int(range_start.timestamp())
+    end_ts      = int(range_end.timestamp())
+    start_date_str = range_start.strftime("%Y-%m-%dT%H:%M:%SZ")
+    end_date_str   = range_end.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    print(f"[to-ticks-multi] Parquet date range: {range_start} → {range_end}", file=sys.stderr)
+
+    # Filter series
+    wanted_slugs = set(slugs_arg.split(",")) if slugs_arg else None
+    series_list = [
+        s for s in MULTI_SERIES
+        if wanted_slugs is None or s["slug"] in wanted_slugs
+    ]
+
+    print(f"[to-ticks-multi] Processing {len(series_list)} series: "
+          f"{[s['slug'] for s in series_list]}", file=sys.stderr)
+
+    con = get_con()
+
+    # Build a lookup: stem → file path (e.g. "2026-05-10T17" → Path)
+    file_by_stem: dict[str, Path] = {}
+    for f in files:
+        dt = parse_file_ts(f)
+        if dt:
+            file_by_stem[f.stem] = f
+
+    results = []
+
+    for series in series_list:
+        prefix  = series["prefix"]
+        slug    = series["slug"]
+        binance = series["binance"]
+
+        print(f"\n{'='*60}", file=sys.stderr)
+        print(f"[to-ticks-multi] Series: {slug} (prefix={prefix}, binance={binance})", file=sys.stderr)
+
+        # ── Step 1: Load condition IDs from local historical JSONL ─────────────
+        # Primary: scraped historical data (no network needed, covers full history)
+        markets_info = load_markets_from_historical_jsonl(
+            slug, start_ts, end_ts, workspace_dir
+        )
+
+        # Supplement: if the JSONL doesn't cover the full range, fill the gap
+        # using the Gamma /events?slug= endpoint (works for recent closed markets).
+        if markets_info:
+            covered_end_ts = max(m["end_ts"] for m in markets_info)
+            # Leave a 1-window grace margin before calling the events API
+            gap_start = covered_end_ts - window_minutes * 60
+            if gap_start < end_ts - window_minutes * 60:
+                print(f"[to-ticks-multi] {slug}: JSONL covers through "
+                      f"{datetime.fromtimestamp(covered_end_ts, tz=timezone.utc).date()}, "
+                      f"filling gap to {range_end.date()} via Gamma events API...",
+                      file=sys.stderr)
+                gap_markets = fetch_gamma_markets_via_events(
+                    prefix, gap_start, end_ts, window_minutes
+                )
+                if gap_markets:
+                    # Merge, deduplicating by condition_id
+                    existing_cids = {m["condition_id"] for m in markets_info}
+                    new_markets = [m for m in gap_markets if m["condition_id"] not in existing_cids]
+                    markets_info.extend(new_markets)
+                    print(f"[to-ticks-multi] {slug}: added {len(new_markets)} markets "
+                          f"from gap fill", file=sys.stderr)
+
+        # Full fallback: if no historical data at all, try Gamma events API
+        if not markets_info:
+            print(f"[to-ticks-multi] {slug}: no local historical data — "
+                  f"falling back to Gamma events API...", file=sys.stderr)
+            markets_info = fetch_gamma_markets_via_events(
+                prefix, start_ts, end_ts, window_minutes
+            )
+
+        if not markets_info:
+            print(f"[to-ticks-multi] {slug}: no markets found — skipping", file=sys.stderr)
+            results.append({
+                "slug": slug, "ok": False,
+                "error": (
+                    "No condition IDs found. Run: "
+                    f"trader-claw backtest-sync --series {slug} "
+                    f"--from {range_start.strftime('%Y-%m-%d')} "
+                    f"--to {range_end.strftime('%Y-%m-%d')}"
+                ),
+            })
+            continue
+
+        # ── Step 2: Day-by-day batch query with SQL 1Hz aggregation ─────────────
+        # Build per-day lookup tables for condition IDs and YES token IDs.
+        # For each calendar day we query only that day's ~24 parquet files with
+        # that day's ~288 condition IDs, AND aggregate to 1 second in DuckDB SQL.
+        # This keeps Python-side memory to ~86,400 rows/day (1 row per second)
+        # instead of 74M+ raw events.
+        from collections import defaultdict as _defaultdict
+
+        yes_token_ids = {m["yes_token_id"] for m in markets_info if m["yes_token_id"]}
+        print(f"[to-ticks-multi] {slug}: {len(markets_info)} condition IDs, "
+              f"{len(yes_token_ids)} YES token IDs", file=sys.stderr)
+
+        cids_by_date:  dict[str, set] = _defaultdict(set)
+        ytids_by_date: dict[str, set] = _defaultdict(set)
+        for m in markets_info:
+            win_open = m["end_ts"] - window_minutes * 60
+            for delta in (0, window_minutes * 60 - 1):
+                day = datetime.fromtimestamp(win_open + delta, tz=timezone.utc).strftime("%Y-%m-%d")
+                cids_by_date[day].add(m["condition_id"])
+                if m["yes_token_id"]:
+                    ytids_by_date[day].add(m["yes_token_id"])
+
+        all_day_dfs: list[pd.DataFrame] = []
+        ts_min_global = int(range_start.timestamp())
+        ts_max_global = int(range_end.timestamp())
+
+        for day_str in sorted(cids_by_date.keys()):
+            day_cids  = list(cids_by_date[day_str])
+            day_ytids = list(ytids_by_date.get(day_str, set()))
+            day_files = [
+                f for stem, f in file_by_stem.items()
+                if stem.startswith(day_str)
+            ]
+            if not day_files:
+                continue
+
+            cids_sql  = ", ".join(f"'{c}'" for c in day_cids)
+            day_file_list = "[" + ", ".join(f"'{f}'" for f in sorted(day_files)) + "]"
+
+            # YES token filter: massive reduction in scanned rows
+            if day_ytids:
+                ytids_sql   = ", ".join(f"'{t}'" for t in day_ytids)
+                asset_filter = f"AND CAST(asset_id AS VARCHAR) IN ({ytids_sql})"
+            else:
+                asset_filter = ""
+
+            # Aggregate to 1Hz in SQL using max_by (last event per second)
+            try:
+                day_df = con.execute(f"""
+                SELECT
+                    CAST(epoch(timestamp_received) AS BIGINT) AS ts_s,
+                    max_by(CAST(best_bid AS DOUBLE), timestamp_received) AS yes_bid,
+                    max_by(CAST(best_ask AS DOUBLE), timestamp_received) AS yes_ask
+                FROM read_parquet({day_file_list}, hive_partitioning=false, union_by_name=true)
+                WHERE event_type = 'price_change'
+                  AND CAST(market AS VARCHAR) IN ({cids_sql})
+                  {asset_filter}
+                GROUP BY ts_s
+                ORDER BY ts_s
+                """).df()
+            except Exception as e:
+                print(f"[to-ticks-multi] {slug} {day_str}: DuckDB error: {e}", file=sys.stderr)
+                continue
+
+            if not day_df.empty:
+                ts_min_global = min(ts_min_global, int(day_df["ts_s"].min()))
+                ts_max_global = max(ts_max_global, int(day_df["ts_s"].max()))
+                all_day_dfs.append(day_df)
+                print(f"  {day_str}: {len(day_df):,} 1Hz rows "
+                      f"({len(day_cids)} cids, {len(day_files)} files)",
+                      file=sys.stderr)
+
+        if not all_day_dfs:
+            print(f"[to-ticks-multi] {slug}: no data in parquets — skipping", file=sys.stderr)
+            results.append({"slug": slug, "ok": False, "error": "No events in local parquets for these condition IDs"})
+            continue
+
+        # ── Step 3: Fetch Binance prices ───────────────────────────────────────
+        print(f"[to-ticks-multi] {slug}: fetching {binance} prices...", file=sys.stderr)
+        binance_prices = fetch_binance_prices(
+            binance, ts_min_global * 1000, ts_max_global * 1000 + 60_000
+        )
+        print(f"[to-ticks-multi] {slug}: {len(binance_prices):,} Binance price points", file=sys.stderr)
+
+        # ── Step 4: Build 1Hz tick table ──────────────────────────────────────
+        # Data is already aggregated to 1Hz by DuckDB; just forward-fill gaps
+        # and add window / Binance fields.
+        window_secs = window_minutes * 60
+        df_1hz = (
+            pd.concat(all_day_dfs, ignore_index=True)
+            .sort_values("ts_s")
+            .drop_duplicates("ts_s", keep="last")  # guard against day-boundary overlaps
+            .reset_index(drop=True)
+        )
+
+        t_min = int(df_1hz["ts_s"].min())
+        t_max = int(df_1hz["ts_s"].max())
+        all_secs = pd.DataFrame({"ts_s": range(t_min, t_max + 1)})
+        yes_1hz = all_secs.merge(df_1hz, on="ts_s", how="left").ffill()
+
+        yes_1hz["yes_bid"]   = yes_1hz["yes_bid"].fillna(0.0)
+        yes_1hz["yes_ask"]   = yes_1hz["yes_ask"].fillna(0.0)
+        yes_1hz["yes_mid"]   = (yes_1hz["yes_bid"] + yes_1hz["yes_ask"]) / 2
+        yes_1hz["no_bid"]    = (1.0 - yes_1hz["yes_ask"]).clip(0, 1)
+        yes_1hz["no_ask"]    = (1.0 - yes_1hz["yes_bid"]).clip(0, 1)
+        yes_1hz["ts_ms_out"] = yes_1hz["ts_s"].astype(int) * 1000
+
+        yes_1hz["binance_price"] = yes_1hz["ts_s"].map(
+            lambda s: binance_prices.get(int(s), 0.0)
+        )
+        yes_1hz["window_ts"] = (
+            (yes_1hz["ts_s"] // window_secs) * window_secs
+        ).astype(int)
+        yes_1hz["window_secs_left"] = (
+            window_secs - (yes_1hz["ts_s"] - yes_1hz["window_ts"])
+        ).clip(0).astype(int)
+        yes_1hz["date"] = pd.to_datetime(
+            yes_1hz["ts_s"], unit="s", utc=True
+        ).dt.date
+
+        if yes_1hz.empty:
+            results.append({"slug": slug, "ok": False, "error": "Empty tick table after resampling"})
+            continue
+
+        # ── Step 5: Write JSONL ────────────────────────────────────────────────
+        out_dir = out_base / slug
+        print(f"[to-ticks-multi] {slug}: writing ticks to {out_dir}...", file=sys.stderr)
+        total_rows = write_ticks_jsonl(yes_1hz, out_dir)
+        n_days = int(yes_1hz["date"].nunique())
+
+        print(f"[to-ticks-multi] {slug}: done — {total_rows:,} ticks over {n_days} day(s)", file=sys.stderr)
+        results.append({
+            "slug": slug,
+            "ok": True,
+            "condition_ids": len(markets_info),
+            "total_rows": total_rows,
+            "days": n_days,
+            "out_dir": str(out_dir),
+            "binance_symbol": binance,
+        })
+
+    # Summary
+    ok_count  = sum(1 for r in results if r.get("ok"))
+    err_count = len(results) - ok_count
+    print(f"\n[to-ticks-multi] Completed: {ok_count} OK, {err_count} failed", file=sys.stderr)
+
+    print(json.dumps({
+        "ok": ok_count > 0,
+        "series_processed": len(results),
+        "series_ok": ok_count,
+        "series_failed": err_count,
+        "results": results,
+        "next_step": (
+            "In Backtesting → Market = 'Orderbook Archive (on_candle)' or "
+            "'Orderbook Archive (on_tick)', then pick a slug from the dropdown."
+        ),
+    }, indent=2))
 
 
 def cmd_to_candles(args: argparse.Namespace) -> None:
@@ -897,11 +1531,26 @@ def main() -> None:
         "to-ticks",
         help="Convert local Parquet to 1-Hz JSONL ticks for the CLOB backtester",
     )
-    p.add_argument("--dir",    required=True,  help="Directory with local *.parquet files")
+    p.add_argument("--in",    dest="input_dir", required=True, help="Directory with local *.parquet files")
     p.add_argument("--market", required=True,  help="Condition ID (0x…)")
-    p.add_argument("--slug",   required=True,  help="Slug name (e.g. btc_ob_5m) — used as folder name")
+    p.add_argument("--slug",   required=True,  help="Slug name (e.g. btc_5m) — used as folder name")
     p.add_argument("--out",    required=True,  help="Output directory (e.g. ~/.traderclaw/workspace/data/ticks/<slug>)")
+    p.add_argument("--binance-symbol", dest="binance_symbol", default=None,
+                   help="Binance symbol for price feed (e.g. BTCUSDT). Fetches 1m klines to fill binance_price.")
     p.add_argument("--window-minutes", type=int, default=5, help="Window duration in minutes (default 5)")
+
+    # to-ticks-multi — auto-detect all 5-min series and convert in one shot
+    p = sub.add_parser(
+        "to-ticks-multi",
+        help="Auto-detect BTC/ETH/SOL/XRP/BNB 5m markets via Gamma API and convert all to JSONL ticks",
+    )
+    p.add_argument("--in",  dest="input_dir", required=True, help="Directory with local *.parquet files")
+    p.add_argument("--out", required=True, help="Base output directory (slug subdirs created automatically)")
+    p.add_argument("--slugs", default=None,
+                   help="Comma-separated slugs to process (default: all). E.g. btc_5m,eth_5m,sol_5m")
+    p.add_argument("--workspace", default=None,
+                   help="Trader-Claw workspace dir (default: ~/.traderclaw/workspace). "
+                        "Used to locate polymarket_historical/*.jsonl for condition ID lookup.")
 
     # to-candles — convert parquet → OHLC JSON (for on_candle(ctx) backtester)
     p = sub.add_parser(
@@ -925,6 +1574,7 @@ def main() -> None:
         "download":       cmd_download,
         "analyze-local":  cmd_analyze_local,
         "to-ticks":       cmd_to_ticks,
+        "to-ticks-multi": cmd_to_ticks_multi,
         "to-candles":     cmd_to_candles,
     }
     dispatch[args.cmd](args)

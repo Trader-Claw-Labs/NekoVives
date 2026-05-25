@@ -980,6 +980,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/orderbook/download/cancel", post(api::handle_api_orderbook_download_cancel))
         .route("/api/orderbook/files", get(api::handle_api_orderbook_files))
         .route("/api/orderbook/ingest", post(api::handle_api_orderbook_ingest))
+        .route("/api/orderbook/ingest-multi", post(api::handle_api_orderbook_ingest_multi))
         .route(
             "/api/channels/telegram/configure",
             get(api::handle_api_telegram_get).post(api::handle_api_telegram_configure),
