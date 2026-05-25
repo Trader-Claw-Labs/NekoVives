@@ -7016,3 +7016,161 @@ pub async fn handle_api_tick_recorder_status(
     let running = crate::tick_recorder::running_recorders().await;
     Json(serde_json::json!({ "running": running })).into_response()
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Orderbook Archive API handlers
+// ────────────────────────────────────────────────────────────────────────────
+
+/// POST /api/orderbook/query — remote DuckDB query (no local download needed).
+/// Body: { days, mode, market?, freq?, window_secs? }
+pub async fn handle_api_orderbook_query(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<crate::tools::orderbook::QueryRequest>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let days = body.days.clamp(1, 30).to_string();
+
+    let result = match body.mode.as_str() {
+        "summary" => {
+            crate::tools::orderbook::run_parser(
+                &workspace_dir,
+                "summary",
+                &["--days", &days],
+            ).await
+        }
+        "top-markets" => {
+            crate::tools::orderbook::run_parser(
+                &workspace_dir,
+                "top-markets",
+                &["--days", &days],
+            ).await
+        }
+        "price-series" => {
+            let Some(ref market) = body.market else {
+                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                    "error": "market is required for price-series mode"
+                }))).into_response();
+            };
+            let freq = body.freq.as_deref().unwrap_or("5min");
+            crate::tools::orderbook::run_parser(
+                &workspace_dir,
+                "price-series",
+                &["--market", market, "--days", &days, "--freq", freq],
+            ).await
+        }
+        "spread-stats" => {
+            let Some(ref market) = body.market else {
+                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                    "error": "market is required for spread-stats mode"
+                }))).into_response();
+            };
+            crate::tools::orderbook::run_parser(
+                &workspace_dir,
+                "spread-stats",
+                &["--market", market, "--days", &days],
+            ).await
+        }
+        "drift" => {
+            let Some(ref market) = body.market else {
+                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                    "error": "market is required for drift mode"
+                }))).into_response();
+            };
+            let window = body.window_secs.unwrap_or(300).to_string();
+            crate::tools::orderbook::run_parser(
+                &workspace_dir,
+                "drift",
+                &["--market", market, "--days", &days, "--window", &window],
+            ).await
+        }
+        other => {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "error": format!("Unknown mode '{}'. Use: summary | top-markets | price-series | spread-stats | drift", other)
+            }))).into_response();
+        }
+    };
+
+    match result {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": e.to_string()
+        }))).into_response(),
+    }
+}
+
+/// POST /api/orderbook/download — start a background download job.
+/// Body: { days, market? }
+pub async fn handle_api_orderbook_download(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<crate::tools::orderbook::DownloadRequest>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+
+    // Reject if a download is already running
+    {
+        let p = state.orderbook.progress.lock().await;
+        if p.running {
+            return (StatusCode::CONFLICT, Json(serde_json::json!({
+                "error": "A download is already in progress. Cancel it first."
+            }))).into_response();
+        }
+    }
+
+    let days = body.days.clamp(1, 30);
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+
+    crate::tools::orderbook::spawn_download(
+        workspace_dir,
+        days,
+        body.market.clone(),
+        state.orderbook.progress.clone(),
+        state.orderbook.cancel.clone(),
+    );
+
+    Json(serde_json::json!({
+        "ok": true,
+        "days": days,
+        "market": body.market,
+        "message": format!("Download started for {} day(s). Poll /api/orderbook/download/status for progress.", days)
+    })).into_response()
+}
+
+/// GET /api/orderbook/download/status — poll download progress.
+pub async fn handle_api_orderbook_download_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+    let p = state.orderbook.progress.lock().await.clone();
+    Json(serde_json::to_value(&p).unwrap_or_default()).into_response()
+}
+
+/// POST /api/orderbook/download/cancel — cancel ongoing download.
+pub async fn handle_api_orderbook_download_cancel(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+    state.orderbook.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+    Json(serde_json::json!({ "ok": true, "message": "Cancel signal sent." })).into_response()
+}
+
+/// GET /api/orderbook/files — list locally downloaded Parquet files.
+pub async fn handle_api_orderbook_files(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let files = crate::tools::orderbook::list_local_files(&workspace_dir);
+    let total_mb: f64 = files.iter().map(|f| f.size_mb).sum();
+    Json(serde_json::json!({
+        "file_count": files.len(),
+        "total_mb": total_mb,
+        "files": files,
+    })).into_response()
+}

@@ -69,6 +69,7 @@ pub mod schema;
 pub mod traits;
 pub mod web_fetch;
 pub mod web_search_tool;
+pub mod orderbook;
 
 pub use backtest::{BacktestListScriptsTool, BacktestRunTool};
 pub use browser::{BrowserTool, ComputerUseConfig};
