@@ -112,11 +112,18 @@ def get_con() -> duckdb.DuckDBPyConnection:
     # Allow more threads and memory for big queries
     con.execute("SET threads=4")
     con.execute("SET memory_limit='512MB'")
-    # R2 requires a User-Agent header (403 otherwise)
+    # R2 returns 403 without a User-Agent. DuckDB 1.x uses custom_user_agent.
     try:
-        con.execute("SET http_user_agent='orderbook-parser/1.0'")
+        con.execute("SET custom_user_agent='orderbook-parser/1.0'")
     except Exception:
-        pass  # older DuckDB versions may not support this
+        pass  # ignore on versions that don't support this
+    # Improve reliability with retries and a longer timeout for big remote files
+    try:
+        con.execute("SET http_retries=3")
+        con.execute("SET http_timeout=120000")   # 120 s per request
+        con.execute("SET http_retry_wait_ms=2000")
+    except Exception:
+        pass
     return con
 
 
@@ -354,6 +361,28 @@ def analyze_drift(df: pd.DataFrame, window_secs: int = 300) -> pd.DataFrame:
 
 # ── Download helpers ───────────────────────────────────────────────────────────
 
+_DOWNLOAD_UA = "orderbook-parser/1.0"
+_CHUNK = 1024 * 256  # 256 KB read chunks
+
+
+def _http_download(url: str, dest: Path) -> None:
+    """Stream-download a URL to `dest` using a proper User-Agent.
+    Cloudflare R2 returns 403 without User-Agent."""
+    req = urllib.request.Request(url, headers={"User-Agent": _DOWNLOAD_UA})
+    tmp = dest.with_suffix(".tmp")
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp, open(tmp, "wb") as fh:
+            while True:
+                chunk = resp.read(_CHUNK)
+                if not chunk:
+                    break
+                fh.write(chunk)
+        tmp.rename(dest)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 def download_hourly_files(
     days: int,
     out_dir: Path,
@@ -365,8 +394,6 @@ def download_hourly_files(
     Stores them in out_dir/YYYY-MM-DDTHH.parquet (full) or filtered .parquet.
     Returns a summary dict with file counts and sizes.
     """
-    import urllib.request
-
     out_dir.mkdir(parents=True, exist_ok=True)
     urls = urls_for_range(days)
     total = len(urls)
@@ -395,7 +422,8 @@ def download_hourly_files(
 
         try:
             if market_id:
-                # Use DuckDB to filter and re-write as a smaller local Parquet
+                # Use DuckDB to filter and re-write as a smaller local Parquet.
+                # DuckDB's HTTP reader uses get_con() which sets http_user_agent.
                 con = get_con()
                 con.execute(f"""
                 COPY (
@@ -404,13 +432,18 @@ def download_hourly_files(
                 ) TO '{out_path}' (FORMAT PARQUET, COMPRESSION 'zstd')
                 """)
             else:
-                # Full download
-                urllib.request.urlretrieve(url, out_path)
+                # Full download via streaming GET with User-Agent header.
+                _http_download(url, out_path)
             downloaded += 1
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                # Archive skips empty hours — not an error
+                pass
+            else:
+                errors.append(f"{hour_str}: HTTP {e.code} {e.reason}")
         except Exception as e:
-            err_msg = f"{hour_str}: {e}"
-            errors.append(err_msg)
-            # Don't abort — some hours may be missing (archive skips empty hours)
+            errors.append(f"{hour_str}: {e}")
+            # Continue — don't abort the whole batch on one failure
 
     # Final progress update
     result = {
