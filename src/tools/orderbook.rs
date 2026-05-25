@@ -112,7 +112,7 @@ pub struct DownloadRequest {
     pub market: Option<String>,
 }
 
-/// Ingest request body: download + auto-convert to ticks in one job.
+/// Ingest request body: download + auto-convert to ticks in one job (single market).
 #[derive(Debug, Deserialize)]
 pub struct IngestRequest {
     pub days: u32,
@@ -122,6 +122,15 @@ pub struct IngestRequest {
     pub slug: String,
     /// Binance symbol used as the underlying price feed (e.g. "BTCUSDT").
     pub binance_symbol: String,
+}
+
+/// Ingest-multi request body: download + auto-convert ALL recurring 5-min series.
+#[derive(Debug, Deserialize)]
+pub struct IngestMultiRequest {
+    pub days: u32,
+    /// Comma-separated list of slugs to process (default: all 7 series).
+    /// E.g. "btc_5m,eth_5m,sol_5m"
+    pub slugs: Option<String>,
 }
 
 /// Run the Python parser with the given sub-command + args.
@@ -444,6 +453,150 @@ pub fn spawn_ingest(
             Err(e) => {
                 p.errors.push(format!("to-ticks spawn error: {e}"));
             }
+        }
+    });
+}
+
+/// Spawn a combined download + to-ticks-multi job.
+/// Downloads `days` of parquets then runs `to-ticks-multi` to auto-detect and convert
+/// all recurring 5-min UP/DOWN series (BTC/ETH/SOL/XRP/BNB/DOGE/HYPE).
+pub fn spawn_ingest_multi(
+    workspace_dir: PathBuf,
+    days: u32,
+    slugs: Option<String>,
+    progress: Arc<Mutex<DownloadProgress>>,
+    cancel: Arc<AtomicBool>,
+) {
+    tokio::spawn(async move {
+        let out_dir = workspace_dir.join("data").join("orderbook");
+        let ticks_base = workspace_dir.join("data").join("ticks");
+        let progress_file = workspace_dir.join("data").join("orderbook_progress.json");
+        let slugs_label = slugs.clone().unwrap_or_else(|| "all series".to_string());
+
+        {
+            let mut p = progress.lock().await;
+            *p = DownloadProgress {
+                running: true,
+                phase: "downloading".to_string(),
+                out_dir: out_dir.to_string_lossy().to_string(),
+                slug: slugs_label.clone(),
+                started_at: Some(chrono::Utc::now().to_rfc3339()),
+                ..Default::default()
+            };
+        }
+
+        cancel.store(false, Ordering::SeqCst);
+
+        let script = match ensure_parser_script(&workspace_dir) {
+            Ok(s) => s,
+            Err(e) => {
+                let mut p = progress.lock().await;
+                p.running = false;
+                p.phase = "done".to_string();
+                p.errors.push(format!("script error: {e}"));
+                return;
+            }
+        };
+
+        // ── Phase 1: download all parquets (no market filter — full archive) ──
+        let days_str = days.to_string();
+        let out_dir_str = out_dir.to_string_lossy().to_string();
+        let progress_file_str = progress_file.to_string_lossy().to_string();
+
+        tracing::info!("[orderbook/ingest-multi] download: days={days} slugs={slugs_label}");
+
+        let child = tokio::process::Command::new("python3")
+            .arg(&script)
+            .arg("download")
+            .args(["--days", &days_str,
+                   "--out", &out_dir_str,
+                   "--progress", &progress_file_str])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn();
+
+        let mut child = match child {
+            Ok(c) => c,
+            Err(e) => {
+                let mut p = progress.lock().await;
+                p.running = false;
+                p.phase = "done".to_string();
+                p.finished_at = Some(chrono::Utc::now().to_rfc3339());
+                p.errors.push(format!("spawn failed: {e}"));
+                return;
+            }
+        };
+
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            if cancel.load(Ordering::SeqCst) {
+                let _ = child.kill().await;
+                let mut p = progress.lock().await;
+                p.running = false;
+                p.phase = "done".to_string();
+                p.finished_at = Some(chrono::Utc::now().to_rfc3339());
+                p.errors.push("cancelled by user".to_string());
+                return;
+            }
+            if let Ok(raw) = std::fs::read_to_string(&progress_file) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+                    let mut p = progress.lock().await;
+                    p.done      = v["done"].as_u64().unwrap_or(0) as usize;
+                    p.total     = v["total"].as_u64().unwrap_or(0) as usize;
+                    p.current_hour = v["current"].as_str().unwrap_or("").to_string();
+                    p.downloaded   = v["downloaded"].as_u64().unwrap_or(0) as usize;
+                    p.skipped      = v["skipped"].as_u64().unwrap_or(0) as usize;
+                }
+            }
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => continue,
+                Err(e) => { tracing::warn!("[orderbook/ingest-multi] wait: {e}"); break; }
+            }
+        }
+
+        // ── Phase 2: to-ticks-multi ────────────────────────────────────────────
+        {
+            let mut p = progress.lock().await;
+            p.phase = "converting".to_string();
+            p.current_hour = format!("Auto-detecting series → {}", ticks_base.display());
+        }
+
+        let out_dir_str2 = out_dir.to_string_lossy().to_string();
+        let ticks_base_str = ticks_base.to_string_lossy().to_string();
+
+        let mut cmd = tokio::process::Command::new("python3");
+        cmd.arg(&script)
+           .arg("to-ticks-multi")
+           .args(["--in", &out_dir_str2, "--out", &ticks_base_str]);
+        if let Some(ref s) = slugs {
+            cmd.args(["--slugs", s]);
+        }
+
+        tracing::info!("[orderbook/ingest-multi] running to-ticks-multi slugs={slugs_label}");
+
+        let result = cmd.stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::piped())
+                        .output()
+                        .await;
+
+        let mut p = progress.lock().await;
+        p.running = false;
+        p.phase = "done".to_string();
+        p.finished_at = Some(chrono::Utc::now().to_rfc3339());
+
+        match result {
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                if !out.status.success() {
+                    p.errors.push(format!("to-ticks-multi failed: {}", stderr.trim()));
+                    tracing::error!("[orderbook/ingest-multi] {}", stderr.trim());
+                } else {
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    tracing::info!("[orderbook/ingest-multi] done: {}", stdout.trim());
+                }
+            }
+            Err(e) => p.errors.push(format!("to-ticks-multi spawn error: {e}")),
         }
     });
 }

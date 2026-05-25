@@ -7179,6 +7179,47 @@ pub async fn handle_api_orderbook_files(
     })).into_response()
 }
 
+/// POST /api/orderbook/ingest-multi — download ALL parquets + auto-convert all 5-min series.
+/// Body: { days, slugs? }
+pub async fn handle_api_orderbook_ingest_multi(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<crate::tools::orderbook::IngestMultiRequest>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+
+    {
+        let p = state.orderbook.progress.lock().await;
+        if p.running {
+            return (StatusCode::CONFLICT, Json(serde_json::json!({
+                "error": "A download/ingest job is already in progress. Cancel it first."
+            }))).into_response();
+        }
+    }
+
+    let days = body.days.clamp(1, 30);
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let slugs_label = body.slugs.clone().unwrap_or_else(|| "btc_5m,eth_5m,sol_5m,xrp_5m,bnb_5m".to_string());
+
+    crate::tools::orderbook::spawn_ingest_multi(
+        workspace_dir,
+        days,
+        body.slugs.clone(),
+        state.orderbook.progress.clone(),
+        state.orderbook.cancel.clone(),
+    );
+
+    Json(serde_json::json!({
+        "ok": true,
+        "days": days,
+        "slugs": slugs_label,
+        "message": format!(
+            "Multi-ingest started: downloading {} day(s) → auto-converting series [{}]. Poll /api/orderbook/download/status.",
+            days, slugs_label
+        )
+    })).into_response()
+}
+
 /// POST /api/orderbook/ingest — download + auto-convert to ticks in one job.
 /// Body: { days, market, slug, binance_symbol }
 pub async fn handle_api_orderbook_ingest(
