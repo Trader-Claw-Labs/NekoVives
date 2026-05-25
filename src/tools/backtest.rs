@@ -4385,20 +4385,50 @@ pub fn run_clob_1hz_backtest(
     let _fee_factor = 1.0 - fee_pct / 100.0; // captured inside closures per tick
 
     for (tick_idx, tick) in ticks.iter().enumerate() {
-        // Track window-open price (first tick of each new window)
+        // ── Window-transition resolution ─────────────────────────────────────
+        // Resolve any open position whenever the window changes. This handles two cases:
+        //   (a) Archive JSONL: window_ts changes at each 5-min boundary; the exact
+        //       window_secs_left == 0 tick may be absent in older files.
+        //   (b) Live recorder: same window_ts change at the market close.
+        // Resolution price = binance_price at the LAST tick of the expiring window.
         {
             let mut s = sim.lock().unwrap();
+            if tick.window_ts != s.current_window_ts && s.current_window_ts != 0 {
+                // window just closed — settle any open position using the previous tick's price
+                if s.position != 0 && s.window_open_price > 0.0 {
+                    let prev_close = if tick.binance_price > 0.0 { tick.binance_price }
+                                     else { s.window_open_price };
+                    let yes_won = prev_close > s.window_open_price;
+                    let (won, side_label) = match s.position {
+                        1  => (yes_won,  "bet_yes"),
+                        -1 => (!yes_won, "bet_no"),
+                        _  => (false,    "flat"),
+                    };
+                    let ts = chrono::DateTime::from_timestamp_millis(tick.ts_ms)
+                        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+                        .unwrap_or_else(|| tick.ts_ms.to_string());
+                    let pnl = if won {
+                        let payout = s.stake / s.entry_price;
+                        s.balance += payout;
+                        payout - s.stake
+                    } else { -s.stake };
+                    let ep = s.entry_price; let sk = s.stake;
+                    s.trades.push(Trade { timestamp: ts, side: side_label.to_string(),
+                        price: ep, size: sk, pnl, debug: None });
+                    s.position = 0; s.entry_price = 0.0; s.stake = 0.0;
+                }
+                s.window_open_price = 0.0;
+            }
             if tick.window_ts != s.current_window_ts {
-                // New window: resolve any carry-over (shouldn't happen in clean data, but guard)
                 s.current_window_ts = tick.window_ts;
-                s.window_open_price = tick.binance_price;
             }
             if s.window_open_price <= 0.0 && tick.binance_price > 0.0 {
                 s.window_open_price = tick.binance_price;
             }
         }
 
-        // ── Resolve at window close ──────────────────────────────────────────
+        // ── Resolve at explicit window-close tick (window_secs_left == 0) ────
+        // Also handles properly-formatted JSONL files that emit a secs_left=0 tick.
         if tick.window_secs_left == 0 {
             let mut s = sim.lock().unwrap();
             if s.position != 0 {

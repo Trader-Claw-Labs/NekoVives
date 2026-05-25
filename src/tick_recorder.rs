@@ -295,8 +295,15 @@ async fn recorder_loop(cfg: TickRecorderConfig, stop: Arc<AtomicBool>) -> anyhow
             0
         };
 
-        let window_ts = now_s - (now_s % window_secs);
-        let window_secs_left = window_secs - (now_s % window_secs);
+        // At exact window boundaries (now_s % window_secs == 0) this second belongs
+        // to the PREVIOUS window as its close tick (secs_left = 0).  All other seconds
+        // count down from window_secs-1 to 1 within their window.
+        let rem = now_s % window_secs;
+        let (window_ts, window_secs_left) = if rem == 0 {
+            (now_s - window_secs, 0)
+        } else {
+            (now_s - rem, window_secs - rem)
+        };
 
         let tick = Tick {
             ts_ms: now_ms,
