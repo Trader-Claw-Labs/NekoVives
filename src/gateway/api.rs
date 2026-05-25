@@ -7178,3 +7178,48 @@ pub async fn handle_api_orderbook_files(
         "files": files,
     })).into_response()
 }
+
+/// POST /api/orderbook/ingest — download + auto-convert to ticks in one job.
+/// Body: { days, market, slug, binance_symbol }
+pub async fn handle_api_orderbook_ingest(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<crate::tools::orderbook::IngestRequest>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+
+    // Reject if already running
+    {
+        let p = state.orderbook.progress.lock().await;
+        if p.running {
+            return (StatusCode::CONFLICT, Json(serde_json::json!({
+                "error": "A download/ingest job is already in progress. Cancel it first."
+            }))).into_response();
+        }
+    }
+
+    let days = body.days.clamp(1, 30);
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+
+    crate::tools::orderbook::spawn_ingest(
+        workspace_dir,
+        days,
+        body.market.clone(),
+        body.slug.clone(),
+        body.binance_symbol.clone(),
+        state.orderbook.progress.clone(),
+        state.orderbook.cancel.clone(),
+    );
+
+    Json(serde_json::json!({
+        "ok": true,
+        "days": days,
+        "market": body.market,
+        "slug": body.slug,
+        "binance_symbol": body.binance_symbol,
+        "message": format!(
+            "Ingest started: downloading {} day(s) for market {} → converting to ticks/{} slug. Poll /api/orderbook/download/status for progress.",
+            days, body.market, body.slug
+        )
+    })).into_response()
+}

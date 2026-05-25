@@ -3147,6 +3147,20 @@ pub async fn run_backtest_engine(
         ).await;
     }
 
+    // ── archive_candles: tick JSONL → 1m OHLC candles → on_candle(ctx) scripts ──
+    // Uses the same tick JSONL files as clob_1hz but aggregates them into 1-minute
+    // OHLC candles from the Binance price feed. Real CLOB YES token prices at
+    // decision time are injected via ctx.token_price.
+    // `symbol` is used as the tick slug (e.g. "btc_5m").
+    if market_type == "archive_candles" {
+        return run_archive_candles_backtest(
+            script_path, symbol, from_date, to_date,
+            initial_balance, fee_pct, workspace_dir, interval,
+            resolution_logic, threshold, max_position_usd, max_entry_price,
+            sizing_mode, sizing_value, price_mode,
+        ).await;
+    }
+
     // ── polymarket_binary: slug-aligned binary engine ────────────────────────────────
     // Data source determined by resolution_logic:
     //   price_up      -> Binance 1m candles
@@ -4681,6 +4695,201 @@ on_tick(ctx);
 }
 
 /// Async entry point called from the gateway: reads tick files then runs the backtest.
+/// Archive-candles backtest: loads tick JSONL files, builds 1m Binance-style OHLC candles
+/// from the `binance_price` field, injects real CLOB token prices at decision time via
+/// `HistoricalMarketWindow`, then runs `on_candle(ctx)` scripts through the same engine
+/// as `polymarket_binary`.
+///
+/// This allows existing drift strategies (e.g. `polymarket_btc_updown_5m_drift_v2_combo.rhai`)
+/// to be backtested against real orderbook archive data instead of synthetic momentum prices.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_archive_candles_backtest(
+    script_path: &std::path::Path,
+    slug: &str,
+    from_date: &str,
+    to_date: &str,
+    initial_balance: f64,
+    fee_pct: f64,
+    workspace_dir: &std::path::Path,
+    interval: &str,
+    resolution_logic: &str,
+    threshold: Option<f64>,
+    max_position_usd: Option<f64>,
+    max_entry_price: Option<f64>,
+    sizing_mode: &str,
+    sizing_value: f64,
+    price_mode: &str,
+) -> BacktestMetrics {
+    use std::collections::HashMap;
+
+    let script_content = match std::fs::read_to_string(script_path) {
+        Ok(s) => s,
+        Err(e) => return BacktestMetrics {
+            analysis: format!("Error reading script: {e}"),
+            ..Default::default()
+        },
+    };
+
+    // 1. Load ticks
+    let ticks = match load_ticks_for_range(workspace_dir, slug, from_date, to_date) {
+        Ok(t) if !t.is_empty() => t,
+        Ok(_) => return BacktestMetrics {
+            analysis: format!(
+                "No tick data for slug '{}' in range {from_date}→{to_date}. \
+                 Run the tick recorder or ingest the orderbook archive first.",
+                slug
+            ),
+            ..Default::default()
+        },
+        Err(e) => return BacktestMetrics {
+            analysis: e.to_string(),
+            ..Default::default()
+        },
+    };
+
+    tracing::info!("[ARCHIVE-CANDLES] slug={slug} ticks={} from={from_date} to={to_date}", ticks.len());
+
+    // 2. Aggregate ticks → 1-minute OHLC candles using binance_price
+    //    Ticks with binance_price == 0 are skipped for candle building.
+    let mut minute_map: std::collections::BTreeMap<i64, (f64, f64, f64, f64, f64)> = Default::default();
+    // key = minute_ts_ms, value = (open, high, low, close, volume)
+    for tick in &ticks {
+        if tick.binance_price <= 0.0 { continue; }
+        let minute_ms = (tick.ts_ms / 60_000) * 60_000;
+        let entry = minute_map.entry(minute_ms).or_insert((tick.binance_price, tick.binance_price, tick.binance_price, tick.binance_price, 0.0));
+        entry.1 = entry.1.max(tick.binance_price);  // high
+        entry.2 = entry.2.min(tick.binance_price);  // low
+        entry.3 = tick.binance_price;               // close (last tick wins)
+        entry.4 += 1.0;                             // pseudo-volume = tick count
+    }
+
+    if minute_map.is_empty() {
+        return BacktestMetrics {
+            analysis: format!(
+                "Tick data for slug '{}' has no valid Binance prices. \
+                 Archive ticks recorded without a Binance feed cannot build candles.",
+                slug
+            ),
+            ..Default::default()
+        };
+    }
+
+    let candles: Vec<Candle> = minute_map.into_iter()
+        .map(|(ts_ms, (o, h, l, c, v))| Candle { open_time_ms: ts_ms, open: o, high: h, low: l, close: c, volume: v })
+        .collect();
+
+    tracing::info!("[ARCHIVE-CANDLES] built {} 1m candles", candles.len());
+
+    // 3. Build HistoricalMarketWindow entries from tick data.
+    //    For each 5-minute window we capture:
+    //      - window_open_ts / window_close_ts from window_ts field
+    //      - yes_token_price = yes_mid at the decision candle (P4: 1 min before close)
+    //    This enables `ctx.token_price` in the Rhai script.
+    let window_minutes = parse_interval_to_minutes(interval);
+    let window_secs = (window_minutes as i64) * 60;
+    let decision_offset_secs: i64 = 60; // bet at last 1-minute candle inside the window
+
+    // Collect all unique window timestamps
+    let mut windows: HashMap<i64, super::polymarket_historical_types::HistoricalMarketWindow> = HashMap::new();
+    for tick in &ticks {
+        let wts = tick.window_ts;
+        if wts == 0 { continue; }
+        let entry = windows.entry(wts).or_insert_with(|| {
+            super::polymarket_historical_types::HistoricalMarketWindow {
+                window_open_ts: wts,
+                window_close_ts: wts + window_secs,
+                decision_ts: wts + window_secs - decision_offset_secs,
+                condition_id: slug.to_string(),
+                yes_token_id: String::new(),
+                no_token_id: String::new(),
+                yes_token_price: None,
+                no_token_price: None,
+                resolution: None,
+                btc_open: None,
+                btc_close: None,
+                slug: slug.to_string(),
+                from_cache: false,
+            }
+        });
+
+        // Update YES token price with the closest tick to decision time
+        let decision_ts_ms = (wts + window_secs - decision_offset_secs) * 1000;
+        let tick_lag = (tick.ts_ms - decision_ts_ms).abs();
+        let current_lag = entry.yes_token_price.map(|_| i64::MAX).unwrap_or(i64::MAX);
+        // Track tick closest to decision_ts
+        if tick.yes_mid > 0.0 && tick_lag < current_lag {
+            entry.yes_token_price = Some(tick.yes_mid);
+            entry.no_token_price = Some(1.0 - tick.yes_mid);
+        }
+
+        // Resolution: track open/close prices
+        if tick.window_secs_left == 299 && tick.binance_price > 0.0 {
+            entry.btc_open = Some(tick.binance_price);
+        }
+        if tick.window_secs_left == 0 && tick.binance_price > 0.0 {
+            entry.btc_close = Some(tick.binance_price);
+            if let Some(open) = entry.btc_open {
+                entry.resolution = Some(if tick.binance_price > open { "up".to_string() } else { "down".to_string() });
+            }
+        }
+    }
+
+    // Fix: use a simpler approach for finding the decision-time tick price
+    // — for each window, pick the yes_mid from the tick closest to (window_close - 60s)
+    let mut window_decision_prices: HashMap<i64, (f64, i64)> = HashMap::new(); // wts → (yes_mid, lag_abs)
+    for tick in &ticks {
+        if tick.window_ts == 0 || tick.yes_mid <= 0.0 { continue; }
+        let decision_ts_ms = (tick.window_ts + window_secs - decision_offset_secs) * 1000;
+        let lag = (tick.ts_ms - decision_ts_ms).abs();
+        let entry = window_decision_prices.entry(tick.window_ts).or_insert((tick.yes_mid, lag));
+        if lag < entry.1 {
+            *entry = (tick.yes_mid, lag);
+        }
+    }
+    for (wts, (yes_mid, _)) in &window_decision_prices {
+        if let Some(w) = windows.get_mut(wts) {
+            w.yes_token_price = Some(*yes_mid);
+            w.no_token_price = Some(1.0 - yes_mid);
+        }
+    }
+
+    let hist_map: HashMap<i64, super::polymarket_historical_types::HistoricalMarketWindow> =
+        windows.into_iter().collect();
+    let windows_with_price = hist_map.values().filter(|w| w.yes_token_price.is_some()).count();
+    tracing::info!("[ARCHIVE-CANDLES] {} windows, {} with real token price", hist_map.len(), windows_with_price);
+
+    let rl = resolution_logic.to_string();
+    let thr = threshold;
+    let sm = sizing_mode.to_string();
+    let sv = sizing_value;
+    let pm = price_mode.to_string();
+    let hist_clone = Some(hist_map);
+    let prev_hist_clone: Option<HashMap<i64, super::polymarket_historical_types::HistoricalMarketWindow>> = None;
+
+    match tokio::task::spawn_blocking(move || {
+        run_polymarket_slug_backtest(
+            script_content, candles, initial_balance, fee_pct,
+            window_minutes, &rl, thr,
+            max_position_usd, max_entry_price,
+            &sm, sv, &pm,
+            hist_clone, prev_hist_clone,
+        )
+    }).await {
+        Ok(Ok(mut m)) => {
+            m.windows_with_real_price = Some(windows_with_price as u32);
+            m
+        }
+        Ok(Err(e)) => BacktestMetrics {
+            analysis: format!("Archive-candles backtest error: {e}"),
+            ..Default::default()
+        },
+        Err(e) => BacktestMetrics {
+            analysis: format!("Task join error: {e}"),
+            ..Default::default()
+        },
+    }
+}
+
 pub async fn run_clob_1hz_backtest_from_files(
     script_path: &std::path::Path,
     slug: &str,

@@ -1383,7 +1383,7 @@ export default function Backtesting() {
     queryKey: ['backtest-tick-slugs'],
     queryFn: () => apiFetch('/api/backtest/tick-slugs'),
     staleTime: 30 * 1000,
-    enabled: config.market_type === 'clob_1hz',
+    enabled: config.market_type === 'clob_1hz' || config.market_type === 'archive_candles',
   })
   const tickSlugs: TickSlugInfo[] = tickSlugsData?.slugs ?? []
 
@@ -1394,6 +1394,55 @@ export default function Backtesting() {
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  // ── Dataset Download panel state ───────────────────────────────────────────
+  const [datasetPanelOpen, setDatasetPanelOpen] = useState(false)
+  const [ingestDays, setIngestDays] = useState(7)
+  const [ingestMarket, setIngestMarket] = useState('')
+  const [ingestSlug, setIngestSlug] = useState('btc_5m')
+  const [ingestBinance, setIngestBinance] = useState('BTCUSDT')
+
+  interface IngestProgress {
+    running: boolean
+    phase: string        // "downloading" | "converting" | "done" | ""
+    done: number
+    total: number
+    current_hour: string
+    downloaded: number
+    skipped: number
+    errors: string[]
+    slug: string
+    started_at?: string
+    finished_at?: string
+  }
+  const [ingestProgress, setIngestProgress] = useState<IngestProgress | null>(null)
+
+  // Poll ingest progress
+  const { data: rawIngestProgress } = useQuery<IngestProgress>({
+    queryKey: ['orderbook-ingest-status'],
+    queryFn: () => apiFetch('/api/orderbook/download/status'),
+    refetchInterval: ingestProgress?.running ? 3000 : false,
+  })
+  useEffect(() => {
+    if (rawIngestProgress) setIngestProgress(rawIngestProgress)
+  }, [rawIngestProgress])
+
+  const ingestMutation = useMutation({
+    mutationFn: () => apiPost('/api/orderbook/ingest', {
+      days: ingestDays,
+      market: ingestMarket.trim(),
+      slug: ingestSlug.trim(),
+      binance_symbol: ingestBinance.trim(),
+    }),
+    onSuccess: () => {
+      // Start polling
+      setIngestProgress(p => p ? { ...p, running: true, phase: 'downloading' } : null)
+    },
+  })
+
+  const cancelIngestMutation = useMutation({
+    mutationFn: () => apiPost('/api/orderbook/download/cancel', {}),
+  })
 
   // Local UI state (doesn't need to persist)
   const [scriptsExpanded, setScriptsExpanded] = useState(true)
@@ -1538,7 +1587,8 @@ export default function Backtesting() {
   const isEngineKind = (config.kind ?? 'rhai_candle') !== 'rhai_candle'
 
   const isBatchMode = selectedScripts.length > 1
-  const hasClob1HzSlug = config.market_type !== 'clob_1hz' || !!(config.clob_slug ?? config.symbol)
+  const isArchiveMode = config.market_type === 'clob_1hz' || config.market_type === 'archive_candles'
+  const hasClob1HzSlug = !isArchiveMode || !!(config.clob_slug ?? config.symbol)
   const canRun = (isBatchMode || !!config.script || isEngineKind) && hasClob1HzSlug && !isRunning && !batchProgress
 
   // Sort scripts by selected metric descending
@@ -1624,7 +1674,7 @@ export default function Backtesting() {
       {/* Header */}
       <div className="flex items-center gap-3 mb-6">
         <FlaskConical size={20} style={{ color: 'var(--color-accent)' }} />
-        <div>
+        <div className="flex-1">
           <h1 className="text-xl font-bold" style={{ color: 'var(--color-accent)' }}>
             Strategy Backtesting
           </h1>
@@ -1632,6 +1682,19 @@ export default function Backtesting() {
             Run Rhai scripts or strategy-core engines against historical data
           </p>
         </div>
+        <button
+          onClick={() => setDatasetPanelOpen(v => !v)}
+          className="flex items-center gap-1.5 px-3 py-2 rounded text-xs font-semibold"
+          style={{
+            backgroundColor: datasetPanelOpen ? 'var(--color-accent)' : 'var(--color-surface-2)',
+            border: '1px solid var(--color-border)',
+            color: datasetPanelOpen ? '#000' : 'var(--color-text)',
+          }}
+          title="Download Orderbook Archive dataset for backtesting"
+        >
+          <CloudDownload size={13} />
+          Archive Dataset
+        </button>
       </div>
 
       {/* Polymarket historical data sync */}
@@ -1705,6 +1768,8 @@ export default function Backtesting() {
                 <p className="text-[10px] mt-1.5" style={{ color: 'var(--color-text-muted)' }}>
                   {config.market_type === 'clob_1hz'
                     ? 'Engine replays the recorded YES/NO order-book ticks for the selected slug — no Rhai script needed.'
+                    : config.market_type === 'archive_candles'
+                    ? 'Engine aggregates archive ticks into 1m OHLC candles and replays them — no Rhai script needed.'
                     : 'Engine simulates the selected Polymarket series using Binance candles as the underlying signal — no Rhai script needed.'}
                 </p>
               )}
@@ -1731,13 +1796,14 @@ export default function Backtesting() {
                     fee_pct: 1.5,
                     poly_binary_preset: preset.id,
                   })
-                } else if (newType === 'clob_1hz') {
-                  // CLOB 1 HZ supports both Rhai on_tick scripts AND
-                  // strategy-core engine kinds (arb_binary, fair_value, etc.)
-                  // — preserve whichever kind the user has selected.
+                } else if (newType === 'clob_1hz' || newType === 'archive_candles') {
+                  // Archive modes use recorded tick JSONL slugs.
+                  // clob_1hz → on_tick(ctx) scripts
+                  // archive_candles → on_candle(ctx) scripts (aggregated to 1m OHLC)
                   setFullConfig({
                     ...config,
                     market_type: newType,
+                    interval: '5m',
                     fee_pct: 1.5,
                   })
                   refetchTickSlugs()
@@ -1761,7 +1827,8 @@ export default function Backtesting() {
             >
               <option value="crypto">Crypto</option>
               <option value="polymarket_binary">Polymarket Binary</option>
-              <option value="clob_1hz">CLOB 1 Hz (tick replay)</option>
+              <option value="clob_1hz">Orderbook Archive (on_tick)</option>
+              <option value="archive_candles">Orderbook Archive (on_candle)</option>
             </select>
           </div>
 
@@ -1895,10 +1962,10 @@ export default function Backtesting() {
             </div>
           )}
 
-          {/* Symbol / Market selector — adapts to market type. For CLOB 1 Hz we
-              always show the recorded-tick slug picker (Rhai on_tick scripts
+          {/* Symbol / Market selector — adapts to market type. For archive modes we
+              always show the recorded-tick slug picker (Rhai on_tick/on_candle scripts
               and engine kinds both consume the same recorded ticks). */}
-          {config.market_type === 'clob_1hz' ? (
+          {isArchiveMode ? (
             <div className="col-span-2 lg:col-span-4">
               <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>Tick Slug</label>
               {tickSlugs.length === 0 ? (
@@ -1912,8 +1979,8 @@ export default function Backtesting() {
                 >
                   <div>
                     <span className="font-semibold" style={{ color: 'var(--color-text)' }}>No tick data yet.</span>{' '}
-                    CLOB 1 Hz backtests replay 1-second order-book snapshots from <code className="text-[10px]" style={{ color: 'var(--color-accent)' }}>data/ticks/&lt;slug&gt;/</code>.
-                    Pick a recurring series below and click <span className="font-semibold">Start recorder</span> — the dashboard will auto-resolve the current Polymarket window for you. Let it run for at least an hour before backtesting.
+                    Orderbook Archive backtests replay 1-second snapshots from <code className="text-[10px]" style={{ color: 'var(--color-accent)' }}>data/ticks/&lt;slug&gt;/</code>.
+                    Use the <span className="font-semibold">Download Dataset</span> panel below to ingest archive data, or pick a series and click <span className="font-semibold">Start recorder</span> to record live ticks.
                   </div>
                   <div className="flex items-center gap-2 flex-wrap">
                     <select
@@ -2065,8 +2132,8 @@ export default function Backtesting() {
             </div>
           ) : null}
 
-          {/* Interval / Window — hidden for engine kinds and CLOB 1 HZ (tick-level data, no candle interval) */}
-          {!isEngineKind && config.market_type !== 'clob_1hz' && <div className={config.market_type === 'crypto' ? 'lg:col-span-3' : 'lg:col-span-2'}>
+          {/* Interval / Window — hidden for engine kinds and archive tick modes */}
+          {!isEngineKind && !isArchiveMode && <div className={config.market_type === 'crypto' ? 'lg:col-span-3' : 'lg:col-span-2'}>
             <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>
               {config.market_type === 'polymarket_binary' ? 'Window' : 'Interval'}
             </label>
@@ -2489,6 +2556,174 @@ export default function Backtesting() {
             {' '}Strategy fires at the <em>decision candle</em> (last complete 1m before window close) using Binance data
             as a Chainlink BTC/USD proxy. Resolution: close at window end vs window open.
             {' '}Token prices reflect momentum — stronger signals cost more ($0.55–$0.92/token), so higher win rates are needed to profit.
+          </div>
+        </div>
+      )}
+
+      {/* Dataset Download Panel — shown for archive modes or when manually opened */}
+      {(isArchiveMode || datasetPanelOpen) && (
+        <div
+          className="rounded-lg border mb-4 overflow-hidden"
+          style={{ backgroundColor: 'var(--color-surface)', borderColor: 'var(--color-border)' }}
+        >
+          <button
+            onClick={() => setDatasetPanelOpen(v => !v)}
+            className="w-full flex items-center justify-between px-4 py-3 text-sm font-semibold hover:bg-[var(--color-surface-2)]"
+            style={{ color: 'var(--color-text)' }}
+          >
+            <span className="flex items-center gap-2">
+              <CloudDownload size={15} style={{ color: 'var(--color-accent)' }} />
+              Download Orderbook Archive Dataset
+            </span>
+            <span className="text-xs font-normal" style={{ color: 'var(--color-text-muted)' }}>
+              {ingestProgress?.running
+                ? `${ingestProgress.phase === 'downloading' ? '⬇ Downloading' : '⚙ Converting'}…`
+                : ingestProgress?.finished_at
+                ? `Last run: ${ingestProgress.downloaded ?? 0} files downloaded`
+                : 'pmxt.dev v2 archive → tick JSONL'}
+            </span>
+          </button>
+
+          <div className="px-4 pb-4 space-y-4">
+            <p className="text-xs" style={{ color: 'var(--color-text-muted)' }}>
+              Downloads hourly Parquet files from the <strong>pmxt.dev v2</strong> Polymarket CLOB archive,
+              then converts them to <code className="font-mono">data/ticks/&lt;slug&gt;/</code> JSONL format
+              ready for backtesting. Use <em>Orderbook Archive (on_tick)</em> or <em>Orderbook Archive (on_candle)</em> modes.
+            </p>
+
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+              <div>
+                <label className="block text-xs mb-1" style={{ color: 'var(--color-text-muted)' }}>Days to download</label>
+                <input
+                  type="number" min={1} max={30}
+                  value={ingestDays}
+                  onChange={e => setIngestDays(Math.max(1, Math.min(30, Number(e.target.value))))}
+                  className="w-full rounded px-2 py-2 text-sm"
+                  style={{ backgroundColor: 'var(--color-surface-2)', border: '1px solid var(--color-border)', color: 'var(--color-text)' }}
+                />
+              </div>
+              <div className="col-span-2 sm:col-span-1">
+                <label className="block text-xs mb-1" style={{ color: 'var(--color-text-muted)' }}>Condition ID (0x...)</label>
+                <input
+                  type="text"
+                  value={ingestMarket}
+                  onChange={e => setIngestMarket(e.target.value)}
+                  placeholder="0x13dec97d..."
+                  className="w-full rounded px-2 py-2 text-sm font-mono"
+                  style={{ backgroundColor: 'var(--color-surface-2)', border: '1px solid var(--color-border)', color: 'var(--color-text)' }}
+                />
+              </div>
+              <div>
+                <label className="block text-xs mb-1" style={{ color: 'var(--color-text-muted)' }}>Tick slug</label>
+                <input
+                  type="text"
+                  value={ingestSlug}
+                  onChange={e => setIngestSlug(e.target.value)}
+                  placeholder="btc_5m"
+                  className="w-full rounded px-2 py-2 text-sm font-mono"
+                  style={{ backgroundColor: 'var(--color-surface-2)', border: '1px solid var(--color-border)', color: 'var(--color-text)' }}
+                />
+              </div>
+              <div>
+                <label className="block text-xs mb-1" style={{ color: 'var(--color-text-muted)' }}>Binance symbol</label>
+                <input
+                  type="text"
+                  value={ingestBinance}
+                  onChange={e => setIngestBinance(e.target.value)}
+                  placeholder="BTCUSDT"
+                  className="w-full rounded px-2 py-2 text-sm font-mono"
+                  style={{ backgroundColor: 'var(--color-surface-2)', border: '1px solid var(--color-border)', color: 'var(--color-text)' }}
+                />
+              </div>
+            </div>
+
+            {/* Progress bar */}
+            {ingestProgress?.running && (
+              <div className="space-y-1.5">
+                <div className="flex justify-between text-xs" style={{ color: 'var(--color-text-muted)' }}>
+                  <span>
+                    {ingestProgress.phase === 'downloading'
+                      ? `Downloading ${ingestProgress.downloaded ?? 0} files (${ingestProgress.done}/${ingestProgress.total})`
+                      : `Converting to ticks/${ingestProgress.slug}…`}
+                  </span>
+                  {ingestProgress.total > 0 && (
+                    <span>{Math.round((ingestProgress.done / ingestProgress.total) * 100)}%</span>
+                  )}
+                </div>
+                <div className="w-full rounded-full h-1.5" style={{ backgroundColor: 'var(--color-surface-2)' }}>
+                  <div
+                    className="h-1.5 rounded-full transition-all"
+                    style={{
+                      backgroundColor: 'var(--color-accent)',
+                      width: ingestProgress.total > 0
+                        ? `${Math.round((ingestProgress.done / ingestProgress.total) * 100)}%`
+                        : ingestProgress.phase === 'converting' ? '85%' : '5%',
+                    }}
+                  />
+                </div>
+                {ingestProgress.current_hour && (
+                  <div className="text-[10px] font-mono truncate" style={{ color: 'var(--color-text-muted)' }}>
+                    {ingestProgress.current_hour}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Completion / errors */}
+            {!ingestProgress?.running && ingestProgress?.finished_at && (
+              <div
+                className="rounded px-3 py-2 text-xs"
+                style={{
+                  backgroundColor: ingestProgress.errors?.length ? 'rgba(239,68,68,0.08)' : 'rgba(0,255,136,0.06)',
+                  border: `1px solid ${ingestProgress.errors?.length ? 'rgba(239,68,68,0.3)' : 'rgba(0,255,136,0.2)'}`,
+                  color: ingestProgress.errors?.length ? '#ef4444' : 'var(--color-accent)',
+                }}
+              >
+                {ingestProgress.errors?.length
+                  ? `⚠ Completed with ${ingestProgress.errors.length} error(s): ${ingestProgress.errors.slice(0, 2).join(', ')}`
+                  : `✓ Done — ${ingestProgress.downloaded ?? 0} files downloaded, slug '${ingestProgress.slug}' ready for backtesting`}
+              </div>
+            )}
+
+            <div className="flex gap-2">
+              <button
+                disabled={ingestMutation.isPending || ingestProgress?.running || !ingestMarket.trim() || !ingestSlug.trim()}
+                onClick={() => ingestMutation.mutate()}
+                className="flex items-center gap-1.5 px-3 py-2 rounded text-sm font-semibold disabled:opacity-40"
+                style={{ backgroundColor: 'var(--color-accent)', color: '#000' }}
+              >
+                <Download size={13} />
+                {ingestProgress?.running ? 'Running…' : 'Start Download + Convert'}
+              </button>
+              {ingestProgress?.running && (
+                <button
+                  onClick={() => cancelIngestMutation.mutate()}
+                  className="px-3 py-2 rounded text-sm"
+                  style={{ backgroundColor: 'var(--color-surface-2)', border: '1px solid var(--color-border)', color: 'var(--color-text)' }}
+                >
+                  Cancel
+                </button>
+              )}
+              {ingestProgress?.finished_at && !ingestProgress.running && (
+                <button
+                  onClick={() => {
+                    setFullConfig({ ...config, market_type: 'archive_candles', clob_slug: ingestSlug, symbol: ingestSlug })
+                    refetchTickSlugs()
+                  }}
+                  className="px-3 py-2 rounded text-sm flex items-center gap-1.5"
+                  style={{ backgroundColor: 'var(--color-surface-2)', border: '1px solid var(--color-accent)', color: 'var(--color-accent)' }}
+                >
+                  <Database size={13} />
+                  Use for backtesting
+                </button>
+              )}
+            </div>
+
+            {ingestMutation.isError && (
+              <p className="text-xs" style={{ color: '#ef4444' }}>
+                {(ingestMutation.error as Error)?.message ?? 'Failed to start ingest.'}
+              </p>
+            )}
           </div>
         </div>
       )}
