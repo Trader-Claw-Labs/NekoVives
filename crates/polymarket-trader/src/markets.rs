@@ -50,6 +50,12 @@ struct GammaMarket {
     liquidity: serde_json::Value,
     #[serde(rename = "endDateIso")]
     end_date_iso: Option<String>,
+    /// Full RFC3339 timestamp (e.g. "2026-05-26T16:45:00Z"). Gamma also exposes
+    /// `endDateIso` but for recurring markets that field is just "YYYY-MM-DD"
+    /// (no time-of-day) and won't parse as RFC3339 — we prefer `endDate` when
+    /// present and fall back to `endDateIso` otherwise.
+    #[serde(rename = "endDate", default)]
+    end_date: Option<String>,
     category: Option<String>,
     #[serde(default)]
     active: bool,
@@ -129,27 +135,41 @@ fn apply_filter(markets: Vec<GammaMarket>, filter: &MarketFilter) -> Vec<Market>
                     return false;
                 }
             }
-            // Date-range filter: parse end_date_iso and check days until close
+            // Date-range filter: parse the most precise end-date Gamma gives
+            // us (full `endDate` RFC3339 first, fall back to `endDateIso`
+            // which may be a date-only "YYYY-MM-DD" for recurring markets).
             if filter.min_days.is_some() || filter.max_days.is_some() {
-                match m.end_date_iso.as_deref() {
-                    Some(s) => {
-                        let parsed = chrono::DateTime::parse_from_rfc3339(s)
-                            .ok()
-                            .map(|dt| dt.with_timezone(&chrono::Utc));
-                        match parsed {
-                            Some(end_dt) => {
-                                let days = (end_dt - now).num_days();
-                                if let Some(min_d) = filter.min_days {
-                                    if days < min_d as i64 { return false; }
-                                }
-                                if let Some(max_d) = filter.max_days {
-                                    if days > max_d as i64 { return false; }
-                                }
-                            }
-                            None => return false, // unparseable date — exclude
+                let parsed = m
+                    .end_date
+                    .as_deref()
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+                    .or_else(|| {
+                        m.end_date_iso.as_deref().and_then(|s| {
+                            // RFC3339 first (some markets store full timestamp here)
+                            chrono::DateTime::parse_from_rfc3339(s)
+                                .ok()
+                                .map(|dt| dt.with_timezone(&chrono::Utc))
+                                // Fallback: date-only "YYYY-MM-DD" → end of day UTC
+                                .or_else(|| {
+                                    chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                                        .ok()
+                                        .and_then(|d| d.and_hms_opt(23, 59, 59))
+                                        .map(|ndt| ndt.and_utc())
+                                })
+                        })
+                    });
+                match parsed {
+                    Some(end_dt) => {
+                        let days = (end_dt - now).num_days();
+                        if let Some(min_d) = filter.min_days {
+                            if days < min_d as i64 { return false; }
+                        }
+                        if let Some(max_d) = filter.max_days {
+                            if days > max_d as i64 { return false; }
                         }
                     }
-                    None => return false, // no end date — exclude when date filter set
+                    None => return false,
                 }
             }
             true
