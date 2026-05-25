@@ -108,19 +108,19 @@ def filter_available_urls(urls: list[str], max_check: int = 48) -> list[str]:
 # ── DuckDB connection (singleton per process) ──────────────────────────────────
 
 def get_con() -> duckdb.DuckDBPyConnection:
-    con = duckdb.connect()
-    # Allow more threads and memory for big queries
-    con.execute("SET threads=4")
-    con.execute("SET memory_limit='512MB'")
-    # R2 returns 403 without a User-Agent. DuckDB 1.x uses custom_user_agent.
+    # custom_user_agent must be set at connection time (cannot SET after open).
+    # R2 returns 403 without a User-Agent header.
     try:
-        con.execute("SET custom_user_agent='orderbook-parser/1.0'")
+        con = duckdb.connect(config={"custom_user_agent": "orderbook-parser/1.0"})
     except Exception:
-        pass  # ignore on versions that don't support this
-    # Improve reliability with retries and a longer timeout for big remote files
+        con = duckdb.connect()  # older DuckDB — proceed without custom UA
+
+    con.execute("SET threads=4")
+    con.execute("SET memory_limit='1GB'")
+    # Reliability settings for large remote files
     try:
         con.execute("SET http_retries=3")
-        con.execute("SET http_timeout=120000")   # 120 s per request
+        con.execute("SET http_timeout=120000")    # 120 s per HTTP request
         con.execute("SET http_retry_wait_ms=2000")
     except Exception:
         pass
@@ -595,6 +595,240 @@ def cmd_analyze_local(args: argparse.Namespace) -> None:
         print(json.dumps({"error": str(e), "trace": traceback.format_exc()}))
 
 
+def cmd_to_ticks(args: argparse.Namespace) -> None:
+    """
+    Convert local Parquet files into CLOB 1Hz JSONL ticks compatible with the
+    existing tick-recorder backtester (on_tick(ctx) Rhai scripts).
+
+    Output format (one JSON object per line, 1 row per second):
+      ts_ms, yes_bid, yes_ask, no_bid, no_ask, yes_mid,
+      binance_price, chainlink_price, oracle_lag_ms,
+      window_ts, window_secs_left
+
+    Window logic: assumes a 5-minute UP/DOWN market. Each 5-min UTC-aligned
+    interval is a window (300 seconds). window_secs_left counts down from 300.
+    """
+    import math
+
+    data_dir = Path(args.dir)
+    out_dir = Path(args.out)
+    market_id = args.market
+    window_minutes = args.window_minutes
+    window_secs = window_minutes * 60
+    slug = args.slug
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    files = sorted(data_dir.glob("*.parquet"))
+    if not files:
+        print(json.dumps({"error": f"No .parquet files in {data_dir}"}))
+        return
+
+    print(f"[to-ticks] Loading {len(files)} parquet file(s) for market={market_id}...", file=sys.stderr)
+
+    con = get_con()
+    file_list = "[" + ", ".join(f"'{f}'" for f in files) + "]"
+
+    where = f"event_type = 'price_change' AND CAST(market AS VARCHAR) = '{market_id}'"
+
+    # Load all price_change events for this market, sorted by time
+    df = con.execute(f"""
+    SELECT
+        CAST(epoch_ms(timestamp_received) AS BIGINT) AS ts_ms,
+        CAST(best_bid  AS DOUBLE)  AS yes_bid,
+        CAST(best_ask  AS DOUBLE)  AS yes_ask,
+        CAST(price     AS DOUBLE)  AS price,
+        asset_id
+    FROM read_parquet({file_list}, hive_partitioning=false, union_by_name=true)
+    WHERE {where}
+    ORDER BY timestamp_received
+    """).df()
+
+    if df.empty:
+        print(json.dumps({"error": f"No price_change events found for market {market_id}"}))
+        return
+
+    print(f"[to-ticks] Loaded {len(df):,} price_change events. Resampling to 1 Hz...", file=sys.stderr)
+
+    # Determine YES asset_id: take the asset_id whose avg price is closer to 0.5
+    # (or simply the one with more events — more stable)
+    asset_counts = df.groupby("asset_id").size()
+    yes_asset = asset_counts.idxmax()
+    print(f"[to-ticks] Using YES asset_id={yes_asset[:20]}... ({asset_counts[yes_asset]:,} events)", file=sys.stderr)
+
+    yes_df = df[df["asset_id"] == yes_asset].copy()
+    yes_df["ts_s"] = yes_df["ts_ms"] // 1000  # second-level bucket
+
+    # Resample: take last event per second (most recent quote)
+    yes_1hz = yes_df.groupby("ts_s").last().reset_index()
+
+    # Forward-fill bid/ask across missing seconds
+    t_min = int(yes_1hz["ts_s"].min())
+    t_max = int(yes_1hz["ts_s"].max())
+    all_secs = pd.DataFrame({"ts_s": range(t_min, t_max + 1)})
+    yes_1hz = all_secs.merge(yes_1hz, on="ts_s", how="left").ffill()
+
+    yes_1hz["yes_bid"]  = yes_1hz["yes_bid"].fillna(0.0)
+    yes_1hz["yes_ask"]  = yes_1hz["yes_ask"].fillna(0.0)
+    yes_1hz["yes_mid"]  = (yes_1hz["yes_bid"] + yes_1hz["yes_ask"]) / 2
+    # NO token = 1 - YES (CLOB invariant for binary markets)
+    yes_1hz["no_bid"]   = (1.0 - yes_1hz["yes_ask"]).clip(0, 1)
+    yes_1hz["no_ask"]   = (1.0 - yes_1hz["yes_bid"]).clip(0, 1)
+    yes_1hz["ts_ms_out"] = yes_1hz["ts_s"] * 1000
+
+    # Window fields: UTC-aligned window_minutes-min windows
+    def window_ts(ts_s: int) -> int:
+        return int(ts_s // window_secs) * window_secs
+
+    def window_secs_left_fn(ts_s: int) -> int:
+        wt = window_ts(ts_s)
+        return max(0, window_secs - (ts_s - wt))
+
+    yes_1hz["window_ts"]        = yes_1hz["ts_s"].apply(window_ts)
+    yes_1hz["window_secs_left"] = yes_1hz["ts_s"].apply(window_secs_left_fn)
+
+    # Group by date and write one JSONL file per day
+    yes_1hz["date"] = pd.to_datetime(yes_1hz["ts_s"], unit="s", utc=True).dt.date
+    dates = yes_1hz["date"].unique()
+
+    total_rows = 0
+    for date in sorted(dates):
+        day_df = yes_1hz[yes_1hz["date"] == date]
+        date_str = str(date)
+        out_file = out_dir / f"{date_str}.jsonl"
+        rows = []
+        for _, row in day_df.iterrows():
+            rows.append(json.dumps({
+                "ts_ms":            int(row["ts_ms_out"]),
+                "yes_bid":          round(float(row["yes_bid"]), 6),
+                "yes_ask":          round(float(row["yes_ask"]), 6),
+                "no_bid":           round(float(row["no_bid"]),  6),
+                "no_ask":           round(float(row["no_ask"]),  6),
+                "yes_mid":          round(float(row["yes_mid"]), 6),
+                "binance_price":    0.0,
+                "chainlink_price":  0.0,
+                "oracle_lag_ms":    0,
+                "window_ts":        int(row["window_ts"]),
+                "window_secs_left": int(row["window_secs_left"]),
+            }))
+        out_file.write_text("\n".join(rows) + "\n")
+        total_rows += len(rows)
+        print(f"[to-ticks] {date_str} → {len(rows):,} rows", file=sys.stderr)
+
+    result = {
+        "ok": True,
+        "slug": slug,
+        "market": market_id,
+        "yes_asset_id": yes_asset,
+        "total_rows": total_rows,
+        "days": len(dates),
+        "out_dir": str(out_dir),
+        "next_step": (
+            f"Files written to {out_dir}. "
+            f"In the Backtesting page, select Market = 'CLOB 1 Hz (tick replay)' "
+            f"and slug = '{slug}' to backtest with on_tick(ctx) scripts."
+        ),
+    }
+    print(json.dumps(result))
+
+
+def cmd_to_candles(args: argparse.Namespace) -> None:
+    """
+    Convert local Parquet files into OHLC candle JSON compatible with the
+    existing candle-based backtester (on_candle(ctx) Rhai scripts).
+
+    Output: ~/.traderclaw/workspace/data/<slug>_<freq>.json
+    Format: list of {time, open, high, low, close, volume}
+    (same format as Binance klines used by the existing engine)
+    """
+    data_dir = Path(args.dir)
+    market_id = args.market
+    freq = args.freq  # e.g. "5min", "1min", "15min"
+    slug = args.slug
+    out_dir = Path(args.out) if args.out else data_dir
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    files = sorted(data_dir.glob("*.parquet"))
+    if not files:
+        print(json.dumps({"error": f"No .parquet files in {data_dir}"}))
+        return
+
+    print(f"[to-candles] Loading {len(files)} file(s) for market={market_id}...", file=sys.stderr)
+
+    con = get_con()
+    file_list = "[" + ", ".join(f"'{f}'" for f in files) + "]"
+    where = f"event_type = 'price_change' AND CAST(market AS VARCHAR) = '{market_id}'"
+
+    df = con.execute(f"""
+    SELECT
+        timestamp_received,
+        CAST(best_bid AS DOUBLE)  AS yes_bid,
+        CAST(best_ask AS DOUBLE)  AS yes_ask,
+        CAST(price    AS DOUBLE)  AS price,
+        CAST(size     AS DOUBLE)  AS size,
+        asset_id
+    FROM read_parquet({file_list}, hive_partitioning=false, union_by_name=true)
+    WHERE {where}
+    ORDER BY timestamp_received
+    """).df()
+
+    if df.empty:
+        print(json.dumps({"error": f"No price_change events for market {market_id}"}))
+        return
+
+    print(f"[to-candles] {len(df):,} events → building {freq} OHLC...", file=sys.stderr)
+
+    # Use the YES asset (most events)
+    asset_counts = df.groupby("asset_id").size()
+    yes_asset = asset_counts.idxmax()
+    df = df[df["asset_id"] == yes_asset].copy()
+
+    df["timestamp_received"] = pd.to_datetime(df["timestamp_received"], utc=True)
+    df = df.set_index("timestamp_received").sort_index()
+    df["mid"] = (df["yes_bid"] + df["yes_ask"]) / 2
+
+    ohlc = df["mid"].resample(freq).ohlc()
+    ohlc["volume"] = df["size"].resample(freq).sum()
+    ohlc = ohlc.dropna(subset=["open"]).reset_index()
+
+    # Format as list of Binance-compatible candle dicts
+    candles = []
+    for _, row in ohlc.iterrows():
+        candles.append({
+            "time":   int(row["timestamp_received"].timestamp() * 1000),
+            "open":   round(float(row["open"]),   6),
+            "high":   round(float(row["high"]),   6),
+            "low":    round(float(row["low"]),    6),
+            "close":  round(float(row["close"]),  6),
+            "volume": round(float(row["volume"]), 4),
+        })
+
+    out_name = f"{slug}_{freq.replace('min','m').replace('h','H')}.json"
+    out_file = out_dir / out_name
+    out_file.write_text(json.dumps(candles))
+    print(f"[to-candles] Wrote {len(candles):,} candles to {out_file}", file=sys.stderr)
+
+    print(json.dumps({
+        "ok": True,
+        "slug": slug,
+        "freq": freq,
+        "market": market_id,
+        "yes_asset_id": yes_asset,
+        "candle_count": len(candles),
+        "out_file": str(out_file),
+        "date_range": {
+            "from": candles[0]["time"] if candles else None,
+            "to":   candles[-1]["time"] if candles else None,
+        },
+        "next_step": (
+            f"File written: {out_file}. "
+            f"Copy to ~/.traderclaw/workspace/data/ then use "
+            f"market_type='polymarket' with slug='{slug}' in the Backtesting page."
+        ),
+    }))
+
+
 def cmd_drift(args: argparse.Namespace) -> None:
     urls = urls_for_range(args.days)
     print(f"[orderbook_parser] Computing drift for {args.market} window={args.window}s...", file=sys.stderr)
@@ -658,16 +892,40 @@ def main() -> None:
     p.add_argument("--dir", required=True, help="Directory with *.parquet files")
     p.add_argument("--market", default=None)
 
+    # to-ticks — convert parquet → CLOB 1Hz JSONL (for on_tick(ctx) backtester)
+    p = sub.add_parser(
+        "to-ticks",
+        help="Convert local Parquet to 1-Hz JSONL ticks for the CLOB backtester",
+    )
+    p.add_argument("--dir",    required=True,  help="Directory with local *.parquet files")
+    p.add_argument("--market", required=True,  help="Condition ID (0x…)")
+    p.add_argument("--slug",   required=True,  help="Slug name (e.g. btc_ob_5m) — used as folder name")
+    p.add_argument("--out",    required=True,  help="Output directory (e.g. ~/.traderclaw/workspace/data/ticks/<slug>)")
+    p.add_argument("--window-minutes", type=int, default=5, help="Window duration in minutes (default 5)")
+
+    # to-candles — convert parquet → OHLC JSON (for on_candle(ctx) backtester)
+    p = sub.add_parser(
+        "to-candles",
+        help="Convert local Parquet to OHLC candle JSON for the candle backtester",
+    )
+    p.add_argument("--dir",    required=True,  help="Directory with local *.parquet files")
+    p.add_argument("--market", required=True,  help="Condition ID (0x…)")
+    p.add_argument("--slug",   required=True,  help="Slug name (e.g. btc_ob)")
+    p.add_argument("--freq",   default="5min", help="Candle frequency: 1min, 5min, 15min, 1h")
+    p.add_argument("--out",    default=None,   help="Output dir (default: same as --dir)")
+
     args = parser.parse_args()
 
     dispatch = {
-        "summary": cmd_summary,
-        "price-series": cmd_price_series,
-        "top-markets": cmd_top_markets,
-        "spread-stats": cmd_spread_stats,
-        "drift": cmd_drift,
-        "download": cmd_download,
-        "analyze-local": cmd_analyze_local,
+        "summary":        cmd_summary,
+        "price-series":   cmd_price_series,
+        "top-markets":    cmd_top_markets,
+        "spread-stats":   cmd_spread_stats,
+        "drift":          cmd_drift,
+        "download":       cmd_download,
+        "analyze-local":  cmd_analyze_local,
+        "to-ticks":       cmd_to_ticks,
+        "to-candles":     cmd_to_candles,
     }
     dispatch[args.cmd](args)
 
