@@ -97,6 +97,9 @@ pub struct QueryRequest {
     pub freq: Option<String>,
     /// Drift window in seconds (default 300).
     pub window_secs: Option<u32>,
+    /// For top-markets / summary: number of hours to sample (1-6). Default 1.
+    /// Each file is 100-400 MB; keep low for remote queries.
+    pub sample_hours: Option<u32>,
 }
 
 /// Download request body.

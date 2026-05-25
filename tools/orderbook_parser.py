@@ -459,18 +459,21 @@ def analyze_local_dir(data_dir: Path, market_id: Optional[str] = None) -> dict:
 # ── CLI entry-points ───────────────────────────────────────────────────────────
 
 def cmd_summary(args: argparse.Namespace) -> None:
+    # For remote queries, limit sample to avoid downloading hundreds of 400MB files
+    max_hours = getattr(args, "hours", 3)
     urls = urls_for_range(args.days)
-    # Sample just the first 3 hours for a quick summary (avoid scanning all 360 files)
-    sample = urls[:3] if len(urls) > 3 else urls
-    print(f"[orderbook_parser] Sampling {len(sample)} of {len(urls)} hourly files...", file=sys.stderr)
+    sample_urls = urls[:max_hours]
+    print(f"[orderbook_parser] Sampling {max_hours} hour(s) of {len(urls)} total for day range {args.days}...", file=sys.stderr)
     try:
-        counts = query_archive_summary(sample)
-        top = query_top_markets(sample, limit=10)
+        counts = query_archive_summary(sample_urls)
+        top = query_top_markets(sample_urls, limit=10)
         result = {
-            "sample_hours": len(sample),
+            "sample_hours": max_hours,
             "total_hours": len(urls),
+            "estimated_total_gb": round(len(urls) * 0.25, 1),  # ~250MB avg per file
             "event_counts": counts,
             "top_markets_by_volume": top.to_dict(orient="records"),
+            "note": f"Sampled {max_hours} hour(s). For full coverage, download locally first.",
         }
         print(json.dumps(result, default=str))
     except Exception as e:
@@ -478,8 +481,11 @@ def cmd_summary(args: argparse.Namespace) -> None:
 
 
 def cmd_price_series(args: argparse.Namespace) -> None:
+    max_hours = getattr(args, "hours", None)
     urls = urls_for_range(args.days)
-    print(f"[orderbook_parser] Fetching price changes for market={args.market} over {args.days}d ({len(urls)} files)...", file=sys.stderr)
+    if max_hours:
+        urls = urls[:max_hours]
+    print(f"[orderbook_parser] Fetching price changes for market={args.market} — {len(urls)} file(s)...", file=sys.stderr)
     try:
         df = query_price_changes(urls, market_id=args.market, limit=200_000)
         if df.empty:
@@ -502,11 +508,18 @@ def cmd_price_series(args: argparse.Namespace) -> None:
 
 
 def cmd_top_markets(args: argparse.Namespace) -> None:
-    urls = urls_for_range(args.days)
-    print(f"[orderbook_parser] Fetching top markets ({len(urls)} candidate URLs)...", file=sys.stderr)
+    max_hours = getattr(args, "hours", 1)
+    all_urls = urls_for_range(args.days)
+    urls = all_urls[:max_hours]
+    print(f"[orderbook_parser] Fetching top markets — sampling {max_hours} hour(s) of {len(all_urls)} total...", file=sys.stderr)
     try:
         df = query_top_markets(urls, limit=args.limit)
-        print(json.dumps({"markets": df.to_dict(orient="records")}, default=str))
+        print(json.dumps({
+            "sample_hours": max_hours,
+            "total_hours": len(all_urls),
+            "markets": df.to_dict(orient="records"),
+            "note": f"Sampled {max_hours} hour(s). Use --hours N for more coverage, or download locally for full data.",
+        }, default=str))
     except Exception as e:
         print(json.dumps({"error": str(e), "trace": traceback.format_exc()}))
 
@@ -574,16 +587,19 @@ def main() -> None:
     # summary
     p = sub.add_parser("summary", help="Archive summary: event counts + top markets")
     p.add_argument("--days", type=int, default=1, help="Number of past days to query")
+    p.add_argument("--hours", type=int, default=1, help="Sample hours (1-6); each file ≈200MB")
 
     # price-series
     p = sub.add_parser("price-series", help="OHLC price series for a specific market")
     p.add_argument("--market", required=True, help="Condition ID (0x...)")
     p.add_argument("--days", type=int, default=1)
+    p.add_argument("--hours", type=int, default=None, help="Limit remote query to N hours")
     p.add_argument("--freq", default="5min", help="Candle frequency (pandas offset string)")
 
     # top-markets
     p = sub.add_parser("top-markets", help="Top markets by trade volume")
     p.add_argument("--days", type=int, default=1)
+    p.add_argument("--hours", type=int, default=1, help="Sample hours (1-6); each file ≈200MB")
     p.add_argument("--limit", type=int, default=20)
 
     # spread-stats

@@ -7033,19 +7033,23 @@ pub async fn handle_api_orderbook_query(
     let workspace_dir = state.config.lock().workspace_dir.clone();
     let days = body.days.clamp(1, 30).to_string();
 
+    // For remote-query modes, limit sample hours to avoid downloading hundreds of 400MB files.
+    // Each hourly file is 100–400 MB; users should "Download" for full coverage.
+    let sample_hours = body.sample_hours.unwrap_or(1).clamp(1, 6).to_string();
+
     let result = match body.mode.as_str() {
         "summary" => {
             crate::tools::orderbook::run_parser(
                 &workspace_dir,
                 "summary",
-                &["--days", &days],
+                &["--days", &days, "--hours", &sample_hours],
             ).await
         }
         "top-markets" => {
             crate::tools::orderbook::run_parser(
                 &workspace_dir,
                 "top-markets",
-                &["--days", &days],
+                &["--days", &days, "--hours", &sample_hours],
             ).await
         }
         "price-series" => {
