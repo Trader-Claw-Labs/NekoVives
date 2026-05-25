@@ -20,6 +20,7 @@ import {
   Users,
   Search,
   Shield,
+  Database,
 } from 'lucide-react'
 import { useQuery } from '@tanstack/react-query'
 import { apiFetch } from '../hooks/useApi'
@@ -42,6 +43,7 @@ const mainNavItems: NavItem[] = [
   { to: '/risk', icon: <Shield size={18} />, label: 'Risk Center' },
   { to: '/copy-trading', icon: <Users size={18} />, label: 'Copy Trading' },
   { to: '/copy-discovery', icon: <Search size={18} />, label: 'Discovery' },
+  { to: '/orderbook', icon: <Database size={18} />, label: 'Orderbook' },
   { to: '/scheduled-jobs', icon: <Activity size={18} />, label: 'Scheduled Jobs' },
   { to: '/help', icon: <HelpCircle size={18} />, label: 'Help' },
 ]

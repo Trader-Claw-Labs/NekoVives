@@ -385,6 +385,8 @@ pub struct AppState {
     pub hyperliquid_client: Option<Arc<hyperliquid_trader::HyperliquidClient>>,
     /// General trading risk gate (daily loss, drawdown, ATR sizing, correlation).
     pub trading_risk_gate: Option<Arc<risk_manager::general::TradingRiskGate>>,
+    /// Polymarket orderbook archive downloader state.
+    pub orderbook: Arc<crate::tools::orderbook::OrderbookState>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -695,6 +697,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         wallet_indexer,
         hyperliquid_client,
         trading_risk_gate,
+        orderbook: Arc::new(crate::tools::orderbook::OrderbookState::new(
+            config.workspace_dir.clone(),
+        )),
     };
 
     // Expose runner store to the /strat Telegram command handler.
@@ -968,6 +973,12 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             "/api/backtest/polymarket-historical/cancel",
             post(api::handle_api_backtest_polymarket_historical_cancel),
         )
+        // ── Orderbook Archive ──
+        .route("/api/orderbook/query", post(api::handle_api_orderbook_query))
+        .route("/api/orderbook/download", post(api::handle_api_orderbook_download))
+        .route("/api/orderbook/download/status", get(api::handle_api_orderbook_download_status))
+        .route("/api/orderbook/download/cancel", post(api::handle_api_orderbook_download_cancel))
+        .route("/api/orderbook/files", get(api::handle_api_orderbook_files))
         .route(
             "/api/channels/telegram/configure",
             get(api::handle_api_telegram_get).post(api::handle_api_telegram_configure),
@@ -1498,6 +1509,7 @@ mod tests {
             wallet_indexer: Arc::new(wallet_indexer::Indexer::new(&std::env::temp_dir()).unwrap()),
             hyperliquid_client: None,
             trading_risk_gate: None,
+            orderbook: Arc::new(crate::tools::orderbook::OrderbookState::new(std::env::temp_dir())),
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1551,6 +1563,7 @@ mod tests {
             wallet_indexer: Arc::new(wallet_indexer::Indexer::new(&std::env::temp_dir()).unwrap()),
             hyperliquid_client: None,
             trading_risk_gate: None,
+            orderbook: Arc::new(crate::tools::orderbook::OrderbookState::new(std::env::temp_dir())),
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1905,6 +1918,7 @@ mod tests {
             wallet_indexer: Arc::new(wallet_indexer::Indexer::new(&std::env::temp_dir()).unwrap()),
             hyperliquid_client: None,
             trading_risk_gate: None,
+            orderbook: Arc::new(crate::tools::orderbook::OrderbookState::new(std::env::temp_dir())),
         };
 
         let mut headers = HeaderMap::new();
@@ -1973,6 +1987,7 @@ mod tests {
             wallet_indexer: Arc::new(wallet_indexer::Indexer::new(&std::env::temp_dir()).unwrap()),
             hyperliquid_client: None,
             trading_risk_gate: None,
+            orderbook: Arc::new(crate::tools::orderbook::OrderbookState::new(std::env::temp_dir())),
         };
 
         let headers = HeaderMap::new();
@@ -2053,6 +2068,7 @@ mod tests {
             wallet_indexer: Arc::new(wallet_indexer::Indexer::new(&std::env::temp_dir()).unwrap()),
             hyperliquid_client: None,
             trading_risk_gate: None,
+            orderbook: Arc::new(crate::tools::orderbook::OrderbookState::new(std::env::temp_dir())),
         };
 
         let response = handle_webhook(
@@ -2105,6 +2121,7 @@ mod tests {
             wallet_indexer: Arc::new(wallet_indexer::Indexer::new(&std::env::temp_dir()).unwrap()),
             hyperliquid_client: None,
             trading_risk_gate: None,
+            orderbook: Arc::new(crate::tools::orderbook::OrderbookState::new(std::env::temp_dir())),
         };
 
         let mut headers = HeaderMap::new();
@@ -2162,6 +2179,7 @@ mod tests {
             wallet_indexer: Arc::new(wallet_indexer::Indexer::new(&std::env::temp_dir()).unwrap()),
             hyperliquid_client: None,
             trading_risk_gate: None,
+            orderbook: Arc::new(crate::tools::orderbook::OrderbookState::new(std::env::temp_dir())),
         };
 
         let mut headers = HeaderMap::new();
