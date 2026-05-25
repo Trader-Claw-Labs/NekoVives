@@ -15,10 +15,11 @@ use tokio::sync::Mutex;
 
 // ── Progress shared state ─────────────────────────────────────────────────────
 
-/// Shared state for the background download job.
+/// Shared state for the background download / ingest job.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct DownloadProgress {
     pub running: bool,
+    pub phase: String,          // "downloading" | "converting" | "done" | ""
     pub done: usize,
     pub total: usize,
     pub current_hour: String,
@@ -26,6 +27,7 @@ pub struct DownloadProgress {
     pub skipped: usize,
     pub errors: Vec<String>,
     pub out_dir: String,
+    pub slug: String,           // set by ingest jobs
     pub started_at: Option<String>,
     pub finished_at: Option<String>,
 }
@@ -110,6 +112,18 @@ pub struct DownloadRequest {
     pub market: Option<String>,
 }
 
+/// Ingest request body: download + auto-convert to ticks in one job.
+#[derive(Debug, Deserialize)]
+pub struct IngestRequest {
+    pub days: u32,
+    /// Polymarket condition ID (0x...) — required to filter data for one market.
+    pub market: String,
+    /// Short name for the tick slug (e.g. "btc_5m").
+    pub slug: String,
+    /// Binance symbol used as the underlying price feed (e.g. "BTCUSDT").
+    pub binance_symbol: String,
+}
+
 /// Run the Python parser with the given sub-command + args.
 /// Returns parsed JSON on success.
 pub async fn run_parser(
@@ -169,18 +183,19 @@ pub fn spawn_download(
             }
         };
 
-        let mut args = vec![
-            "download".to_string(),
-            "--days".to_string(),
-            days.to_string(),
-            "--out".to_string(),
-            out_dir.to_string_lossy().to_string(),
-            "--progress".to_string(),
-            progress_file.to_string_lossy().to_string(),
+        let days_str = days.to_string();
+        let out_dir_str = out_dir.to_string_lossy().to_string();
+        let progress_file_str = progress_file.to_string_lossy().to_string();
+        let market_str = market.clone().unwrap_or_default();
+
+        let mut extra_args: Vec<&str> = vec![
+            "--days", &days_str,
+            "--out", &out_dir_str,
+            "--progress", &progress_file_str,
         ];
-        if let Some(ref m) = market {
-            args.push("--market".to_string());
-            args.push(m.clone());
+        if market.is_some() {
+            extra_args.push("--market");
+            extra_args.push(&market_str);
         }
 
         tracing::info!(
@@ -190,7 +205,8 @@ pub fn spawn_download(
 
         let child = tokio::process::Command::new("python3")
             .arg(&script)
-            .args(&args[1..]) // skip "download" since it's the sub-command
+            .arg("download")
+            .args(&extra_args)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn();
@@ -266,6 +282,170 @@ pub struct LocalFileInfo {
     pub filename: String,
     pub hour: String,
     pub size_mb: f64,
+}
+
+/// Spawn a combined download + to-ticks ingest job.
+/// Phase 1: download hourly parquets for the given market/days.
+/// Phase 2: run `to-ticks` conversion → writes JSONL to data/ticks/<slug>/.
+pub fn spawn_ingest(
+    workspace_dir: PathBuf,
+    days: u32,
+    market: String,
+    slug: String,
+    binance_symbol: String,
+    progress: Arc<Mutex<DownloadProgress>>,
+    cancel: Arc<AtomicBool>,
+) {
+    tokio::spawn(async move {
+        let out_dir = workspace_dir.join("data").join("orderbook");
+        let progress_file = workspace_dir.join("data").join("orderbook_progress.json");
+
+        // ── Phase 1: download ──────────────────────────────────────────────────
+        {
+            let mut p = progress.lock().await;
+            *p = DownloadProgress {
+                running: true,
+                phase: "downloading".to_string(),
+                out_dir: out_dir.to_string_lossy().to_string(),
+                slug: slug.clone(),
+                started_at: Some(chrono::Utc::now().to_rfc3339()),
+                ..Default::default()
+            };
+        }
+
+        cancel.store(false, Ordering::SeqCst);
+
+        let script = match ensure_parser_script(&workspace_dir) {
+            Ok(s) => s,
+            Err(e) => {
+                let mut p = progress.lock().await;
+                p.running = false;
+                p.phase = "done".to_string();
+                p.errors.push(format!("script error: {e}"));
+                return;
+            }
+        };
+
+        let days_str = days.to_string();
+        let out_dir_dl = out_dir.to_string_lossy().to_string();
+        let progress_file_str = progress_file.to_string_lossy().to_string();
+
+        tracing::info!(
+            "[orderbook/ingest] starting download: days={days} market={market} slug={slug}"
+        );
+
+        let child = tokio::process::Command::new("python3")
+            .arg(&script)
+            .arg("download")
+            .args(["--days", &days_str,
+                   "--out", &out_dir_dl,
+                   "--market", &market,
+                   "--progress", &progress_file_str])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn();
+
+        let mut child = match child {
+            Ok(c) => c,
+            Err(e) => {
+                let mut p = progress.lock().await;
+                p.running = false;
+                p.phase = "done".to_string();
+                p.finished_at = Some(chrono::Utc::now().to_rfc3339());
+                p.errors.push(format!("spawn failed: {e}"));
+                return;
+            }
+        };
+
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+            if cancel.load(Ordering::SeqCst) {
+                let _ = child.kill().await;
+                let mut p = progress.lock().await;
+                p.running = false;
+                p.phase = "done".to_string();
+                p.finished_at = Some(chrono::Utc::now().to_rfc3339());
+                p.errors.push("cancelled by user".to_string());
+                return;
+            }
+
+            if let Ok(raw) = std::fs::read_to_string(&progress_file) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+                    let mut p = progress.lock().await;
+                    p.done = v["done"].as_u64().unwrap_or(0) as usize;
+                    p.total = v["total"].as_u64().unwrap_or(0) as usize;
+                    p.current_hour = v["current"].as_str().unwrap_or("").to_string();
+                    p.downloaded = v["downloaded"].as_u64().unwrap_or(0) as usize;
+                    p.skipped = v["skipped"].as_u64().unwrap_or(0) as usize;
+                    if let Some(arr) = v["errors"].as_array() {
+                        p.errors = arr.iter().filter_map(|e| e.as_str().map(String::from)).collect();
+                    }
+                }
+            }
+
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => continue,
+                Err(e) => { tracing::warn!("[orderbook/ingest] wait error: {e}"); break; }
+            }
+        }
+
+        {
+            let mut p = progress.lock().await;
+            tracing::info!(
+                "[orderbook/ingest] download done: downloaded={} skipped={} errors={}",
+                p.downloaded, p.skipped, p.errors.len()
+            );
+        }
+
+        // ── Phase 2: to-ticks conversion ───────────────────────────────────────
+        {
+            let mut p = progress.lock().await;
+            p.phase = "converting".to_string();
+            p.current_hour = format!("Converting → data/ticks/{slug}/");
+        }
+
+        let ticks_out = workspace_dir.join("data").join("ticks").join(&slug);
+        let out_dir_str = out_dir.to_string_lossy().to_string();
+        let ticks_out_str = ticks_out.to_string_lossy().to_string();
+
+        tracing::info!("[orderbook/ingest] running to-ticks for slug={slug}");
+
+        let result = tokio::process::Command::new("python3")
+            .arg(&script)
+            .arg("to-ticks")
+            .args(["--market", &market,
+                   "--slug", &slug,
+                   "--binance-symbol", &binance_symbol,
+                   "--in", &out_dir_str,
+                   "--out", &ticks_out_str])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .await;
+
+        let mut p = progress.lock().await;
+        p.running = false;
+        p.phase = "done".to_string();
+        p.finished_at = Some(chrono::Utc::now().to_rfc3339());
+
+        match result {
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                if !out.status.success() {
+                    p.errors.push(format!("to-ticks failed: {}", stderr.trim()));
+                    tracing::error!("[orderbook/ingest] to-ticks failed: {}", stderr.trim());
+                } else {
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    tracing::info!("[orderbook/ingest] to-ticks done: {}", stdout.trim());
+                }
+            }
+            Err(e) => {
+                p.errors.push(format!("to-ticks spawn error: {e}"));
+            }
+        }
+    });
 }
 
 /// List downloaded Parquet files in the orderbook data directory.

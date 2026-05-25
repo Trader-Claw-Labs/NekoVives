@@ -3,7 +3,7 @@ import { apiPost, apiFetch } from './useApi'
 
 // ── Types ─────────────────────────────────────────────────────
 
-export type MarketType = 'crypto' | 'polymarket' | 'polymarket_binary' | 'clob_1hz'
+export type MarketType = 'crypto' | 'polymarket' | 'polymarket_binary' | 'clob_1hz' | 'archive_candles'
 
 // A recurring Polymarket binary market series (loaded from /api/backtest/series)
 export interface MarketSeries {
@@ -289,8 +289,8 @@ export function useBacktestState() {
       updateState({
         progress: {
           step: 'fetching',
-          message: cfg.market_type === 'clob_1hz'
-            ? `Loading CLOB 1 Hz tick data for '${cfg.clob_slug ?? cfg.symbol}' (${cfg.from_date} → ${cfg.to_date})…`
+          message: (cfg.market_type === 'clob_1hz' || cfg.market_type === 'archive_candles')
+            ? `Loading Orderbook Archive tick data for '${cfg.clob_slug ?? cfg.symbol}' (${cfg.from_date} → ${cfg.to_date})…`
             : cfg.market_type === 'polymarket_binary'
             ? `Fetching ${cfg.symbol} 1m candles from Binance (${cfg.from_date} → ${cfg.to_date})…`
             : `Fetching ${cfg.symbol} ${cfg.interval} candles (${cfg.from_date} → ${cfg.to_date})…`,

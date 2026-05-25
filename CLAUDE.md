@@ -62,6 +62,7 @@ Pages and routes:
 - `/chat`            — Multi-chat parallel AI sessions
 - `/tradingview`     — TradingView Screener: live RSI, MACD, price table + active signals panel
 - `/backtesting`     — Strategy backtesting: .rhai script runner, metrics, worst trades, AI analysis
+- `/orderbook`       — Orderbook Archive: remote DuckDB queries, dataset download, local file browser
 - `/settings/llm`    — LLM provider/model config
 - `/settings/config` — Advanced config
 
@@ -70,16 +71,23 @@ All `/api/*` require Bearer token auth (pair via `POST /pair` with `X-Pairing-Co
 Public: `GET /health`, `GET /metrics`, `POST /pair`.
 
 Key routes:
-- `GET  /api/status`                   — system overview
-- `GET  /api/tradingview/scan`         — TradingView Screener indicators (?symbols=BTCUSDT,ETHUSDT)
-- `GET  /api/backtest/scripts`         — list .rhai files from /scripts/
-- `POST /api/backtest/run`             — run backtest (Rhai engine, stub returns metrics)
-- `GET  /api/wallets`                  — list wallets
-- `POST /api/wallets/create`           — create wallet (EVM/Solana/TON)
-- `GET  /api/polymarket/markets`       — list markets
-- `GET  /api/cron`                     — list cron jobs
-- `POST /api/cron`                     — add cron job
-- `GET  /api/memory`                   — list memories
+- `GET  /api/status`                          — system overview
+- `GET  /api/tradingview/scan`                — TradingView Screener indicators (?symbols=BTCUSDT,ETHUSDT)
+- `GET  /api/backtest/scripts`                — list .rhai files from /scripts/
+- `POST /api/backtest/run`                    — run backtest (Rhai engine)
+- `GET  /api/backtest/tick-slugs`             — list available tick JSONL slugs for archive backtesting
+- `GET  /api/wallets`                         — list wallets
+- `POST /api/wallets/create`                  — create wallet (EVM/Solana/TON)
+- `GET  /api/polymarket/markets`              — list markets
+- `GET  /api/cron`                            — list cron jobs
+- `POST /api/cron`                            — add cron job
+- `GET  /api/memory`                          — list memories
+- `POST /api/orderbook/ingest`                — download archive parquets + convert to ticks (combined job)
+- `POST /api/orderbook/download`              — download parquets only
+- `GET  /api/orderbook/download/status`       — poll download/ingest progress
+- `POST /api/orderbook/download/cancel`       — cancel running job
+- `GET  /api/orderbook/files`                 — list local parquet files
+- `POST /api/orderbook/query`                 — remote DuckDB query (summary/top-markets/price-series/spread-stats/drift)
 
 ## Backtesting Engine
 - `<workspace>/scripts/`  — .rhai strategy files (agent-written + bundled defaults)
@@ -213,21 +221,91 @@ Global registry accessible from any tool. Tool: `tick_recorder`
 - `action=status`
 - `action=read  slug=btc_5m last_n=60`
 
-## CLOB 1 HZ Backtesting (`market_type = "clob_1hz"`)
-Replays recorded tick JSONL files through `on_tick(ctx)` Rhai scripts.
-Enables testing of intra-window strategies (spread scalping, timing, entry windows) that
-the 1m-candle engine cannot evaluate.
+## Orderbook Archive Dataset (`tools/orderbook_parser.py`)
+
+Historical Polymarket CLOB data from the **pmxt.dev v2** public archive.
+Hourly Parquet files (~100–400 MB each) on Cloudflare R2:
+`https://r2v2.pmxt.dev/polymarket_orderbook_YYYY-MM-DDTHH.parquet`
+
+Columns: `timestamp_received, market (condition_id), event_type, asset_id,
+best_bid, best_ask, price, size, side, transaction_hash`
+
+**Parser CLI** (`tools/orderbook_parser.py`):
+```bash
+# Remote DuckDB queries (no download)
+python3 tools/orderbook_parser.py summary --days 1
+python3 tools/orderbook_parser.py top-markets --days 1
+python3 tools/orderbook_parser.py price-series --days 3 --market 0x...
+python3 tools/orderbook_parser.py spread-stats --days 3 --market 0x...
+
+# Download parquet files locally
+python3 tools/orderbook_parser.py download --days 15 --market 0x... --out ~/.traderclaw/workspace/data/orderbook/
+
+# Convert downloaded parquets → CLOB 1Hz JSONL (for backtesting)
+python3 tools/orderbook_parser.py to-ticks --market 0x... --slug btc_5m \
+  --binance-symbol BTCUSDT \
+  --in ~/.traderclaw/workspace/data/orderbook/ \
+  --out ~/.traderclaw/workspace/data/ticks/btc_5m/
+
+# Convert downloaded parquets → OHLC candle JSON (for Backtesting page)
+python3 tools/orderbook_parser.py to-candles --market 0x... --slug ob_test \
+  --in ~/.traderclaw/workspace/data/orderbook/ \
+  --out /tmp/candles_test/ --freq 5min
+```
+
+**Important quirks:**
+- Cloudflare R2 returns 403 on HEAD requests — use Range GET with User-Agent header
+- DuckDB `custom_user_agent` must be set at connection creation (not via `SET` after open)
+- Archive files have gaps (missing hours) — `filter_available_urls()` pre-checks each URL
+- NO price = 1 − YES price: `no_bid = 1 − yes_ask`, `no_ask = 1 − yes_bid`
+
+**Gateway API routes** (all require Bearer auth):
+- `POST /api/orderbook/query`            — remote DuckDB query (modes: summary, top-markets, price-series, spread-stats, drift)
+- `POST /api/orderbook/download`         — start background parquet download job
+- `GET  /api/orderbook/download/status`  — poll download/ingest progress
+- `POST /api/orderbook/download/cancel`  — cancel ongoing job
+- `GET  /api/orderbook/files`            — list locally downloaded parquet files
+- `POST /api/orderbook/ingest`           — **combined** download + to-ticks conversion in one job
+
+**Ingest endpoint body:** `{ days, market, slug, binance_symbol }`
+
+**Dashboard page:** `/orderbook` — three tabs: Remote Query, Download, Local Files
+
+## Orderbook Archive Backtesting
+
+Tick JSONL files produced by the archive converter (or the live tick recorder) live at
+`<workspace>/data/ticks/<slug>/` and feed two backtesting modes.
+
+### `clob_1hz` — "Orderbook Archive (on_tick)"
+Replays raw 1-second ticks through `on_tick(ctx)` Rhai scripts.
+For intra-window strategies: spread scalping, timing, entry windows.
 
 **Workflow:**
-1. Record ticks with `tick_recorder action=start slug=btc_5m condition_id=0x...`
-2. Let it run for at least 1 day
-3. In the Backtesting page, select **Market = "CLOB 1 Hz (tick replay)"**
-4. Pick the slug from the dropdown (auto-loaded from `GET /api/backtest/tick-slugs`)
-5. Select a script that uses `on_tick(ctx)` (e.g. `clob_1hz_spread_scalper.rhai`)
-6. Run — engine replays every recorded tick and resolves each 5m window
+1. In Backtesting UI, click **Archive Dataset** button → fill in condition ID, slug, days → **Start Download + Convert**
+   — OR — run `to-ticks` from CLI manually
+2. Select **Market = "Orderbook Archive (on_tick)"**
+3. Pick the slug from the dropdown (auto-loaded from `GET /api/backtest/tick-slugs`)
+4. Select a script with `on_tick(ctx)` (e.g. `clob_1hz_spread_scalper.rhai`)
+5. Run
 
-**Key functions:** `run_clob_1hz_backtest()`, `list_tick_slugs()`,
-`run_clob_1hz_backtest_from_files()` in `src/tools/backtest.rs`
+### `archive_candles` — "Orderbook Archive (on_candle)"
+Aggregates tick JSONL → 1-minute Binance-style OHLC candles from `binance_price`,
+then injects real CLOB YES token prices at decision time via `HistoricalMarketWindow`.
+Runs `on_candle(ctx)` scripts through the same engine as `polymarket_binary`.
+
+**Use this mode for existing drift strategies** (e.g. `polymarket_btc_updown_5m_drift_v2_combo.rhai`).
+`ctx.token_price` gets the real CLOB ask from the archive instead of a synthetic momentum estimate.
+
+**Workflow:**
+1. Same as above — ingest ticks for the target slug
+2. Select **Market = "Orderbook Archive (on_candle)"**
+3. Pick slug, pick any `on_candle(ctx)` script
+4. Run
+
+**Key functions in `src/tools/backtest.rs`:**
+- `run_clob_1hz_backtest()` / `run_clob_1hz_backtest_from_files()` — on_tick path
+- `run_archive_candles_backtest()` — on_candle path (new)
+- `load_ticks_for_range()` — shared tick loader used by both paths
 
 **Gateway API:** `GET /api/backtest/tick-slugs` — returns available slugs with date ranges.
 
