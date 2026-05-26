@@ -4813,7 +4813,10 @@ pub async fn run_archive_candles_backtest(
     // 3. Build HistoricalMarketWindow entries from tick data.
     //    For each 5-minute window we capture:
     //      - window_open_ts / window_close_ts from window_ts field
-    //      - yes_token_price = yes_mid at the decision candle (P4: 1 min before close)
+    //      - yes_token_price = yes_ASK at the decision candle (P4: 1 min before close)
+    //      - no_token_price  = no_ask (= 1 - yes_bid) at the same tick
+    //    Using the ask (not mid) matches what a live trader actually pays at the CLOB,
+    //    preventing the backtest from overstating returns vs live performance.
     //    This enables `ctx.token_price` in the Rhai script.
     let window_minutes = parse_interval_to_minutes(interval);
     let window_secs = (window_minutes as i64) * 60;
@@ -4842,17 +4845,7 @@ pub async fn run_archive_candles_backtest(
             }
         });
 
-        // Update YES token price with the closest tick to decision time
-        let decision_ts_ms = (wts + window_secs - decision_offset_secs) * 1000;
-        let tick_lag = (tick.ts_ms - decision_ts_ms).abs();
-        let current_lag = entry.yes_token_price.map(|_| i64::MAX).unwrap_or(i64::MAX);
-        // Track tick closest to decision_ts
-        if tick.yes_mid > 0.0 && tick_lag < current_lag {
-            entry.yes_token_price = Some(tick.yes_mid);
-            entry.no_token_price = Some(1.0 - tick.yes_mid);
-        }
-
-        // Resolution: track open/close prices
+        // Resolution: track open/close prices (first tick of window = secs_left 299, last = 0)
         if tick.window_secs_left == 299 && tick.binance_price > 0.0 {
             entry.btc_open = Some(tick.binance_price);
         }
@@ -4864,22 +4857,37 @@ pub async fn run_archive_candles_backtest(
         }
     }
 
-    // Fix: use a simpler approach for finding the decision-time tick price
-    // — for each window, pick the yes_mid from the tick closest to (window_close - 60s)
-    let mut window_decision_prices: HashMap<i64, (f64, i64)> = HashMap::new(); // wts → (yes_mid, lag_abs)
+    // For each window, find the tick closest to the decision time (T+240s = secs_left=60)
+    // using window_secs_left as the proximity metric.
+    //
+    // We use yes_ASK (not yes_mid) as the entry price for YES bets, and
+    // no_ask = 1 - yes_bid as the entry price for NO bets. This matches what a
+    // live trader actually pays at the CLOB ask, and prevents overstating returns
+    // relative to live performance. Using yes_mid inflates payouts by ~20-30% in
+    // extreme-zone windows (yes_mid ≈ 0.08-0.12) because mid < ask.
+    //
+    // wts → (yes_ask, no_ask, secs_left_lag)
+    let mut window_decision_prices: HashMap<i64, (f64, f64, i64)> = HashMap::new();
     for tick in &ticks {
-        if tick.window_ts == 0 || tick.yes_mid <= 0.0 { continue; }
-        let decision_ts_ms = (tick.window_ts + window_secs - decision_offset_secs) * 1000;
-        let lag = (tick.ts_ms - decision_ts_ms).abs();
-        let entry = window_decision_prices.entry(tick.window_ts).or_insert((tick.yes_mid, lag));
-        if lag < entry.1 {
-            *entry = (tick.yes_mid, lag);
+        if tick.window_ts == 0 || tick.yes_ask <= 0.0 { continue; }
+        // secs_left at decision time = decision_offset_secs (60 for a 5-min window)
+        let secs_lag = (tick.window_secs_left - decision_offset_secs).abs();
+        let no_ask = if tick.yes_bid > 0.0 {
+            (1.0 - tick.yes_bid).clamp(0.01, 0.99)
+        } else {
+            (1.0 - tick.yes_ask + 0.02).clamp(0.01, 0.99) // fallback: infer from ask
+        };
+        let entry = window_decision_prices
+            .entry(tick.window_ts)
+            .or_insert((tick.yes_ask, no_ask, secs_lag));
+        if secs_lag < entry.2 {
+            *entry = (tick.yes_ask, no_ask, secs_lag);
         }
     }
-    for (wts, (yes_mid, _)) in &window_decision_prices {
+    for (wts, (yes_ask, no_ask, _)) in &window_decision_prices {
         if let Some(w) = windows.get_mut(wts) {
-            w.yes_token_price = Some(*yes_mid);
-            w.no_token_price = Some(1.0 - yes_mid);
+            w.yes_token_price = Some(*yes_ask);
+            w.no_token_price = Some(*no_ask);
         }
     }
 
