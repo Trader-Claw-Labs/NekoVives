@@ -3005,10 +3005,12 @@ fn run_polymarket_slug_backtest(
 
         if pb || ps {
             let bet_up  = pb;
+            // Percent mode: sizing_value is stored as a percentage (e.g. 5.0 = 5%),
+            // matching strategy_runner.rs: max_frac = live_sizing_value / 100.0
             let raw_stake = if sizing_mode == "fixed" {
                 sizing_value.min(bal).max(0.0)
             } else {
-                (bal * sizing_value.max(0.0).min(1.0)).max(0.0)
+                (bal * (sizing_value / 100.0).clamp(0.0, 1.0)).max(0.0)
             };
             // Enforce Polymarket position limit: stake cannot exceed available market liquidity.
             // Real 5-min binary markets typically have $500-$3,000 USDC of liquidity per window.
