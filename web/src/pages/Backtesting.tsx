@@ -2321,7 +2321,7 @@ export default function Backtesting() {
           )}
 
           {/* Hour Gate (Polymarket binary only) */}
-          {config.market_type === 'polymarket_binary' && (
+          {(config.market_type === 'polymarket_binary' || config.market_type === 'archive_candles') && (
             <div className="lg:col-span-4">
               <label className="block text-xs mb-1.5 flex items-center gap-1.5" style={{ color: 'var(--color-text-muted)' }}>
                 Hour Gate (UTC)
