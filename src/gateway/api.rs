@@ -4025,6 +4025,7 @@ pub async fn handle_api_backtest_run(
         sizing_value,
         price_mode,
         &workspace_dir,
+        &body.allowed_hours,
     )
     .await;
 

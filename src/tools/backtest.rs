@@ -347,7 +347,7 @@ impl Tool for BacktestRunTool {
         // Run the real Rhai backtest engine
         let metrics = run_backtest_engine(
             &script_path, market_type, symbol, interval, from_date, to_date,
-            initial_balance, fee_pct, "price_up", None, None, None, "percent", 1.0, "historical", &self.workspace_dir
+            initial_balance, fee_pct, "price_up", None, None, None, "percent", 1.0, "historical", &self.workspace_dir, &[]
         ).await;
 
         let worst_trades_text = metrics
@@ -2569,6 +2569,7 @@ fn run_polymarket_slug_backtest(
     price_mode: &str,
     historical_data: Option<HashMap<i64, HistoricalMarketWindow>>,
     prev_historical_data: Option<HashMap<i64, HistoricalMarketWindow>>,
+    allowed_hours: &[u8],
 ) -> anyhow::Result<BacktestMetrics> {
     use rhai::{Engine, Scope};
     use std::sync::{Arc, Mutex};
@@ -2816,6 +2817,15 @@ fn run_polymarket_slug_backtest(
         let decision_ts   = window_ts + ((window_minutes as i64) - 1) * 60;
         let resolution_ts = window_ts + (window_minutes as i64) * 60;
         window_ts += window_secs;
+
+        // ── Allowed-hours gate (mirrors live strategy_runner logic exactly) ──
+        // (window_ts % 86400) / 3600 gives the UTC hour of the window open.
+        if !allowed_hours.is_empty() {
+            let window_hour = ((minute0_ts % 86400) / 3600) as u8;
+            if !allowed_hours.contains(&window_hour) {
+                continue;
+            }
+        }
 
         let (Some(&m0_idx), Some(&dec_idx), Some(&res_idx)) = (
             ts_to_idx.get(&minute0_ts),
@@ -3112,6 +3122,7 @@ pub async fn run_backtest_engine(
     sizing_value: f64,
     price_mode: &str,
     workspace_dir: &std::path::Path,
+    allowed_hours: &[u8],
 ) -> BacktestMetrics {
     tracing::info!(
         "[BACKTEST] Starting backtest: script={}, market={}, symbol={}, interval={}, from={}, to={}, balance={}, fee={}%",
@@ -3157,7 +3168,7 @@ pub async fn run_backtest_engine(
             script_path, symbol, from_date, to_date,
             initial_balance, fee_pct, workspace_dir, interval,
             resolution_logic, threshold, max_position_usd, max_entry_price,
-            sizing_mode, sizing_value, price_mode,
+            sizing_mode, sizing_value, price_mode, allowed_hours,
         ).await;
     }
 
@@ -3234,9 +3245,10 @@ pub async fn run_backtest_engine(
         let price_mode_owned = price_mode.to_string();
         let hist_clone = historical_data.clone();
         let prev_hist_clone = prev_historical_data.clone();
+        let allowed_hours_owned = allowed_hours.to_vec();
 
         return match tokio::task::spawn_blocking(move || {
-            run_polymarket_slug_backtest(script_content, candles, initial_balance, fee_pct, window_minutes, &rl, thr, max_position_usd, max_entry_price, &sizing_mode_owned, sizing_value, &price_mode_owned, hist_clone, prev_hist_clone)
+            run_polymarket_slug_backtest(script_content, candles, initial_balance, fee_pct, window_minutes, &rl, thr, max_position_usd, max_entry_price, &sizing_mode_owned, sizing_value, &price_mode_owned, hist_clone, prev_hist_clone, &allowed_hours_owned)
         })
         .await
         {
@@ -4233,6 +4245,7 @@ pub fn run_polymarket_binary_on_candle_buffer(
         "historical",
         None,
         None,
+        &[], // no hour gate when called from live runner buffer
     )
     .unwrap_or_else(|e| BacktestMetrics {
         total_return_pct: 0.0, sharpe_ratio: 0.0, max_drawdown_pct: 0.0,
@@ -4749,6 +4762,7 @@ pub async fn run_archive_candles_backtest(
     sizing_mode: &str,
     sizing_value: f64,
     price_mode: &str,
+    allowed_hours: &[u8],
 ) -> BacktestMetrics {
     use std::collections::HashMap;
 
@@ -4857,25 +4871,20 @@ pub async fn run_archive_candles_backtest(
         }
     }
 
-    // For each window, find the tick closest to the decision time (T+240s = secs_left=60)
-    // using window_secs_left as the proximity metric.
-    //
-    // We use yes_ASK (not yes_mid) as the entry price for YES bets, and
-    // no_ask = 1 - yes_bid as the entry price for NO bets. This matches what a
-    // live trader actually pays at the CLOB ask, and prevents overstating returns
-    // relative to live performance. Using yes_mid inflates payouts by ~20-30% in
-    // extreme-zone windows (yes_mid ≈ 0.08-0.12) because mid < ask.
+    // ── P4 (decision price): tick closest to secs_left = decision_offset_secs (60) ──
+    // Uses yes_ASK (not yes_mid) — matches what a live trader pays at the CLOB.
+    // Uses window_secs_left proximity so we stay within the correct market's data
+    // rather than mixing prices from 288 simultaneous markets by timestamp.
     //
     // wts → (yes_ask, no_ask, secs_left_lag)
     let mut window_decision_prices: HashMap<i64, (f64, f64, i64)> = HashMap::new();
     for tick in &ticks {
         if tick.window_ts == 0 || tick.yes_ask <= 0.0 { continue; }
-        // secs_left at decision time = decision_offset_secs (60 for a 5-min window)
         let secs_lag = (tick.window_secs_left - decision_offset_secs).abs();
         let no_ask = if tick.yes_bid > 0.0 {
             (1.0 - tick.yes_bid).clamp(0.01, 0.99)
         } else {
-            (1.0 - tick.yes_ask + 0.02).clamp(0.01, 0.99) // fallback: infer from ask
+            (1.0 - tick.yes_ask + 0.02).clamp(0.01, 0.99)
         };
         let entry = window_decision_prices
             .entry(tick.window_ts)
@@ -4891,10 +4900,53 @@ pub async fn run_archive_candles_backtest(
         }
     }
 
+    // ── P3 (prev-decision price): tick closest to secs_left = p3_offset_secs (120) ──
+    // The live strategy runner captures P3 at T+180s (secs_left=120), one minute
+    // before the decision candle. token_drift = P4 - P3 enables §1 mid-band setups.
+    // Without this, token_drift is always 0.0 and §1 never fires — making the
+    // backtest test a completely different set of trades than the live runner does.
+    //
+    // wts → (yes_ask_p3, secs_left_lag)
+    let p3_offset_secs: i64 = window_secs - (decision_offset_secs + 60); // = 180 for 5m
+    let mut window_p3_prices: HashMap<i64, (f64, i64)> = HashMap::new();
+    for tick in &ticks {
+        if tick.window_ts == 0 || tick.yes_ask <= 0.0 { continue; }
+        let secs_lag = (tick.window_secs_left - p3_offset_secs).abs();
+        let entry = window_p3_prices
+            .entry(tick.window_ts)
+            .or_insert((tick.yes_ask, secs_lag));
+        if secs_lag < entry.1 {
+            *entry = (tick.yes_ask, secs_lag);
+        }
+    }
+    // Build prev_historical map (same shape as hist_map, keyed by window_ts)
+    let mut prev_windows: HashMap<i64, super::polymarket_historical_types::HistoricalMarketWindow> = HashMap::new();
+    for (wts, (p3_ask, _)) in &window_p3_prices {
+        prev_windows.insert(*wts, super::polymarket_historical_types::HistoricalMarketWindow {
+            window_open_ts:  *wts,
+            window_close_ts: *wts + window_secs,
+            decision_ts:     *wts + window_secs - decision_offset_secs,
+            condition_id:    slug.to_string(),
+            yes_token_id:    String::new(),
+            no_token_id:     String::new(),
+            yes_token_price: Some(*p3_ask),
+            no_token_price:  Some((1.0 - p3_ask).clamp(0.01, 0.99)),
+            resolution:      None,
+            btc_open:        None,
+            btc_close:       None,
+            slug:            slug.to_string(),
+            from_cache:      false,
+        });
+    }
+    let windows_with_p3 = prev_windows.len();
+
     let hist_map: HashMap<i64, super::polymarket_historical_types::HistoricalMarketWindow> =
         windows.into_iter().collect();
     let windows_with_price = hist_map.values().filter(|w| w.yes_token_price.is_some()).count();
-    tracing::info!("[ARCHIVE-CANDLES] {} windows, {} with real token price", hist_map.len(), windows_with_price);
+    tracing::info!(
+        "[ARCHIVE-CANDLES] {} windows, {} with P4 price, {} with P3 price (drift enabled)",
+        hist_map.len(), windows_with_price, windows_with_p3
+    );
 
     let rl = resolution_logic.to_string();
     let thr = threshold;
@@ -4902,7 +4954,8 @@ pub async fn run_archive_candles_backtest(
     let sv = sizing_value;
     let pm = price_mode.to_string();
     let hist_clone = Some(hist_map);
-    let prev_hist_clone: Option<HashMap<i64, super::polymarket_historical_types::HistoricalMarketWindow>> = None;
+    let prev_hist_clone = Some(prev_windows);
+    let allowed_hours_owned = allowed_hours.to_vec();
 
     match tokio::task::spawn_blocking(move || {
         run_polymarket_slug_backtest(
@@ -4911,6 +4964,7 @@ pub async fn run_archive_candles_backtest(
             max_position_usd, max_entry_price,
             &sm, sv, &pm,
             hist_clone, prev_hist_clone,
+            &allowed_hours_owned,
         )
     }).await {
         Ok(Ok(mut m)) => {
@@ -5154,7 +5208,7 @@ mod tests {
             candles, 1000.0, 0.0, 5,
             "price_up", None, None, None,
             "fixed", 10.0, "historical",
-            Some(p4), Some(p3),
+            Some(p4), Some(p3), &[],
         ).expect("backtest must succeed");
 
         assert!(metrics.total_trades >= 3, "expected ≥3 trades, got {}", metrics.total_trades);
@@ -5209,7 +5263,7 @@ mod tests {
             candles, 1000.0, 0.0, 5,
             "price_up", None, None, None,
             "fixed", 10.0, "historical",
-            Some(p4), None,
+            Some(p4), None, &[],
         ).expect("backtest must succeed");
 
         for trade in metrics.all_trades.iter() {
@@ -5244,7 +5298,7 @@ mod tests {
             candles, 1000.0, 0.0, 5,
             "price_up", None, None, None,
             "fixed", 10.0, "historical",
-            Some(p4), Some(p3),
+            Some(p4), Some(p3), &[],
         ).expect("backtest must succeed");
 
         let mut trades = metrics.all_trades;
