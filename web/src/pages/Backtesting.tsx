@@ -2409,6 +2409,53 @@ export default function Backtesting() {
             </div>
           )}
 
+          {/* Spread Guard (archive_candles only — real CLOB bid/ask required) */}
+          {config.market_type === 'archive_candles' && (
+            <div className="lg:col-span-2">
+              <label className="block text-xs mb-1.5 flex items-center gap-1.5" style={{ color: 'var(--color-text-muted)' }}>
+                Spread Guard
+                <span
+                  className="px-1 rounded text-[9px]"
+                  style={{ backgroundColor: 'var(--color-surface-2)', color: 'var(--color-text-muted)' }}
+                  title="Skip windows where CLOB spread (yes_ask − yes_bid) > threshold at decision time. Mirrors live runner max_spread_pct. Default 3%."
+                >live parity</span>
+              </label>
+              <div className="flex items-center gap-2">
+                <input
+                  type="number"
+                  min={0.005}
+                  max={0.5}
+                  step={0.005}
+                  value={config.max_spread_pct != null ? (config.max_spread_pct * 100).toFixed(1) : ''}
+                  onChange={(e) => {
+                    const val = e.target.value
+                    set('max_spread_pct', val === '' ? undefined : Number(val) / 100)
+                  }}
+                  placeholder="3.0 (default)"
+                  className="flex-1 rounded px-2 py-2 text-sm font-mono"
+                  style={{
+                    backgroundColor: 'var(--color-surface-2)',
+                    border: '1px solid var(--color-border)',
+                    color: 'var(--color-text)',
+                  }}
+                />
+                <span className="text-sm" style={{ color: 'var(--color-text-muted)' }}>%</span>
+                {config.max_spread_pct != null && (
+                  <button
+                    onClick={() => set('max_spread_pct', undefined)}
+                    className="text-xs px-2 py-1 rounded"
+                    style={{ backgroundColor: 'var(--color-surface-2)', color: 'var(--color-text-muted)', border: '1px solid var(--color-border)' }}
+                  >reset</button>
+                )}
+              </div>
+              <div className="text-[11px] mt-1" style={{ color: 'var(--color-text-muted)' }}>
+                {config.max_spread_pct != null
+                  ? `Skip windows with spread > ${(config.max_spread_pct * 100).toFixed(1)}% — matches live runner gate`
+                  : 'Default 3% — matches live runner default (max_spread_pct = 0.03)'}
+              </div>
+            </div>
+          )}
+
           {/* Sizing Mode */}
           <div className="lg:col-span-2">
             <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>

@@ -3825,6 +3825,11 @@ pub struct BacktestRunBody {
     /// Hour gate: only trade during these UTC hours (0-23). Empty = no restriction.
     #[serde(default)]
     pub allowed_hours: Vec<u8>,
+    /// Spread guard: skip windows where CLOB spread at decision time exceeds this fraction.
+    /// Mirrors the live runner's max_spread_pct gate (default 3% = 0.03).
+    /// Only applied in archive_candles mode (real bid/ask required). None = use default 3%.
+    #[serde(default)]
+    pub max_spread_pct: Option<f64>,
     /// RV floor: skip windows where BTC 1h realized-vol < this value. 0 = disabled.
     #[serde(default)]
     pub rv_min_btc: Option<f64>,
@@ -4026,6 +4031,7 @@ pub async fn handle_api_backtest_run(
         price_mode,
         &workspace_dir,
         &body.allowed_hours,
+        body.max_spread_pct,
     )
     .await;
 
