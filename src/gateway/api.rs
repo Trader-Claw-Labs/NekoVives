@@ -4032,6 +4032,7 @@ pub async fn handle_api_backtest_run(
         &workspace_dir,
         &body.allowed_hours,
         body.max_spread_pct,
+        body.rv_min_btc,
     )
     .await;
 

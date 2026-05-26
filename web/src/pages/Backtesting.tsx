@@ -2373,8 +2373,8 @@ export default function Backtesting() {
             </div>
           )}
 
-          {/* RV Floor (Polymarket binary only) */}
-          {config.market_type === 'polymarket_binary' && (
+          {/* RV Floor (Polymarket binary + archive_candles) */}
+          {(config.market_type === 'polymarket_binary' || config.market_type === 'archive_candles') && (
             <div className="lg:col-span-2">
               <label className="block text-xs mb-1.5 flex items-center gap-1.5" style={{ color: 'var(--color-text-muted)' }}>
                 BTC RV Floor
