@@ -32,6 +32,7 @@ import traceback
 try:
     import duckdb
     import pandas as pd
+    import numpy as _np
     import urllib.request
     import urllib.error
 except ImportError as e:
@@ -955,9 +956,20 @@ def build_ticks_from_df(
         lambda s: binance_prices.get(int(s), 0.0)
     )
 
-    # Window fields
-    yes_1hz["window_ts"]        = (yes_1hz["ts_s"] // window_secs * window_secs).astype(int)
-    yes_1hz["window_secs_left"] = (window_secs - (yes_1hz["ts_s"] - yes_1hz["window_ts"])).clip(0).astype(int)
+    # Window fields.
+    # At exact 5-min boundaries (ts_s % window_secs == 0) the second belongs to the
+    # PREVIOUS window as its close tick (secs_left = 0).  All other seconds count
+    # down from window_secs-1 to 1 within their window.
+    # This ensures `window_secs_left == 0` ticks exist for the clob_1hz backtester
+    # to resolve open positions.
+    _rem = (yes_1hz["ts_s"] % window_secs).astype(int)
+    _is_boundary = _rem == 0
+    yes_1hz["window_ts"] = _np.where(
+        _is_boundary,
+        yes_1hz["ts_s"].astype(int) - window_secs,
+        yes_1hz["ts_s"].astype(int) - _rem,
+    ).astype(int)
+    yes_1hz["window_secs_left"] = _np.where(_is_boundary, 0, window_secs - _rem).astype(int)
 
     yes_1hz["date"] = pd.to_datetime(yes_1hz["ts_s"], unit="s", utc=True).dt.date
     return yes_1hz
@@ -1317,12 +1329,16 @@ def cmd_to_ticks_multi(args: argparse.Namespace) -> None:
         yes_1hz["binance_price"] = yes_1hz["ts_s"].map(
             lambda s: binance_prices.get(int(s), 0.0)
         )
-        yes_1hz["window_ts"] = (
-            (yes_1hz["ts_s"] // window_secs) * window_secs
+        _rem2 = (yes_1hz["ts_s"] % window_secs).astype(int)
+        _is_boundary2 = _rem2 == 0
+        yes_1hz["window_ts"] = _np.where(
+            _is_boundary2,
+            yes_1hz["ts_s"].astype(int) - window_secs,
+            yes_1hz["ts_s"].astype(int) - _rem2,
         ).astype(int)
-        yes_1hz["window_secs_left"] = (
-            window_secs - (yes_1hz["ts_s"] - yes_1hz["window_ts"])
-        ).clip(0).astype(int)
+        yes_1hz["window_secs_left"] = _np.where(
+            _is_boundary2, 0, window_secs - _rem2
+        ).astype(int)
         yes_1hz["date"] = pd.to_datetime(
             yes_1hz["ts_s"], unit="s", utc=True
         ).dt.date

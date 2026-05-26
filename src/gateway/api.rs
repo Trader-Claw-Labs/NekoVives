@@ -3975,8 +3975,16 @@ pub async fn handle_api_backtest_run(
             .into_response();
     }
 
-    // If a series_id was provided, resolve it to symbol/interval/resolution_logic/threshold
-    let (symbol, interval, resolution_logic, threshold) = if let Some(ref sid) = body.series_id {
+    // For archive modes the `symbol` field already holds the tick slug (e.g. "btc_5m").
+    // Do NOT resolve via series_id — that would replace the slug with a Binance symbol
+    // ("BTCUSDT") which doesn't match any tick directory and causes 0 trades.
+    let (symbol, interval, resolution_logic, threshold) =
+    if body.market_type == "archive_candles" || body.market_type == "clob_1hz" {
+        // Use body.symbol directly as the tick slug; ignore series_id for archive modes.
+        (body.symbol.clone(), body.interval.clone(),
+         body.resolution_logic.clone().unwrap_or_else(|| "price_up".into()),
+         body.threshold)
+    } else if let Some(ref sid) = body.series_id {
         let series = crate::tools::series::builtin_series();
         if let Some(s) = series.iter().find(|s| s.id == *sid) {
             let rl = match s.resolution_logic {
