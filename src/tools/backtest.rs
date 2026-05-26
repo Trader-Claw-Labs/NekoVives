@@ -347,7 +347,7 @@ impl Tool for BacktestRunTool {
         // Run the real Rhai backtest engine
         let metrics = run_backtest_engine(
             &script_path, market_type, symbol, interval, from_date, to_date,
-            initial_balance, fee_pct, "price_up", None, None, None, "percent", 1.0, "historical", &self.workspace_dir, &[]
+            initial_balance, fee_pct, "price_up", None, None, None, "percent", 1.0, "historical", &self.workspace_dir, &[], None, None
         ).await;
 
         let worst_trades_text = metrics
@@ -2554,6 +2554,22 @@ fn align_up_to(ts: i64, step: i64) -> i64 {
 /// Resolution: close of minute N-1 candle vs window open price.
 ///
 /// Extra ctx fields: `ctx.window_open`, `ctx.window_minutes`, `ctx.token_price`.
+/// Compute 1-minute realized volatility from up to 61 candle closes ending at `idx`.
+/// Mirrors strategy_runner::compute_btc_rv_1h — same formula, same window size.
+fn compute_rv_at_candle_idx(candles: &[Candle], idx: usize) -> Option<f64> {
+    let start = if idx + 1 >= 61 { idx + 1 - 61 } else { 0 };
+    let closes: Vec<f64> = candles[start..=idx].iter().rev().take(61).map(|c| c.close).collect();
+    if closes.len() < 5 { return None; }
+    let returns: Vec<f64> = closes.windows(2)
+        .filter(|w| w[0] > 0.0 && w[1] > 0.0)
+        .map(|w| (w[0] / w[1]).ln())
+        .collect();
+    if returns.len() < 4 { return None; }
+    let mean = returns.iter().sum::<f64>() / returns.len() as f64;
+    let var  = returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / (returns.len() - 1) as f64;
+    Some(var.sqrt())
+}
+
 fn run_polymarket_slug_backtest(
     script_content: String,
     candles: Vec<Candle>,
@@ -2570,6 +2586,8 @@ fn run_polymarket_slug_backtest(
     historical_data: Option<HashMap<i64, HistoricalMarketWindow>>,
     prev_historical_data: Option<HashMap<i64, HistoricalMarketWindow>>,
     allowed_hours: &[u8],
+    spread_skipped_windows: &std::collections::HashSet<i64>,
+    rv_min_btc: Option<f64>,
 ) -> anyhow::Result<BacktestMetrics> {
     use rhai::{Engine, Scope};
     use std::sync::{Arc, Mutex};
@@ -2827,11 +2845,32 @@ fn run_polymarket_slug_backtest(
             }
         }
 
+        // ── Spread guard gate (mirrors live strategy_runner max_spread_pct) ──
+        // Windows where the CLOB spread at decision time exceeds the threshold
+        // are skipped, exactly as the live runner does.
+        if spread_skipped_windows.contains(&minute0_ts) {
+            continue;
+        }
+
         let (Some(&m0_idx), Some(&dec_idx), Some(&res_idx)) = (
             ts_to_idx.get(&minute0_ts),
             ts_to_idx.get(&decision_ts),
             ts_to_idx.get(&resolution_ts),
         ) else { continue; };
+
+        // ── RV floor gate (mirrors live strategy_runner rv_min_btc) ──
+        // Skips windows when BTC 1-minute realized vol (60-bar sample std of log-returns)
+        // is below the threshold. Flat-market conditions degrade the drift signal to noise.
+        // Uses the same formula as compute_btc_rv_1h in strategy_runner.rs.
+        if let Some(rv_min) = rv_min_btc {
+            if rv_min > 0.0 {
+                if let Some(rv) = compute_rv_at_candle_idx(&candles, dec_idx) {
+                    if rv < rv_min {
+                        continue;
+                    }
+                }
+            }
+        }
 
         let window_open        = candles[m0_idx].open;
         let prev_window_close  = if m0_idx > 0 { candles[m0_idx - 1].close } else { window_open };
@@ -3123,6 +3162,8 @@ pub async fn run_backtest_engine(
     price_mode: &str,
     workspace_dir: &std::path::Path,
     allowed_hours: &[u8],
+    max_spread_pct: Option<f64>,
+    rv_min_btc: Option<f64>,
 ) -> BacktestMetrics {
     tracing::info!(
         "[BACKTEST] Starting backtest: script={}, market={}, symbol={}, interval={}, from={}, to={}, balance={}, fee={}%",
@@ -3169,6 +3210,7 @@ pub async fn run_backtest_engine(
             initial_balance, fee_pct, workspace_dir, interval,
             resolution_logic, threshold, max_position_usd, max_entry_price,
             sizing_mode, sizing_value, price_mode, allowed_hours,
+            max_spread_pct, rv_min_btc,
         ).await;
     }
 
@@ -3246,9 +3288,11 @@ pub async fn run_backtest_engine(
         let hist_clone = historical_data.clone();
         let prev_hist_clone = prev_historical_data.clone();
         let allowed_hours_owned = allowed_hours.to_vec();
+        // polymarket_binary path has no CLOB tick data → spread guard not applicable
+        let no_spread_skip: std::collections::HashSet<i64> = std::collections::HashSet::new();
 
         return match tokio::task::spawn_blocking(move || {
-            run_polymarket_slug_backtest(script_content, candles, initial_balance, fee_pct, window_minutes, &rl, thr, max_position_usd, max_entry_price, &sizing_mode_owned, sizing_value, &price_mode_owned, hist_clone, prev_hist_clone, &allowed_hours_owned)
+            run_polymarket_slug_backtest(script_content, candles, initial_balance, fee_pct, window_minutes, &rl, thr, max_position_usd, max_entry_price, &sizing_mode_owned, sizing_value, &price_mode_owned, hist_clone, prev_hist_clone, &allowed_hours_owned, &no_spread_skip, None)
         })
         .await
         {
@@ -4246,6 +4290,8 @@ pub fn run_polymarket_binary_on_candle_buffer(
         None,
         None,
         &[], // no hour gate when called from live runner buffer
+        &std::collections::HashSet::new(), // no spread gate when called from live runner
+        None, // no rv gate when called from live runner buffer
     )
     .unwrap_or_else(|e| BacktestMetrics {
         total_return_pct: 0.0, sharpe_ratio: 0.0, max_drawdown_pct: 0.0,
@@ -4763,6 +4809,8 @@ pub async fn run_archive_candles_backtest(
     sizing_value: f64,
     price_mode: &str,
     allowed_hours: &[u8],
+    max_spread_pct: Option<f64>,
+    rv_min_btc: Option<f64>,
 ) -> BacktestMetrics {
     use std::collections::HashMap;
 
@@ -4876,8 +4924,8 @@ pub async fn run_archive_candles_backtest(
     // Uses window_secs_left proximity so we stay within the correct market's data
     // rather than mixing prices from 288 simultaneous markets by timestamp.
     //
-    // wts → (yes_ask, no_ask, secs_left_lag)
-    let mut window_decision_prices: HashMap<i64, (f64, f64, i64)> = HashMap::new();
+    // wts → (yes_ask, no_ask, spread_pct, secs_left_lag)
+    let mut window_decision_prices: HashMap<i64, (f64, f64, f64, i64)> = HashMap::new();
     for tick in &ticks {
         if tick.window_ts == 0 || tick.yes_ask <= 0.0 { continue; }
         let secs_lag = (tick.window_secs_left - decision_offset_secs).abs();
@@ -4886,19 +4934,46 @@ pub async fn run_archive_candles_backtest(
         } else {
             (1.0 - tick.yes_ask + 0.02).clamp(0.01, 0.99)
         };
+        // Spread = yes_ask - yes_bid (mirrors strategy_runner.rs spread_pct calc)
+        let spread = if tick.yes_bid > 0.0 { tick.yes_ask - tick.yes_bid } else { 0.0 };
         let entry = window_decision_prices
             .entry(tick.window_ts)
-            .or_insert((tick.yes_ask, no_ask, secs_lag));
-        if secs_lag < entry.2 {
-            *entry = (tick.yes_ask, no_ask, secs_lag);
+            .or_insert((tick.yes_ask, no_ask, spread, secs_lag));
+        if secs_lag < entry.3 {
+            *entry = (tick.yes_ask, no_ask, spread, secs_lag);
         }
     }
-    for (wts, (yes_ask, no_ask, _)) in &window_decision_prices {
-        if let Some(w) = windows.get_mut(wts) {
+
+    // ── Spread guard: build set of windows to skip (mirrors live max_spread_pct gate) ──
+    // Default 3% matches strategy_runner.rs default. A window is excluded when
+    // the CLOB spread at decision time exceeds the threshold.
+    let spread_threshold = max_spread_pct.unwrap_or(0.03);
+    let mut spread_skipped: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let mut spread_skipped_count = 0usize;
+    for (wts, (yes_ask, no_ask, spread, _)) in &window_decision_prices {
+        if *yes_ask > 0.0 && *spread > spread_threshold {
+            spread_skipped.insert(*wts);
+            spread_skipped_count += 1;
+        } else if let Some(w) = windows.get_mut(wts) {
             w.yes_token_price = Some(*yes_ask);
             w.no_token_price = Some(*no_ask);
         }
     }
+    // Also set prices for non-skipped windows that weren't handled above
+    for (wts, (yes_ask, no_ask, spread, _)) in &window_decision_prices {
+        if !spread_skipped.contains(wts) {
+            if let Some(w) = windows.get_mut(wts) {
+                if w.yes_token_price.is_none() {
+                    w.yes_token_price = Some(*yes_ask);
+                    w.no_token_price = Some(*no_ask);
+                }
+            }
+        }
+    }
+    tracing::info!(
+        "[ARCHIVE-CANDLES] spread_guard={:.1}%: {} windows excluded (spread > threshold)",
+        spread_threshold * 100.0, spread_skipped_count
+    );
 
     // ── P3 (prev-decision price): tick closest to secs_left = p3_offset_secs (120) ──
     // The live strategy runner captures P3 at T+180s (secs_left=120), one minute
@@ -4956,6 +5031,7 @@ pub async fn run_archive_candles_backtest(
     let hist_clone = Some(hist_map);
     let prev_hist_clone = Some(prev_windows);
     let allowed_hours_owned = allowed_hours.to_vec();
+    let spread_skipped_owned = spread_skipped;
 
     match tokio::task::spawn_blocking(move || {
         run_polymarket_slug_backtest(
@@ -4965,6 +5041,8 @@ pub async fn run_archive_candles_backtest(
             &sm, sv, &pm,
             hist_clone, prev_hist_clone,
             &allowed_hours_owned,
+            &spread_skipped_owned,
+            rv_min_btc,
         )
     }).await {
         Ok(Ok(mut m)) => {
@@ -5209,6 +5287,7 @@ mod tests {
             "price_up", None, None, None,
             "fixed", 10.0, "historical",
             Some(p4), Some(p3), &[],
+            &std::collections::HashSet::new(), None,
         ).expect("backtest must succeed");
 
         assert!(metrics.total_trades >= 3, "expected ≥3 trades, got {}", metrics.total_trades);
@@ -5264,6 +5343,7 @@ mod tests {
             "price_up", None, None, None,
             "fixed", 10.0, "historical",
             Some(p4), None, &[],
+            &std::collections::HashSet::new(), None,
         ).expect("backtest must succeed");
 
         for trade in metrics.all_trades.iter() {
@@ -5299,6 +5379,7 @@ mod tests {
             "price_up", None, None, None,
             "fixed", 10.0, "historical",
             Some(p4), Some(p3), &[],
+            &std::collections::HashSet::new(), None,
         ).expect("backtest must succeed");
 
         let mut trades = metrics.all_trades;

@@ -77,6 +77,8 @@ export interface BacktestConfig {
   price_mode?: 'historical' | 'mid'
   // Hour gate: only trade during these UTC hours. Empty = no restriction.
   allowed_hours?: number[]
+  // Spread guard: skip windows where CLOB spread > threshold. Default 0.03 (3%). archive_candles only.
+  max_spread_pct?: number
   // RV floor: skip windows where BTC 1h realized-vol < this value. 0/undefined = disabled.
   rv_min_btc?: number
   // CLOB 1 HZ: tick slug to replay (e.g. "btc_5m"). Used as `symbol` in the backtest request.
@@ -159,6 +161,7 @@ const DEFAULT_CONFIG: BacktestConfig = {
   sizing_value: 1.0,
   price_mode: 'historical',
   allowed_hours: [],
+  max_spread_pct: undefined, // undefined = use backend default (3%)
   rv_min_btc: undefined,
 }
 
