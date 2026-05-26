@@ -45,7 +45,10 @@ const POLY_BTC_V5_STRICT_HOURS_SCRIPT:   &str = include_str!("scripts/polymarket
 const POLY_BTC_V5_ENSEMBLE_SCRIPT:       &str = include_str!("scripts/polymarket_btc_updown_5m_v5_ensemble.rhai");
 
 // ── CLOB 1 HZ tick-based scripts ─────────────────────────────────────────────
-const CLOB_1HZ_SPREAD_SCALPER_SCRIPT: &str = include_str!("scripts/clob_1hz_spread_scalper.rhai");
+const CLOB_1HZ_SPREAD_SCALPER_SCRIPT:  &str = include_str!("scripts/clob_1hz_spread_scalper.rhai");
+const CLOB_1HZ_EARLY_ORACLE_SCRIPT:    &str = include_str!("scripts/clob_1hz_early_oracle.rhai");
+const CLOB_1HZ_LATE_CERTAINTY_SCRIPT:  &str = include_str!("scripts/clob_1hz_late_certainty.rhai");
+const CLOB_1HZ_VOLATILITY_REGIME_SCRIPT: &str = include_str!("scripts/clob_1hz_volatility_regime.rhai");
 
 // ── Classic Indicators ────────────────────────────────────────────────────────
 const RSI_STRATEGY_SCRIPT: &str = include_str!("scripts/rsi_strategy.rhai");
@@ -53,7 +56,7 @@ const RSI_STRATEGY_SCRIPT: &str = include_str!("scripts/rsi_strategy.rhai");
 /// Write bundled default scripts to `<workspace>/scripts/` if they don't exist yet.
 /// Called by both backtest tools so the scripts are always available on first run.
 /// All bundled default scripts as (filename, content) pairs.
-const DEFAULT_SCRIPTS: [(&str, &str); 28] = [
+const DEFAULT_SCRIPTS: [(&str, &str); 31] = [
     // ── Polymarket binary ──────────────────────────────────────────────────────
     ("polymarket_btc_binary.rhai",              POLYMARKET_BTC_BINARY_SCRIPT),
     ("polymarket_5min.rhai",                    POLYMARKET_5MIN_SCRIPT),
@@ -87,6 +90,9 @@ const DEFAULT_SCRIPTS: [(&str, &str); 28] = [
     ("liquidation_hunt.rhai",                   LIQUIDATION_HUNT_SCRIPT),
     // ── CLOB 1 HZ tick-based strategies ──────────────────────────────────────
     ("clob_1hz_spread_scalper.rhai",            CLOB_1HZ_SPREAD_SCALPER_SCRIPT),
+    ("clob_1hz_early_oracle.rhai",              CLOB_1HZ_EARLY_ORACLE_SCRIPT),
+    ("clob_1hz_late_certainty.rhai",            CLOB_1HZ_LATE_CERTAINTY_SCRIPT),
+    ("clob_1hz_volatility_regime.rhai",         CLOB_1HZ_VOLATILITY_REGIME_SCRIPT),
     // ── Reference & templates ─────────────────────────────────────────────────
     ("strategy.rhai",                           STRATEGY_SCRIPT),
 ];
