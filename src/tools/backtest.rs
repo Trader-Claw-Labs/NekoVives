@@ -4402,7 +4402,7 @@ pub fn run_clob_1hz_backtest(
     initial_balance: f64,
     fee_pct: f64,
 ) -> anyhow::Result<BacktestMetrics> {
-    use rhai::{Dynamic, Engine};
+    use rhai::{Dynamic, Engine, Map, Scope};
     use std::sync::{Arc, Mutex};
 
     if ticks.is_empty() {
@@ -4449,7 +4449,81 @@ pub fn run_clob_1hz_backtest(
     let mut portfolio_values: Vec<f64> = vec![initial_balance];
     let mut peak = initial_balance;
     let mut max_dd = 0.0_f64;
-    let _fee_factor = 1.0 - fee_pct / 100.0; // captured inside closures per tick
+    // ── Pre-compile script once (was compiling per-tick — catastrophic for 1M+ ticks)
+    let mut eng = Engine::new();
+    eng.set_max_operations(200_000);
+    eng.set_max_call_levels(32);
+
+    let patched = script_content
+        .replace("ctx.bet_yes(", "bet_yes_impl(")
+        .replace("ctx.bet_no(",  "bet_no_impl(")
+        .replace("ctx.set(",     "set_impl(")
+        .replace("ctx.get(",     "get_impl(");
+
+    let ast = eng.compile(&patched)
+        .map_err(|e| anyhow::anyhow!("Script compile error: {e}"))?;
+
+    // Shared mutable scalars that closures read each tick (avoids re-creating closures)
+    let current_yes_ask = Arc::new(Mutex::new(0.0f64));
+    let current_no_ask  = Arc::new(Mutex::new(0.0f64));
+    let current_balance = Arc::new(Mutex::new(0.0f64));
+    let current_fee     = Arc::new(Mutex::new(fee_pct));
+
+    // bet_yes_impl
+    let sim_yes = sim.clone();
+    let yes_ask_ref = current_yes_ask.clone();
+    let balance_ref = current_balance.clone();
+    let fee_ref     = current_fee.clone();
+    eng.register_fn("bet_yes_impl", move |size: f64| {
+        let ya  = *yes_ask_ref.lock().unwrap();
+        let bal = *balance_ref.lock().unwrap();
+        let f   = *fee_ref.lock().unwrap();
+        let mut s = sim_yes.lock().unwrap();
+        if s.position != 0 { return; }
+        if ya <= 0.0 || ya >= 1.0 { return; }
+        let frac = size.clamp(0.0, 1.0);
+        let stake_amt = bal * frac * (1.0 - f / 100.0);
+        if stake_amt <= 0.01 { return; }
+        s.balance -= stake_amt;
+        s.position = 1;
+        s.entry_price = ya;
+        s.stake = stake_amt;
+    });
+
+    // bet_no_impl
+    let sim_no = sim.clone();
+    let no_ask_ref   = current_no_ask.clone();
+    let balance_ref2 = current_balance.clone();
+    let fee_ref2     = current_fee.clone();
+    eng.register_fn("bet_no_impl", move |size: f64| {
+        let na  = *no_ask_ref.lock().unwrap();
+        let bal = *balance_ref2.lock().unwrap();
+        let f   = *fee_ref2.lock().unwrap();
+        let mut s = sim_no.lock().unwrap();
+        if s.position != 0 { return; }
+        if na <= 0.0 || na >= 1.0 { return; }
+        let frac = size.clamp(0.0, 1.0);
+        let stake_amt = bal * frac * (1.0 - f / 100.0);
+        if stake_amt <= 0.01 { return; }
+        s.balance -= stake_amt;
+        s.position = -1;
+        s.entry_price = na;
+        s.stake = stake_amt;
+    });
+
+    // set_impl / get_impl
+    let sim_set = sim.clone();
+    eng.register_fn("set_impl", move |key: String, val: rhai::Dynamic| {
+        if let Some(f) = dynamic_to_f64(&val) {
+            sim_set.lock().unwrap().kv.insert(key, f);
+        }
+    });
+
+    let sim_get = sim.clone();
+    eng.register_fn("get_impl", move |key: String, default: rhai::Dynamic| -> f64 {
+        let def = dynamic_to_f64(&default).unwrap_or(0.0);
+        sim_get.lock().unwrap().kv.get(&key).copied().unwrap_or(def)
+    });
 
     for (tick_idx, tick) in ticks.iter().enumerate() {
         // ── Window-transition resolution ─────────────────────────────────────
@@ -4560,118 +4634,32 @@ pub fn run_clob_1hz_backtest(
             0
         };
 
-        // Register native functions with captured tick data
-        let mut eng = Engine::new();
-        eng.set_max_operations(200_000);
-        eng.set_max_call_levels(32);
+        // Update shared scalars so pre-registered closures see current tick data
+        *current_yes_ask.lock().unwrap() = tick.yes_ask;
+        *current_no_ask.lock().unwrap()  = tick.no_ask;
+        *current_balance.lock().unwrap() = cur_balance;
 
-        let sim_yes = sim.clone();
-        let yes_ask_cap = tick.yes_ask;
-        let yes_stake = cur_balance;
-        let fee_yes = fee_pct;
-        eng.register_fn("bet_yes_impl", move |size: f64| {
-            let mut s = sim_yes.lock().unwrap();
-            if s.position != 0 { return; }  // already in a trade
-            if yes_ask_cap <= 0.0 || yes_ask_cap >= 1.0 { return; }
-            let frac = size.clamp(0.0, 1.0);
-            let stake_amt = yes_stake * frac * (1.0 - fee_yes / 100.0);
-            if stake_amt <= 0.01 { return; }
-            s.balance -= stake_amt;
-            s.position = 1;
-            s.entry_price = yes_ask_cap;
-            s.stake = stake_amt;
-            s.pending_yes = None;
-        });
+        // Build ctx map and invoke pre-compiled on_tick
+        let mut ctx_map = Map::new();
+        ctx_map.insert("ts_ms".into(),            Dynamic::from(tick.ts_ms));
+        ctx_map.insert("yes_bid".into(),          Dynamic::from(tick.yes_bid));
+        ctx_map.insert("yes_ask".into(),          Dynamic::from(tick.yes_ask));
+        ctx_map.insert("yes_mid".into(),          Dynamic::from(tick.yes_mid));
+        ctx_map.insert("no_bid".into(),           Dynamic::from(tick.no_bid));
+        ctx_map.insert("no_ask".into(),           Dynamic::from(tick.no_ask));
+        ctx_map.insert("spread_pct".into(),       Dynamic::from(spread_pct));
+        ctx_map.insert("binance_price".into(),    Dynamic::from(tick.binance_price));
+        ctx_map.insert("window_ts".into(),        Dynamic::from(tick.window_ts));
+        ctx_map.insert("window_secs_left".into(), Dynamic::from(tick.window_secs_left));
+        ctx_map.insert("second_in_window".into(), Dynamic::from(second_in_window));
+        ctx_map.insert("balance".into(),          Dynamic::from(cur_balance));
+        ctx_map.insert("position".into(),         Dynamic::from(cur_position));
+        ctx_map.insert("entry_price".into(),      Dynamic::from(cur_entry_price));
 
-        let sim_no = sim.clone();
-        let no_ask_cap = tick.no_ask;
-        let no_stake = cur_balance;
-        let fee_no = fee_pct;
-        eng.register_fn("bet_no_impl", move |size: f64| {
-            let mut s = sim_no.lock().unwrap();
-            if s.position != 0 { return; }
-            if no_ask_cap <= 0.0 || no_ask_cap >= 1.0 { return; }
-            let frac = size.clamp(0.0, 1.0);
-            let stake_amt = no_stake * frac * (1.0 - fee_no / 100.0);
-            if stake_amt <= 0.01 { return; }
-            s.balance -= stake_amt;
-            s.position = -1;
-            s.entry_price = no_ask_cap;
-            s.stake = stake_amt;
-            s.pending_no = None;
-        });
-
-        let sim_set = sim.clone();
-        eng.register_fn("set_impl", move |key: String, val: rhai::Dynamic| {
-            if let Some(f) = dynamic_to_f64(&val) {
-                sim_set.lock().unwrap().kv.insert(key, f);
-            }
-        });
-
-        let sim_get = sim.clone();
-        eng.register_fn("get_impl", move |key: String, default: rhai::Dynamic| -> f64 {
-            let def = dynamic_to_f64(&default).unwrap_or(0.0);
-            sim_get.lock().unwrap().kv.get(&key).copied().unwrap_or(def)
-        });
-
-        // Patch ctx.* → *_impl(
-        let patched = script_content
-            .replace("ctx.bet_yes(", "bet_yes_impl(")
-            .replace("ctx.bet_no(",  "bet_no_impl(")
-            .replace("ctx.set(",     "set_impl(")
-            .replace("ctx.get(",     "get_impl(");
-
-        let full_script = format!(r#"
-{patched}
-
-let ctx = #{{}};
-ctx.ts_ms            = {ts_ms};
-ctx.yes_bid          = {yes_bid};
-ctx.yes_ask          = {yes_ask};
-ctx.yes_mid          = {yes_mid};
-ctx.no_bid           = {no_bid};
-ctx.no_ask           = {no_ask};
-ctx.spread_pct       = {spread_pct};
-ctx.binance_price    = {binance_price};
-ctx.window_ts        = {window_ts};
-ctx.window_secs_left = {window_secs_left};
-ctx.second_in_window = {second_in_window};
-ctx.balance          = {balance};
-ctx.position         = {position};
-ctx.entry_price      = {entry_price};
-on_tick(ctx);
-"#,
-            patched          = patched,
-            ts_ms            = tick.ts_ms,
-            yes_bid          = tick.yes_bid,
-            yes_ask          = tick.yes_ask,
-            yes_mid          = tick.yes_mid,
-            no_bid           = tick.no_bid,
-            no_ask           = tick.no_ask,
-            spread_pct       = spread_pct,
-            binance_price    = tick.binance_price,
-            window_ts        = tick.window_ts,
-            window_secs_left = tick.window_secs_left,
-            second_in_window = second_in_window,
-            balance          = cur_balance,
-            position         = cur_position,
-            entry_price      = cur_entry_price,
-        );
-
-        match eng.compile(&full_script) {
-            Ok(ast) => {
-                let mut scope = rhai::Scope::new();
-                if let Err(e) = eng.eval_ast_with_scope::<Dynamic>(&mut scope, &ast) {
-                    if tick_idx < 5 {
-                        tracing::warn!("[CLOB1HZ] on_tick error at tick {tick_idx}: {e}");
-                    }
-                }
-            }
-            Err(e) => {
-                if tick_idx == 0 {
-                    tracing::error!("[CLOB1HZ] Script compile error: {e}");
-                    return Err(anyhow::anyhow!("Script compile error: {e}"));
-                }
+        let mut scope = Scope::new();
+        if let Err(e) = eng.call_fn::<Dynamic>(&mut scope, &ast, "on_tick", (ctx_map,)) {
+            if tick_idx < 5 {
+                tracing::warn!("[CLOB1HZ] on_tick error at tick {tick_idx}: {e}");
             }
         }
 
