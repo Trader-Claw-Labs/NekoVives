@@ -771,15 +771,25 @@ def fetch_gamma_markets_via_events(
     return results
 
 
-# Known recurring series: Gamma slug prefix → (tick slug, Binance symbol)
+# Known recurring series: Gamma slug prefix → (tick slug, Binance symbol, window minutes)
 MULTI_SERIES: list[dict] = [
-    {"prefix": "btc-updown-5m",  "slug": "btc_5m",  "binance": "BTCUSDT"},
-    {"prefix": "eth-updown-5m",  "slug": "eth_5m",  "binance": "ETHUSDT"},
-    {"prefix": "sol-updown-5m",  "slug": "sol_5m",  "binance": "SOLUSDT"},
-    {"prefix": "xrp-updown-5m",  "slug": "xrp_5m",  "binance": "XRPUSDT"},
-    {"prefix": "bnb-updown-5m",  "slug": "bnb_5m",  "binance": "BNBUSDT"},
-    {"prefix": "doge-updown-5m", "slug": "doge_5m", "binance": "DOGEUSDT"},
-    {"prefix": "hype-updown-5m", "slug": "hype_5m", "binance": "HYPEUSDT"},
+    # ── 5-minute markets ──────────────────────────────────────────────────────
+    {"prefix": "btc-updown-5m",  "slug": "btc_5m",  "binance": "BTCUSDT",  "window_minutes": 5},
+    {"prefix": "eth-updown-5m",  "slug": "eth_5m",  "binance": "ETHUSDT",  "window_minutes": 5},
+    {"prefix": "sol-updown-5m",  "slug": "sol_5m",  "binance": "SOLUSDT",  "window_minutes": 5},
+    {"prefix": "xrp-updown-5m",  "slug": "xrp_5m",  "binance": "XRPUSDT",  "window_minutes": 5},
+    {"prefix": "bnb-updown-5m",  "slug": "bnb_5m",  "binance": "BNBUSDT",  "window_minutes": 5},
+    {"prefix": "doge-updown-5m", "slug": "doge_5m", "binance": "DOGEUSDT", "window_minutes": 5},
+    {"prefix": "hype-updown-5m", "slug": "hype_5m", "binance": "HYPEUSDT", "window_minutes": 5},
+    # ── 15-minute markets ─────────────────────────────────────────────────────
+    {"prefix": "btc-updown-15m", "slug": "btc_15m", "binance": "BTCUSDT",  "window_minutes": 15},
+    {"prefix": "eth-updown-15m", "slug": "eth_15m", "binance": "ETHUSDT",  "window_minutes": 15},
+    {"prefix": "sol-updown-15m", "slug": "sol_15m", "binance": "SOLUSDT",  "window_minutes": 15},
+    {"prefix": "xrp-updown-15m", "slug": "xrp_15m", "binance": "XRPUSDT",  "window_minutes": 15},
+    # ── 1-hour markets ────────────────────────────────────────────────────────
+    {"prefix": "btc-updown-1h",  "slug": "btc_1h",  "binance": "BTCUSDT",  "window_minutes": 60},
+    {"prefix": "eth-updown-1h",  "slug": "eth_1h",  "binance": "ETHUSDT",  "window_minutes": 60},
+    {"prefix": "sol-updown-1h",  "slug": "sol_1h",  "binance": "SOLUSDT",  "window_minutes": 60},
 ]
 
 
@@ -1094,20 +1104,23 @@ def cmd_to_ticks(args: argparse.Namespace) -> None:
 
 def cmd_to_ticks_multi(args: argparse.Namespace) -> None:
     """
-    Convert all recurring 5-min UP/DOWN markets (BTC, ETH, SOL, XRP, BNB, DOGE, HYPE)
-    from local Parquet files to 1-Hz JSONL ticks with real Binance prices.
+    Convert all recurring UP/DOWN markets (5m, 15m, 1h) from local Parquet files
+    to 1-Hz JSONL ticks with real Binance prices.
 
-    Condition IDs are sourced from the scraped historical JSONL files at:
+    Supported series (use --slugs to restrict):
+      5m:  btc_5m, eth_5m, sol_5m, xrp_5m, bnb_5m, doge_5m, hype_5m
+      15m: btc_15m, eth_15m, sol_15m, xrp_15m
+      1h:  btc_1h, eth_1h, sol_1h
+
+    Condition IDs are sourced from scraped historical JSONL files at:
       <workspace>/data/polymarket_historical/<slug>.jsonl
-    (produced by `trader-claw backtest-sync --series <slug>`).
     Falls back to the Gamma API for any series missing a local JSONL file.
 
     Writes:
       <out>/btc_5m/YYYY-MM-DD.jsonl
-      <out>/eth_5m/YYYY-MM-DD.jsonl
+      <out>/btc_15m/YYYY-MM-DD.jsonl
+      <out>/btc_1h/YYYY-MM-DD.jsonl
       ...
-
-    Slugs for backtesting: btc_5m, eth_5m, sol_5m, xrp_5m, bnb_5m, doge_5m, hype_5m
     """
     data_dir  = Path(args.input_dir)
     out_base  = Path(args.out)
@@ -1152,6 +1165,7 @@ def cmd_to_ticks_multi(args: argparse.Namespace) -> None:
           f"{[s['slug'] for s in series_list]}", file=sys.stderr)
 
     con = get_con()
+    window_minutes = 5  # default; overridden per-series below
 
     # Build a lookup: stem → file path (e.g. "2026-05-10T17" → Path)
     file_by_stem: dict[str, Path] = {}
@@ -1163,12 +1177,13 @@ def cmd_to_ticks_multi(args: argparse.Namespace) -> None:
     results = []
 
     for series in series_list:
-        prefix  = series["prefix"]
-        slug    = series["slug"]
-        binance = series["binance"]
+        prefix         = series["prefix"]
+        slug           = series["slug"]
+        binance        = series["binance"]
+        window_minutes = series.get("window_minutes", 5)
 
         print(f"\n{'='*60}", file=sys.stderr)
-        print(f"[to-ticks-multi] Series: {slug} (prefix={prefix}, binance={binance})", file=sys.stderr)
+        print(f"[to-ticks-multi] Series: {slug} (prefix={prefix}, binance={binance}, window={window_minutes}m)", file=sys.stderr)
 
         # ── Step 1: Load condition IDs from local historical JSONL ─────────────
         # Primary: scraped historical data (no network needed, covers full history)
@@ -1558,7 +1573,7 @@ def main() -> None:
     # to-ticks-multi — auto-detect all 5-min series and convert in one shot
     p = sub.add_parser(
         "to-ticks-multi",
-        help="Auto-detect BTC/ETH/SOL/XRP/BNB 5m markets via Gamma API and convert all to JSONL ticks",
+        help="Auto-detect 5m/15m/1h UP/DOWN markets via Gamma API and convert all to JSONL ticks",
     )
     p.add_argument("--in",  dest="input_dir", required=True, help="Directory with local *.parquet files")
     p.add_argument("--out", required=True, help="Base output directory (slug subdirs created automatically)")
