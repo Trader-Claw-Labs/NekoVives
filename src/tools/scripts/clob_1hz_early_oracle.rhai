@@ -21,9 +21,12 @@
 fn on_tick(ctx) {
     if ctx.position != 0 { return; }
 
+    // Guard: Binance price must be valid
+    if ctx.binance_price <= 0.0 { return; }
+
     // Track window_open price from first valid Binance tick
     let wopen = ctx.get("window_open", 0.0);
-    if wopen <= 0.0 && ctx.binance_price > 0.0 {
+    if wopen <= 0.0 {
         ctx.set("window_open", ctx.binance_price);
         wopen = ctx.binance_price;
     }
@@ -37,15 +40,20 @@ fn on_tick(ctx) {
     // Liquidity gate
     if ctx.spread_pct > 5.0 { return; }
 
+    // Extreme price guard: avoid buying tokens priced near zero
+    if ctx.yes_ask < 0.03 || ctx.no_ask < 0.03 { return; }
+
     let change_pct = (ctx.binance_price - wopen) / wopen * 100.0;
 
-    // Minimum directional signal
-    if change_pct.abs() < 0.03 { return; }
+    // Minimum directional signal (raised to 0.05% — 0.03% was noise)
+    if change_pct.abs() < 0.05 { return; }
 
     // Token must still be in the "undecided" band
     if ctx.yes_mid < 0.40 || ctx.yes_mid > 0.60 { return; }
 
-    let stake = 0.08;
+    // Sizing: 20% of balance (capped at $600 by the backtest engine's
+    // max_position_usd setting — actual stake will be min(20% balance, $600))
+    let stake = 0.20;
 
     // BTC moving UP  → YES underpriced  → buy YES
     if change_pct > 0.0 && ctx.yes_ask < 0.58 {

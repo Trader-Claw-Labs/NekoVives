@@ -26,9 +26,12 @@
 fn on_tick(ctx) {
     if ctx.position != 0 { return; }
 
+    // Guard: Binance price must be valid
+    if ctx.binance_price <= 0.0 { return; }
+
     // Track window_open price
     let wopen = ctx.get("window_open", 0.0);
-    if wopen <= 0.0 && ctx.binance_price > 0.0 {
+    if wopen <= 0.0 {
         ctx.set("window_open", ctx.binance_price);
         wopen = ctx.binance_price;
     }
@@ -42,8 +45,13 @@ fn on_tick(ctx) {
     // Liquidity gate
     if ctx.spread_pct > 4.0 { return; }
 
+    // Extreme price guard: avoid buying tokens priced near zero (payout explosion)
+    if ctx.yes_ask < 0.03 || ctx.no_ask < 0.03 { return; }
+
     let change_pct = (ctx.binance_price - wopen) / wopen * 100.0;
-    let stake = 0.10;
+    // Sizing: 35% of balance (capped at $600 by the backtest engine's
+    // max_position_usd setting — actual stake will be min(35% balance, $600))
+    let stake = 0.35;
 
     // ── Setup A: BTC clearly UP, YES not at ceiling ──
     if change_pct > 0.04 && ctx.yes_ask < 0.80 {

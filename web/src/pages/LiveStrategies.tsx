@@ -14,6 +14,7 @@ const ENGINE_KIND_LABELS: Record<string, string> = {
   rotation_compounder: 'Rotation Compounder',
   arb_hedge: 'Arb + Hedge Overlay',
   minting_mm: 'Minting MM',
+  rhai_tick: 'Rhai Tick (1Hz on_tick)',
 }
 
 function strategyDisplayLabel(config: { kind?: string; script?: string }): string {
@@ -841,7 +842,8 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript, prefil
     engine_params: (prefill?.engine_params ?? {}) as Record<string, unknown>,
   })
 
-  const isEngineKind = form.kind !== 'rhai_candle'
+  const isRhaiTick = form.kind === 'rhai_tick'
+  const isEngineKind = form.kind !== 'rhai_candle' && !isRhaiTick
   const [error, setError] = useState('')
   const [showMissingApiKeyModal, setShowMissingApiKeyModal] = useState(false)
   const [showMissingPrivateKeyModal, setShowMissingPrivateKeyModal] = useState(false)
@@ -1021,6 +1023,22 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript, prefil
         script: defaultScript ?? scripts[0]?.path ?? '',
         engine_params: {},
       }))
+    } else if (newKind === 'rhai_tick') {
+      // Rhai Tick needs both a script (on_tick) and a series_id (for token resolution).
+      const defaultSeries = allSeries.find(s => s.id === 'btc_5m') ?? allSeries[0]
+      const tickScript = scripts.find(s => s.path.includes('clob_1hz'))?.path
+        ?? scripts[0]?.path
+        ?? ''
+      setForm(f => ({
+        ...f,
+        kind: newKind,
+        market_type: 'polymarket_binary',
+        symbol: defaultSeries?.symbol ?? 'BTCUSDT',
+        series_id: defaultSeries?.id ?? 'btc_5m',
+        interval: defaultSeries?.cadence ?? '5m',
+        script: tickScript,
+        engine_params: {},
+      }))
     } else {
       // Default to the BTC 5m recurring series so the engine picks up the
       // current window slug each poll. Without a series_id the engine would
@@ -1067,7 +1085,8 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript, prefil
             <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>Strategy Engine</label>
             <select className="w-full rounded px-3 py-2 text-sm" value={form.kind}
               onChange={e => onKindChange(e.target.value)}>
-              <option value="rhai_candle">Rhai Script (default)</option>
+              <option value="rhai_candle">Rhai Script (on_candle, default)</option>
+              <option value="rhai_tick">Rhai Tick (1Hz on_tick) — runs CLOB scalpers second-by-second</option>
               {ENGINE_KINDS.map((e) => (
                 <option key={e.id} value={e.id}>{engineKindOptionLabel(e.id)}</option>
               ))}
@@ -1091,22 +1110,33 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript, prefil
 
           {!isEngineKind && (
             <div>
-              <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>Market Type</label>
-              <select className="w-full rounded px-3 py-2 text-sm" value={form.market_type}
-                onChange={e => onMarketTypeChange(e.target.value)}>
-                <option value="crypto">Crypto</option>
-                <option value="funding_arb">Funding Arb</option>
-                <option value="polymarket_binary">Polymarket Binary</option>
-              </select>
+              {!isRhaiTick && (
+                <>
+                  <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>Market Type</label>
+                  <select className="w-full rounded px-3 py-2 text-sm" value={form.market_type}
+                    onChange={e => onMarketTypeChange(e.target.value)}>
+                    <option value="crypto">Crypto</option>
+                    <option value="funding_arb">Funding Arb</option>
+                    <option value="polymarket_binary">Polymarket Binary</option>
+                  </select>
+                </>
+              )}
               <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>Strategy Script</label>
               <select className="w-full rounded px-3 py-2 text-sm font-mono" value={form.script}
                 onChange={e => set('script', e.target.value)}>
-                {scripts.map(s => (
-                  <option key={s.path} value={s.path}>
-                    {s.name} {s.last_run_stats ? `(${(s.last_run_stats.win_rate_pct ?? 0).toFixed(1)}% WR)` : ''}
-                  </option>
-                ))}
+                {scripts
+                  .filter(s => !isRhaiTick || s.path.includes('clob_1hz') || s.name.includes('clob_1hz'))
+                  .map(s => (
+                    <option key={s.path} value={s.path}>
+                      {s.name} {s.last_run_stats ? `(${(s.last_run_stats.win_rate_pct ?? 0).toFixed(1)}% WR)` : ''}
+                    </option>
+                  ))}
               </select>
+              {isRhaiTick && (
+                <p className="text-[10px] mt-1" style={{ color: 'var(--color-text-muted)' }}>
+                  Only <span className="font-mono">clob_1hz_*</span> scripts are listed (they implement <span className="font-mono">on_tick(ctx)</span> for 1Hz CLOB execution).
+                </p>
+              )}
             </div>
           )}
 
@@ -1139,8 +1169,8 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript, prefil
             </div>
           )}
 
-          <div className={`grid gap-3 ${isEngineKind ? 'grid-cols-1' : 'grid-cols-2'}`}>
-            {!isEngineKind && (
+          <div className={`grid gap-3 ${isEngineKind || isRhaiTick ? 'grid-cols-1' : 'grid-cols-2'}`}>
+            {!isEngineKind && !isRhaiTick && (
               <div>
                 <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>Market Type</label>
                 <select className="w-full rounded px-3 py-2 text-sm" value={form.market_type}
@@ -1158,7 +1188,7 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript, prefil
                 leftLabel="Dry Run"
                 rightLabel="Live"
                 activeColor={form.mode === 'live' ? 'var(--color-warning)' : 'var(--color-accent)'}
-                disabled={!isEngineKind && form.market_type !== 'polymarket_binary'}
+                disabled={!isEngineKind && !isRhaiTick && form.market_type !== 'polymarket_binary'}
               />
             </div>
           </div>

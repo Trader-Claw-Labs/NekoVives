@@ -3203,7 +3203,7 @@ pub async fn run_backtest_engine(
     if market_type == "clob_1hz" {
         return run_clob_1hz_backtest_from_files(
             script_path, symbol, from_date, to_date,
-            initial_balance, fee_pct, workspace_dir,
+            initial_balance, fee_pct, workspace_dir, max_position_usd,
         ).await;
     }
 
@@ -4401,6 +4401,7 @@ pub fn run_clob_1hz_backtest(
     ticks: Vec<crate::tick_recorder::Tick>,
     initial_balance: f64,
     fee_pct: f64,
+    max_position_usd: Option<f64>,
 ) -> anyhow::Result<BacktestMetrics> {
     use rhai::{Dynamic, Engine, Map, Scope};
     use std::sync::{Arc, Mutex};
@@ -4468,21 +4469,24 @@ pub fn run_clob_1hz_backtest(
     let current_no_ask  = Arc::new(Mutex::new(0.0f64));
     let current_balance = Arc::new(Mutex::new(0.0f64));
     let current_fee     = Arc::new(Mutex::new(fee_pct));
+    let max_pos_usd     = Arc::new(Mutex::new(max_position_usd.unwrap_or(f64::MAX)));
 
     // bet_yes_impl
     let sim_yes = sim.clone();
     let yes_ask_ref = current_yes_ask.clone();
     let balance_ref = current_balance.clone();
     let fee_ref     = current_fee.clone();
+    let max_pos_ref = max_pos_usd.clone();
     eng.register_fn("bet_yes_impl", move |size: f64| {
         let ya  = *yes_ask_ref.lock().unwrap();
         let bal = *balance_ref.lock().unwrap();
         let f   = *fee_ref.lock().unwrap();
+        let max_pos = *max_pos_ref.lock().unwrap();
         let mut s = sim_yes.lock().unwrap();
         if s.position != 0 { return; }
-        if ya <= 0.0 || ya >= 1.0 { return; }
+        if ya < 0.03 || ya >= 1.0 { return; } // min 3¢ entry — prevent payout explosion
         let frac = size.clamp(0.0, 1.0);
-        let stake_amt = bal * frac * (1.0 - f / 100.0);
+        let stake_amt = (bal * frac * (1.0 - f / 100.0)).min(max_pos);
         if stake_amt <= 0.01 { return; }
         s.balance -= stake_amt;
         s.position = 1;
@@ -4495,15 +4499,17 @@ pub fn run_clob_1hz_backtest(
     let no_ask_ref   = current_no_ask.clone();
     let balance_ref2 = current_balance.clone();
     let fee_ref2     = current_fee.clone();
+    let max_pos_ref2 = max_pos_usd.clone();
     eng.register_fn("bet_no_impl", move |size: f64| {
         let na  = *no_ask_ref.lock().unwrap();
         let bal = *balance_ref2.lock().unwrap();
         let f   = *fee_ref2.lock().unwrap();
+        let max_pos = *max_pos_ref2.lock().unwrap();
         let mut s = sim_no.lock().unwrap();
         if s.position != 0 { return; }
-        if na <= 0.0 || na >= 1.0 { return; }
+        if na < 0.03 || na >= 1.0 { return; } // min 3¢ entry — prevent payout explosion
         let frac = size.clamp(0.0, 1.0);
-        let stake_amt = bal * frac * (1.0 - f / 100.0);
+        let stake_amt = (bal * frac * (1.0 - f / 100.0)).min(max_pos);
         if stake_amt <= 0.01 { return; }
         s.balance -= stake_amt;
         s.position = -1;
@@ -5064,6 +5070,7 @@ pub async fn run_clob_1hz_backtest_from_files(
     initial_balance: f64,
     fee_pct: f64,
     workspace_dir: &std::path::Path,
+    max_position_usd: Option<f64>,
 ) -> BacktestMetrics {
     let script_content = match std::fs::read_to_string(script_path) {
         Ok(s) => s,
@@ -5084,8 +5091,9 @@ pub async fn run_clob_1hz_backtest_from_files(
     let script_for_task = script_content.clone();
     let initial_bal = initial_balance;
     let fee = fee_pct;
+    let max_pos = max_position_usd;
     match tokio::task::spawn_blocking(move || {
-        run_clob_1hz_backtest(&script_for_task, ticks, initial_bal, fee)
+        run_clob_1hz_backtest(&script_for_task, ticks, initial_bal, fee, max_pos)
     }).await {
         Ok(Ok(m))  => m,
         Ok(Err(e)) => BacktestMetrics {

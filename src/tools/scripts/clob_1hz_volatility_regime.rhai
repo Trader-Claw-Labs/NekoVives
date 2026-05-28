@@ -24,9 +24,12 @@
 fn on_tick(ctx) {
     if ctx.position != 0 { return; }
 
+    // Guard: Binance price must be valid
+    if ctx.binance_price <= 0.0 { return; }
+
     // Track window_open price
     let wopen = ctx.get("window_open", 0.0);
-    if wopen <= 0.0 && ctx.binance_price > 0.0 {
+    if wopen <= 0.0 {
         ctx.set("window_open", ctx.binance_price);
         wopen = ctx.binance_price;
     }
@@ -55,7 +58,12 @@ fn on_tick(ctx) {
 
     if ctx.spread_pct > 5.0 { return; }
 
-    let stake = 0.08;
+    // Extreme price guard
+    if ctx.yes_ask < 0.03 || ctx.no_ask < 0.03 { return; }
+
+    // Sizing: 25% of balance (capped at $600 by the backtest engine's
+    // max_position_usd setting — actual stake will be min(25% balance, $600))
+    let stake = 0.25;
 
     // ═══════════════════════════════════════════════════════════════
     // HIGH-VOLATILITY REGIME → follow momentum
