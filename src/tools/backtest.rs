@@ -353,7 +353,7 @@ impl Tool for BacktestRunTool {
         // Run the real Rhai backtest engine
         let metrics = run_backtest_engine(
             &script_path, market_type, symbol, interval, from_date, to_date,
-            initial_balance, fee_pct, "price_up", None, None, None, "percent", 1.0, "historical", &self.workspace_dir, &[], None, None
+            initial_balance, fee_pct, "price_up", None, None, None, "percent", 1.0, "historical", &self.workspace_dir, &[], None, None, None, None, None, None
         ).await;
 
         let worst_trades_text = metrics
@@ -411,6 +411,32 @@ impl Tool for BacktestRunTool {
 }
 
 // ── Internal engine ──────────────────────────────────────────────────
+
+/// Optional guardrail parameters that mirror the live runner's risk controls.
+/// When passed to a backtest, the same gates that protect live money are applied
+/// to the simulated run so backtest P&L reflects what would actually happen live.
+#[derive(Debug, Clone, Default)]
+pub struct BacktestGuardrails {
+    /// Maximum kelly multiplier. Caps scripts that emit large kelly_size values.
+    pub kelly_size_cap: Option<f64>,
+    /// Minimum entry price: skip bets when token ask < this value (e.g. 0.05 = 5¢).
+    pub min_entry_price: Option<f64>,
+    /// Auto-stop simulation after N consecutive losses.
+    pub max_consecutive_losses: Option<u32>,
+    /// Per-trade stop-loss: exit early if token drops this fraction from entry.
+    pub stop_loss_pct: Option<f64>,
+}
+
+/// Market gates applied per-bet in the on_tick backtester, mirroring the live
+/// tick_runner_loop's pending-order gates (max_spread_pct, allowed_hours,
+/// max_entry_price, min_entry_price) so backtest and live skip the same bets.
+#[derive(Debug, Clone, Default)]
+pub struct TickGates {
+    pub max_spread_pct: Option<f64>,
+    pub max_entry_price: Option<f64>,
+    pub min_entry_price: Option<f64>,
+    pub allowed_hours: Vec<u8>,
+}
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct BacktestMetrics {
@@ -2594,6 +2620,7 @@ fn run_polymarket_slug_backtest(
     allowed_hours: &[u8],
     spread_skipped_windows: &std::collections::HashSet<i64>,
     rv_min_btc: Option<f64>,
+    guardrails: Option<BacktestGuardrails>,
 ) -> anyhow::Result<BacktestMetrics> {
     use rhai::{Engine, Scope};
     use std::sync::{Arc, Mutex};
@@ -3013,11 +3040,25 @@ fn run_polymarket_slug_backtest(
             let bet_up  = pb;
             // Percent mode: sizing_value is stored as a percentage (e.g. 5.0 = 5%),
             // matching strategy_runner.rs: max_frac = live_sizing_value / 100.0
-            let raw_stake = if sizing_mode == "fixed" {
+            let base_stake = if sizing_mode == "fixed" {
                 sizing_value.min(bal).max(0.0)
             } else {
                 (bal * (sizing_value / 100.0).clamp(0.0, 1.0)).max(0.0)
             };
+            // Confidence-weighted sizing (live-parity): read `kelly_size` the script
+            // emitted via ctx.set, clamp to [0.1, kelly_size_cap]. Mirrors the live
+            // runner's `kelly_mult` in execute_live_polymarket_signal.
+            let kelly_cap = guardrails.as_ref()
+                .and_then(|g| g.kelly_size_cap)
+                .unwrap_or(1.5)
+                .clamp(1.0, 3.0);
+            let kelly_mult = {
+                let s = state.lock().unwrap();
+                s.kv.get("kelly_size").copied()
+                    .map(|v| v.clamp(0.1, kelly_cap))
+                    .unwrap_or(1.0)
+            };
+            let raw_stake = base_stake * kelly_mult;
             // Enforce Polymarket position limit: stake cannot exceed available market liquidity.
             // Real 5-min binary markets typically have $500-$3,000 USDC of liquidity per window.
             let stake = if let Some(max_s) = max_stake_usd {
@@ -3030,8 +3071,26 @@ fn run_polymarket_slug_backtest(
             let token_p = if bet_up { yes_token_price } else { no_token_price_hist.max(0.03) };
             // Skip if token price exceeds max entry price threshold
             if let Some(max_ep) = max_entry_price {
-                if token_p > max_ep {
-                    continue;
+                if token_p > max_ep { continue; }
+            }
+            // Guardrail: min_entry_price — skip extreme long-shot bets
+            if let Some(ref gr) = guardrails {
+                if let Some(min_ep) = gr.min_entry_price {
+                    if min_ep > 0.0 && token_p < min_ep { continue; }
+                }
+                // Guardrail: max_consecutive_losses — stop simulation if streak exceeded
+                if let Some(max_streak) = gr.max_consecutive_losses {
+                    if max_streak > 0 {
+                        let streak: u32 = {
+                            let s = state.lock().unwrap();
+                            let mut n = 0u32;
+                            for t in s.trades.iter().rev() {
+                                if t.pnl < 0.0 { n += 1; } else { break; }
+                            }
+                            n
+                        };
+                        if streak >= max_streak { break; }
+                    }
                 }
             }
             let won     = (bet_up && went_up) || (!bet_up && !went_up);
@@ -3172,6 +3231,10 @@ pub async fn run_backtest_engine(
     allowed_hours: &[u8],
     max_spread_pct: Option<f64>,
     rv_min_btc: Option<f64>,
+    kelly_size_cap: Option<f64>,
+    min_entry_price: Option<f64>,
+    max_consecutive_losses: Option<u32>,
+    stop_loss_pct: Option<f64>,
 ) -> BacktestMetrics {
     tracing::info!(
         "[BACKTEST] Starting backtest: script={}, market={}, symbol={}, interval={}, from={}, to={}, balance={}, fee={}%",
@@ -3201,9 +3264,18 @@ pub async fn run_backtest_engine(
     // ── clob_1hz: tick-level backtest from recorded JSONL files ─────────────────
     // `symbol` is used as the tick slug (e.g. "btc_5m").
     if market_type == "clob_1hz" {
+        // Apply the same market gates the live tick_runner_loop enforces so the
+        // on_tick backtest skips the same bets (live-parity for spread/hours/entry).
+        let tick_gates = TickGates {
+            max_spread_pct,
+            max_entry_price,
+            min_entry_price,
+            allowed_hours: allowed_hours.to_vec(),
+        };
         return run_clob_1hz_backtest_from_files(
             script_path, symbol, from_date, to_date,
             initial_balance, fee_pct, workspace_dir, max_position_usd,
+            tick_gates,
         ).await;
     }
 
@@ -3293,6 +3365,12 @@ pub async fn run_backtest_engine(
         let script_for_log = script_content.clone();
         let sizing_mode_owned = sizing_mode.to_string();
         let price_mode_owned = price_mode.to_string();
+        let guardrails_owned = Some(BacktestGuardrails {
+            kelly_size_cap,
+            min_entry_price,
+            max_consecutive_losses,
+            stop_loss_pct,
+        });
         let hist_clone = historical_data.clone();
         let prev_hist_clone = prev_historical_data.clone();
         let allowed_hours_owned = allowed_hours.to_vec();
@@ -3300,7 +3378,7 @@ pub async fn run_backtest_engine(
         let no_spread_skip: std::collections::HashSet<i64> = std::collections::HashSet::new();
 
         return match tokio::task::spawn_blocking(move || {
-            run_polymarket_slug_backtest(script_content, candles, initial_balance, fee_pct, window_minutes, &rl, thr, max_position_usd, max_entry_price, &sizing_mode_owned, sizing_value, &price_mode_owned, hist_clone, prev_hist_clone, &allowed_hours_owned, &no_spread_skip, None)
+            run_polymarket_slug_backtest(script_content, candles, initial_balance, fee_pct, window_minutes, &rl, thr, max_position_usd, max_entry_price, &sizing_mode_owned, sizing_value, &price_mode_owned, hist_clone, prev_hist_clone, &allowed_hours_owned, &no_spread_skip, None, guardrails_owned)
         })
         .await
         {
@@ -4300,6 +4378,7 @@ pub fn run_polymarket_binary_on_candle_buffer(
         &[], // no hour gate when called from live runner buffer
         &std::collections::HashSet::new(), // no spread gate when called from live runner
         None, // no rv gate when called from live runner buffer
+        None, // no guardrails when called from live runner buffer
     )
     .unwrap_or_else(|e| BacktestMetrics {
         total_return_pct: 0.0, sharpe_ratio: 0.0, max_drawdown_pct: 0.0,
@@ -4390,6 +4469,46 @@ pub fn load_ticks_for_range(
 
 /// CLOB 1 HZ backtest: runs `on_tick(ctx)` for every recorded second of Polymarket CLOB data.
 ///
+/// Simulate a market-order fill against a 2-level approximated order book.
+/// Shared between the on_tick backtester and the live/dry-run tick runner so
+/// paper fills are computed identically in both paths (live-parity).
+///
+/// When `depth_usd > 0` (book data available):
+///   Level 1: best_ask,           capacity = depth_usd × 0.50
+///   Level 2: best_ask + spread,  capacity = depth_usd × 0.30
+///   Level 3: best_ask + 2×spread,capacity = depth_usd × 0.20
+///   Residual beyond the book fills at best_ask + 2×spread (conservative worst-case)
+/// When `depth_usd == 0`: fills entirely at best_ask (no slippage modeled).
+pub fn sim_fill_vwap(ask: f64, bid: f64, depth_usd: f64, stake_usd: f64) -> f64 {
+    if depth_usd <= 0.0 || stake_usd <= 0.0 {
+        return ask;
+    }
+    let spread = (ask - bid).max(0.0);
+    let levels: &[(f64, f64)] = &[
+        (ask,                depth_usd * 0.50),
+        (ask + spread,       depth_usd * 0.30),
+        (ask + spread * 2.0, depth_usd * 0.20),
+    ];
+    let mut remaining = stake_usd;
+    let mut total_cost = 0.0_f64;
+    let mut total_shares = 0.0_f64;
+    for &(price, level_usd) in levels {
+        if remaining <= 0.0 || price <= 0.0 || price >= 1.0 { break; }
+        let fill_usd = remaining.min(level_usd);
+        let shares = fill_usd / price;
+        total_cost   += fill_usd;
+        total_shares += shares;
+        remaining    -= fill_usd;
+    }
+    if remaining > 0.0 {
+        let worst = (ask + spread * 2.0).min(0.99);
+        let shares = remaining / worst;
+        total_cost   += remaining;
+        total_shares += shares;
+    }
+    if total_shares > 0.0 { total_cost / total_shares } else { ask }
+}
+
 /// Position mechanics:
 /// - `ctx.bet_yes(size)` / `ctx.bet_no(size)`: place a binary bet (size = fraction of balance).
 ///   Entry at the current ask price; only ONE open position per window allowed.
@@ -4402,6 +4521,7 @@ pub fn run_clob_1hz_backtest(
     initial_balance: f64,
     fee_pct: f64,
     max_position_usd: Option<f64>,
+    gates: TickGates,
 ) -> anyhow::Result<BacktestMetrics> {
     use rhai::{Dynamic, Engine, Map, Scope};
     use std::sync::{Arc, Mutex};
@@ -4432,6 +4552,8 @@ pub fn run_clob_1hz_backtest(
         kv:               std::collections::HashMap<String, f64>,
         pending_yes:      Option<f64>,  // size to bet YES (set by script)
         pending_no:       Option<f64>,  // size to bet NO
+        resolved_official: u32,  // trades settled via official window_yes_won
+        resolved_binance:  u32,  // trades settled via Binance price fallback
     }
 
     let sim = Arc::new(Mutex::new(Sim {
@@ -4445,6 +4567,8 @@ pub fn run_clob_1hz_backtest(
         kv: std::collections::HashMap::new(),
         pending_yes: None,
         pending_no: None,
+        resolved_official: 0,
+        resolved_binance: 0,
     }));
 
     let mut portfolio_values: Vec<f64> = vec![initial_balance];
@@ -4465,55 +4589,107 @@ pub fn run_clob_1hz_backtest(
         .map_err(|e| anyhow::anyhow!("Script compile error: {e}"))?;
 
     // Shared mutable scalars that closures read each tick (avoids re-creating closures)
-    let current_yes_ask = Arc::new(Mutex::new(0.0f64));
-    let current_no_ask  = Arc::new(Mutex::new(0.0f64));
-    let current_balance = Arc::new(Mutex::new(0.0f64));
-    let current_fee     = Arc::new(Mutex::new(fee_pct));
-    let max_pos_usd     = Arc::new(Mutex::new(max_position_usd.unwrap_or(f64::MAX)));
+    let current_yes_ask     = Arc::new(Mutex::new(0.0f64));
+    let current_no_ask      = Arc::new(Mutex::new(0.0f64));
+    let current_yes_bid     = Arc::new(Mutex::new(0.0f64));
+    let current_balance     = Arc::new(Mutex::new(0.0f64));
+    let current_fee         = Arc::new(Mutex::new(fee_pct));
+    let max_pos_usd         = Arc::new(Mutex::new(max_position_usd.unwrap_or(f64::MAX)));
+    let current_ask_depth   = Arc::new(Mutex::new(0.0f64)); // ask_depth_usd
+    let current_bid_depth   = Arc::new(Mutex::new(0.0f64)); // bid_depth_usd
+    let current_spread_pct  = Arc::new(Mutex::new(0.0f64)); // (yes_ask-yes_bid)*100 in ¢
+    let current_hour        = Arc::new(Mutex::new(0u8));     // UTC hour of current tick
+    // Gate config (shared into closures by value via Arc clone of immutable copy)
+    let gates_arc = Arc::new(gates);
+
+    // Gate helper: returns true if the bet should be SKIPPED given current market.
+    // Mirrors the live tick_runner_loop pending-order gates.
+    fn tick_gate_blocks(gates: &TickGates, entry_price: f64, spread_pct: f64, hour: u8) -> bool {
+        if let Some(max_sp) = gates.max_spread_pct {
+            if max_sp > 0.0 && spread_pct / 100.0 > max_sp { return true; }
+        }
+        if !gates.allowed_hours.is_empty() && !gates.allowed_hours.contains(&hour) { return true; }
+        if let Some(max_ep) = gates.max_entry_price {
+            if entry_price > max_ep { return true; }
+        }
+        if let Some(min_ep) = gates.min_entry_price {
+            if min_ep > 0.0 && entry_price < min_ep { return true; }
+        }
+        false
+    }
 
     // bet_yes_impl
     let sim_yes = sim.clone();
-    let yes_ask_ref = current_yes_ask.clone();
-    let balance_ref = current_balance.clone();
-    let fee_ref     = current_fee.clone();
-    let max_pos_ref = max_pos_usd.clone();
+    let yes_ask_ref   = current_yes_ask.clone();
+    let yes_bid_ref   = current_yes_bid.clone();
+    let ask_depth_ref = current_ask_depth.clone();
+    let balance_ref   = current_balance.clone();
+    let fee_ref       = current_fee.clone();
+    let max_pos_ref   = max_pos_usd.clone();
+    let spread_ref    = current_spread_pct.clone();
+    let hour_ref      = current_hour.clone();
+    let gates_yes     = gates_arc.clone();
     eng.register_fn("bet_yes_impl", move |size: f64| {
-        let ya  = *yes_ask_ref.lock().unwrap();
-        let bal = *balance_ref.lock().unwrap();
-        let f   = *fee_ref.lock().unwrap();
+        let ya    = *yes_ask_ref.lock().unwrap();
+        let yb    = *yes_bid_ref.lock().unwrap();
+        let depth = *ask_depth_ref.lock().unwrap();
+        let bal   = *balance_ref.lock().unwrap();
+        let f     = *fee_ref.lock().unwrap();
         let max_pos = *max_pos_ref.lock().unwrap();
+        let spread = *spread_ref.lock().unwrap();
+        let hour   = *hour_ref.lock().unwrap();
         let mut s = sim_yes.lock().unwrap();
         if s.position != 0 { return; }
         if ya < 0.03 || ya >= 1.0 { return; } // min 3¢ entry — prevent payout explosion
+        if tick_gate_blocks(&gates_yes, ya, spread, hour) { return; }
         let frac = size.clamp(0.0, 1.0);
         let stake_amt = (bal * frac * (1.0 - f / 100.0)).min(max_pos);
         if stake_amt <= 0.01 { return; }
+        let fill_price = sim_fill_vwap(ya, yb, depth, stake_amt);
         s.balance -= stake_amt;
         s.position = 1;
-        s.entry_price = ya;
+        s.entry_price = fill_price;
         s.stake = stake_amt;
     });
 
     // bet_no_impl
     let sim_no = sim.clone();
-    let no_ask_ref   = current_no_ask.clone();
-    let balance_ref2 = current_balance.clone();
-    let fee_ref2     = current_fee.clone();
-    let max_pos_ref2 = max_pos_usd.clone();
+    let no_ask_ref    = current_no_ask.clone();
+    let no_bid_ref_for_no = {
+        // NO bid ≈ 1 - YES ask; we track it via the no_ask field and yes_bid
+        // The no "bid" for depth approximation mirrors yes_bid → no_ask inversion.
+        // For the spread we use yes spread as proxy (symmetric binary market).
+        current_yes_ask.clone()
+    };
+    let bid_depth_ref = current_bid_depth.clone();
+    let balance_ref2  = current_balance.clone();
+    let fee_ref2      = current_fee.clone();
+    let max_pos_ref2  = max_pos_usd.clone();
+    let spread_ref2   = current_spread_pct.clone();
+    let hour_ref2     = current_hour.clone();
+    let gates_no      = gates_arc.clone();
     eng.register_fn("bet_no_impl", move |size: f64| {
-        let na  = *no_ask_ref.lock().unwrap();
-        let bal = *balance_ref2.lock().unwrap();
-        let f   = *fee_ref2.lock().unwrap();
+        let na    = *no_ask_ref.lock().unwrap();
+        // yes_ask proxies as no_bid for the spread calculation
+        let yes_ask_as_no_bid = *no_bid_ref_for_no.lock().unwrap();
+        let no_bid = (1.0 - yes_ask_as_no_bid).clamp(0.0, 1.0);
+        let depth = *bid_depth_ref.lock().unwrap();
+        let bal   = *balance_ref2.lock().unwrap();
+        let f     = *fee_ref2.lock().unwrap();
         let max_pos = *max_pos_ref2.lock().unwrap();
+        let spread = *spread_ref2.lock().unwrap();
+        let hour   = *hour_ref2.lock().unwrap();
         let mut s = sim_no.lock().unwrap();
         if s.position != 0 { return; }
         if na < 0.03 || na >= 1.0 { return; } // min 3¢ entry — prevent payout explosion
+        if tick_gate_blocks(&gates_no, na, spread, hour) { return; }
         let frac = size.clamp(0.0, 1.0);
         let stake_amt = (bal * frac * (1.0 - f / 100.0)).min(max_pos);
         if stake_amt <= 0.01 { return; }
+        let fill_price = sim_fill_vwap(na, no_bid, depth, stake_amt);
         s.balance -= stake_amt;
         s.position = -1;
-        s.entry_price = na;
+        s.entry_price = fill_price;
         s.stake = stake_amt;
     });
 
@@ -4541,11 +4717,19 @@ pub fn run_clob_1hz_backtest(
         {
             let mut s = sim.lock().unwrap();
             if tick.window_ts != s.current_window_ts && s.current_window_ts != 0 {
-                // window just closed — settle any open position using the previous tick's price
+                // window just closed — settle any open position using the previous tick's price.
+                // Use official Polymarket resolution (window_yes_won) when available;
+                // fall back to Binance price comparison only when not yet resolved.
                 if s.position != 0 && s.window_open_price > 0.0 {
                     let prev_close = if tick.binance_price > 0.0 { tick.binance_price }
                                      else { s.window_open_price };
-                    let yes_won = prev_close > s.window_open_price;
+                    let yes_won = if let Some(official) = tick.window_yes_won {
+                        s.resolved_official += 1;
+                        official // Use Polymarket's official Chainlink-based resolution
+                    } else {
+                        s.resolved_binance += 1;
+                        prev_close > s.window_open_price // Fallback: Binance price comparison
+                    };
                     let (won, side_label) = match s.position {
                         1  => (yes_won,  "bet_yes"),
                         -1 => (!yes_won, "bet_no"),
@@ -4581,7 +4765,11 @@ pub fn run_clob_1hz_backtest(
             if s.position != 0 {
                 let open_p  = s.window_open_price;
                 let close_p = tick.binance_price;
-                let yes_won = close_p > open_p;
+                // Prefer official Polymarket resolution; fall back to Binance price
+                let yes_won = match tick.window_yes_won {
+                    Some(official) => { s.resolved_official += 1; official }
+                    None => { s.resolved_binance += 1; close_p > open_p }
+                };
 
                 let (won, side_label) = match s.position {
                     1  => (yes_won,  "bet_yes"),
@@ -4641,9 +4829,18 @@ pub fn run_clob_1hz_backtest(
         };
 
         // Update shared scalars so pre-registered closures see current tick data
-        *current_yes_ask.lock().unwrap() = tick.yes_ask;
-        *current_no_ask.lock().unwrap()  = tick.no_ask;
-        *current_balance.lock().unwrap() = cur_balance;
+        *current_yes_ask.lock().unwrap()   = tick.yes_ask;
+        *current_yes_bid.lock().unwrap()   = tick.yes_bid;
+        *current_no_ask.lock().unwrap()    = tick.no_ask;
+        *current_balance.lock().unwrap()   = cur_balance;
+        *current_ask_depth.lock().unwrap() = tick.ask_depth_usd;
+        *current_bid_depth.lock().unwrap() = tick.bid_depth_usd;
+        *current_spread_pct.lock().unwrap() = spread_pct;
+        *current_hour.lock().unwrap() = {
+            use chrono::{TimeZone, Timelike, Utc};
+            Utc.timestamp_millis_opt(tick.ts_ms).single()
+                .map(|dt| dt.hour() as u8).unwrap_or(0)
+        };
 
         // Build ctx map and invoke pre-compiled on_tick
         let mut ctx_map = Map::new();
@@ -4661,6 +4858,15 @@ pub fn run_clob_1hz_backtest(
         ctx_map.insert("balance".into(),          Dynamic::from(cur_balance));
         ctx_map.insert("position".into(),         Dynamic::from(cur_position));
         ctx_map.insert("entry_price".into(),      Dynamic::from(cur_entry_price));
+        // Book-depth fields — 0 when not available (old tick files)
+        ctx_map.insert("ask_depth_usd".into(),    Dynamic::from(tick.ask_depth_usd));
+        ctx_map.insert("bid_depth_usd".into(),    Dynamic::from(tick.bid_depth_usd));
+        // Official Polymarket resolution: true=YES, false=NO, or () (unit) when unknown
+        ctx_map.insert("window_yes_won".into(), match tick.window_yes_won {
+            Some(true)  => Dynamic::from(true),
+            Some(false) => Dynamic::from(false),
+            None        => Dynamic::UNIT,
+        });
 
         let mut scope = Scope::new();
         if let Err(e) = eng.call_fn::<Dynamic>(&mut scope, &ast, "on_tick", (ctx_map,)) {
@@ -4705,6 +4911,8 @@ pub fn run_clob_1hz_backtest(
     let final_balance = s.balance;
     let trades = s.trades.clone();
     let kv_state = s.kv.clone();
+    let resolved_official = s.resolved_official;
+    let resolved_binance  = s.resolved_binance;
     drop(s);
 
     let total_return_pct = (final_balance / initial_balance - 1.0) * 100.0;
@@ -4758,17 +4966,39 @@ pub fn run_clob_1hz_backtest(
         0.0
     };
 
+    // Resolution-source breakdown — tells the user whether this backtest used the
+    // official Polymarket oracle (live-parity) or fell back to Binance price compare.
+    let total_resolved = resolved_official + resolved_binance;
+    let official_pct = if total_resolved > 0 {
+        resolved_official as f64 / total_resolved as f64 * 100.0
+    } else { 0.0 };
+    let resolution_note = if total_resolved == 0 {
+        String::new()
+    } else if resolved_binance == 0 {
+        "\nResolution: 100% official Polymarket oracle (full live-parity).".to_string()
+    } else if resolved_official == 0 {
+        "\n⚠ Resolution: 100% Binance fallback — NO official data. Run `backfill-resolutions` \
+         to attach window_yes_won for live-parity; results may differ from live.".to_string()
+    } else {
+        format!(
+            "\n⚠ Resolution: {:.0}% official Polymarket / {:.0}% Binance fallback. \
+             Run `backfill-resolutions` to reach full live-parity.",
+            official_pct, 100.0 - official_pct
+        )
+    };
+
     let analysis = format!(
         "CLOB 1 HZ backtest: {} ticks, {} trades. \
         Win rate {:.1}%, return {:.2}%, Sharpe {:.2}, max drawdown {:.2}%.\n\
         Strategy: on_tick() API — positions resolved each time window_secs_left = 0.\n\
-        P&L computed assuming $1 payout per YES/NO token at resolution.",
+        P&L computed assuming $1 payout per YES/NO token at resolution.{}",
         ticks.len(),
         total_trades,
         win_rate_pct,
         total_return_pct,
         sharpe,
         max_dd,
+        resolution_note,
     );
 
     Ok(BacktestMetrics {
@@ -4781,6 +5011,9 @@ pub fn run_clob_1hz_backtest(
         all_trades,
         analysis,
         kv_state,
+        // Reuse the real/estimated price fields to surface resolution-source counts.
+        windows_with_real_price: Some(resolved_official),
+        windows_with_estimated_price: Some(resolved_binance),
         ..Default::default()
     })
 }
@@ -5045,6 +5278,7 @@ pub async fn run_archive_candles_backtest(
             &allowed_hours_owned,
             &spread_skipped_owned,
             rv_min_btc,
+            None, // archive_candles: guardrails not propagated here (TODO)
         )
     }).await {
         Ok(Ok(mut m)) => {
@@ -5062,6 +5296,7 @@ pub async fn run_archive_candles_backtest(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_clob_1hz_backtest_from_files(
     script_path: &std::path::Path,
     slug: &str,
@@ -5071,6 +5306,7 @@ pub async fn run_clob_1hz_backtest_from_files(
     fee_pct: f64,
     workspace_dir: &std::path::Path,
     max_position_usd: Option<f64>,
+    gates: TickGates,
 ) -> BacktestMetrics {
     let script_content = match std::fs::read_to_string(script_path) {
         Ok(s) => s,
@@ -5093,7 +5329,7 @@ pub async fn run_clob_1hz_backtest_from_files(
     let fee = fee_pct;
     let max_pos = max_position_usd;
     match tokio::task::spawn_blocking(move || {
-        run_clob_1hz_backtest(&script_for_task, ticks, initial_bal, fee, max_pos)
+        run_clob_1hz_backtest(&script_for_task, ticks, initial_bal, fee, max_pos, gates)
     }).await {
         Ok(Ok(m))  => m,
         Ok(Err(e)) => BacktestMetrics {

@@ -2307,6 +2307,59 @@ pub async fn handle_api_polymarket_refresh_credentials(
     }
 }
 
+/// GET /api/polymarket/balance — returns the real USDC balance of the
+/// configured Polymarket wallet (Polygon RPC + CLOB API, takes the max).
+/// Used by the UI to pre-populate the Initial Balance field when switching
+/// a runner to live mode.
+pub async fn handle_api_polymarket_balance(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let creds = match get_poly_creds(&state) {
+        Some(c) if !c.api_key.is_empty() => c,
+        _ => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "Polymarket credentials not configured. Set api_key, secret, passphrase and wallet_address in Settings → Config."
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let client = std::sync::Arc::new(polymarket_trader::orders::ClobClient::new(creds.clone()));
+
+    let api_bal = client.get_api_balance().await.ok();
+    let rpc_bal = client.get_balance().await.ok();
+
+    let balance = match (api_bal, rpc_bal) {
+        (Some(a), Some(r)) => a.max(r),
+        (Some(a), None) => a,
+        (None, Some(r)) => r,
+        (None, None) => {
+            return (
+                axum::http::StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": "Could not fetch balance from Polymarket CLOB API or Polygon RPC. Check credentials and network."
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    Json(serde_json::json!({
+        "balance": balance,
+        "wallet_address": creds.wallet_address,
+        "currency": "USDC"
+    }))
+    .into_response()
+}
+
 // ── Polymarket orders / positions helpers ────────────────────────
 
 fn get_poly_creds(state: &AppState) -> Option<polymarket_trader::auth::PolyCredentials> {
@@ -3842,6 +3895,19 @@ pub struct BacktestRunBody {
     /// Merged over each engine's default config at runtime.
     #[serde(default)]
     pub engine_params: Option<serde_json::Value>,
+    // ── Guardrail parameters (mirrored from RunnerConfig) ─────────────────────
+    /// Maximum kelly multiplier applied to script kelly_size. Default 1.5.
+    #[serde(default)]
+    pub kelly_size_cap: Option<f64>,
+    /// Minimum entry price: skip bets when token ask < this value. Default 0.05.
+    #[serde(default)]
+    pub min_entry_price: Option<f64>,
+    /// Auto-stop after N consecutive losses in backtest simulation. 0 = disabled.
+    #[serde(default)]
+    pub max_consecutive_losses: Option<u32>,
+    /// Stop-loss per trade: exit early if token drops this fraction from entry.
+    #[serde(default)]
+    pub stop_loss_pct: Option<f64>,
 }
 
 fn default_market_type() -> String {
@@ -4033,6 +4099,10 @@ pub async fn handle_api_backtest_run(
         &body.allowed_hours,
         body.max_spread_pct,
         body.rv_min_btc,
+        body.kelly_size_cap,
+        body.min_entry_price,
+        body.max_consecutive_losses,
+        body.stop_loss_pct,
     )
     .await;
 
@@ -4750,6 +4820,8 @@ pub struct CreateRunnerBody {
     #[serde(default)]
     pub max_spread_pct: Option<f64>,
     #[serde(default)]
+    pub max_slippage_pct: Option<f64>,
+    #[serde(default)]
     pub allowed_hours: Option<Vec<u8>>,
     #[serde(default)]
     pub rv_min_btc: Option<f64>,
@@ -4785,6 +4857,18 @@ pub struct CreateRunnerBody {
     /// Per-engine tunable parameters from the UI EngineParamsForm.
     #[serde(default)]
     pub engine_params: Option<serde_json::Value>,
+    /// Maximum kelly multiplier (default 1.5). Prevents scripts from over-sizing bets.
+    #[serde(default)]
+    pub kelly_size_cap: Option<f64>,
+    /// Auto-stop when cumulative live P&L loss exceeds this % of initial_balance. 0 = disabled.
+    #[serde(default)]
+    pub max_runner_loss_pct: Option<f64>,
+    /// Auto-stop after N consecutive losses. 0 = disabled.
+    #[serde(default)]
+    pub max_consecutive_losses: Option<u32>,
+    /// Minimum entry price. Skip orders when token ask < this value. Default 0.05.
+    #[serde(default)]
+    pub min_entry_price: Option<f64>,
 }
 
 #[derive(serde::Deserialize)]
@@ -4802,12 +4886,30 @@ pub struct PatchRunnerBody {
     #[serde(default, deserialize_with = "nullable::deserialize")]
     pub max_spread_pct: Option<Option<f64>>,
     #[serde(default, deserialize_with = "nullable::deserialize")]
+    pub max_slippage_pct: Option<Option<f64>>,
+    #[serde(default, deserialize_with = "nullable::deserialize")]
     pub early_fire_secs: Option<Option<u32>>,
     /// UTC hours (0-23) where trading is allowed. Empty array = no restriction.
     pub allowed_hours: Option<Vec<u8>>,
     /// Minimum BTC RV-1h threshold; null/0 = disabled.
     #[serde(default, deserialize_with = "nullable::deserialize")]
     pub rv_min_btc: Option<Option<f64>>,
+    /// Maximum kelly multiplier override.
+    #[serde(default)]
+    pub kelly_size_cap: Option<f64>,
+    /// Auto-stop loss percentage (0 = disabled).
+    #[serde(default)]
+    pub max_runner_loss_pct: Option<f64>,
+    /// Auto-stop consecutive losses (0 = disabled).
+    #[serde(default)]
+    pub max_consecutive_losses: Option<u32>,
+    /// Minimum entry price (0 = disabled, use default 0.05).
+    #[serde(default)]
+    pub min_entry_price: Option<f64>,
+    /// Stop-loss per trade: exit early if token drops this fraction from entry.
+    /// null/0 = disabled.
+    #[serde(default, deserialize_with = "nullable::deserialize")]
+    pub stop_loss_pct: Option<Option<f64>>,
 }
 
 async fn hydrate_live_runtime_config(
@@ -5001,9 +5103,15 @@ pub async fn handle_api_live_patch(
         || body.max_entry_price.is_some()
         || body.price_mode.is_some()
         || body.max_spread_pct.is_some()
+        || body.max_slippage_pct.is_some()
+        || body.stop_loss_pct.is_some()
         || body.early_fire_secs.is_some()
         || body.allowed_hours.is_some()
         || body.rv_min_btc.is_some()
+        || body.kelly_size_cap.is_some()
+        || body.max_runner_loss_pct.is_some()
+        || body.max_consecutive_losses.is_some()
+        || body.min_entry_price.is_some()
     {
         let mode = body.live_sizing_mode.map(|m| match m.as_str() {
             "fixed" => crate::strategy_runner::LiveSizingMode::Fixed,
@@ -5018,7 +5126,13 @@ pub async fn handle_api_live_patch(
             body.rv_min_btc,
             body.price_mode,
             body.max_spread_pct,
+            body.max_slippage_pct,
             body.early_fire_secs,
+            body.kelly_size_cap,
+            body.max_runner_loss_pct,
+            body.max_consecutive_losses,
+            body.min_entry_price,
+            body.stop_loss_pct,
         ) {
             Some(runner) => return Json(serde_json::json!({ "runner": runner })).into_response(),
             None => return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "runner not found" }))).into_response(),
@@ -5145,8 +5259,13 @@ pub async fn handle_api_live_create(
         max_entry_price: body.max_entry_price,
         price_mode: body.price_mode,
         max_spread_pct: body.max_spread_pct,
+        max_slippage_pct: body.max_slippage_pct,
         allowed_hours: body.allowed_hours.unwrap_or_default(),
         rv_min_btc: body.rv_min_btc.filter(|&v| v > 0.0),
+        kelly_size_cap: body.kelly_size_cap.unwrap_or(1.5),
+        max_runner_loss_pct: body.max_runner_loss_pct.filter(|&v| v > 0.0),
+        max_consecutive_losses: body.max_consecutive_losses.filter(|&v| v > 0),
+        min_entry_price: body.min_entry_price.unwrap_or(0.05),
         hl_signer: None,
         risk_gate: state.trading_risk_gate.clone(),
         binance_creds: None,
@@ -5263,6 +5382,54 @@ pub async fn handle_api_live_restart(
         Some(cfg_path),
     );
     Json(serde_json::json!({ "runner": runner })).into_response()
+}
+
+/// POST /api/live/strategies/{id}/sync-onchain — reconcile untracked onchain
+/// transactions against the runner's live_orders log. Inserts any TRADE events
+/// from the last 48 h that are missing from the log as UNTRACKED records.
+pub async fn handle_api_live_sync_onchain(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+
+    // Need the wallet address — fall back to global polymarket config
+    let wallet = {
+        let gcfg = state.config.lock();
+        gcfg.polymarket.proxy_address.clone()
+            .unwrap_or_else(|| gcfg.polymarket.wallet_address.clone().unwrap_or_default())
+    };
+    // Verify runner exists
+    if state.strategy_runner.get(&id).is_none() {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error":"runner not found"}))).into_response();
+    }
+
+    if wallet.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"no wallet address found for this runner"}))).into_response();
+    }
+
+    crate::strategy_runner::reconcile_untracked_onchain_pub(
+        &state.strategy_runner,
+        &id,
+        &wallet,
+    ).await;
+
+    Json(serde_json::json!({"success": true, "wallet": wallet})).into_response()
+}
+
+/// POST /api/live/stop-all-live — emergency stop all running live-mode runners.
+pub async fn handle_api_live_stop_all(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+    let stopped = state.strategy_runner.stop_all_live();
+    Json(serde_json::json!({
+        "success": true,
+        "stopped_count": stopped.len(),
+        "stopped_ids": stopped,
+    })).into_response()
 }
 
 // ── Export / Import ──────────────────────────────────────────────────────────
@@ -6962,12 +7129,16 @@ pub struct TickRecorderStartBody {
     #[serde(default = "default_binance_symbol")]
     pub binance_symbol: String,
     pub chainlink_url: Option<String>,
+    /// Days of historical files to keep. Default 7. Pass 0 to DISABLE pruning entirely
+    /// — required when the directory contains regenerated historical ticks from
+    /// `to-ticks-multi` that must not be deleted.
+    pub retain_days: Option<u64>,
 }
 
 fn default_binance_symbol() -> String { "BTCUSDT".to_string() }
 
 /// POST /api/tick-recorder/start — start a 1-Hz CLOB tick recorder for a market.
-/// Body: { slug, condition_id, binance_symbol?, chainlink_url? }
+/// Body: { slug, condition_id, binance_symbol?, chainlink_url?, retain_days? }
 pub async fn handle_api_tick_recorder_start(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -6983,6 +7154,9 @@ pub async fn handle_api_tick_recorder_start(
         &workspace_dir,
     );
     cfg.chainlink_url = body.chainlink_url;
+    if let Some(rd) = body.retain_days {
+        cfg.retain_days = rd;
+    }
 
     crate::tick_recorder::start_recorder(cfg).await;
 

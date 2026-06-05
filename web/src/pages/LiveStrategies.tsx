@@ -55,8 +55,14 @@ interface RunnerConfig {
   early_fire_secs?: number | null
   max_entry_price?: number | null
   max_spread_pct?: number | null
+  max_slippage_pct?: number | null
   allowed_hours?: number[]
   rv_min_btc?: number | null
+  // Guardrails
+  kelly_size_cap?: number
+  max_runner_loss_pct?: number | null
+  max_consecutive_losses?: number | null
+  min_entry_price?: number
 }
 
 interface RunnerStatus {
@@ -827,8 +833,15 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript, prefil
     early_fire_secs: null as number | null,
     max_entry_price: 0.65 as number | null,
     max_spread_pct: 0.03 as number | null,
+    max_slippage_pct: 10 as number | null,
+    price_mode: 'historical' as string,
     allowed_hours: [] as number[],
     rv_min_btc: null as number | null,
+    // ── Guardrails (risk controls) ──
+    kelly_size_cap: 1.5 as number,
+    max_runner_loss_pct: 0.30 as number | null,
+    max_consecutive_losses: 8 as number | null,
+    min_entry_price: 0.10 as number,
     wallet_password: '',
     binance_api_key: '',
     binance_api_secret: '',
@@ -844,9 +857,43 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript, prefil
 
   const isRhaiTick = form.kind === 'rhai_tick'
   const isEngineKind = form.kind !== 'rhai_candle' && !isRhaiTick
+
+  // Guard against the React controlled-<select> trap: when `form.script` is
+  // '' (or doesn't match any rendered <option>), the browser shows the first
+  // item but no `change` event fires unless the user manually picks a
+  // different option. Auto-sync to the first visible option to keep the
+  // form value in lock-step with what the user actually sees.
+  useEffect(() => {
+    if (isEngineKind) return
+    const visible = scripts.filter(s => !isRhaiTick || s.path.includes('clob_1hz') || s.name.includes('clob_1hz'))
+    if (visible.length === 0) return
+    if (!form.script || !visible.some(s => s.path === form.script)) {
+      setForm(f => ({ ...f, script: visible[0].path }))
+    }
+  }, [isEngineKind, isRhaiTick, scripts, form.script])
+
   const [error, setError] = useState('')
   const [showMissingApiKeyModal, setShowMissingApiKeyModal] = useState(false)
   const [showMissingPrivateKeyModal, setShowMissingPrivateKeyModal] = useState(false)
+  const [balanceFetching, setBalanceFetching] = useState(false)
+  const [balanceFetchError, setBalanceFetchError] = useState('')
+
+  // When user switches to live mode, auto-fetch the real Polymarket wallet
+  // balance and pre-populate initial_balance so sizing is based on actual funds.
+  useEffect(() => {
+    if (form.mode !== 'live') return
+    setBalanceFetching(true)
+    setBalanceFetchError('')
+    apiFetch('/api/polymarket/balance')
+      .then((data: unknown) => {
+        const d = data as { balance?: number }
+        if (typeof d.balance === 'number' && d.balance > 0) {
+          setForm(f => ({ ...f, initial_balance: Math.floor(d.balance as number) }))
+        }
+      })
+      .catch((e: Error) => setBalanceFetchError(e.message ?? 'Could not fetch wallet balance'))
+      .finally(() => setBalanceFetching(false))
+  }, [form.mode])
 
   // Tick recorder fields (only relevant for polymarket_binary)
   const [tickRecord, setTickRecord] = useState(false)
@@ -1242,26 +1289,45 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript, prefil
             </div>
           )}
 
-          {/* Dry Run fields — hidden in live mode */}
-          {form.mode === 'paper' && (
-            <div className="grid grid-cols-3 gap-3">
-              <div>
-                <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>Initial Balance ($)</label>
-                <input type="number" className="w-full rounded px-3 py-2 text-sm" value={form.initial_balance}
-                  onChange={e => set('initial_balance', Number(e.target.value))} />
-              </div>
-              <div>
-                <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>Fee %</label>
-                <input type="number" step="0.01" className="w-full rounded px-3 py-2 text-sm" value={form.fee_pct}
-                  onChange={e => set('fee_pct', Number(e.target.value))} />
-              </div>
-              <div>
-                <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>Warmup Days</label>
-                <input type="number" className="w-full rounded px-3 py-2 text-sm" value={form.warmup_days}
-                  onChange={e => set('warmup_days', Number(e.target.value))} />
-              </div>
+          {/* Balance / warmup row — shown in both modes.
+              In live mode the balance is auto-fetched from the real wallet. */}
+          <div className="grid grid-cols-3 gap-3">
+            <div>
+              <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>
+                {form.mode === 'live' ? 'Wallet Balance ($)' : 'Initial Balance ($)'}
+                {balanceFetching && (
+                  <span className="ml-1 text-xs opacity-60">fetching…</span>
+                )}
+              </label>
+              <input
+                type="number"
+                className="w-full rounded px-3 py-2 text-sm"
+                value={form.initial_balance}
+                readOnly={form.mode === 'live' && balanceFetching}
+                onChange={e => set('initial_balance', Number(e.target.value))}
+              />
+              {form.mode === 'live' && balanceFetchError && (
+                <p className="text-xs mt-1" style={{ color: 'var(--color-danger)' }}>{balanceFetchError}</p>
+              )}
+              {form.mode === 'live' && !balanceFetching && !balanceFetchError && form.initial_balance > 0 && (
+                <p className="text-xs mt-1 opacity-60">Live wallet balance — used for order sizing</p>
+              )}
             </div>
-          )}
+            {form.mode === 'paper' && (
+              <>
+                <div>
+                  <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>Fee %</label>
+                  <input type="number" step="0.01" className="w-full rounded px-3 py-2 text-sm" value={form.fee_pct}
+                    onChange={e => set('fee_pct', Number(e.target.value))} />
+                </div>
+                <div>
+                  <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>Warmup Days</label>
+                  <input type="number" className="w-full rounded px-3 py-2 text-sm" value={form.warmup_days}
+                    onChange={e => set('warmup_days', Number(e.target.value))} />
+                </div>
+              </>
+            )}
+          </div>
 
           {/* Live sizing config — shown for all market types */}
           <div className="grid grid-cols-2 gap-3">
@@ -1535,6 +1601,130 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript, prefil
                   ? `Skip windows when yes+no mids deviate >${(form.max_spread_pct * 100).toFixed(2)}% from 1.0 (type percentage: e.g. "2" = 2%) — avoids paper-fill optimism in wide books`
                   : 'Disabled — trades regardless of spread width'}
               </p>
+            </div>
+          )}
+
+          {/* Price Mode — how entry price is recorded for P&L */}
+          {form.market_type === 'polymarket_binary' && (
+            <div>
+              <label className="block text-[11px] font-medium mb-1" style={{ color: 'var(--color-text-muted)' }}>
+                Price Mode
+              </label>
+              <select
+                className="w-full rounded border px-2 py-1 text-xs"
+                style={{ background: 'var(--color-surface-2)', borderColor: 'var(--color-border)', color: 'var(--color-text)' }}
+                value={form.price_mode}
+                onChange={e => set('price_mode', e.target.value)}
+              >
+                <option value="historical">Historical — real CLOB ask price (recommended)</option>
+                <option value="mid">Mid-price — (bid+ask)/2, more optimistic</option>
+              </select>
+              <p className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
+                {form.price_mode === 'mid'
+                  ? 'Mid-price is cheaper than what you\'d actually pay — use only when comparing to BT calibrated on mid'
+                  : 'Historical uses the real CLOB ask price, matching actual live execution cost'}
+              </p>
+            </div>
+          )}
+
+          {/* Slippage Cap (live mode only — controls worst_price on market orders) */}
+          {form.market_type === 'polymarket_binary' && form.mode === 'live' && (
+            <div>
+              <label className="block text-[11px] font-medium mb-1" style={{ color: 'var(--color-text-muted)' }}>
+                Max Slippage (live orders)
+              </label>
+              <div className="flex items-center gap-2">
+                <input
+                  type="number"
+                  className="w-20 rounded border px-2 py-1 text-xs"
+                  style={{ background: 'var(--color-surface-2)', borderColor: 'var(--color-border)', color: 'var(--color-text)' }}
+                  placeholder="10"
+                  min={1}
+                  max={50}
+                  step={1}
+                  value={form.max_slippage_pct != null ? form.max_slippage_pct : ''}
+                  onChange={e => set('max_slippage_pct', e.target.value === '' ? null : Number(e.target.value))}
+                />
+                <span className="text-[11px]" style={{ color: 'var(--color-text-muted)' }}>%</span>
+              </div>
+              <p className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
+                {form.max_slippage_pct != null
+                  ? `Market orders rejected if fill price > mid × ${(1 + form.max_slippage_pct / 100).toFixed(2)}× — retries up to 3× then skips`
+                  : 'Using default 10%'}
+              </p>
+            </div>
+          )}
+
+          {/* ── Guardrails (risk controls — Polymarket Binary) ───────────── */}
+          {form.market_type === 'polymarket_binary' && (
+            <div className="rounded border p-3" style={{ borderColor: 'var(--color-warning)', backgroundColor: 'rgba(245,158,11,0.05)' }}>
+              <div className="text-[11px] font-semibold mb-2" style={{ color: 'var(--color-warning)' }}>
+                🛡 Guardrails (risk controls)
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                {/* Min Entry ¢ */}
+                <div>
+                  <label className="block text-[10px] mb-1" style={{ color: 'var(--color-text-muted)' }}>Min Entry (¢)</label>
+                  <input
+                    type="number" min={1} max={50} step={1} placeholder="10"
+                    className="w-full rounded border px-2 py-1 text-xs"
+                    style={{ background: 'var(--color-surface-2)', borderColor: 'var(--color-border)', color: 'var(--color-text)' }}
+                    value={form.min_entry_price != null ? Math.round(form.min_entry_price * 100) : ''}
+                    onChange={e => { const v = Number(e.target.value); if (!Number.isNaN(v) && v > 0) set('min_entry_price', v / 100) }}
+                  />
+                  <p className="text-[9px] mt-0.5" style={{ color: 'var(--color-text-muted)' }}>Skip bets &lt; this — blocks long-shots</p>
+                </div>
+                {/* Max Loss % */}
+                <div>
+                  <label className="block text-[10px] mb-1" style={{ color: 'var(--color-text-muted)' }}>Max Loss (%)</label>
+                  <div className="flex items-center gap-1.5">
+                    <input
+                      type="number" min={5} max={100} step={5} placeholder="off"
+                      className="w-full rounded border px-2 py-1 text-xs"
+                      style={{ background: 'var(--color-surface-2)', borderColor: 'var(--color-border)', color: 'var(--color-text)' }}
+                      value={form.max_runner_loss_pct != null ? Math.round(form.max_runner_loss_pct * 100) : ''}
+                      onChange={e => { const raw = e.target.value; if (raw === '') set('max_runner_loss_pct', null); else { const v = Number(raw); if (!Number.isNaN(v)) set('max_runner_loss_pct', v / 100) } }}
+                    />
+                    <SegmentedToggle
+                      value={form.max_runner_loss_pct != null}
+                      onChange={v => set('max_runner_loss_pct', v ? 0.30 : null)}
+                      leftLabel="Off" rightLabel="On" activeColor="#f87171"
+                    />
+                  </div>
+                  <p className="text-[9px] mt-0.5" style={{ color: 'var(--color-text-muted)' }}>Auto-stop + switch to paper</p>
+                </div>
+                {/* Max Consecutive Losses */}
+                <div>
+                  <label className="block text-[10px] mb-1" style={{ color: 'var(--color-text-muted)' }}>Max Loss Streak</label>
+                  <div className="flex items-center gap-1.5">
+                    <input
+                      type="number" min={3} max={50} step={1} placeholder="off"
+                      className="w-full rounded border px-2 py-1 text-xs"
+                      style={{ background: 'var(--color-surface-2)', borderColor: 'var(--color-border)', color: 'var(--color-text)' }}
+                      value={form.max_consecutive_losses != null ? form.max_consecutive_losses : ''}
+                      onChange={e => { const raw = e.target.value; if (raw === '') set('max_consecutive_losses', null); else { const v = parseInt(raw, 10); if (!Number.isNaN(v)) set('max_consecutive_losses', v) } }}
+                    />
+                    <SegmentedToggle
+                      value={form.max_consecutive_losses != null}
+                      onChange={v => set('max_consecutive_losses', v ? 8 : null)}
+                      leftLabel="Off" rightLabel="On" activeColor="#f87171"
+                    />
+                  </div>
+                  <p className="text-[9px] mt-0.5" style={{ color: 'var(--color-text-muted)' }}>Auto-stop after N losses</p>
+                </div>
+                {/* Kelly Cap */}
+                <div>
+                  <label className="block text-[10px] mb-1" style={{ color: 'var(--color-text-muted)' }}>Kelly Cap (×)</label>
+                  <input
+                    type="number" min={1.0} max={3.0} step={0.1} placeholder="1.5"
+                    className="w-full rounded border px-2 py-1 text-xs"
+                    style={{ background: 'var(--color-surface-2)', borderColor: 'var(--color-border)', color: 'var(--color-text)' }}
+                    value={form.kelly_size_cap ?? 1.5}
+                    onChange={e => { const v = Number(e.target.value); if (!Number.isNaN(v)) set('kelly_size_cap', v) }}
+                  />
+                  <p className="text-[9px] mt-0.5" style={{ color: 'var(--color-text-muted)' }}>Caps script kelly_size mult</p>
+                </div>
+              </div>
             </div>
           )}
 
@@ -2182,7 +2372,7 @@ interface RunnerCardProps {
   onRestart: () => void
   onDelete: () => void
   onToggleHidden: () => void
-  onUpdateConfig?: (updates: { live_sizing_mode?: string; live_sizing_value?: number; max_entry_price?: number | null; max_spread_pct?: number | null; early_fire_secs?: number | null; allowed_hours?: number[]; rv_min_btc?: number | null }) => void
+  onUpdateConfig?: (updates: { live_sizing_mode?: string; live_sizing_value?: number; max_entry_price?: number | null; max_spread_pct?: number | null; max_slippage_pct?: number | null; price_mode?: string; stop_loss_pct?: number | null; early_fire_secs?: number | null; allowed_hours?: number[]; rv_min_btc?: number | null; kelly_size_cap?: number; max_runner_loss_pct?: number | null; max_consecutive_losses?: number | null; min_entry_price?: number }) => void
   isPatching?: boolean
   onUpgradeToLive?: () => void
 }
@@ -2252,6 +2442,11 @@ function RunnerCard({ runner, onStop, onRestart, onDelete, onToggleHidden, onUpd
   const [tickConditionId, setTickConditionId] = useState('')
   const [tickDetecting, setTickDetecting] = useState(false)
   const [tickDetectError, setTickDetectError] = useState('')
+
+  // Onchain sync
+  const syncOnchainMutation = useMutation({
+    mutationFn: () => apiPost(`/api/live/strategies/${config.id}/sync-onchain`, {}),
+  })
 
   function autoDetectConditionId(seriesId: string) {
     if (!seriesId) return
@@ -2409,6 +2604,18 @@ function RunnerCard({ runner, onStop, onRestart, onDelete, onToggleHidden, onUpd
             >
               <Activity size={11} className={isRecording ? 'animate-pulse' : ''} />
               {isRecording ? 'Recording' : 'Record'}
+            </button>
+          )}
+          {config.mode === 'live' && (
+            <button
+              onClick={() => syncOnchainMutation.mutate()}
+              disabled={syncOnchainMutation.isPending}
+              title="Sync untracked onchain transactions into runner log"
+              className="flex items-center gap-1 px-2 py-1 rounded text-[10px] font-semibold disabled:opacity-50 transition-opacity"
+              style={{ backgroundColor: 'rgba(34,197,94,0.12)', color: 'var(--color-accent)' }}
+            >
+              <RefreshCw size={11} className={syncOnchainMutation.isPending ? 'animate-spin' : ''} />
+              {syncOnchainMutation.isPending ? 'Syncing…' : 'Sync'}
             </button>
           )}
           {config.mode === 'paper' && onUpgradeToLive && (
@@ -2599,6 +2806,53 @@ function RunnerCard({ runner, onStop, onRestart, onDelete, onToggleHidden, onUpd
               disabled={isPatching}
             />
           </div>
+          {/* Price Mode — affects entry price used for P&L accounting */}
+          {config.market_type === 'polymarket_binary' && (
+            <div className="flex items-center gap-3 text-xs mt-2">
+              <span style={{ color: 'var(--color-text-muted)' }} className="font-medium w-24 shrink-0">Price Mode:</span>
+              <select
+                className="rounded border px-1.5 py-0.5 text-xs"
+                style={{ background: 'var(--color-surface-2)', borderColor: 'var(--color-border)', color: 'var(--color-text)' }}
+                value={(config as any).price_mode ?? 'historical'}
+                onChange={e => onUpdateConfig({ price_mode: e.target.value })}
+                disabled={isPatching}
+              >
+                <option value="historical">Historical (real CLOB ask)</option>
+                <option value="mid">Mid-price (bid+ask)/2</option>
+              </select>
+              <span className="text-[10px]" style={{ color: 'var(--color-text-muted)' }}>
+                historical = real fill cost from CLOB, mid = optimistic mid-price
+              </span>
+            </div>
+          )}
+          {/* Stop Loss per trade */}
+          {config.market_type === 'polymarket_binary' && config.mode === 'live' && (
+            <div className="flex items-center gap-3 text-xs mt-2">
+              <span style={{ color: 'var(--color-text-muted)' }} className="font-medium w-24 shrink-0">Stop Loss:</span>
+              <input
+                type="number"
+                className="w-16 rounded border px-1.5 py-0.5 text-xs"
+                style={{ background: 'var(--color-surface-2)', borderColor: 'var(--color-border)', color: 'var(--color-text)' }}
+                min={10} max={90} step={5} placeholder="40"
+                value={config.stop_loss_pct != null ? Math.round(config.stop_loss_pct * 100) : ''}
+                onChange={e => {
+                  const raw = e.target.value
+                  if (raw === '') onUpdateConfig({ stop_loss_pct: null })
+                  else { const val = Number(raw); if (!Number.isNaN(val)) onUpdateConfig({ stop_loss_pct: val / 100 }) }
+                }}
+                disabled={isPatching}
+              />
+              <span style={{ color: 'var(--color-text-muted)' }}>%</span>
+              <SegmentedToggle
+                value={config.stop_loss_pct != null}
+                onChange={v => onUpdateConfig({ stop_loss_pct: v ? 0.40 : null })}
+                leftLabel="Off" rightLabel="On" activeColor="#f87171" disabled={isPatching}
+              />
+              <span className="text-[10px]" style={{ color: 'var(--color-text-muted)' }}>
+                {config.stop_loss_pct != null ? `Exit early if token drops ${Math.round(config.stop_loss_pct * 100)}% from entry` : 'Disabled'}
+              </span>
+            </div>
+          )}
           {config.market_type === 'polymarket_binary' && (
             <div className="flex items-center gap-3 text-xs mt-2">
               <span style={{ color: 'var(--color-text-muted)' }} className="font-medium">Max Spread:</span>
@@ -2717,6 +2971,106 @@ function RunnerCard({ runner, onStop, onRestart, onDelete, onToggleHidden, onUpd
               </div>
             </div>
           )}
+          {/* ── Guardrails (live mode — polymarket binary) ─────────────────── */}
+          {config.market_type === 'polymarket_binary' && config.mode === 'live' && (
+            <div className="mt-3 pt-2 border-t" style={{ borderColor: 'var(--color-border)' }}>
+              <span className="text-[11px] font-semibold block mb-2" style={{ color: 'var(--color-warning)' }}>Guardrails</span>
+              <div className="flex flex-col gap-2">
+                {/* Max Runner Loss % */}
+                <div className="flex items-center gap-3 text-xs">
+                  <span style={{ color: 'var(--color-text-muted)' }} className="font-medium w-28 shrink-0">Max Loss %:</span>
+                  <input
+                    type="number" className="w-16 rounded border px-1.5 py-0.5 text-xs"
+                    style={{ background: 'var(--color-surface-2)', borderColor: 'var(--color-border)', color: 'var(--color-text)' }}
+                    min={5} max={100} step={5} placeholder="40"
+                    value={config.max_runner_loss_pct != null ? Math.round(config.max_runner_loss_pct * 100) : ''}
+                    onChange={e => {
+                      const raw = e.target.value
+                      if (raw === '') onUpdateConfig({ max_runner_loss_pct: null })
+                      else { const val = Number(raw); if (!Number.isNaN(val)) onUpdateConfig({ max_runner_loss_pct: val / 100 }) }
+                    }}
+                    disabled={isPatching}
+                  />
+                  <span style={{ color: 'var(--color-text-muted)' }}>%</span>
+                  <SegmentedToggle
+                    value={config.max_runner_loss_pct != null}
+                    onChange={v => onUpdateConfig({ max_runner_loss_pct: v ? 0.40 : null })}
+                    leftLabel="Off" rightLabel="On" activeColor="#f87171" disabled={isPatching}
+                  />
+                  <span className="text-[10px]" style={{ color: 'var(--color-text-muted)' }}>
+                    {config.max_runner_loss_pct != null
+                      ? `Auto-stop if down ${Math.round(config.max_runner_loss_pct * 100)}% from initial_balance`
+                      : 'Disabled'}
+                  </span>
+                </div>
+                {/* Max Consecutive Losses */}
+                <div className="flex items-center gap-3 text-xs">
+                  <span style={{ color: 'var(--color-text-muted)' }} className="font-medium w-28 shrink-0">Max Streak:</span>
+                  <input
+                    type="number" className="w-16 rounded border px-1.5 py-0.5 text-xs"
+                    style={{ background: 'var(--color-surface-2)', borderColor: 'var(--color-border)', color: 'var(--color-text)' }}
+                    min={3} max={50} step={1} placeholder="8"
+                    value={config.max_consecutive_losses != null ? config.max_consecutive_losses : ''}
+                    onChange={e => {
+                      const raw = e.target.value
+                      if (raw === '') onUpdateConfig({ max_consecutive_losses: null })
+                      else { const val = parseInt(raw, 10); if (!Number.isNaN(val)) onUpdateConfig({ max_consecutive_losses: val }) }
+                    }}
+                    disabled={isPatching}
+                  />
+                  <span style={{ color: 'var(--color-text-muted)' }}>losses</span>
+                  <SegmentedToggle
+                    value={config.max_consecutive_losses != null}
+                    onChange={v => onUpdateConfig({ max_consecutive_losses: v ? 8 : null })}
+                    leftLabel="Off" rightLabel="On" activeColor="#f87171" disabled={isPatching}
+                  />
+                  <span className="text-[10px]" style={{ color: 'var(--color-text-muted)' }}>
+                    {config.max_consecutive_losses != null
+                      ? `Auto-stop after ${config.max_consecutive_losses} consecutive losses`
+                      : 'Disabled'}
+                  </span>
+                </div>
+                {/* Min Entry Price */}
+                <div className="flex items-center gap-3 text-xs">
+                  <span style={{ color: 'var(--color-text-muted)' }} className="font-medium w-28 shrink-0">Min Entry ¢:</span>
+                  <input
+                    type="number" className="w-16 rounded border px-1.5 py-0.5 text-xs"
+                    style={{ background: 'var(--color-surface-2)', borderColor: 'var(--color-border)', color: 'var(--color-text)' }}
+                    min={1} max={50} step={1} placeholder="5"
+                    value={config.min_entry_price != null ? Math.round(config.min_entry_price * 100) : ''}
+                    onChange={e => {
+                      const val = Number(e.target.value)
+                      if (!Number.isNaN(val) && val > 0) onUpdateConfig({ min_entry_price: val / 100 })
+                    }}
+                    disabled={isPatching}
+                  />
+                  <span style={{ color: 'var(--color-text-muted)' }}>¢</span>
+                  <span className="text-[10px]" style={{ color: 'var(--color-text-muted)' }}>
+                    Skip bets when token price &lt; this (default 5¢ = blocks extreme long-shots)
+                  </span>
+                </div>
+                {/* Kelly Cap */}
+                <div className="flex items-center gap-3 text-xs">
+                  <span style={{ color: 'var(--color-text-muted)' }} className="font-medium w-28 shrink-0">Kelly Cap:</span>
+                  <input
+                    type="number" className="w-16 rounded border px-1.5 py-0.5 text-xs"
+                    style={{ background: 'var(--color-surface-2)', borderColor: 'var(--color-border)', color: 'var(--color-text)' }}
+                    min={1.0} max={3.0} step={0.1} placeholder="1.5"
+                    value={config.kelly_size_cap ?? 1.5}
+                    onChange={e => {
+                      const val = Number(e.target.value)
+                      if (!Number.isNaN(val)) onUpdateConfig({ kelly_size_cap: val })
+                    }}
+                    disabled={isPatching}
+                  />
+                  <span className="text-[10px]" style={{ color: 'var(--color-text-muted)' }}>
+                    × max kelly multiplier (default 1.5 — prevents BNB-style 6× bet explosions)
+                  </span>
+                </div>
+              </div>
+            </div>
+          )}
+
           {/* RV Min */}
           {config.market_type === 'polymarket_binary' && (
             <div className="flex items-center gap-3 text-xs mt-2">
@@ -2900,6 +3254,61 @@ function RunnerCard({ runner, onStop, onRestart, onDelete, onToggleHidden, onUpd
               </span>
             </div>
             <LiveEquityChart trades={liveOrdersToTrades(result.live_orders, startBalance)} initialBalance={startBalance} />
+          </div>
+        )
+      })()}
+
+      {/* Onchain vs Simulado discrepancy widget — live mode only */}
+      {config.mode === 'live' && config.market_type === 'polymarket_binary' && result?.live_orders && (() => {
+        const simPnl = result.live_orders.reduce((s, o) => s + (o.pnl ?? 0), 0)
+        const walletBal = result.wallet_balance_usdc
+        const initBal = config.initial_balance
+        // Estimated onchain balance = initial wallet funding - simulated losses (rough proxy)
+        const simBalance = initBal + simPnl
+        const hasWallet = typeof walletBal === 'number'
+        const discrepancy = hasWallet ? (walletBal - simBalance) : null
+        const discrepancyAbs = discrepancy !== null ? Math.abs(discrepancy) : 0
+        const showDiscrepancy = discrepancyAbs > 5  // Only show if > $5 diff
+        const untrackedCount = result.live_orders.filter(o => o.result === 'UNTRACKED').length
+
+        return (
+          <div className="mx-4 mb-3 rounded border overflow-hidden" style={{ borderColor: showDiscrepancy ? 'rgba(239,68,68,0.4)' : 'var(--color-border)' }}>
+            <div className="px-3 py-2 text-xs flex items-center justify-between gap-3 flex-wrap"
+              style={{ backgroundColor: showDiscrepancy ? 'rgba(239,68,68,0.06)' : 'var(--color-base)' }}>
+              <span className="font-semibold flex items-center gap-1.5" style={{ color: showDiscrepancy ? 'var(--color-danger)' : 'var(--color-text-muted)' }}>
+                <Activity size={11} />
+                Onchain vs Simulado
+              </span>
+              <div className="flex items-center gap-4 flex-wrap">
+                <span style={{ color: 'var(--color-text-muted)' }}>
+                  Sim P&L: <strong style={{ color: simPnl >= 0 ? 'var(--color-accent)' : 'var(--color-danger)' }}>{simPnl >= 0 ? '+' : ''}{simPnl.toFixed(2)} USDC</strong>
+                </span>
+                {hasWallet && (
+                  <span style={{ color: 'var(--color-text-muted)' }}>
+                    Wallet real: <strong style={{ color: walletBal! >= initBal * 0.5 ? 'var(--color-text)' : 'var(--color-danger)' }}>${walletBal!.toFixed(2)}</strong>
+                  </span>
+                )}
+                {showDiscrepancy && discrepancy !== null && (
+                  <span className="font-semibold" style={{ color: 'var(--color-danger)' }}>
+                    ⚠ Discrepancia: {discrepancy > 0 ? '+' : ''}{discrepancy.toFixed(2)} USDC
+                  </span>
+                )}
+                {untrackedCount > 0 && (
+                  <span className="px-1.5 py-0.5 rounded text-[10px]" style={{ backgroundColor: 'rgba(245,158,11,0.15)', color: 'var(--color-warning)' }}>
+                    {untrackedCount} tx sin rastrear
+                  </span>
+                )}
+              </div>
+              <button
+                onClick={() => syncOnchainMutation.mutate()}
+                disabled={syncOnchainMutation.isPending}
+                className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-semibold disabled:opacity-50"
+                style={{ backgroundColor: 'rgba(34,197,94,0.12)', color: 'var(--color-accent)' }}
+              >
+                <RefreshCw size={9} className={syncOnchainMutation.isPending ? 'animate-spin' : ''} />
+                {syncOnchainMutation.isPending ? 'Syncing…' : 'Sync Onchain'}
+              </button>
+            </div>
           </div>
         )
       })()}
@@ -3331,6 +3740,20 @@ export default function LiveStrategies() {
               </div>
             )}
           </div>
+          {liveRunning > 0 && (
+            <button
+              onClick={() => {
+                if (!confirm(`Stop ALL ${liveRunning} live runner(s) now? This is an emergency action.`)) return
+                apiPost('/api/live/stop-all-live', {}).then(() => refetch())
+              }}
+              className="flex items-center gap-1 px-2 h-[34px] rounded text-xs font-semibold border"
+              style={{ borderColor: 'var(--color-danger)', color: 'var(--color-danger)', backgroundColor: 'rgba(239,68,68,0.08)' }}
+              title="Emergency: stop all live runners immediately"
+            >
+              <StopCircle size={12} />
+              Stop All Live
+            </button>
+          )}
           <button onClick={() => refetch()}
             className="p-2 rounded border hover:bg-white/5 h-[34px] flex items-center justify-center"
             style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-muted)' }}>

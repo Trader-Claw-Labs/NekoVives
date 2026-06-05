@@ -13,6 +13,31 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 use tokio::task::AbortHandle;
 
+// ── Per-series order serialization (P3B) ─────────────────────────────────────
+// One semaphore per series_id ensures parallel runners on the same series
+// cannot overlap order submission, preventing book impact from concurrent fills.
+
+static ORDER_QUEUES: std::sync::OnceLock<Arc<Mutex<std::collections::HashMap<String, Arc<tokio::sync::Semaphore>>>>> = std::sync::OnceLock::new();
+
+fn get_series_semaphore(series_id: &str) -> Arc<tokio::sync::Semaphore> {
+    let queues = ORDER_QUEUES.get_or_init(|| {
+        Arc::new(Mutex::new(std::collections::HashMap::new()))
+    });
+    let mut map = queues.lock().unwrap();
+    map.entry(series_id.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(1)))
+        .clone()
+}
+
+// ── Global CLOB API rate limiter (P3C) ───────────────────────────────────────
+// Cap concurrent CLOB API calls at 5 to avoid 429 / rate-limit errors.
+
+static CLOB_RATE_LIMIT: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+
+fn clob_semaphore() -> Arc<tokio::sync::Semaphore> {
+    CLOB_RATE_LIMIT.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(5))).clone()
+}
+
 // ── Types ────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -96,6 +121,27 @@ pub struct RunnerConfig {
     /// like 1.0 to disable the gate entirely.
     #[serde(default)]
     pub max_spread_pct: Option<f64>,
+    /// Maximum slippage % accepted for live market orders.
+    /// worst_price = mid * (1 + max_slippage_pct / 100).
+    /// If the order can only fill above this ceiling, the CLOB rejects it.
+    /// Default 10.0 (10%). Set lower to be stricter; set higher for thin books.
+    #[serde(default)]
+    pub max_slippage_pct: Option<f64>,
+    /// Maximum kelly multiplier. Prevents scripts from scaling bets beyond this
+    /// multiple of the base stake. Default 1.5 (50% above base). Was hardcoded 2.0.
+    #[serde(default = "default_kelly_cap")]
+    pub kelly_size_cap: f64,
+    /// Auto-stop when cumulative live P&L loss exceeds this % of initial_balance.
+    /// E.g. 0.40 = stop when down 40%. Default disabled (0.0).
+    #[serde(default)]
+    pub max_runner_loss_pct: Option<f64>,
+    /// Auto-stop after N consecutive losses without a win. Default disabled (0).
+    #[serde(default)]
+    pub max_consecutive_losses: Option<u32>,
+    /// Minimum entry price (token ask price). Skip orders when ep < this value.
+    /// Prevents extreme long-shot bets at 3-5% probability. Default 0.05.
+    #[serde(default = "default_min_entry_price")]
+    pub min_entry_price: f64,
     /// Allowed UTC hours (0-23). When set, the runner skips decision windows
     /// whose hour is NOT in this list. Empirically, hours 01/03/04/07/08/14/17/20
     /// (UTC) show ~34% WR vs 56% for the best hours. Empty vec = no restriction.
@@ -270,6 +316,8 @@ pub struct StrategyRunnerStore {
 
 fn default_auto_restart() -> bool { true }
 fn default_chainlink_interval() -> u64 { 5 }
+fn default_kelly_cap() -> f64 { 1.5 }
+fn default_min_entry_price() -> f64 { 0.05 }
 
 fn default_funding_watchlist() -> Vec<String> {
     vec!["BTC".into(), "ETH".into(), "SOL".into(), "AVAX".into()]
@@ -364,7 +412,13 @@ impl StrategyRunnerStore {
         rv_min_btc: Option<Option<f64>>,
         price_mode: Option<String>,
         max_spread_pct: Option<Option<f64>>,
+        max_slippage_pct: Option<Option<f64>>,
         early_fire_secs: Option<Option<u32>>,
+        kelly_size_cap: Option<f64>,
+        max_runner_loss_pct: Option<f64>,
+        max_consecutive_losses: Option<u32>,
+        min_entry_price: Option<f64>,
+        stop_loss_pct: Option<Option<f64>>,
     ) -> Option<StoredRunner> {
         let mut map = self.runners.lock().unwrap();
         let updated = map.get_mut(id).map(|r| {
@@ -383,6 +437,9 @@ impl StrategyRunnerStore {
             if let Some(maybe) = max_spread_pct {
                 r.config.max_spread_pct = maybe;
             }
+            if let Some(maybe) = max_slippage_pct {
+                r.config.max_slippage_pct = maybe;
+            }
             if let Some(maybe) = early_fire_secs {
                 r.config.early_fire_secs = maybe;
             }
@@ -391,6 +448,21 @@ impl StrategyRunnerStore {
             }
             if let Some(maybe) = rv_min_btc {
                 r.config.rv_min_btc = maybe;
+            }
+            if let Some(cap) = kelly_size_cap {
+                r.config.kelly_size_cap = cap;
+            }
+            if let Some(loss_pct) = max_runner_loss_pct {
+                r.config.max_runner_loss_pct = if loss_pct > 0.0 { Some(loss_pct) } else { None };
+            }
+            if let Some(streak) = max_consecutive_losses {
+                r.config.max_consecutive_losses = if streak > 0 { Some(streak) } else { None };
+            }
+            if let Some(min_ep) = min_entry_price {
+                r.config.min_entry_price = min_ep;
+            }
+            if let Some(maybe_sl) = stop_loss_pct {
+                r.config.stop_loss_pct = maybe_sl;
             }
             r.clone()
         });
@@ -514,6 +586,26 @@ impl StrategyRunnerStore {
         } else {
             false
         }
+    }
+
+    /// Stop ALL currently-running live-mode runners. Called by the portfolio guard
+    /// when the global max-loss threshold is breached.
+    pub fn stop_all_live(&self) -> Vec<String> {
+        let ids: Vec<String> = {
+            let map = self.runners.lock().unwrap();
+            map.values()
+                .filter(|r| r.config.mode == "live" && r.status.status == "running")
+                .map(|r| r.config.id.clone())
+                .collect()
+        };
+        let stopped: Vec<String> = ids.iter().filter(|id| self.stop(id)).cloned().collect();
+        if !stopped.is_empty() {
+            tracing::warn!(
+                "[PORTFOLIO_GUARD] Emergency stop triggered. Stopped {} live runners: {:?}",
+                stopped.len(), stopped
+            );
+        }
+        stopped
     }
 
     pub fn delete(&self, id: &str) -> bool {
@@ -1967,6 +2059,110 @@ async fn fetch_binance_price(coin: &str) -> Option<f64> {
 // ── Polymarket binary live runner ─────────────────────────────────────────────
 //
 // For polymarket_binary, each window (5m/15m/1h/24h) is a separate market.
+/// Query data-api.polymarket.com for the last 48h of on-chain activity for
+/// `wallet_address`. Any TRADE transaction whose hash is not present in the
+/// runner's live_orders is inserted as an UNTRACKED order so the dashboard
+/// shows the real P&L instead of only the in-memory log.
+async fn reconcile_untracked_onchain(
+    store: &Arc<StrategyRunnerStore>,
+    id: &str,
+    wallet_address: &str,
+) {
+    let url = format!(
+        "https://data-api.polymarket.com/activity?user={}&limit=500&offset=0",
+        wallet_address
+    );
+    let client = reqwest::Client::builder()
+        .user_agent("trader-claw/1.0")
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .unwrap_or_default();
+
+    let onchain: Vec<serde_json::Value> = match client.get(&url).send().await {
+        Ok(r) if r.status().is_success() => {
+            r.json().await.unwrap_or_default()
+        }
+        _ => {
+            tracing::debug!("[RUNNER {id}] Onchain reconciliation: data-api unavailable, skipping");
+            return;
+        }
+    };
+
+    // Filter to TRADE events in the last 48 h
+    let cutoff = chrono::Utc::now().timestamp() - 48 * 3600;
+    let trades: Vec<&serde_json::Value> = onchain.iter()
+        .filter(|t| {
+            t.get("type").and_then(|v| v.as_str()) == Some("TRADE")
+            && t.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(0) >= cutoff
+        })
+        .collect();
+
+    if trades.is_empty() { return; }
+
+    // Collect known tx hashes from existing runner orders
+    let known_tx: std::collections::HashSet<String> = {
+        let map = store.runners.lock().unwrap();
+        map.get(id)
+            .and_then(|r| r.result.as_ref())
+            .map(|res| res.live_orders.iter()
+                .filter_map(|o| o.tx_hash.clone())
+                .map(|h| h.to_lowercase())
+                .collect())
+            .unwrap_or_default()
+    };
+
+    let mut new_orders: Vec<LiveOrder> = Vec::new();
+    for t in &trades {
+        let tx = t.get("transactionHash")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_lowercase();
+        if tx.is_empty() || known_tx.contains(&tx) { continue; }
+
+        let ts_unix = t.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(0);
+        let ts_str = chrono::DateTime::from_timestamp(ts_unix, 0)
+            .map(|dt| dt.to_rfc3339())
+            .unwrap_or_default();
+        let usdc = t.get("usdcSize").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let size = t.get("size").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let ep = if size > 0.0 && usdc > 0.0 { usdc / size } else { 0.0 };
+        let outcome = t.get("outcome").and_then(|v| v.as_str()).unwrap_or("?").to_lowercase();
+        let side = if outcome.contains("up") || outcome.contains("yes") { "yes" } else { "no" };
+
+        new_orders.push(LiveOrder {
+            timestamp: ts_str,
+            window_ts: ts_unix - (ts_unix % 300),
+            side: side.to_string(),
+            token_id: t.get("conditionId").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            amount_usdc: usdc,
+            order_id: format!("onchain-{}", &tx[..tx.len().min(16)]),
+            status: "MATCHED".to_string(),
+            entry_price: if ep > 0.0 { Some(ep) } else { None },
+            tx_hash: Some(tx),
+            result: Some("UNTRACKED".to_string()),
+            ..Default::default()
+        });
+    }
+
+    if new_orders.is_empty() { return; }
+
+    let count = new_orders.len();
+    {
+        let mut map = store.runners.lock().unwrap();
+        if let Some(r) = map.get_mut(id) {
+            if let Some(ref mut res) = r.result {
+                res.live_orders.extend(new_orders);
+            }
+        }
+    }
+    store.persist();
+    append_runner_log(store, id, &format!(
+        "Onchain reconciliation: {} untracked transaction(s) added from data-api",
+        count
+    ));
+    tracing::info!("[RUNNER {id}] Reconciled {count} untracked onchain transactions");
+}
+
 // Paper mode: uses a 1m Binance WebSocket feed and re-runs full slug simulation
 //             at each window boundary to generate a fresh decision.
 // Live mode:  same signal generation, but then calls Polymarket CLOB API to
@@ -2067,6 +2263,27 @@ async fn polymarket_runner_loop(
     let initial = eval_polymarket(&script_content, &buffer, window_minutes, &config);
     update_runner_result(&store, &id, &config, &initial, None, None, None, None, None, None, None).await;
     set_runner_status(&store, &id, "running");
+
+    // ─ Onchain reconciliation (live mode): patch any untracked transactions ────
+    // Query data-api.polymarket.com for the last 48h of activity on the proxy
+    // wallet. Transactions that exist onchain but are absent from live_orders
+    // (e.g. because the binary crashed before flushing to disk) are inserted
+    // as UNTRACKED records so the dashboard reflects the real P&L.
+    if is_live {
+        if let Some(ref creds) = config.poly_creds {
+            let wallet = creds.proxy_address.clone()
+                .or_else(|| Some(creds.wallet_address.clone()))
+                .unwrap_or_default();
+            if !wallet.is_empty() {
+                let store_rc = store.clone();
+                let id_rc    = id.clone();
+                let wallet_rc = wallet.clone();
+                tokio::spawn(async move {
+                    reconcile_untracked_onchain(&store_rc, &id_rc, &wallet_rc).await;
+                });
+            }
+        }
+    }
 
     // ─ Connect 1m WebSocket (polymarket binary always uses 1m real-time feed)
     let mut candle_rx = crate::live_feed::spawn_binance_kline_feed(
@@ -2551,20 +2768,51 @@ async fn polymarket_runner_loop(
                     // Prefer Polymarket's own resolution (matches what the chain paid);
                     // fall back to Binance candle inference only when the market
                     // hasn't been reconciled by Polymarket yet.
-                    let (resolved_via_poly, went_up_opt) = match config.series_id.as_deref() {
+                    let (resolved_via_poly, went_up_opt, resolution_provisional) =
+                        match config.series_id.as_deref() {
                         Some(sid) if !sid.is_empty() => {
                             match fetch_polymarket_resolution(sid, prev_window).await {
-                                Some(yes_won) => (true, Some(yes_won)),
-                                None => (false, resolve_window_outcome(
-                                    &buffer, prev_window, window_secs as i64, res_logic, config.threshold,
-                                )),
+                                Some(yes_won) => (true, Some(yes_won), false),
+                                None => {
+                                    // Not settled yet — use Binance as provisional,
+                                    // spawn monitor to upgrade when oracle arrives
+                                    let binance_res = resolve_window_outcome(
+                                        &buffer, prev_window, window_secs as i64, res_logic, config.threshold,
+                                    );
+                                    (false, binance_res, true)
+                                }
                             }
                         }
                         _ => (false, resolve_window_outcome(
                             &buffer, prev_window, window_secs as i64, res_logic, config.threshold,
-                        )),
+                        ), false),
                     };
-                    let resolution_source_str = if resolved_via_poly { "polymarket" } else { "binance" };
+                    let resolution_source_str = if resolved_via_poly {
+                        "polymarket"
+                    } else if resolution_provisional {
+                        "binance_provisional"
+                    } else {
+                        "binance"
+                    };
+
+                    // Spawn resolution monitor for provisional results.
+                    // on_candle engine rebuilds balance from sum(order.pnl) each cycle,
+                    // so the monitor only needs to patch order.pnl (tick_state = None).
+                    if resolution_provisional {
+                        if let Some(ref sid) = config.series_id {
+                            if let Some(binance_guess) = went_up_opt {
+                                spawn_resolution_monitor(
+                                    id.clone(),
+                                    sid.clone(),
+                                    prev_window,
+                                    store.clone(),
+                                    binance_guess,
+                                    None, // on_candle: balance recalculated from orders
+                                    config.fee_pct,
+                                );
+                            }
+                        }
+                    }
                     if let Some(went_up) = went_up_opt {
                         let outcome = if went_up { "UP" } else { "DOWN" };
 
@@ -2669,10 +2917,28 @@ async fn polymarket_runner_loop(
                                         // it back from CLOB /data/trades. Fall back to the
                                         // decision-time midpoint (capped to 0.10) otherwise —
                                         // those orders carry an asterisk so we can spot them.
+                                        //
+                                        // Guard against a poisoned fill_price: a simulated paper
+                                        // fill on the illiquid NON-favourite book can land at ~0.99
+                                        // while the decision ask (entry_price) was ~0.44. A market
+                                        // buy never fills more than ~25% above the ask, so reject a
+                                        // fill that diverges that far and use entry_price instead.
+                                        let decision_ep = order.entry_price.unwrap_or(0.5);
+                                        let fill_is_sane = |fp: f64| {
+                                            fp >= 0.01 && fp <= 0.99
+                                                && (decision_ep <= 0.0 || fp <= decision_ep * 1.25)
+                                        };
                                         let (ep, suspect) = match order.fill_price {
-                                            Some(fp) if fp >= 0.01 && fp <= 0.99 => (fp, false),
-                                            _ => {
-                                                let raw_ep = order.entry_price.unwrap_or(0.5);
+                                            Some(fp) if fill_is_sane(fp) => (fp, false),
+                                            Some(fp) => {
+                                                tracing::warn!(
+                                                    "[RUNNER {id}] Window {} settle: fill_price {:.4} diverges from decision ask {:.4} (>25%); using entry_price",
+                                                    prev_window, fp, decision_ep
+                                                );
+                                                if decision_ep < 0.10 { (0.50, true) } else { (decision_ep.max(0.10), true) }
+                                            }
+                                            None => {
+                                                let raw_ep = decision_ep;
                                                 if raw_ep < 0.10 {
                                                     tracing::warn!(
                                                         "[RUNNER {id}] Window {} settle: entry_price {:.4} below trust floor 0.10 and no fill_price; capping to 0.50",
@@ -2684,8 +2950,12 @@ async fn polymarket_runner_loop(
                                                 }
                                             }
                                         };
+                                        // Apply fee_pct to the winning payout for parity with
+                                        // the backtest on_candle model (net_pay = tokens × (1−fee%)).
                                         let pnl = if won {
-                                            order.amount_usdc * (1.0 / ep - 1.0)
+                                            let gross_payout = order.amount_usdc / ep;
+                                            let net_payout = gross_payout * (1.0 - config.fee_pct / 100.0);
+                                            net_payout - order.amount_usdc
                                         } else {
                                             -order.amount_usdc
                                         };
@@ -2781,6 +3051,68 @@ async fn polymarket_runner_loop(
         // ── Decision point: evaluate strategy and place order (once per window) ──
         if minute_in_window == decision_minute && current_window != last_decision_window {
             last_decision_window = current_window;
+
+            // ── Guardrail: max_runner_loss_pct ──────────────────────────────────────
+            if let Some(max_loss_pct) = config.max_runner_loss_pct {
+                if max_loss_pct > 0.0 {
+                    let settled_pnl: f64 = live_orders.iter().filter_map(|o| o.pnl).sum();
+                    let loss_pct = -settled_pnl / config.initial_balance.max(1.0);
+                    if loss_pct >= max_loss_pct {
+                        let msg = format!(
+                            "AUTO-STOP: max_runner_loss_pct {:.0}% breached (down {:.1}% = ${:.2}). Switching to paper.",
+                            max_loss_pct * 100.0, loss_pct * 100.0, -settled_pnl
+                        );
+                        tracing::warn!("[RUNNER {id}] {msg}");
+                        append_runner_log(&store, &id, &msg);
+                        // Switch to paper mode in the config and store so it doesn't restart live
+                        {
+                            let mut map = store.runners.lock().unwrap();
+                            if let Some(r) = map.get_mut(&id) {
+                                r.config.mode = "paper".to_string();
+                            }
+                        }
+                        config.mode = "paper".to_string();
+                        clob_client = None; // Switch to paper mode in-loop
+                        store.persist();
+                    }
+                }
+            }
+
+            // ── Guardrail: max_consecutive_losses ───────────────────────────────────
+            let consecutive_losses: u32 = {
+                let settled: Vec<_> = live_orders.iter()
+                    .filter(|o| o.pnl.is_some())
+                    .collect();
+                let mut streak = 0u32;
+                for o in settled.iter().rev() {
+                    if (o.pnl.unwrap_or(0.0)) < 0.0 {
+                        streak += 1;
+                    } else {
+                        break;
+                    }
+                }
+                streak
+            };
+            if let Some(max_streak) = config.max_consecutive_losses {
+                if max_streak > 0 && consecutive_losses >= max_streak {
+                    let msg = format!(
+                        "AUTO-STOP: {} consecutive losses (max={}). Switching to paper.",
+                        consecutive_losses, max_streak
+                    );
+                    tracing::warn!("[RUNNER {id}] {msg}");
+                    append_runner_log(&store, &id, &msg);
+                    {
+                        let mut map = store.runners.lock().unwrap();
+                        if let Some(r) = map.get_mut(&id) {
+                            r.config.mode = "paper".to_string();
+                        }
+                    }
+                    config.mode = "paper".to_string();
+                    clob_client = None;
+                    store.persist();
+                }
+            }
+
             let display_minute = decision_minute + 1; // 1-based for user clarity
             tracing::info!(
                 "[RUNNER {id}] Decision point for window {} (minute {}/{}, candle close at {:02}:{:02}), evaluating strategy...",
@@ -3053,11 +3385,12 @@ async fn polymarket_runner_loop(
             if !current_signal.starts_with("flat") {
                 // Confidence-weighted sizing: scripts can emit a `kelly_size`
                 // value in their kv_state. The runner reads it here and passes
-                // as a multiplier (clamped to [0.1, 2.0]) on the base stake.
+                // as a multiplier (clamped to [0.1, kelly_cap]) on the base stake.
                 // Default 1.0 if the script doesn't set it.
+                let kelly_cap = config.kelly_size_cap.max(1.0).min(3.0);
                 let kelly_mult = live_result.kv_state.get("kelly_size")
                     .copied()
-                    .map(|v| v.clamp(0.1, 2.0))
+                    .map(|v| v.clamp(0.1, kelly_cap))
                     .unwrap_or(1.0);
                 if (kelly_mult - 1.0).abs() > 0.001 {
                     append_runner_log(
@@ -3065,9 +3398,22 @@ async fn polymarket_runner_loop(
                         &format!("Confidence sizing: kelly_size={:.2}x", kelly_mult),
                     );
                 }
+                // Regressive sizing: reduce bet to 50% after 3+ consecutive losses
+                let effective_size = if consecutive_losses >= 3 {
+                    let reduced = live_result.size * 0.5;
+                    append_runner_log(
+                        &store, &id,
+                        &format!("Regressive sizing: {} consecutive losses → size {}→{:.4}", consecutive_losses, live_result.size, reduced),
+                    );
+                    reduced
+                } else {
+                    live_result.size
+                };
                 let (order_result, renewed_client) = execute_live_polymarket_signal(
-                    &id, clob_client.clone(), &current_signal, live_result.size, &config, &live, &store, current_window,
+                    &id, clob_client.clone(), &current_signal, effective_size, &config, &live, &store, current_window,
+                    next_window,
                     yes_token_price, no_token_price, kelly_mult,
+                    config.series_id.as_deref().unwrap_or(""),
                 ).await;
                 // If credentials were renewed, update the runner's client so all
                 // subsequent windows use the fresh L2 session, and persist to disk.
@@ -3105,6 +3451,7 @@ async fn polymarket_runner_loop(
                         }
                     }
                     live_orders.push(order);
+                    store.persist();
                 }
             }
 
@@ -3432,6 +3779,159 @@ async fn fetch_polymarket_resolution(series_id: &str, window_ts: i64) -> Option<
     None
 }
 
+/// Spawn a background task that polls Polymarket's Gamma API until the official
+/// resolution for `window_ts` is available, then updates the matching LiveOrder
+/// in the store and reconciles the P&L.
+///
+/// Rationale: the Chainlink oracle that settles Polymarket binary markets
+/// typically publishes 60–180 seconds after the window closes.  At the moment
+/// the live runner settles a position (first tick of the next window), the
+/// market is often still "open" on Gamma.  Without this monitor, runners fall
+/// back to Binance price comparison which may not match the oracle.
+///
+/// The task polls every 30 s, gives up after 10 min, and replaces the Binance
+/// result only when the official resolution is found.
+fn spawn_resolution_monitor(
+    runner_id: String,
+    series_id: String,
+    window_ts: i64,
+    store: Arc<StrategyRunnerStore>,
+    binance_fallback_yes_won: bool,
+    // For tick_runner_loop: the shared internal state so balance + win counter
+    // can be corrected in-place (not just RunnerResult which the loop overwrites).
+    tick_state: Option<Arc<std::sync::Mutex<TickRunnerState>>>,
+    // Fee % applied to winning payout — must match the settle-time fee model.
+    fee_pct: f64,
+) {
+    tokio::spawn(async move {
+        let id = runner_id.as_str();
+        let deadline = chrono::Utc::now().timestamp() + 600; // 10-minute window
+
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        interval.tick().await; // skip immediate first tick — already tried once
+
+        loop {
+            interval.tick().await;
+
+            if chrono::Utc::now().timestamp() > deadline {
+                tracing::debug!(
+                    "[RUNNER {id}] Resolution monitor: giving up on window {window_ts} after 10 min"
+                );
+                return;
+            }
+
+            if let Some(yes_won) = fetch_polymarket_resolution(&series_id, window_ts).await {
+                // Official resolution arrived — patch the matching order in the store
+                let already_correct = {
+                    let map = store.runners.lock().unwrap();
+                    map.get(id)
+                        .and_then(|r| r.result.as_ref())
+                        .and_then(|res| res.live_orders.iter().find(|o| o.window_ts == window_ts))
+                        .map(|o| o.resolution_source.as_deref() == Some("polymarket"))
+                        .unwrap_or(false)
+                };
+                if already_correct { return; }
+
+                // Recalculate P&L with the official resolution
+                let (entry_price, stake, position, old_pnl) = {
+                    let map = store.runners.lock().unwrap();
+                    map.get(id)
+                        .and_then(|r| r.result.as_ref())
+                        .and_then(|res| res.live_orders.iter().find(|o| o.window_ts == window_ts))
+                        .map(|o| (
+                            o.entry_price.unwrap_or(0.5),
+                            o.amount_usdc,
+                            if o.side.starts_with("yes") { 1i32 } else { -1i32 },
+                            o.pnl.unwrap_or(0.0),
+                        ))
+                        .unwrap_or((0.5, 0.0, 0, 0.0))
+                };
+
+                let won = (position == 1 && yes_won) || (position == -1 && !yes_won);
+                // Apply fee_pct to the winning payout (parity with settle-time + backtest).
+                let pnl = if won && entry_price > 0.0 {
+                    (stake / entry_price) * (1.0 - fee_pct / 100.0) - stake
+                } else {
+                    -stake
+                };
+
+                let mut changed = false;
+                {
+                    let mut map = store.runners.lock().unwrap();
+                    if let Some(r) = map.get_mut(id) {
+                        if let Some(ref mut res) = r.result {
+                            if let Some(order) = res.live_orders.iter_mut().find(|o| o.window_ts == window_ts) {
+                                changed = order.resolution_yes_won != Some(yes_won);
+                                order.resolution_yes_won = Some(yes_won);
+                                order.resolution_source = Some("polymarket".to_string());
+                                order.result = Some(if won { "WIN".to_string() } else { "LOSS".to_string() });
+
+                                if changed {
+                                    let pnl_delta = pnl - old_pnl;
+                                    order.pnl = Some(pnl);
+
+                                    // For on_candle engine: balance = initial + sum(pnl),
+                                    // recalculated from orders, so just patching order.pnl
+                                    // is enough — the next update_runner_result call rebuilds it.
+                                    // For tick engine: the loop writes res.balance = TickRunnerState.balance
+                                    // every second, which would overwrite a direct res.balance patch.
+                                    // So we patch tick_state directly when provided.
+                                    if tick_state.is_none() {
+                                        // on_candle path: patch res.balance as intermediate value
+                                        res.balance += pnl_delta;
+                                    }
+                                    // live_wins counter: adjust if win/loss flipped
+                                    let was_win = binance_fallback_yes_won == (position == 1);
+                                    let is_win  = won;
+                                    if was_win && !is_win {
+                                        res.live_wins = res.live_wins.saturating_sub(1);
+                                    } else if !was_win && is_win {
+                                        res.live_wins = res.live_wins.saturating_add(1);
+                                    }
+                                    tracing::info!(
+                                        "[RUNNER {id}] Official resolution for window {window_ts}: \
+                                        yes_won={yes_won} (was binance={binance_fallback_yes_won}) \
+                                        pnl_delta={pnl_delta:+.2}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // For tick_runner_loop: patch the internal TickRunnerState so the loop's
+                // `res.balance = TickRunnerState.balance` write propagates the corrected value.
+                if changed {
+                    if let Some(ref ts) = tick_state {
+                        let mut s = ts.lock().unwrap();
+                        // Remove provisional pnl and credit official pnl
+                        let provisional_pnl = if binance_fallback_yes_won == (position == 1) {
+                            // was a win: payout was stake/entry_price
+                            if entry_price > 0.0 { stake / entry_price } else { 0.0 }
+                        } else {
+                            0.0 // was a loss: nothing was added
+                        };
+                        let official_pnl = if won && entry_price > 0.0 { stake / entry_price } else { 0.0 };
+                        s.balance = s.balance - provisional_pnl + official_pnl;
+                    }
+                }
+
+                store.persist();
+
+                append_runner_log(
+                    &store, id,
+                    &format!(
+                        "Resolution updated: window {window_ts} → {} (official Polymarket oracle, was Binance provisional{})",
+                        if yes_won { "YES/UP" } else { "NO/DOWN" },
+                        if changed { " — balance corrected" } else { ", no change" }
+                    ),
+                );
+                return; // done — official resolution recorded
+            }
+        }
+    });
+}
+
 /// Poll the CLOB `/data/trades` endpoint to find the on-chain fills for the
 /// freshly-placed order and return (vwap_fill_price, total_size, first_tx_hash).
 ///
@@ -3448,6 +3948,7 @@ async fn reconcile_order_fill(
     order_id: &str,
     after_secs: i64,
 ) -> Option<(f64, f64, String)> {
+    let _permit = clob_semaphore().acquire_owned().await;
     if order_id.is_empty() || order_id == "ok" || order_id == "FAILED" || order_id == "REJECTED" {
         return None;
     }
@@ -3482,6 +3983,99 @@ async fn reconcile_order_fill(
     None
 }
 
+/// Spawn a background task that:
+/// 1. Polls `/data/trades` for up to ~120 s after order placement to capture
+///    late fills (market orders that settle slowly, limit orders that fill later).
+/// 2. When a fill is found, updates the LiveOrder in the store in-place so the
+///    UI shows the real fill_price / fill_size / tx_hash instead of the midpoint.
+/// 3. For limit orders (`is_limit = true`): if still unfilled when
+///    `window_close_ts` passes, cancels the order via the CLOB API and updates
+///    status to "CANCELLED" so P&L doesn't get credited on a ghost position.
+fn spawn_order_monitor(
+    runner_id: String,
+    order_id: String,
+    client: Arc<polymarket_trader::orders::ClobClient>,
+    store: Arc<StrategyRunnerStore>,
+    placed_at: i64,
+    window_close_ts: i64,
+    is_limit: bool,
+) {
+    tokio::spawn(async move {
+        let id = runner_id.as_str();
+        // Give the chain / matching engine up to 120 s.
+        // Poll every 10 s so we don't hammer the API.
+        let deadline = placed_at + 120;
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+        interval.tick().await; // skip the immediate first tick (already checked inline)
+
+        loop {
+            interval.tick().await;
+            let now = chrono::Utc::now().timestamp();
+
+            // Try to find a fill in trade history.
+            if let Some((vwap, size, tx)) = reconcile_order_fill(&client, &order_id, placed_at - 5).await {
+                tracing::info!(
+                    "[RUNNER {id}] BG-FILL order {}: price={:.4} size={:.2} tx={}",
+                    order_id, vwap, size, tx
+                );
+                // Update the matching LiveOrder in the store.
+                let mut map = store.runners.lock().unwrap();
+                if let Some(r) = map.get_mut(id) {
+                    if let Some(ref mut res) = r.result {
+                        if let Some(o) = res.live_orders.iter_mut().find(|o| o.order_id == order_id) {
+                            o.fill_price = Some(vwap);
+                            o.fill_size  = Some(size);
+                            o.tx_hash    = Some(tx.clone());
+                            o.status     = "MATCHED".to_string();
+                        }
+                    }
+                }
+                drop(map);
+                append_runner_log(
+                    &store, id,
+                    &format!(
+                        "Fill confirmed (bg): order {} filled @ {:.4} ({:.2} shares) tx={}",
+                        order_id, vwap, size, tx
+                    ),
+                );
+                store.persist();
+                return;
+            }
+
+            // Cancel limit orders once window has closed and they're still open.
+            if is_limit && now >= window_close_ts {
+                tracing::info!("[RUNNER {id}] BG-CANCEL limit order {} (window closed, unfilled)", order_id);
+                if let Err(e) = client.cancel_order(&order_id).await {
+                    tracing::warn!("[RUNNER {id}] BG-CANCEL failed for {}: {e}", order_id);
+                }
+                // Mark as cancelled in the store so P&L isn't counted.
+                let mut map = store.runners.lock().unwrap();
+                if let Some(r) = map.get_mut(id) {
+                    if let Some(ref mut res) = r.result {
+                        if let Some(o) = res.live_orders.iter_mut().find(|o| o.order_id == order_id) {
+                            o.status = "CANCELLED".to_string();
+                            o.result = Some("CANCELLED".to_string());
+                            o.pnl    = Some(0.0);
+                        }
+                    }
+                }
+                drop(map);
+                append_runner_log(
+                    &store, id,
+                    &format!("Limit order {} cancelled (unfilled at window close)", order_id),
+                );
+                store.persist();
+                return;
+            }
+
+            if now > deadline {
+                tracing::debug!("[RUNNER {id}] BG-FILL: giving up on order {} after 120 s", order_id);
+                return;
+            }
+        }
+    });
+}
+
 async fn execute_live_polymarket_signal(
     id: &str,
     client: Option<Arc<polymarket_trader::orders::ClobClient>>,
@@ -3491,20 +4085,43 @@ async fn execute_live_polymarket_signal(
     _live: &crate::live_feed::LiveCandle,
     store: &Arc<StrategyRunnerStore>,
     window_ts: i64,
+    window_close_ts: i64,
     yes_token_price: f64,
     no_token_price: f64,
     kelly_mult: f64,
+    series_id: &str,
 ) -> (Option<LiveOrder>, Option<Arc<polymarket_trader::orders::ClobClient>>) {
+    // Serialize order execution per series to prevent book impact from parallel runners
+    let _series_permit = if !series_id.is_empty() {
+        let sem = get_series_semaphore(series_id);
+        Some(sem.acquire_owned().await)
+    } else {
+        None
+    };
     use polymarket_trader::orders::Side;
 
     // In binary markets YES/NO are complementary tokens.
     // "yes" → buy YES token  |  "no" → buy NO token
+    // Distinguish live vs paper before resolving token_id so the skip reason
+    // is actionable: live-mode skip on missing token_id = resolution failure;
+    // paper-mode skip = programmer error (signal without token configured).
+    let is_live_order = client.is_some();
+
     let (token_id, side) = if signal.starts_with("yes") {
         match &config.poly_token_id {
             Some(tid) if !tid.is_empty() => (tid.clone(), Side::Buy),
             _ => {
-                tracing::warn!("[RUNNER {id}] Live mode: no YES token_id configured, skipping order");
-                append_runner_log(store, id, "No Polymarket YES token_id configured.");
+                let reason = if is_live_order {
+                    format!(
+                        "LIVE SKIP window {window_ts}: YES token_id not resolved — \
+                        Gamma API may be lagging. Order NOT placed. \
+                        Check runner logs for token resolution errors."
+                    )
+                } else {
+                    "Paper SKIP: YES token_id not set".to_string()
+                };
+                tracing::error!("[RUNNER {id}] {reason}");
+                append_runner_log(store, id, &reason);
                 return (None, None);
             }
         }
@@ -3512,8 +4129,17 @@ async fn execute_live_polymarket_signal(
         match &config.poly_no_token_id {
             Some(tid) if !tid.is_empty() => (tid.clone(), Side::Buy),
             _ => {
-                tracing::warn!("[RUNNER {id}] Live mode: no NO token_id configured, skipping order");
-                append_runner_log(store, id, "No Polymarket NO token_id configured.");
+                let reason = if is_live_order {
+                    format!(
+                        "LIVE SKIP window {window_ts}: NO token_id not resolved — \
+                        Gamma API may be lagging. Order NOT placed. \
+                        Check runner logs for token resolution errors."
+                    )
+                } else {
+                    "Paper SKIP: NO token_id not set".to_string()
+                };
+                tracing::error!("[RUNNER {id}] {reason}");
+                append_runner_log(store, id, &reason);
                 return (None, None);
             }
         }
@@ -3622,6 +4248,17 @@ async fn execute_live_polymarket_signal(
         return (None, None);
     }
 
+    // Skip if entry price is below minimum (prevents extreme long-shot bets)
+    let min_ep = config.min_entry_price;
+    if min_ep > 0.0 && ep < min_ep {
+        tracing::info!("[RUNNER {id}] Skipped: entry price {:.4} < min_entry_price {:.4}", ep, min_ep);
+        append_runner_log(
+            store, id,
+            &format!("SKIP: ep={:.4} < min_entry_price={:.4} (extreme long-shot bet blocked)", ep, min_ep),
+        );
+        return (None, None);
+    }
+
     // Skip trade if entry price exceeds the configured maximum
     if let Some(max_ep) = config.max_entry_price {
         if ep > max_ep {
@@ -3664,10 +4301,16 @@ async fn execute_live_polymarket_signal(
 
         // Use the midpoint as worst acceptable price with 5% slippage tolerance.
         // This prevents fills at extreme prices when the book is thin.
-        let worst_price = (ep * 1.05).min(0.95);
+        let slippage_cap = config.max_slippage_pct.unwrap_or(5.0) / 100.0;
+        let worst_price = (ep * (1.0 + slippage_cap)).min(0.95);
         let max_retries = 3;
         let retry_delay = std::time::Duration::from_secs(10);
         let mut attempt = 0;
+
+        tracing::info!(
+            "[RUNNER {id}] Slippage cap: {:.1}% → worst_price={:.4} (mid={:.4})",
+            slippage_cap * 100.0, worst_price, ep
+        );
 
         // Holds a freshly-renewed client when order_version_mismatch triggers
         // re-authentication.  Returned to the caller so the runner loop can
@@ -3686,6 +4329,10 @@ async fn execute_live_polymarket_signal(
             attempt += 1;
             let is_final = attempt >= max_retries;
 
+            // On the final attempt fall back to a limit order at the decision-time
+            // mid price. A limit order only fills if the market comes to you —
+            // it is safer than a market order when the book is thin or the window
+            // is nearly closed.
             if is_final {
                 let limit_price = if signal.starts_with("yes") {
                     (yes_token_price * 100.0).round() / 100.0
@@ -3718,7 +4365,21 @@ async fn execute_live_polymarket_signal(
                                     );
                                     (Some(p), Some(s), Some(h))
                                 }
-                                None => (None, None, None),
+                                None => {
+                                    // Limit order placed but not yet filled. Background monitor
+                                    // will update fill data when it lands.
+                                    let monitor_client = renewed.clone().unwrap_or_else(|| client_arc.clone());
+                                    spawn_order_monitor(
+                                        id.to_string(),
+                                        resp.order_id.clone(),
+                                        monitor_client,
+                                        store.clone(),
+                                        placed_at,
+                                        window_close_ts,
+                                        true, // is_limit: cancel at window close if unfilled
+                                    );
+                                    (None, None, None)
+                                }
                             };
                         return (Some(LiveOrder {
                             timestamp: chrono::Utc::now().to_rfc3339(),
@@ -3757,8 +4418,8 @@ async fn execute_live_polymarket_signal(
             }
 
             tracing::info!(
-                "[RUNNER {id}] Live MARKET order (attempt {}/{}): {:?} {} USDC on token {}",
-                attempt, max_retries, side, amount_usdc, token_id
+                "[RUNNER {id}] Live MARKET order (attempt {}/{}): {:?} ${:.0} USDC on token {} worst_price={:.4}",
+                attempt, max_retries, side, amount_usdc, token_id, worst_price
             );
 
             match active!().create_market_order(&token_id, side, amount_usdc, worst_price).await {
@@ -3782,7 +4443,21 @@ async fn execute_live_polymarket_signal(
                                 );
                                 (Some(p), Some(s), Some(h))
                             }
-                            None => (None, None, None),
+                            None => {
+                                // Market order placed but trade not yet in history.
+                                // Background monitor will update fill data when it lands.
+                                let monitor_client = renewed.clone().unwrap_or_else(|| client_arc.clone());
+                                spawn_order_monitor(
+                                    id.to_string(),
+                                    resp.order_id.clone(),
+                                    monitor_client,
+                                    store.clone(),
+                                    placed_at,
+                                    window_close_ts,
+                                    false, // market order — reconcile fill only, don't cancel
+                                );
+                                (None, None, None)
+                            }
                         };
                     return (Some(LiveOrder {
                         timestamp: chrono::Utc::now().to_rfc3339(),
@@ -3813,7 +4488,6 @@ async fn execute_live_polymarket_signal(
                             tracing::warn!(
                                 "[RUNNER {id}] order_version_mismatch — renewing L2 credentials then falling back to limit order"
                             );
-                            // Re-authenticate via L1 EIP-712 to get fresh L2 session.
                             match client_arc.renew().await {
                                 Ok(new_client) => {
                                     tracing::info!("[RUNNER {id}] Credentials renewed successfully");
@@ -3843,15 +4517,30 @@ async fn execute_live_polymarket_signal(
             }
         }
     } else {
-        // ── PAPER mode: simulate order ────────────────────────────
+        // ── PAPER mode: simulate order with real CLOB market price ───────
         let order_id = format!("paper-{}", chrono::Utc::now().timestamp_millis());
+
+        // Step 1: fetch the real CLOB ask price for this token via GET /price?side=buy.
+        // This is the actual price you'd pay as a market buyer — more accurate than mid.
+        let clob_ask_price = polymarket_trader::markets::get_market_price(&token_id)
+            .await
+            .unwrap_or(ep); // fall back to mid on error
+
+        // Step 2: walk the order book to simulate the VWAP for the stake size.
+        // This captures the slippage beyond the best ask when the book is thin.
+        let (sim_fill_price, slippage_pct) =
+            simulate_book_fill(&token_id, amount_usdc, clob_ask_price).await;
+
         tracing::info!(
-            "[RUNNER {id}] Paper order: {} ${:.0} on token {} @ {:.4}",
-            signal, amount_usdc, token_id, ep
+            "[RUNNER {id}] Paper order: {} ${:.0} on token {} mid={:.4} ask={:.4} sim_fill={:.4} slippage={:.2}%",
+            signal, amount_usdc, token_id, ep, clob_ask_price, sim_fill_price, slippage_pct
         );
         append_runner_log(
             store, id,
-            &format!("Paper order: {} ${:.0} @ {:.4} (id={})", signal, amount_usdc, ep, order_id),
+            &format!(
+                "Paper order: {} ${:.0} mid={:.4} clob_ask={:.4} sim_fill={:.4} slip={:.2}% (id={})",
+                signal, amount_usdc, ep, clob_ask_price, sim_fill_price, slippage_pct, order_id
+            ),
         );
         (Some(LiveOrder {
             timestamp: chrono::Utc::now().to_rfc3339(),
@@ -3861,13 +4550,100 @@ async fn execute_live_polymarket_signal(
             amount_usdc,
             order_id,
             status: "LIVE".to_string(),
-            entry_price: Some(ep),
+            // entry_price = real CLOB ask (what you'd actually pay as a buyer)
+            entry_price: Some(clob_ask_price),
+            // fill_price = VWAP after walking book depth (captures liquidity cost)
+            fill_price: Some(sim_fill_price),
             result: None,
             pnl: None,
             stop_loss_triggered: false,
             ..Default::default()
         }), None)
     }
+}
+
+/// Simulate a market-buy fill by walking the ask side of the Polymarket CLOB
+/// order book for `token_id`. Returns (vwap_fill_price, slippage_pct).
+///
+/// On any error (network, parse, empty book) falls back to `mid_price` with
+/// 0 % slippage so paper mode still works without a live book.
+async fn simulate_book_fill(token_id: &str, amount_usdc: f64, mid_price: f64) -> (f64, f64) {
+    let url = format!("https://clob.polymarket.com/book?token_id={}", token_id);
+    let client = reqwest::Client::new();
+    let body = match client
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>().await {
+            Ok(v) => v,
+            Err(_) => return (mid_price, 0.0),
+        },
+        _ => return (mid_price, 0.0),
+    };
+
+    // The CLOB book endpoint returns {"asks": [{"price":"0.52","size":"150"}, ...], ...}
+    // Asks are ordered ascending (lowest ask first). A buy walks them in order.
+    let asks = match body.get("asks").and_then(|v| v.as_array()) {
+        Some(a) if !a.is_empty() => a.clone(),
+        _ => return (mid_price, 0.0),
+    };
+
+    let mut remaining = amount_usdc;
+    let mut total_shares = 0.0_f64;
+    let mut total_cost   = 0.0_f64;
+
+    for level in &asks {
+        let price = level.get("price")
+            .and_then(|v| v.as_str().map(str::to_string).or_else(|| v.as_f64().map(|f| f.to_string())))
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        let size = level.get("size")
+            .and_then(|v| v.as_str().map(str::to_string).or_else(|| v.as_f64().map(|f| f.to_string())))
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(0.0);
+
+        if price <= 0.0 || size <= 0.0 { continue; }
+
+        let cost_at_level = price * size; // USD cost to buy all shares at this level
+        if cost_at_level >= remaining {
+            // Partial fill of this level covers the remainder
+            let shares_here = remaining / price;
+            total_shares += shares_here;
+            total_cost   += remaining;
+            break;
+        }
+        total_shares += size;
+        total_cost   += cost_at_level;
+        remaining    -= cost_at_level;
+    }
+
+    if total_shares <= 0.0 || total_cost <= 0.0 {
+        return (mid_price, 0.0);
+    }
+
+    let raw_vwap = total_cost / total_shares;
+
+    // ── Sanity-cap the simulated fill ───────────────────────────────────────
+    // The NON-favourite token (usually NO on UP/DOWN markets) is illiquid — the
+    // crowd trades the YES leg, so the NO `/book` can be nearly empty with a
+    // stale resting ask at ~0.99. Walking that book yields a VWAP wildly above
+    // the real ask (`mid_price`, from `/price?side=buy`), which then poisons P&L
+    // (a $30 NO win at fill 0.99 nets −$0.15 instead of +$30+).
+    //
+    // A real market buy never fills worse than ask × (1 + max_slippage). Cap the
+    // sim to that bound — mirrors the live runner's `max_slippage_pct` reject.
+    // When the book disagrees with the ask by more than the cap, the book is
+    // unreliable, so we fall back to the capped ask rather than the bogus VWAP.
+    const MAX_PAPER_SLIPPAGE_PCT: f64 = 5.0;
+    let vwap = if mid_price > 0.0 {
+        raw_vwap.min(mid_price * (1.0 + MAX_PAPER_SLIPPAGE_PCT / 100.0))
+    } else {
+        raw_vwap
+    };
+    let slippage_pct = if mid_price > 0.0 { (vwap / mid_price - 1.0) * 100.0 } else { 0.0 };
+    (vwap, slippage_pct)
 }
 
 /// Fetch Yes/No token mid prices from Polymarket CLOB API.
@@ -3886,6 +4662,7 @@ async fn execute_live_polymarket_signal(
 ///
 /// Returns (0.0, 0.0) on hard error.
 async fn fetch_token_prices(yes_token_id: &str, no_token_id: &str) -> (f64, f64) {
+    let _permit = clob_semaphore().acquire_owned().await;
     let client = reqwest::Client::new();
 
     async fn fetch_midpoint(client: &reqwest::Client, token_id: &str, label: &str) -> f64 {
@@ -4234,10 +5011,20 @@ pub fn set_runner_status(store: &Arc<StrategyRunnerStore>, id: &str, status: &st
     store.persist();
 }
 
+/// Public wrapper for `reconcile_untracked_onchain` called from the gateway.
+pub async fn reconcile_untracked_onchain_pub(
+    store: &Arc<StrategyRunnerStore>,
+    id: &str,
+    wallet: &str,
+) {
+    reconcile_untracked_onchain(store, id, wallet).await;
+}
+
 /// Fetch USDC/pUSD trading balance from Polymarket CLOB API + Polygon RPC.
 /// Combines both sources because the CLOB API may not report pUSD balance
 /// (Polymarket migrated from USDC.e to pUSD). Uses the higher of the two.
 async fn fetch_usdc_balance_clob(client: &polymarket_trader::orders::ClobClient) -> Option<f64> {
+    let _permit = clob_semaphore().acquire_owned().await;
     let api_bal = match client.get_api_balance().await {
         Ok(b) => {
             tracing::info!("Polymarket CLOB API balance: ${:.2}", b);
@@ -4630,11 +5417,14 @@ async fn tick_runner_loop(
         pending: None,
     }));
 
-    // Shared per-tick scalars (yes_ask, no_ask, balance, fee, max_pos)
-    let cur_yes_ask = Arc::new(Mutex::new(0f64));
-    let cur_no_ask  = Arc::new(Mutex::new(0f64));
-    let cur_balance = Arc::new(Mutex::new(0f64));
-    let cur_fee     = Arc::new(Mutex::new(config.fee_pct));
+    // Shared per-tick scalars (yes_ask, no_ask, balance, fee, max_pos + book depth)
+    let cur_yes_ask   = Arc::new(Mutex::new(0f64));
+    let cur_no_ask    = Arc::new(Mutex::new(0f64));
+    let cur_yes_bid   = Arc::new(Mutex::new(0f64));
+    let cur_balance   = Arc::new(Mutex::new(0f64));
+    let cur_fee       = Arc::new(Mutex::new(config.fee_pct));
+    let cur_ask_depth = Arc::new(Mutex::new(0f64));
+    let cur_bid_depth = Arc::new(Mutex::new(0f64));
     let cap_per_bet: f64 = match config.live_sizing_mode {
         LiveSizingMode::Fixed => config.live_sizing_value.max(5.0),
         LiveSizingMode::Percent => {
@@ -4649,11 +5439,15 @@ async fn tick_runner_loop(
     {
         let st = state.clone();
         let yes_ask_ref = cur_yes_ask.clone();
+        let yes_bid_ref = cur_yes_bid.clone();
+        let ask_depth_ref = cur_ask_depth.clone();
         let bal_ref = cur_balance.clone();
         let fee_ref = cur_fee.clone();
         let max_pos_ref = max_pos_usd_arc.clone();
         eng.register_fn("bet_yes_impl", move |size: f64| {
-            let ya  = *yes_ask_ref.lock().unwrap();
+            let ya    = *yes_ask_ref.lock().unwrap();
+            let yb    = *yes_bid_ref.lock().unwrap();
+            let depth = *ask_depth_ref.lock().unwrap();
             let bal = *bal_ref.lock().unwrap();
             let f   = *fee_ref.lock().unwrap();
             let max_pos = *max_pos_ref.lock().unwrap();
@@ -4663,17 +5457,20 @@ async fn tick_runner_loop(
             let frac = size.clamp(0.0, 1.0);
             let stake_amt = (bal * frac * (1.0 - f / 100.0)).min(max_pos);
             if stake_amt <= 0.01 { return; }
+            // Paper fill = book-VWAP (live-parity with on_tick backtester).
+            // For live mode the real fill replaces this via reconcile after placement.
+            let fill_price = crate::tools::backtest::sim_fill_vwap(ya, yb, depth, stake_amt);
             // Reserve immediately for paper accounting; live placement happens
             // after on_tick returns. Position flag is set so subsequent ticks
             // in this window cannot place a second bet.
             s.balance -= stake_amt;
             s.position = 1;
-            s.entry_price = ya;
+            s.entry_price = fill_price;
             s.stake = stake_amt;
             s.pending = Some(TickPendingOrder {
                 side: "yes".to_string(),
                 stake_usdc: stake_amt,
-                entry_price: ya,
+                entry_price: fill_price,
             });
         });
     }
@@ -4682,11 +5479,15 @@ async fn tick_runner_loop(
     {
         let st = state.clone();
         let no_ask_ref = cur_no_ask.clone();
+        let yes_ask_ref2 = cur_yes_ask.clone(); // yes_ask → no_bid = 1 - yes_ask
+        let bid_depth_ref = cur_bid_depth.clone();
         let bal_ref = cur_balance.clone();
         let fee_ref = cur_fee.clone();
         let max_pos_ref = max_pos_usd_arc.clone();
         eng.register_fn("bet_no_impl", move |size: f64| {
-            let na  = *no_ask_ref.lock().unwrap();
+            let na    = *no_ask_ref.lock().unwrap();
+            let no_bid = (1.0 - *yes_ask_ref2.lock().unwrap()).clamp(0.0, 1.0);
+            let depth = *bid_depth_ref.lock().unwrap();
             let bal = *bal_ref.lock().unwrap();
             let f   = *fee_ref.lock().unwrap();
             let max_pos = *max_pos_ref.lock().unwrap();
@@ -4696,14 +5497,15 @@ async fn tick_runner_loop(
             let frac = size.clamp(0.0, 1.0);
             let stake_amt = (bal * frac * (1.0 - f / 100.0)).min(max_pos);
             if stake_amt <= 0.01 { return; }
+            let fill_price = crate::tools::backtest::sim_fill_vwap(na, no_bid, depth, stake_amt);
             s.balance -= stake_amt;
             s.position = -1;
-            s.entry_price = na;
+            s.entry_price = fill_price;
             s.stake = stake_amt;
             s.pending = Some(TickPendingOrder {
                 side: "no".to_string(),
                 stake_usdc: stake_amt,
-                entry_price: na,
+                entry_price: fill_price,
             });
         });
     }
@@ -4810,12 +5612,12 @@ async fn tick_runner_loop(
             last_window = window_ts;
         }
 
-        // ── Fetch CLOB book (yes_bid/yes_ask/no_bid/no_ask) ───────────────
+        // ── Fetch CLOB book (yes_bid/yes_ask/no_bid/no_ask + depth) ───────
         let yes_token = config.poly_token_id.clone().unwrap_or_default();
-        let (yes_bid, yes_ask, no_bid, no_ask) = if !yes_token.is_empty() {
+        let (yes_bid, yes_ask, no_bid, no_ask, ask_depth_usd, bid_depth_usd) = if !yes_token.is_empty() {
             fetch_clob_book(&http, &yes_token).await
         } else {
-            (0.0, 0.0, 0.0, 0.0)
+            (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
         };
         let yes_mid = if yes_bid > 0.0 && yes_ask > 0.0 { (yes_bid + yes_ask) / 2.0 }
                       else if yes_bid > 0.0 { yes_bid }
@@ -4827,56 +5629,94 @@ async fn tick_runner_loop(
         {
             let mut s = state.lock().unwrap();
             // First-time anchor of window_open_price for the current window
-            if s.current_window_ts == 0 || window_ts != s.current_window_ts {
-                // Window changed → settle previous open position using current bp
-                if s.position != 0 && s.window_open_price > 0.0 && bp > 0.0 {
-                    let yes_won = bp > s.window_open_price;
-                    let won = (s.position == 1 && yes_won) || (s.position == -1 && !yes_won);
-                    let (pnl, payout) = if won {
-                        let payout = if s.entry_price > 0.0 { s.stake / s.entry_price } else { 0.0 };
-                        s.balance += payout;
-                        (payout - s.stake, payout)
-                    } else {
-                        (-s.stake, 0.0)
-                    };
-                    // Update the most recent matching live order with result/pnl
+            // Extract all state we need before any potential await, then drop the guard.
+            let need_advance = s.current_window_ts == 0 || window_ts != s.current_window_ts;
+            let prev_wts    = s.current_window_ts;
+            let stake       = s.stake;
+            let entry_price = s.entry_price;
+            let position    = s.position;
+            let wopen       = s.window_open_price;
+            let has_pos     = position != 0 && wopen > 0.0 && bp > 0.0;
+            drop(s); // always drop before any async work
+
+            if need_advance {
+                // Window changed → settle previous open position.
+                // Strategy: settle immediately with Binance price (synchronous, no await),
+                // then ALWAYS spawn a background monitor that retries the official Polymarket
+                // oracle every 30 s.  When the oracle settles (usually 60-180 s later), the
+                // monitor patches the order with the correct result and corrects the P&L.
+                if has_pos {
+                    let yes_won_binance = bp > wopen;
+                    let won = (position == 1 && yes_won_binance) || (position == -1 && !yes_won_binance);
+                    let pnl = if won && entry_price > 0.0 {
+                        stake / entry_price - stake
+                    } else { -stake };
+
+                    {
+                        let mut s2 = state.lock().unwrap();
+                        if won { s2.balance += if entry_price > 0.0 { stake / entry_price } else { 0.0 }; }
+                        s2.position = 0; s2.entry_price = 0.0; s2.stake = 0.0;
+                    }
+
                     if let Some(order) = live_orders.iter_mut().rev().find(|o| {
-                        o.window_ts == s.current_window_ts && o.result.is_none()
+                        o.window_ts == prev_wts && o.result.is_none()
                     }) {
                         order.result = Some(if won { "WIN".to_string() } else { "LOSS".to_string() });
                         order.pnl = Some(pnl);
-                        order.resolution_yes_won = Some(yes_won);
-                        order.resolution_source = Some("binance".to_string());
+                        order.resolution_yes_won = Some(yes_won_binance);
+                        order.resolution_source = Some("binance_provisional".to_string());
                     }
+
                     if won { live_wins = live_wins.saturating_add(1); }
                     live_total = live_total.saturating_add(1);
-                    let _ = payout;
+
                     append_runner_log(
                         &store, &id,
                         &format!(
-                            "Window {} resolved: {} (open={:.2} close={:.2} pos={} pnl={:+.2})",
-                            s.current_window_ts,
-                            if won { "WIN" } else { "LOSS" },
-                            s.window_open_price, bp, s.position, pnl
+                            "Window {} provisional: {} via Binance (open={:.2} close={:.2} pnl={:+.2}) — awaiting oracle",
+                            prev_wts, if won { "WIN" } else { "LOSS" }, wopen, bp, pnl
                         ),
                     );
-                    s.position = 0; s.entry_price = 0.0; s.stake = 0.0;
+
+                    // Always spawn the official oracle monitor — it will correct the result
+                    // when Polymarket/Chainlink settles (typically 60-180 s after window close).
+                    if let Some(ref sid) = config.series_id {
+                        if !sid.is_empty() {
+                            spawn_resolution_monitor(
+                                id.to_string(), sid.clone(), prev_wts, store.clone(), yes_won_binance,
+                                Some(state.clone()),
+                                config.fee_pct,
+                            );
+                        }
+                    }
                 }
-                s.current_window_ts = window_ts;
-                s.window_open_price = if bp > 0.0 { bp } else { 0.0 };
-            } else if s.window_open_price <= 0.0 && bp > 0.0 {
-                s.window_open_price = bp;
+
+                {
+                    let mut s2 = state.lock().unwrap();
+                    s2.current_window_ts = window_ts;
+                    s2.window_open_price = if bp > 0.0 { bp } else { 0.0 };
+                    tracing::info!(
+                        "[RUNNER {id}] new window {} anchored open={:.2} (yes_token={}…)",
+                        window_ts, s2.window_open_price,
+                        config.poly_token_id.as_deref().unwrap_or("").chars().take(10).collect::<String>(),
+                    );
+                }
+            } else if wopen <= 0.0 && bp > 0.0 {
+                state.lock().unwrap().window_open_price = bp;
             }
         }
 
         // ── Build ctx_map and run on_tick ─────────────────────────────────
-        let (cur_pos, cur_entry, cur_bal) = {
+        let (cur_pos, cur_entry, cur_bal, cur_window_open) = {
             let s = state.lock().unwrap();
-            (s.position, s.entry_price, s.balance)
+            (s.position, s.entry_price, s.balance, s.window_open_price)
         };
-        *cur_yes_ask.lock().unwrap() = yes_ask;
-        *cur_no_ask.lock().unwrap()  = no_ask;
-        *cur_balance.lock().unwrap() = cur_bal;
+        *cur_yes_ask.lock().unwrap()   = yes_ask;
+        *cur_no_ask.lock().unwrap()    = no_ask;
+        *cur_yes_bid.lock().unwrap()   = yes_bid;
+        *cur_balance.lock().unwrap()   = cur_bal;
+        *cur_ask_depth.lock().unwrap() = ask_depth_usd;
+        *cur_bid_depth.lock().unwrap() = bid_depth_usd;
 
         let mut ctx_map = Map::new();
         ctx_map.insert("ts_ms".into(),            Dynamic::from(now_s * 1000));
@@ -4893,10 +5733,31 @@ async fn tick_runner_loop(
         ctx_map.insert("balance".into(),          Dynamic::from(cur_bal));
         ctx_map.insert("position".into(),         Dynamic::from(cur_pos));
         ctx_map.insert("entry_price".into(),      Dynamic::from(cur_entry));
+        ctx_map.insert("window_open_price".into(), Dynamic::from(cur_window_open));
+        ctx_map.insert("ask_depth_usd".into(),    Dynamic::from(ask_depth_usd));
+        ctx_map.insert("bid_depth_usd".into(),    Dynamic::from(bid_depth_usd));
 
         let mut scope = Scope::new();
         if let Err(e) = eng.call_fn::<Dynamic>(&mut scope, &ast, "on_tick", (ctx_map,)) {
             tracing::warn!("[RUNNER {id}] on_tick error: {e}");
+        }
+
+        // ── Diagnostic snapshot: log every 10s in entry zone ──────────────
+        if window_secs_left > 0 && window_secs_left <= 60 && (window_secs_left % 10 == 0) {
+            let wopen = state.lock().unwrap().window_open_price;
+            let change_pct = if wopen > 0.0 && bp > 0.0 {
+                (bp - wopen) / wopen * 100.0
+            } else { 0.0 };
+            tracing::info!(
+                "[RUNNER {id}] tick secs_left={ws} bp={bp:.2} open={wopen:.2} change={change_pct:.4}% \
+                 yes={yes_bid:.3}/{yes_mid:.3}/{yes_ask:.3} no_ask={no_ask:.3} spread={spread_pct:.2}c \
+                 pos={cur_pos} pending={pending}",
+                ws = window_secs_left,
+                bp = bp, wopen = wopen, change_pct = change_pct,
+                yes_bid = yes_bid, yes_mid = yes_mid, yes_ask = yes_ask, no_ask = no_ask,
+                spread_pct = spread_pct, cur_pos = cur_pos,
+                pending = state.lock().unwrap().pending.is_some(),
+            );
         }
 
         // ── Process pending order (gates → place paper or live) ───────────
@@ -4923,6 +5784,12 @@ async fn tick_runner_loop(
                     if po.entry_price > max_ep {
                         skip_reason = Some(format!("entry {:.4} > max {:.4}", po.entry_price, max_ep));
                     }
+                }
+            }
+            // Gate: min_entry_price (guardrail — blocks extreme long-shot bets)
+            if skip_reason.is_none() && config.min_entry_price > 0.0 {
+                if po.entry_price < config.min_entry_price {
+                    skip_reason = Some(format!("entry {:.4} < min {:.4}", po.entry_price, config.min_entry_price));
                 }
             }
 
@@ -4961,6 +5828,7 @@ async fn tick_runner_loop(
                     if let Some(c) = renewed { clob_client = Some(c); }
                     if let Some(order) = order_opt {
                         live_orders.push(order);
+                        store.persist();
                     } else {
                         // Order failed: refund paper stake & flat position
                         let mut s = state.lock().unwrap();
@@ -5018,39 +5886,126 @@ async fn tick_runner_loop(
 
 /// Fetch best bid/ask from Polymarket CLOB `/book` for a YES token id and
 /// derive NO from the complement (no_bid = 1 - yes_ask, no_ask = 1 - yes_bid).
+///
+/// Polymarket's `/book` returns bids ordered low→high and asks low→high, so
+/// best bid = max(bid prices) and best ask = min(ask prices). Many windows
+/// have only one side populated (e.g. asks=0 once YES has won) — fall back to
+/// the `/price` endpoint with side=BUY/SELL to fill the missing side.
+/// Returns (yes_bid, yes_ask, no_bid, no_ask, ask_depth_usd, bid_depth_usd).
+/// Depth = USD liquidity within 2% of the best price on each side, used by the
+/// tick runner's `sim_fill_vwap` to model slippage in paper mode (live-parity
+/// with the on_tick backtester).
 async fn fetch_clob_book(
     client: &reqwest::Client,
     yes_token_id: &str,
-) -> (f64, f64, f64, f64) {
+) -> (f64, f64, f64, f64, f64, f64) {
+    let _permit = clob_semaphore().acquire_owned().await;
     let url = format!("https://clob.polymarket.com/book?token_id={}", yes_token_id);
-    match client.get(&url).send().await {
+    let (mut yes_bid, mut yes_ask, ask_depth, bid_depth) = match client.get(&url).send().await {
         Ok(resp) if resp.status().is_success() => {
             match resp.json::<serde_json::Value>().await {
                 Ok(json) => {
-                    let yes_bid = clob_best_price(&json, "bids");
-                    let yes_ask = clob_best_price(&json, "asks");
-                    let no_bid = if yes_ask > 0.0 { (1.0 - yes_ask).max(0.0) } else { 0.0 };
-                    let no_ask = if yes_bid > 0.0 { (1.0 - yes_bid).max(0.0) } else { 0.0 };
-                    (yes_bid, yes_ask, no_bid, no_ask)
+                    let yb = clob_best_price(&json, "bids");
+                    let ya = clob_best_price(&json, "asks");
+                    let ad = clob_side_depth(&json, "asks", ya, 0.02);
+                    let bd = clob_side_depth(&json, "bids", yb, 0.02);
+                    (yb, ya, ad, bd)
                 }
                 Err(_) => (0.0, 0.0, 0.0, 0.0),
             }
         }
         _ => (0.0, 0.0, 0.0, 0.0),
+    };
+
+    // Fallback: query /price endpoint for any missing side.
+    if yes_bid <= 0.0 {
+        yes_bid = fetch_clob_side_price(client, yes_token_id, "SELL").await;
+    }
+    if yes_ask <= 0.0 {
+        yes_ask = fetch_clob_side_price(client, yes_token_id, "BUY").await;
+    }
+
+    let no_bid = if yes_ask > 0.0 { (1.0 - yes_ask).max(0.0) } else { 0.0 };
+    let no_ask = if yes_bid > 0.0 { (1.0 - yes_bid).max(0.0) } else { 0.0 };
+    (yes_bid, yes_ask, no_bid, no_ask, ask_depth, bid_depth)
+}
+
+/// Sum USD-equivalent liquidity within `pct` of `best_price` on a book side.
+/// `price × size` over all levels with price ≤ best×(1+pct) (asks) or ≥ best×(1-pct) (bids).
+fn clob_side_depth(json: &serde_json::Value, side: &str, best_price: f64, pct: f64) -> f64 {
+    if best_price <= 0.0 { return 0.0; }
+    let arr = match json.get(side).and_then(|v| v.as_array()) {
+        Some(a) => a,
+        None => return 0.0,
+    };
+    let (lo, hi) = if side == "asks" {
+        (0.0, best_price * (1.0 + pct))
+    } else {
+        (best_price * (1.0 - pct), f64::INFINITY)
+    };
+    arr.iter().map(|entry| {
+        let parse = |k1: &str, k2: &str| -> f64 {
+            entry.get(k1).or_else(|| entry.get(k2))
+                .and_then(|v| match v {
+                    serde_json::Value::String(s) => s.parse::<f64>().ok(),
+                    serde_json::Value::Number(n) => n.as_f64(),
+                    _ => None,
+                })
+                .unwrap_or(0.0)
+        };
+        let price = parse("price", "p");
+        let size  = parse("size", "s");
+        if price >= lo && price <= hi && price > 0.0 && size > 0.0 {
+            price * size
+        } else { 0.0 }
+    }).sum()
+}
+
+async fn fetch_clob_side_price(client: &reqwest::Client, token_id: &str, side: &str) -> f64 {
+    let url = format!("https://clob.polymarket.com/price?token_id={}&side={}", token_id, side);
+    match client.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            match resp.json::<serde_json::Value>().await {
+                Ok(json) => json
+                    .get("price")
+                    .and_then(|v| match v {
+                        serde_json::Value::String(s) => s.parse::<f64>().ok(),
+                        serde_json::Value::Number(n) => n.as_f64(),
+                        _ => None,
+                    })
+                    .unwrap_or(0.0),
+                Err(_) => 0.0,
+            }
+        }
+        _ => 0.0,
     }
 }
 
 fn clob_best_price(json: &serde_json::Value, side: &str) -> f64 {
-    json.get(side)
-        .and_then(|v| v.as_array())
-        .and_then(|arr| arr.first())
-        .and_then(|entry| entry.get("price").or_else(|| entry.get("p")))
-        .and_then(|p| match p {
-            serde_json::Value::String(s) => s.parse().ok(),
+    // Polymarket /book returns levels as arrays; bids are best=highest price,
+    // asks are best=lowest price. Compute the extreme explicitly rather than
+    // trusting arr.first() / arr.last() — the order is documented but has
+    // changed before across CLOB versions.
+    let arr = match json.get(side).and_then(|v| v.as_array()) {
+        Some(a) if !a.is_empty() => a,
+        _ => return 0.0,
+    };
+    let prices: Vec<f64> = arr.iter().filter_map(|entry| {
+        let p = entry.get("price").or_else(|| entry.get("p"))?;
+        match p {
+            serde_json::Value::String(s) => s.parse::<f64>().ok(),
             serde_json::Value::Number(n) => n.as_f64(),
             _ => None,
-        })
-        .unwrap_or(0.0)
+        }
+    }).collect();
+    if prices.is_empty() {
+        return 0.0;
+    }
+    if side == "bids" {
+        prices.into_iter().fold(0f64, f64::max)
+    } else {
+        prices.into_iter().fold(f64::INFINITY, f64::min)
+    }
 }
 
 /// Place a paper or live market order for the rhai_tick engine.

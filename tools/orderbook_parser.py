@@ -920,11 +920,132 @@ def fetch_gamma_markets_for_prefix(prefix: str, start_date_str: str, end_date_st
 
 # ── 1Hz tick builder (shared by to-ticks and to-ticks-multi) ──────────────────
 
+def estimate_depth_from_trades(
+    trade_df: pd.DataFrame,
+    yes_token_ids: set,
+    window_s: int = 30,
+) -> pd.DataFrame:
+    """
+    Estimate YES ask-side and bid-side depth (USD) per second from trade events.
+
+    Strategy: use a rolling `window_s`-second sum of traded USD volume as a proxy
+    for available liquidity at that moment. Ask depth ≈ SELL trades (someone
+    taking the ask); bid depth ≈ BUY trades (someone taking the bid).
+
+    The parquet `side` column records the taker side ("BUY" = taker hit the ask,
+    "SELL" = taker hit the bid). `price × size` gives the USD notional per trade.
+
+    Returns DataFrame indexed by ts_s with columns ask_depth_usd, bid_depth_usd.
+    Returns empty DataFrame when no trade data is available.
+    """
+    if trade_df.empty:
+        return pd.DataFrame()
+    if yes_token_ids:
+        tdf = trade_df[trade_df["asset_id"].isin(yes_token_ids)].copy()
+    else:
+        tdf = trade_df.copy()
+    if tdf.empty:
+        return pd.DataFrame()
+
+    tdf["ts_s"] = tdf["ts_ms"] // 1000
+    tdf["notional"] = (tdf["price"].astype(float) * tdf["size"].astype(float)).fillna(0.0)
+    # Taker side BUY = hitting the ask → adds to ask-side depth estimate
+    # Taker side SELL = hitting the bid → adds to bid-side depth estimate
+    tdf["ask_vol"] = _np.where(tdf["side"].str.upper() == "BUY",  tdf["notional"], 0.0)
+    tdf["bid_vol"] = _np.where(tdf["side"].str.upper() == "SELL", tdf["notional"], 0.0)
+
+    per_sec = tdf.groupby("ts_s")[["ask_vol", "bid_vol"]].sum().reset_index()
+    # Rolling sum over window_s seconds — proxy for liquidity available now
+    per_sec = per_sec.sort_values("ts_s")
+    per_sec["ask_depth_usd"] = per_sec["ask_vol"].rolling(window_s, min_periods=1).sum()
+    per_sec["bid_depth_usd"] = per_sec["bid_vol"].rolling(window_s, min_periods=1).sum()
+    per_sec = per_sec[["ts_s", "ask_depth_usd", "bid_depth_usd"]].set_index("ts_s")
+    return per_sec
+
+
+def fetch_polymarket_window_resolutions(
+    condition_ids: list,
+    window_secs: int = 300,
+) -> dict:
+    """
+    Query the Polymarket Gamma API to get official resolution for each window.
+
+    For every condition_id in `condition_ids` this function fetches the
+    `outcomePrices` field. A resolved YES market has outcomePrices ≈ ["1","0"]
+    (YES token pays $1); a resolved NO market has ["0","1"].
+
+    Returns: {window_ts_unix_secs: True/False/None}
+      True  = YES won (price went up / UP outcome)
+      False = NO won  (price went down / DOWN outcome)
+      None  = market not yet resolved or fetch failed
+
+    Uses the public Gamma API (no auth required):
+      GET https://gamma-api.polymarket.com/markets?condition_id=0x...
+    """
+    import urllib.request as _ur
+    import time as _time
+
+    resolutions: dict = {}
+
+    for cid in condition_ids:
+        if not cid:
+            continue
+        url = f"https://gamma-api.polymarket.com/markets?condition_id={cid}&limit=1"
+        try:
+            req = _ur.Request(url, headers={"User-Agent": "trader-claw/1.0"})
+            with _ur.urlopen(req, timeout=10) as r:
+                markets = json.loads(r.read())
+            if not markets:
+                continue
+            market = markets[0]
+            closed = market.get("closed", False) or market.get("resolved", False)
+            outcome_prices = market.get("outcomePrices")
+            # window_ts: Polymarket encodes the window open timestamp in the slug.
+            # e.g. slug "btc-up-or-down-jan-1-0000" maps to a known window.
+            # Simpler: use startDate / endDate from the market to derive window_ts.
+            end_date_str = market.get("endDate") or market.get("end_date_iso")
+            window_ts = None
+            if end_date_str:
+                try:
+                    import datetime as _dt
+                    if "T" in str(end_date_str):
+                        dt = _dt.datetime.fromisoformat(str(end_date_str).replace("Z", "+00:00"))
+                    else:
+                        dt = _dt.datetime.strptime(str(end_date_str)[:10], "%Y-%m-%d").replace(tzinfo=_dt.timezone.utc)
+                    end_ts = int(dt.timestamp())
+                    # window_ts = end of window rounded to window_secs
+                    window_ts = end_ts - (end_ts % window_secs)
+                except Exception:
+                    pass
+
+            if window_ts is None:
+                continue
+
+            yes_won = None
+            if closed and outcome_prices and len(outcome_prices) >= 2:
+                try:
+                    yes_price = float(outcome_prices[0])
+                    yes_won = yes_price >= 0.5
+                except (ValueError, TypeError):
+                    pass
+
+            resolutions[window_ts] = yes_won
+
+        except Exception as e:
+            print(f"[resolution] Gamma fetch failed for {cid[:16]}...: {e}", file=sys.stderr)
+
+        _time.sleep(0.05)  # 50ms pause to avoid rate-limiting
+
+    return resolutions
+
+
 def build_ticks_from_df(
     df: pd.DataFrame,
     yes_token_ids: set,
     window_minutes: int,
     binance_prices: dict,
+    trade_df: "pd.DataFrame | None" = None,
+    window_resolutions: "dict | None" = None,
 ) -> pd.DataFrame:
     """
     Given a DataFrame of price_change events for one or many markets,
@@ -932,6 +1053,8 @@ def build_ticks_from_df(
 
     `yes_token_ids`: set of asset_ids that are the YES token for their respective market.
     `binance_prices`: {ts_s: float} lookup for Binance spot price.
+    `trade_df`: optional DataFrame of last_trade_price events for depth estimation.
+    `window_resolutions`: {window_ts_secs: True/False/None} official Polymarket resolution.
     Returns DataFrame with all tick fields ready to serialize as JSONL.
     """
     window_secs = window_minutes * 60
@@ -966,6 +1089,24 @@ def build_ticks_from_df(
         lambda s: binance_prices.get(int(s), 0.0)
     )
 
+    # ── Book depth estimation from trade history ──────────────────────────────
+    # Merge rolling-volume depth estimate when trade data is available.
+    if trade_df is not None and not trade_df.empty:
+        depth_df = estimate_depth_from_trades(trade_df, yes_token_ids)
+        if not depth_df.empty:
+            yes_1hz = yes_1hz.merge(
+                depth_df[["ask_depth_usd", "bid_depth_usd"]],
+                left_on="ts_s", right_index=True, how="left"
+            )
+            yes_1hz["ask_depth_usd"] = yes_1hz["ask_depth_usd"].fillna(0.0)
+            yes_1hz["bid_depth_usd"] = yes_1hz["bid_depth_usd"].fillna(0.0)
+        else:
+            yes_1hz["ask_depth_usd"] = 0.0
+            yes_1hz["bid_depth_usd"] = 0.0
+    else:
+        yes_1hz["ask_depth_usd"] = 0.0
+        yes_1hz["bid_depth_usd"] = 0.0
+
     # Window fields.
     # At exact 5-min boundaries (ts_s % window_secs == 0) the second belongs to the
     # PREVIOUS window as its close tick (secs_left = 0).  All other seconds count
@@ -980,6 +1121,16 @@ def build_ticks_from_df(
         yes_1hz["ts_s"].astype(int) - _rem,
     ).astype(int)
     yes_1hz["window_secs_left"] = _np.where(_is_boundary, 0, window_secs - _rem).astype(int)
+
+    # ── Official Polymarket resolution per window ─────────────────────────────
+    # Attach yes_won (True/False/None) from the Gamma API lookup.
+    # None = not yet resolved or data not available.
+    if window_resolutions:
+        yes_1hz["window_yes_won"] = yes_1hz["window_ts"].map(
+            lambda wts: window_resolutions.get(int(wts))
+        )
+    else:
+        yes_1hz["window_yes_won"] = None
 
     yes_1hz["date"] = pd.to_datetime(yes_1hz["ts_s"], unit="s", utc=True).dt.date
     return yes_1hz
@@ -1007,6 +1158,10 @@ def write_ticks_jsonl(yes_1hz: pd.DataFrame, out_dir: Path) -> int:
                 "oracle_lag_ms":    0,
                 "window_ts":        int(row["window_ts"]),
                 "window_secs_left": int(row["window_secs_left"]),
+                "ask_depth_usd":    round(float(row.get("ask_depth_usd", 0.0)), 2),
+                "bid_depth_usd":    round(float(row.get("bid_depth_usd", 0.0)), 2),
+                # Official Polymarket resolution: True=YES won, False=NO won, null=pending
+                "window_yes_won":   None if (wyw := row.get("window_yes_won")) is None or (isinstance(wyw, float) and _np.isnan(wyw)) else bool(wyw),
             }))
         out_file.write_text("\n".join(rows) + "\n")
         total += len(rows)
@@ -1070,6 +1225,25 @@ def cmd_to_ticks(args: argparse.Namespace) -> None:
     yes_asset = asset_counts.idxmax()
     print(f"[to-ticks] YES asset_id={yes_asset[:20]}... ({asset_counts[yes_asset]:,} events)", file=sys.stderr)
 
+    # Trade events for depth estimation (optional — gracefully absent in older parquets)
+    trade_df = None
+    try:
+        where_trades = f"event_type = 'last_trade_price' AND CAST(market AS VARCHAR) = '{market_id}'"
+        trade_df = con.execute(f"""
+        SELECT
+            CAST(epoch_ms(timestamp_received) AS BIGINT) AS ts_ms,
+            CAST(price  AS DOUBLE) AS price,
+            CAST(size   AS DOUBLE) AS size,
+            CAST(side   AS VARCHAR) AS side,
+            asset_id
+        FROM read_parquet({file_list}, hive_partitioning=false, union_by_name=true)
+        WHERE {where_trades}
+        ORDER BY timestamp_received
+        """).df()
+        print(f"[to-ticks] {len(trade_df):,} trade events for depth estimation", file=sys.stderr)
+    except Exception as e:
+        print(f"[to-ticks] Trade depth query skipped ({e})", file=sys.stderr)
+
     # Binance prices (optional)
     binance_prices: dict = {}
     if binance_symbol:
@@ -1079,7 +1253,15 @@ def cmd_to_ticks(args: argparse.Namespace) -> None:
         binance_prices = fetch_binance_prices(binance_symbol, ts_min, ts_max + 60_000)
         print(f"[to-ticks] {len(binance_prices):,} Binance price points", file=sys.stderr)
 
-    yes_1hz = build_ticks_from_df(df, {yes_asset}, window_minutes, binance_prices)
+    # Fetch official Polymarket resolution for each window in this market
+    print(f"[to-ticks] Fetching Polymarket resolution from Gamma API...", file=sys.stderr)
+    window_resolutions = fetch_polymarket_window_resolutions(
+        [market_id], window_secs=window_minutes * 60
+    )
+    resolved_count = sum(1 for v in window_resolutions.values() if v is not None)
+    print(f"[to-ticks] {len(window_resolutions)} windows, {resolved_count} resolved", file=sys.stderr)
+
+    yes_1hz = build_ticks_from_df(df, {yes_asset}, window_minutes, binance_prices, trade_df, window_resolutions)
     if yes_1hz.empty:
         print(json.dumps({"error": "Failed to build tick table"}))
         return
@@ -1358,6 +1540,138 @@ def cmd_to_ticks_multi(args: argparse.Namespace) -> None:
             yes_1hz["ts_s"], unit="s", utc=True
         ).dt.date
 
+        # ── Depth estimation from trade events (optional) ──────────────────────
+        yes_1hz["ask_depth_usd"] = 0.0
+        yes_1hz["bid_depth_usd"] = 0.0
+        try:
+            all_day_trades = []
+            for day_str_d, day_files in [
+                (d, [f for f in sorted((out_base.parent / "orderbook").glob("*.parquet"))
+                     if d in f.stem])
+                for d in set(str(yes_1hz["date"].iloc[i]) for i in range(min(3, len(yes_1hz))))
+            ]:
+                _ = day_str_d, day_files  # iterated below
+
+            # Re-query trades from parquets already loaded above
+            all_file_list = "[" + ", ".join(f"'{f}'" for f in sorted(
+                f for day_files_inner in [
+                    [ff for ff in sorted((p / "orderbook").glob("*.parquet"))
+                     if any(d in ff.stem for d in set(str(dt) for dt in yes_1hz["date"].unique()))]
+                    for p in [out_base.parent]
+                ]
+                for f in day_files_inner
+            )) + "]"
+
+            if all_file_list != "[]":
+                trade_depth_df = con.execute(f"""
+                SELECT
+                    CAST(epoch_ms(timestamp_received) AS BIGINT) AS ts_ms,
+                    CAST(price  AS DOUBLE) AS price,
+                    CAST(size   AS DOUBLE) AS size,
+                    CAST(side   AS VARCHAR) AS side,
+                    asset_id
+                FROM read_parquet({all_file_list}, hive_partitioning=false, union_by_name=true)
+                WHERE event_type = 'last_trade_price'
+                  AND CAST(market AS VARCHAR) IN ({cids_sql})
+                  {asset_filter}
+                ORDER BY timestamp_received
+                """).df()
+
+                if not trade_depth_df.empty:
+                    depth_df = estimate_depth_from_trades(trade_depth_df, set(day_ytids))
+                    if not depth_df.empty:
+                        yes_1hz = yes_1hz.merge(
+                            depth_df[["ask_depth_usd", "bid_depth_usd"]],
+                            left_on="ts_s", right_index=True, how="left",
+                            suffixes=("_old", ""),
+                        )
+                        if "ask_depth_usd_old" in yes_1hz.columns:
+                            yes_1hz.drop(columns=["ask_depth_usd_old", "bid_depth_usd_old"],
+                                         inplace=True, errors="ignore")
+                        yes_1hz["ask_depth_usd"] = yes_1hz["ask_depth_usd"].fillna(0.0)
+                        yes_1hz["bid_depth_usd"] = yes_1hz["bid_depth_usd"].fillna(0.0)
+                        print(f"[to-ticks-multi] {slug}: depth estimated from "
+                              f"{len(trade_depth_df):,} trade events", file=sys.stderr)
+        except Exception as _dep_e:
+            print(f"[to-ticks-multi] {slug}: depth estimation skipped ({_dep_e})", file=sys.stderr)
+
+        if yes_1hz.empty:
+            results.append({"slug": slug, "ok": False, "error": "Empty tick table after resampling"})
+            continue
+
+        # ── Step 4b: Fetch official Polymarket resolutions ───────────────────────
+        # We already have markets_info which contains end_ts for each window.
+        # Build {window_ts → yes_won} directly from markets_info "outcomePrices"
+        # by querying Gamma. Rate-limit: 1 req/50ms → 9500 windows ≈ 8 min.
+        # Optimization: only fetch markets whose end_ts is in the past (resolved).
+        # Use parallel batch requests to speed up (~50 concurrent).
+        yes_1hz["window_yes_won"] = None
+        try:
+            import time as _time
+            import urllib.request as _ur
+            import concurrent.futures as _cf
+
+            now_ts = _time.time()
+            # Filter to resolved markets (end_ts < now) and build {cid: window_ts}
+            resolved_markets = [
+                m for m in markets_info
+                if m.get("end_ts", 0) < now_ts
+            ]
+            print(
+                f"[to-ticks-multi] {slug}: fetching resolutions for "
+                f"{len(resolved_markets)} of {len(markets_info)} resolved markets...",
+                file=sys.stderr
+            )
+
+            def _fetch_one(m):
+                cid = m.get("condition_id", "")
+                if not cid:
+                    return None
+                url = f"https://gamma-api.polymarket.com/markets?condition_id={cid}&limit=1"
+                try:
+                    req = _ur.Request(url, headers={"User-Agent": "trader-claw/1.0"})
+                    with _ur.urlopen(req, timeout=8) as r:
+                        markets_resp = json.loads(r.read())
+                    if not markets_resp:
+                        return None
+                    mkt = markets_resp[0]
+                    outcome_prices = mkt.get("outcomePrices")
+                    if outcome_prices and len(outcome_prices) >= 2:
+                        yes_price = float(outcome_prices[0])
+                        yes_won = yes_price >= 0.5
+                    else:
+                        yes_won = None
+                    window_ts = int(m.get("end_ts", 0)) - window_minutes * 60
+                    return (window_ts, yes_won)
+                except Exception:
+                    return None
+
+            window_resolutions_multi: dict = {}
+            # Process in batches of 50 concurrent to balance speed & rate limits
+            batch_size = 50
+            for i in range(0, len(resolved_markets), batch_size):
+                batch = resolved_markets[i: i + batch_size]
+                with _cf.ThreadPoolExecutor(max_workers=batch_size) as ex:
+                    for result in ex.map(_fetch_one, batch):
+                        if result is not None:
+                            wts, won = result
+                            if wts > 0:
+                                window_resolutions_multi[wts] = won
+                _time.sleep(0.1)  # 100ms pause between batches
+
+            resolved_count = sum(1 for v in window_resolutions_multi.values() if v is not None)
+            print(
+                f"[to-ticks-multi] {slug}: {resolved_count} windows with official resolution",
+                file=sys.stderr
+            )
+
+            if window_resolutions_multi:
+                yes_1hz["window_yes_won"] = yes_1hz["window_ts"].map(
+                    lambda wts: window_resolutions_multi.get(int(wts))
+                )
+        except Exception as _res_e:
+            print(f"[to-ticks-multi] {slug}: resolution fetch skipped ({_res_e})", file=sys.stderr)
+
         if yes_1hz.empty:
             results.append({"slug": slug, "ok": False, "error": "Empty tick table after resampling"})
             continue
@@ -1510,6 +1824,161 @@ def cmd_drift(args: argparse.Namespace) -> None:
         print(json.dumps({"error": str(e), "trace": traceback.format_exc()}))
 
 
+def cmd_backfill_resolutions(args: argparse.Namespace) -> None:
+    """
+    Retroactively patch official Polymarket resolution (window_yes_won) into
+    existing JSONL tick files.
+
+    For every unique window_ts in the JSONL files, queries the Gamma API to
+    find the market with matching slug (series + window_ts) and reads
+    outcomePrices to determine if YES won.
+
+    Usage:
+        python3 tools/orderbook_parser.py backfill-resolutions \\
+            --slug btc_5m \\
+            --series btc-up-or-down-5m \\
+            --window-minutes 5
+
+    This rewrites the JSONL files in-place, adding window_yes_won to every row.
+    Safe to re-run: already-resolved rows are preserved.
+    """
+    import time as _time
+    import concurrent.futures as _cf
+    import urllib.request as _ur
+
+    slug = args.slug
+    series_prefix = args.series  # e.g. "btc-up-or-down-5m"
+    window_minutes = args.window_minutes
+    window_secs = window_minutes * 60
+
+    # Auto-detect ticks dir
+    ticks_dir: Path
+    if args.ticks_dir:
+        ticks_dir = Path(args.ticks_dir) / slug
+    else:
+        workspace = Path.home() / ".traderclaw" / "workspace"
+        ticks_dir = workspace / "data" / "ticks" / slug
+
+    if not ticks_dir.exists():
+        print(json.dumps({"error": f"Ticks dir not found: {ticks_dir}"}))
+        return
+
+    jsonl_files = sorted(ticks_dir.glob("*.jsonl"))
+    if not jsonl_files:
+        print(json.dumps({"error": f"No JSONL files found in {ticks_dir}"}))
+        return
+
+    print(f"[backfill] Found {len(jsonl_files)} JSONL files in {ticks_dir}", file=sys.stderr)
+
+    # Step 1: collect unique window_ts values that are not yet resolved
+    all_window_ts: set = set()
+    already_resolved: dict = {}
+    for f in jsonl_files:
+        with open(f) as fp:
+            for line in fp:
+                try:
+                    row = json.loads(line)
+                    wts = row.get("window_ts", 0)
+                    if wts <= 0:
+                        continue
+                    if "window_yes_won" in row and row["window_yes_won"] is not None:
+                        already_resolved[wts] = row["window_yes_won"]
+                    else:
+                        all_window_ts.add(wts)
+                except Exception:
+                    pass
+
+    pending = sorted(all_window_ts - set(already_resolved.keys()))
+    print(
+        f"[backfill] {len(already_resolved)} windows already resolved, "
+        f"{len(pending)} need resolution",
+        file=sys.stderr
+    )
+
+    # Step 2: batch-fetch resolutions from Gamma API using slug + window_ts
+    def fetch_one(wts: int):
+        slug_for_window = f"{series_prefix}-{wts}"
+        url = f"https://gamma-api.polymarket.com/markets?slug={slug_for_window}&limit=1"
+        try:
+            req = _ur.Request(url, headers={"User-Agent": "trader-claw/1.0"})
+            with _ur.urlopen(req, timeout=8) as r:
+                markets_list = json.loads(r.read())
+            if not markets_list:
+                # Try timestamp in milliseconds variant
+                slug_ms = f"{series_prefix}-{wts * 1000}"
+                url2 = f"https://gamma-api.polymarket.com/markets?slug={slug_ms}&limit=1"
+                req2 = _ur.Request(url2, headers={"User-Agent": "trader-claw/1.0"})
+                with _ur.urlopen(req2, timeout=8) as r2:
+                    markets_list = json.loads(r2.read())
+            if not markets_list:
+                return (wts, None)
+            mkt = markets_list[0]
+            outcome_prices = mkt.get("outcomePrices")
+            if outcome_prices and len(outcome_prices) >= 2:
+                yes_price = float(outcome_prices[0])
+                return (wts, yes_price >= 0.5)
+            return (wts, None)
+        except Exception:
+            return (wts, None)
+
+    now_ts = _time.time()
+    # Only fetch windows that ended in the past (can be resolved)
+    resolvable = [wts for wts in pending if wts + window_secs < now_ts]
+    print(f"[backfill] Fetching {len(resolvable)} resolvable windows...", file=sys.stderr)
+
+    new_resolutions: dict = dict(already_resolved)
+    batch_size = 30
+    fetched = 0
+    for i in range(0, len(resolvable), batch_size):
+        batch = resolvable[i: i + batch_size]
+        with _cf.ThreadPoolExecutor(max_workers=batch_size) as ex:
+            for wts, won in ex.map(fetch_one, batch):
+                new_resolutions[wts] = won
+                if won is not None:
+                    fetched += 1
+        _time.sleep(0.15)
+
+    print(f"[backfill] Resolved {fetched} new windows", file=sys.stderr)
+
+    # Step 3: rewrite JSONL files in-place
+    patched_files = 0
+    patched_rows = 0
+    for f in jsonl_files:
+        rows = []
+        changed = False
+        with open(f) as fp:
+            for line in fp:
+                line = line.rstrip("\n")
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                    wts = row.get("window_ts", 0)
+                    if wts in new_resolutions:
+                        old_val = row.get("window_yes_won")
+                        new_val = new_resolutions[wts]
+                        if old_val != new_val:
+                            row["window_yes_won"] = new_val
+                            changed = True
+                            patched_rows += 1
+                    rows.append(json.dumps(row))
+                except Exception:
+                    rows.append(line)
+        if changed:
+            f.write_text("\n".join(rows) + "\n")
+            patched_files += 1
+
+    print(f"[backfill] Patched {patched_rows} rows across {patched_files} files", file=sys.stderr)
+    print(json.dumps({
+        "ok": True,
+        "slug": slug,
+        "files_patched": patched_files,
+        "rows_patched": patched_rows,
+        "windows_resolved": fetched,
+        "windows_already_had_resolution": len(already_resolved),
+    }))
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -1594,19 +2063,30 @@ def main() -> None:
     p.add_argument("--freq",   default="5min", help="Candle frequency: 1min, 5min, 15min, 1h")
     p.add_argument("--out",    default=None,   help="Output dir (default: same as --dir)")
 
+    # backfill-resolutions — patch window_yes_won into existing tick JSONL files
+    p = sub.add_parser(
+        "backfill-resolutions",
+        help="Patch official Polymarket resolution (window_yes_won) into existing JSONL tick files"
+    )
+    p.add_argument("--slug",    required=True, help="Tick slug (e.g. btc_5m)")
+    p.add_argument("--ticks-dir", default=None, help="Path to ticks/ directory (default: auto-detect from workspace)")
+    p.add_argument("--series",  required=True, help="Market series slug prefix (e.g. btc-up-or-down-5m)")
+    p.add_argument("--window-minutes", type=int, default=5, help="Window duration in minutes (default: 5)")
+
     args = parser.parse_args()
 
     dispatch = {
-        "summary":        cmd_summary,
-        "price-series":   cmd_price_series,
-        "top-markets":    cmd_top_markets,
-        "spread-stats":   cmd_spread_stats,
-        "drift":          cmd_drift,
-        "download":       cmd_download,
-        "analyze-local":  cmd_analyze_local,
-        "to-ticks":       cmd_to_ticks,
-        "to-ticks-multi": cmd_to_ticks_multi,
-        "to-candles":     cmd_to_candles,
+        "summary":              cmd_summary,
+        "price-series":         cmd_price_series,
+        "top-markets":          cmd_top_markets,
+        "spread-stats":         cmd_spread_stats,
+        "drift":                cmd_drift,
+        "download":             cmd_download,
+        "analyze-local":        cmd_analyze_local,
+        "to-ticks":             cmd_to_ticks,
+        "to-ticks-multi":       cmd_to_ticks_multi,
+        "to-candles":           cmd_to_candles,
+        "backfill-resolutions": cmd_backfill_resolutions,
     }
     dispatch[args.cmd](args)
 

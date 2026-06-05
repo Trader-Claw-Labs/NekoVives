@@ -83,6 +83,11 @@ export interface BacktestConfig {
   rv_min_btc?: number
   // CLOB 1 HZ: tick slug to replay (e.g. "btc_5m"). Used as `symbol` in the backtest request.
   clob_slug?: string
+  // Guardrail parameters — mirror the live runner's risk controls for live-parity backtesting.
+  kelly_size_cap?: number
+  min_entry_price?: number
+  max_consecutive_losses?: number
+  stop_loss_pct?: number
 }
 
 export interface TradeLog {
@@ -158,7 +163,8 @@ const DEFAULT_CONFIG: BacktestConfig = {
   // Default $500 per trade reflects real Polymarket 5-min binary window liquidity
   max_position_usd: 500,
   sizing_mode: 'percent',
-  sizing_value: 1.0,
+  // Backend convention: percent mode uses 0-100 (e.g. 5 = 5%). Same as live runner.
+  sizing_value: 5,
   price_mode: 'historical',
   allowed_hours: [],
   max_spread_pct: undefined, // undefined = use backend default (3%)
@@ -184,11 +190,18 @@ function loadFromStorage(): Partial<BacktestState> {
     const raw = localStorage.getItem(LS_KEY)
     if (!raw) return {}
     const parsed = JSON.parse(raw)
-    // Only restore non-running state — don't restore stale isRunning/progress
+    const cfg: BacktestConfig = { ...DEFAULT_CONFIG, ...(parsed.config ?? {}) }
+    // ── ONE-TIME MIGRATION: legacy fractional sizing_value → percent ───
+    // Backend now expects 0-100 (5 = 5%). Old localStorage may have 0.05/0.25/1.0.
+    if ((cfg.sizing_mode ?? 'percent') === 'percent'
+        && cfg.sizing_value != null
+        && cfg.sizing_value > 0
+        && cfg.sizing_value <= 1.5) {
+      console.log('[Backtest] One-time migration of localStorage sizing_value:', cfg.sizing_value, '→', cfg.sizing_value * 100)
+      cfg.sizing_value = cfg.sizing_value * 100
+    }
     return {
-      // Spread DEFAULT_CONFIG first so any new fields get their defaults
-      // even when the stored config predates them (e.g. max_position_usd added later)
-      config: { ...DEFAULT_CONFIG, ...(parsed.config ?? {}) },
+      config: cfg,
       result: parsed.result ?? null,
       scriptResults: parsed.scriptResults ?? {},
     }
@@ -323,11 +336,39 @@ export function useBacktestState() {
         })
       }, 15_000)
 
+      // ── Normalize cfg before sending ────────────────────────────────────
+      const cfgToSend: BacktestConfig = { ...cfg }
+
+      // 1. sizing_value: legacy fraction → percent (backend uses 0-100).
+      if ((cfg.sizing_mode ?? 'percent') === 'percent'
+          && cfg.sizing_value != null
+          && cfg.sizing_value > 0
+          && cfg.sizing_value <= 1.5) {
+        cfgToSend.sizing_value = cfg.sizing_value * 100
+        console.log('[Backtest] Normalized legacy sizing_value', cfg.sizing_value, '→', cfgToSend.sizing_value)
+      }
+
+      // 2. archive modes use `symbol` as the tick-slug directory name (e.g. "btc_5m"),
+      // NOT as a Binance ticker. If the user switched market_type without re-selecting
+      // the slug, `symbol` may still be "BTCUSDT" from polymarket_binary mode → backend
+      // looks for ticks in data/ticks/BTCUSDT/ (doesn't exist) → 0 trades. Fix here.
+      if (cfg.market_type === 'clob_1hz' || cfg.market_type === 'archive_candles') {
+        const slug = cfg.clob_slug ?? cfg.series_id
+        if (slug && cfg.symbol !== slug) {
+          cfgToSend.symbol = slug
+          console.log('[Backtest] Archive mode: symbol "' + cfg.symbol + '" → "' + slug + '" (slug)')
+        }
+      }
+
+      // ALWAYS log the EXACT payload that will be sent to the backend.
+      // Helps diagnose 0-trade results when the UI sends unexpected values.
+      console.log('[Backtest] Sending payload:', JSON.stringify(cfgToSend, null, 2))
+
       try {
-        const response = await apiPost<BacktestResult>('/api/backtest/run', cfg)
+        const response = await apiPost<BacktestResult>('/api/backtest/run', cfgToSend)
         clearTimeout(phaseTimer)
         clearTimeout(analyzeTimer)
-        console.log('[Backtest] Complete:', response)
+        console.log('[Backtest] Complete: trades=', response.total_trades, 'return=', response.total_return_pct)
         return response
       } catch (err) {
         clearTimeout(phaseTimer)

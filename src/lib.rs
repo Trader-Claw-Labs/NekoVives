@@ -68,6 +68,7 @@ pub(crate) mod service;
 pub(crate) mod skills;
 pub mod engines;
 pub mod live_feed;
+pub mod portfolio_guard;
 pub mod strategy_runner;
 pub mod tick_recorder;
 pub mod tools;

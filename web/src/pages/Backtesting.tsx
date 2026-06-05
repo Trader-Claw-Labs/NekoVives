@@ -1450,6 +1450,21 @@ export default function Backtesting() {
   const [showLiveModal, setShowLiveModal] = useState(false)
   const [selectedScripts, setSelectedScripts] = useState<string[]>([])
   const [batchProgress, setBatchProgress] = useState<{ current: number; total: number; script: string } | null>(null)
+  // ── Optimizer state (parameter sweep with TRAIN/TEST split) ──
+  type OptParam = 'min_entry_price' | 'sizing_value' | 'max_spread_pct' | 'kelly_size_cap'
+  const [showOptimizer, setShowOptimizer] = useState(false)
+  const [optParam, setOptParam] = useState<OptParam>('min_entry_price')
+  const [optGrid, setOptGrid] = useState<string>('0.10,0.15,0.20,0.25,0.30')
+  const [optProgress, setOptProgress] = useState<{ phase: string; current: number; total: number } | null>(null)
+  type OptRow = {
+    label: string
+    train: { trades: number; wr: number; ret: number; sharpe: number; dd: number } | null
+    test:  { trades: number; wr: number; ret: number; sharpe: number; dd: number } | null
+    isBaseline: boolean
+    isWinner: boolean
+  }
+  const [optResults, setOptResults] = useState<OptRow[] | null>(null)
+  const [optVerdict, setOptVerdict] = useState<{ kind: 'accept' | 'marginal' | 'reject'; msg: string; bestValue?: number } | null>(null)
   type SortMode = 'default' | 'win_rate_desc' | 'trades_desc' | 'balance_desc'
   const [sortBy, setSortBy] = useState<SortMode>('default')
   const SORT_MODES: SortMode[] = ['default', 'win_rate_desc', 'trades_desc', 'balance_desc']
@@ -1669,6 +1684,143 @@ export default function Backtesting() {
     refetchScripts()
   }
 
+  // ── Optimizer: parameter sweep with TRAIN/TEST split ─────────────────────
+  // Runs a sweep over `optParam` values, each on a 70%/30% TRAIN/TEST split
+  // of the configured date range. The "winner" is the value with highest
+  // TRAIN Sharpe; we then verify it on TEST out-of-sample. If TEST collapses
+  // below baseline, we REJECT (overfit). Mirrors optimize_runner.py logic.
+  const runOptimization = async () => {
+    if (!config.script || !config.from_date || !config.to_date) return
+    setOptResults(null)
+    setOptVerdict(null)
+
+    // Parse grid
+    const grid = optGrid.split(',').map(s => parseFloat(s.trim())).filter(v => !isNaN(v))
+    if (grid.length < 2) {
+      setOptVerdict({ kind: 'reject', msg: 'Grid debe tener al menos 2 valores separados por coma' })
+      return
+    }
+
+    // 70/30 split
+    const fromMs = new Date(config.from_date).getTime()
+    const toMs = new Date(config.to_date).getTime()
+    const totalDays = Math.floor((toMs - fromMs) / 86400000)
+    if (totalDays < 7) {
+      setOptVerdict({ kind: 'reject', msg: 'Rango de fechas muy corto (mínimo 7 días)' })
+      return
+    }
+    const splitMs = fromMs + Math.floor(totalDays * 0.7) * 86400000
+    const trainTo = new Date(splitMs).toISOString().slice(0, 10)
+    const testFrom = new Date(splitMs + 86400000).toISOString().slice(0, 10)
+    const trainRange = { from: config.from_date, to: trainTo }
+    const testRange = { from: testFrom, to: config.to_date }
+
+    const baselineParam = (config as any)[optParam]
+    const totalRuns = 2 + grid.length + 1 // baseline TRAIN + baseline TEST + each grid + winner TEST
+    let runIdx = 0
+
+    const runOne = async (cfg: BacktestConfig, fromD: string, toD: string) => {
+      const c: BacktestConfig = { ...cfg, from_date: fromD, to_date: toD }
+      try {
+        const r = await runBacktestAsync(c)
+        return {
+          trades: r.total_trades || 0,
+          wr: r.win_rate_pct || 0,
+          ret: r.total_return_pct || 0,
+          sharpe: r.sharpe_ratio || 0,
+          dd: r.max_drawdown_pct || 0,
+        }
+      } catch (e) {
+        log('opt run error:', e)
+        return null
+      }
+    }
+
+    setOptProgress({ phase: 'Baseline TRAIN', current: ++runIdx, total: totalRuns })
+    const baselineTrain = await runOne(config, trainRange.from, trainRange.to)
+    setOptProgress({ phase: 'Baseline TEST', current: ++runIdx, total: totalRuns })
+    const baselineTest = await runOne(config, testRange.from, testRange.to)
+
+    const rows: OptRow[] = [{
+      label: `BASELINE (${optParam}=${baselineParam ?? 'default'})`,
+      train: baselineTrain,
+      test: baselineTest,
+      isBaseline: true,
+      isWinner: false,
+    }]
+
+    // Sweep
+    const candidates: { value: number; train: any }[] = []
+    for (const v of grid) {
+      setOptProgress({ phase: `Sweep ${optParam}=${v}`, current: ++runIdx, total: totalRuns })
+      const cfgWithParam = { ...config, [optParam]: v } as BacktestConfig
+      const t = await runOne(cfgWithParam, trainRange.from, trainRange.to)
+      rows.push({
+        label: `${optParam}=${v}`,
+        train: t,
+        test: null,
+        isBaseline: false,
+        isWinner: false,
+      })
+      if (t && t.trades >= 50) candidates.push({ value: v, train: t })
+    }
+
+    if (candidates.length === 0) {
+      setOptVerdict({ kind: 'reject', msg: 'Ningún candidato superó el mínimo de 50 trades en TRAIN' })
+      setOptResults(rows)
+      setOptProgress(null)
+      return
+    }
+
+    candidates.sort((a, b) => b.train.sharpe - a.train.sharpe)
+    const best = candidates[0]
+    setOptProgress({ phase: `OOS verify ${optParam}=${best.value}`, current: ++runIdx, total: totalRuns })
+    const winnerCfg = { ...config, [optParam]: best.value } as BacktestConfig
+    const winnerTest = await runOne(winnerCfg, testRange.from, testRange.to)
+
+    // Mark winner row
+    const winnerIdx = rows.findIndex(r => r.label === `${optParam}=${best.value}`)
+    if (winnerIdx >= 0) {
+      rows[winnerIdx].isWinner = true
+      rows[winnerIdx].test = winnerTest
+    }
+
+    // Verdict
+    const blRet = baselineTest?.ret ?? 0
+    const oosRet = winnerTest?.ret ?? 0
+    const trainRet = best.train.ret
+    const delta = oosRet - blRet
+    const ratio = Math.abs(trainRet) > 0.1 ? oosRet / trainRet : 0
+
+    let verdict: { kind: 'accept' | 'marginal' | 'reject'; msg: string; bestValue?: number }
+    if (!winnerTest || winnerTest.trades < 30) {
+      verdict = { kind: 'reject', msg: 'TEST tiene <30 trades — muestra insuficiente' }
+    } else if (delta > 5 && ratio > 0.4) {
+      verdict = {
+        kind: 'accept',
+        msg: `Aplicar ${optParam}=${best.value}. Mejora OOS: ${delta.toFixed(2)}pts vs baseline. Generalización ${(ratio * 100).toFixed(0)}%.`,
+        bestValue: best.value,
+      }
+    } else if (delta > 0 && ratio > 0.4) {
+      verdict = {
+        kind: 'marginal',
+        msg: `Mejora marginal de ${delta.toFixed(2)}pts OOS. Decisión tuya.`,
+        bestValue: best.value,
+      }
+    } else if (ratio < 0.3 && Math.abs(trainRet) > 20) {
+      verdict = {
+        kind: 'reject',
+        msg: `OVERFIT: TRAIN +${trainRet.toFixed(0)}% no se transfiere a TEST (${oosRet.toFixed(2)}%). Ratio ${ratio.toFixed(2)}.`,
+      }
+    } else {
+      verdict = { kind: 'reject', msg: 'No hay mejora significativa OOS' }
+    }
+
+    setOptResults(rows)
+    setOptVerdict(verdict)
+    setOptProgress(null)
+  }
+
   return (
     <div className="p-6 max-w-6xl mx-auto">
       {/* Header */}
@@ -1800,11 +1952,16 @@ export default function Backtesting() {
                   // Archive modes use recorded tick JSONL slugs.
                   // clob_1hz → on_tick(ctx) scripts
                   // archive_candles → on_candle(ctx) scripts (aggregated to 1m OHLC)
+                  // CRITICAL: symbol must equal the slug (not "BTCUSDT") because the backend
+                  // reads ticks from data/ticks/<symbol>/. Default to series_id or btc_5m.
+                  const slug = config.clob_slug ?? config.series_id ?? 'btc_5m'
                   setFullConfig({
                     ...config,
                     market_type: newType,
                     interval: '5m',
                     fee_pct: 1.5,
+                    clob_slug: slug,
+                    symbol: slug,
                   })
                   refetchTickSlugs()
                 } else {
@@ -2466,8 +2623,9 @@ export default function Backtesting() {
               onChange={(e) => {
                 const mode = e.target.value as 'fixed' | 'percent'
                 set('sizing_mode', mode)
-                if (mode === 'percent' && (config.sizing_value == null || config.sizing_value > 1)) {
-                  set('sizing_value', 0.25)
+                // Default to 5% on percent (backend expects 0-100 percent, NOT fraction)
+                if (mode === 'percent' && (config.sizing_value == null || config.sizing_value < 0.5 || config.sizing_value > 100)) {
+                  set('sizing_value', 5)
                 }
               }}
               className="w-full rounded px-2 py-2 text-sm"
@@ -2485,22 +2643,22 @@ export default function Backtesting() {
           {/* Sizing Value */}
           {(() => {
             const isPercent = (config.sizing_mode ?? 'percent') === 'percent'
-            // stored as fraction 0-1; display as 0-100
-            const displayVal = isPercent
-              ? Math.round((config.sizing_value ?? 0.25) * 1000) / 10
-              : (config.sizing_value ?? 100)
-            // upper bound: can't produce a stake > max_position_usd
+            // Backend convention: percent mode stores 0-100 (e.g. 5 = 5%) — same as live runner.
+            // Migrate legacy fractional values (≤ 1.5 in percent mode is assumed to be 0-1 fraction).
+            const sv = config.sizing_value ?? (isPercent ? 5 : 100)
+            const normalizedPct = isPercent && sv > 0 && sv <= 1.5 ? sv * 100 : sv
+            const displayVal = isPercent ? normalizedPct : sv
             const maxPct = isPercent && config.max_position_usd && config.initial_balance > 0
-              ? Math.min(100, Math.round((config.max_position_usd / config.initial_balance) * 1000) / 10)
+              ? Math.min(100, (config.max_position_usd / config.initial_balance) * 100)
               : 100
             const effectiveDollar = isPercent
               ? Math.min(
-                  config.initial_balance * (config.sizing_value ?? 0.25),
+                  config.initial_balance * (normalizedPct / 100),
                   config.max_position_usd ?? Infinity
                 )
-              : (config.sizing_value ?? 100)
+              : sv
             const exceedsMax = isPercent && config.max_position_usd != null
-              && config.initial_balance * (config.sizing_value ?? 0.25) > config.max_position_usd
+              && config.initial_balance * (normalizedPct / 100) > config.max_position_usd
 
             return (
               <div className="lg:col-span-2">
@@ -2515,7 +2673,8 @@ export default function Backtesting() {
                   value={displayVal}
                   onChange={(e) => {
                     const v = Number(e.target.value)
-                    set('sizing_value', isPercent ? Math.min(v, maxPct) / 100 : v)
+                    // Store directly as percent (0-100). Backend expects this.
+                    set('sizing_value', isPercent ? Math.min(v, maxPct) : v)
                   }}
                   className="w-full rounded px-2 py-2 text-sm font-mono"
                   style={{
@@ -2536,6 +2695,59 @@ export default function Backtesting() {
               </div>
             )
           })()}
+
+          {/* ── Guardrails (mirrors live runner risk controls) ─────────────────── */}
+          {(config.market_type === 'polymarket_binary' || config.market_type === 'archive_candles') && (
+            <div className="lg:col-span-4 border-t pt-3" style={{ borderColor: 'var(--color-border)' }}>
+              <div className="text-xs font-semibold mb-2" style={{ color: 'var(--color-warning)' }}>
+                Guardrails (live parity)
+              </div>
+              <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+                <div>
+                  <label className="block text-[11px] mb-1" style={{ color: 'var(--color-text-muted)' }}>Kelly Cap</label>
+                  <input type="number" min={1.0} max={3.0} step={0.1} placeholder="1.5"
+                    value={(config as any).kelly_size_cap ?? ''}
+                    onChange={e => set('kelly_size_cap', e.target.value === '' ? undefined : Number(e.target.value))}
+                    className="w-full rounded px-2 py-1.5 text-xs font-mono"
+                    style={{ backgroundColor: 'var(--color-surface-2)', border: '1px solid var(--color-border)', color: 'var(--color-text)' }} />
+                  <div className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-muted)' }}>max kelly × (default 1.5)</div>
+                </div>
+                <div>
+                  <label className="block text-[11px] mb-1" style={{ color: 'var(--color-text-muted)' }}>Min Entry ¢</label>
+                  <input type="number" min={1} max={50} step={1} placeholder="5"
+                    value={(config as any).min_entry_price != null ? Math.round((config as any).min_entry_price * 100) : ''}
+                    onChange={e => {
+                      const val = Number(e.target.value)
+                      set('min_entry_price', e.target.value === '' ? undefined : val / 100)
+                    }}
+                    className="w-full rounded px-2 py-1.5 text-xs font-mono"
+                    style={{ backgroundColor: 'var(--color-surface-2)', border: '1px solid var(--color-border)', color: 'var(--color-text)' }} />
+                  <div className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-muted)' }}>skip bets &lt; N¢ (default 5¢)</div>
+                </div>
+                <div>
+                  <label className="block text-[11px] mb-1" style={{ color: 'var(--color-text-muted)' }}>Max Loss Streak</label>
+                  <input type="number" min={0} max={100} step={1} placeholder="off"
+                    value={(config as any).max_consecutive_losses ?? ''}
+                    onChange={e => set('max_consecutive_losses', e.target.value === '' ? undefined : Number(e.target.value))}
+                    className="w-full rounded px-2 py-1.5 text-xs font-mono"
+                    style={{ backgroundColor: 'var(--color-surface-2)', border: '1px solid var(--color-border)', color: 'var(--color-text)' }} />
+                  <div className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-muted)' }}>stop sim after N losses</div>
+                </div>
+                <div>
+                  <label className="block text-[11px] mb-1" style={{ color: 'var(--color-text-muted)' }}>Stop Loss %</label>
+                  <input type="number" min={5} max={90} step={5} placeholder="off"
+                    value={(config as any).stop_loss_pct != null ? Math.round((config as any).stop_loss_pct * 100) : ''}
+                    onChange={e => {
+                      const val = Number(e.target.value)
+                      set('stop_loss_pct', e.target.value === '' ? undefined : val / 100)
+                    }}
+                    className="w-full rounded px-2 py-1.5 text-xs font-mono"
+                    style={{ backgroundColor: 'var(--color-surface-2)', border: '1px solid var(--color-border)', color: 'var(--color-text)' }} />
+                  <div className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-muted)' }}>exit early if token drops N%</div>
+                </div>
+              </div>
+            </div>
+          )}
 
           {/* Run + Live Trading buttons */}
           <div className={clsx('col-span-2 flex gap-2', config.market_type !== 'polymarket_binary' && 'lg:col-span-2')}>
@@ -2571,17 +2783,167 @@ export default function Backtesting() {
               )}
             </button>
             {!isBatchMode && config.script && !isRunning && !batchProgress && (
-              <button
-                onClick={() => setShowLiveModal(true)}
-                className="flex items-center justify-center gap-1.5 px-3 py-2.5 rounded font-semibold text-sm whitespace-nowrap"
-                style={{ backgroundColor: 'var(--color-surface-2)', border: '1px solid var(--color-border)', color: 'var(--color-text)' }}
-                title="Launch this strategy in Live Trading"
-              >
-                <Zap size={14} style={{ color: 'var(--color-accent)' }} />
-                Live
-              </button>
+              <>
+                <button
+                  onClick={() => setShowOptimizer(v => !v)}
+                  className="flex items-center justify-center gap-1.5 px-3 py-2.5 rounded font-semibold text-sm whitespace-nowrap"
+                  style={{
+                    backgroundColor: showOptimizer ? 'var(--color-warning)' : 'var(--color-surface-2)',
+                    border: '1px solid var(--color-border)',
+                    color: showOptimizer ? '#000' : 'var(--color-text)',
+                  }}
+                  title="Parameter sweep with TRAIN/TEST split (out-of-sample validation)"
+                >
+                  <FlaskConical size={14} style={{ color: showOptimizer ? '#000' : 'var(--color-warning)' }} />
+                  Optimize
+                </button>
+                <button
+                  onClick={() => setShowLiveModal(true)}
+                  className="flex items-center justify-center gap-1.5 px-3 py-2.5 rounded font-semibold text-sm whitespace-nowrap"
+                  style={{ backgroundColor: 'var(--color-surface-2)', border: '1px solid var(--color-border)', color: 'var(--color-text)' }}
+                  title="Launch this strategy in Live Trading"
+                >
+                  <Zap size={14} style={{ color: 'var(--color-accent)' }} />
+                  Live
+                </button>
+              </>
             )}
           </div>
+
+          {/* ── OPTIMIZER PANEL ──────────────────────────────────────────── */}
+          {showOptimizer && !isBatchMode && config.script && (
+            <div className="col-span-2 lg:col-span-4 rounded border p-3 mt-2"
+              style={{ backgroundColor: 'var(--color-surface-2)', borderColor: 'var(--color-warning)' }}>
+              <div className="flex items-center gap-2 mb-2">
+                <FlaskConical size={14} style={{ color: 'var(--color-warning)' }} />
+                <span className="text-sm font-semibold">Parameter Optimizer (TRAIN/TEST split 70/30)</span>
+                <span className="text-[10px] px-1.5 py-0.5 rounded" style={{ backgroundColor: 'var(--color-base)', color: 'var(--color-text-muted)' }}>
+                  out-of-sample validation
+                </span>
+              </div>
+              <div className="flex flex-wrap items-end gap-3 mb-3">
+                <div>
+                  <label className="block text-[10px] mb-1" style={{ color: 'var(--color-text-muted)' }}>Parámetro</label>
+                  <select
+                    value={optParam}
+                    onChange={e => {
+                      const p = e.target.value as OptParam
+                      setOptParam(p)
+                      // Suggest sensible default grid per param
+                      if (p === 'min_entry_price') setOptGrid('0.10,0.15,0.20,0.25,0.30')
+                      else if (p === 'sizing_value') setOptGrid('2,3,5,7,10')
+                      else if (p === 'max_spread_pct') setOptGrid('0.02,0.03,0.04,0.05,0.06')
+                      else if (p === 'kelly_size_cap') setOptGrid('1.0,1.25,1.5,2.0,2.5')
+                    }}
+                    className="rounded border px-2 py-1.5 text-xs"
+                    style={{ backgroundColor: 'var(--color-base)', borderColor: 'var(--color-border)', color: 'var(--color-text)' }}
+                  >
+                    <option value="min_entry_price">min_entry_price</option>
+                    <option value="sizing_value">sizing_value (%)</option>
+                    <option value="max_spread_pct">max_spread_pct</option>
+                    <option value="kelly_size_cap">kelly_size_cap</option>
+                  </select>
+                </div>
+                <div className="flex-1 min-w-[200px]">
+                  <label className="block text-[10px] mb-1" style={{ color: 'var(--color-text-muted)' }}>
+                    Grid (valores separados por coma)
+                  </label>
+                  <input
+                    value={optGrid}
+                    onChange={e => setOptGrid(e.target.value)}
+                    placeholder="0.10,0.15,0.20,0.25,0.30"
+                    className="w-full rounded border px-2 py-1.5 text-xs font-mono"
+                    style={{ backgroundColor: 'var(--color-base)', borderColor: 'var(--color-border)', color: 'var(--color-text)' }}
+                  />
+                </div>
+                <button
+                  onClick={() => runOptimization()}
+                  disabled={isRunning || !!optProgress}
+                  className="flex items-center gap-1.5 px-4 py-2 rounded font-semibold text-xs disabled:opacity-40"
+                  style={{ backgroundColor: 'var(--color-warning)', color: '#000' }}
+                >
+                  {optProgress ? (
+                    <>
+                      <RefreshCw size={12} className="animate-spin" />
+                      {optProgress.phase} ({optProgress.current}/{optProgress.total})
+                    </>
+                  ) : (
+                    <>
+                      <Play size={12} />
+                      Run Sweep
+                    </>
+                  )}
+                </button>
+              </div>
+
+              {/* Results table */}
+              {optResults && (
+                <div className="rounded border overflow-hidden mt-2" style={{ borderColor: 'var(--color-border)' }}>
+                  <table className="w-full text-xs">
+                    <thead style={{ backgroundColor: 'var(--color-base)' }}>
+                      <tr>
+                        <th className="text-left px-2 py-1.5">Config</th>
+                        <th className="text-right px-2 py-1.5" colSpan={3}>TRAIN (70%)</th>
+                        <th className="text-right px-2 py-1.5" colSpan={3}>TEST OOS (30%)</th>
+                      </tr>
+                      <tr style={{ color: 'var(--color-text-muted)' }}>
+                        <th className="text-left px-2 py-1 text-[10px]"></th>
+                        <th className="text-right px-2 py-1 text-[10px]">Trades</th>
+                        <th className="text-right px-2 py-1 text-[10px]">Ret</th>
+                        <th className="text-right px-2 py-1 text-[10px]">Sharpe</th>
+                        <th className="text-right px-2 py-1 text-[10px]">Trades</th>
+                        <th className="text-right px-2 py-1 text-[10px]">Ret</th>
+                        <th className="text-right px-2 py-1 text-[10px]">Sharpe</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {optResults.map((row, i) => (
+                        <tr key={i} style={{
+                          backgroundColor: row.isBaseline ? 'rgba(129,140,248,0.08)' : row.isWinner ? 'rgba(34,197,94,0.10)' : undefined,
+                          borderTop: '1px solid var(--color-border)',
+                        }}>
+                          <td className="px-2 py-1 font-mono text-[11px]">
+                            {row.isBaseline && '◆ '}{row.isWinner && '★ '}{row.label}
+                          </td>
+                          <td className="px-2 py-1 text-right">{row.train?.trades ?? '—'}</td>
+                          <td className="px-2 py-1 text-right" style={{ color: (row.train?.ret ?? 0) >= 0 ? 'var(--color-accent)' : 'var(--color-danger)' }}>
+                            {row.train ? `${row.train.ret >= 0 ? '+' : ''}${row.train.ret.toFixed(1)}%` : '—'}
+                          </td>
+                          <td className="px-2 py-1 text-right">{row.train?.sharpe.toFixed(2) ?? '—'}</td>
+                          <td className="px-2 py-1 text-right">{row.test?.trades ?? '—'}</td>
+                          <td className="px-2 py-1 text-right" style={{ color: (row.test?.ret ?? 0) >= 0 ? 'var(--color-accent)' : 'var(--color-danger)' }}>
+                            {row.test ? `${row.test.ret >= 0 ? '+' : ''}${row.test.ret.toFixed(1)}%` : '—'}
+                          </td>
+                          <td className="px-2 py-1 text-right">{row.test?.sharpe.toFixed(2) ?? '—'}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+
+              {/* Verdict */}
+              {optVerdict && (
+                <div className="rounded border p-3 mt-3 text-xs"
+                  style={{
+                    backgroundColor: optVerdict.kind === 'accept' ? 'rgba(34,197,94,0.10)' : optVerdict.kind === 'marginal' ? 'rgba(245,158,11,0.10)' : 'rgba(239,68,68,0.10)',
+                    borderColor: optVerdict.kind === 'accept' ? 'var(--color-accent)' : optVerdict.kind === 'marginal' ? 'var(--color-warning)' : 'var(--color-danger)',
+                  }}>
+                  <div className="font-semibold mb-1" style={{
+                    color: optVerdict.kind === 'accept' ? 'var(--color-accent)' : optVerdict.kind === 'marginal' ? 'var(--color-warning)' : 'var(--color-danger)',
+                  }}>
+                    {optVerdict.kind === 'accept' ? '✓ ACCEPT' : optVerdict.kind === 'marginal' ? '~ MARGINAL' : '✗ REJECT'}
+                  </div>
+                  <div style={{ color: 'var(--color-text)' }}>{optVerdict.msg}</div>
+                  {optVerdict.kind === 'accept' && optVerdict.bestValue !== undefined && (
+                    <div className="mt-2 pt-2 border-t text-[11px]" style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-muted)' }}>
+                      Para aplicar a un runner live, ve a Live Strategies → editar el runner → cambiar <span className="font-mono">{optParam}</span> a <span className="font-mono font-semibold">{optVerdict.bestValue}</span>.
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
           </div>
         </div>
       </div>

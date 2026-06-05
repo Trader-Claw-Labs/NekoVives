@@ -55,6 +55,24 @@ pub struct Tick {
     pub window_ts: i64,
     /// Seconds remaining in the current 5-min window.
     pub window_secs_left: i64,
+
+    // ── Order-book depth fields (0 when not available) ────────────────────────
+    /// USD-equivalent liquidity on the YES ask side within 2% of best ask.
+    /// Populated by the live tick recorder from CLOB /book every 10 s.
+    /// Used by the on_tick backtester to simulate realistic market-order fill.
+    #[serde(default)]
+    pub ask_depth_usd: f64,
+    /// USD-equivalent liquidity on the YES bid side within 2% of best bid.
+    #[serde(default)]
+    pub bid_depth_usd: f64,
+
+    // ── Official Polymarket resolution (populated by to-ticks from Gamma API) ─
+    /// True = YES won (price went UP), False = NO won, None = not resolved yet.
+    /// Written by `orderbook_parser.py to-ticks` after querying gamma-api.polymarket.com.
+    /// When present, the on_tick backtester uses this for exact resolution instead of
+    /// comparing Binance prices (avoids oracle timing mismatch).
+    #[serde(default)]
+    pub window_yes_won: Option<bool>,
 }
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -233,6 +251,11 @@ async fn recorder_loop(cfg: TickRecorderConfig, stop: Arc<AtomicBool>) -> anyhow
     let mut current_day = String::new();
     let mut file: Option<tokio::fs::File> = None;
 
+    // Cached book depth: refreshed every 10 seconds from CLOB /book
+    let mut cached_ask_depth_usd: f64 = 0.0;
+    let mut cached_bid_depth_usd: f64 = 0.0;
+    let mut depth_tick_counter: u32 = 0;
+
     loop {
         interval.tick().await;
 
@@ -271,6 +294,15 @@ async fn recorder_loop(cfg: TickRecorderConfig, stop: Arc<AtomicBool>) -> anyhow
                     continue;
                 }
             }
+        }
+
+        // ── Refresh order-book depth every 10 s ──────────────────────────────
+        depth_tick_counter += 1;
+        if depth_tick_counter >= 10 {
+            depth_tick_counter = 0;
+            let (ad, bd) = fetch_book_depth(&http, &cfg.clob_base_url, &cfg.condition_id).await;
+            if ad > 0.0 { cached_ask_depth_usd = ad; }
+            if bd > 0.0 { cached_bid_depth_usd = bd; }
         }
 
         // ── Fetch Polymarket CLOB prices ──────────────────────────────────────
@@ -317,6 +349,9 @@ async fn recorder_loop(cfg: TickRecorderConfig, stop: Arc<AtomicBool>) -> anyhow
             oracle_lag_ms,
             window_ts,
             window_secs_left,
+            ask_depth_usd: cached_ask_depth_usd,
+            bid_depth_usd: cached_bid_depth_usd,
+            window_yes_won: None, // live recorder: resolution not known until market settles
         };
 
         // ── Write JSONL ───────────────────────────────────────────────────────
@@ -370,6 +405,51 @@ async fn fetch_clob_prices(
     }
 }
 
+/// Fetch aggregated USD depth within 2% of best ask/bid from CLOB `/book`.
+/// Returns (ask_depth_usd, bid_depth_usd). Both 0 on error.
+async fn fetch_book_depth(
+    http: &reqwest::Client,
+    base_url: &str,
+    condition_id: &str,
+) -> (f64, f64) {
+    let url = format!("{}/book?token_id={}", base_url.trim_end_matches('/'), condition_id);
+    let body = match http.get(&url)
+        .timeout(std::time::Duration::from_secs(5))
+        .send().await
+    {
+        Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>().await {
+            Ok(v) => v,
+            Err(_) => return (0.0, 0.0),
+        },
+        _ => return (0.0, 0.0),
+    };
+
+    fn side_depth(json: &serde_json::Value, key: &str, best_price: f64, pct: f64) -> f64 {
+        let levels = match json.get(key).and_then(|v| v.as_array()) {
+            Some(a) => a,
+            None => return 0.0,
+        };
+        let threshold = best_price * (1.0 + pct);
+        levels.iter().map(|level| {
+            let price = level.get("price")
+                .and_then(|v| v.as_str().and_then(|s| s.parse::<f64>().ok())
+                    .or_else(|| v.as_f64()))
+                .unwrap_or(0.0);
+            let size = level.get("size")
+                .and_then(|v| v.as_str().and_then(|s| s.parse::<f64>().ok())
+                    .or_else(|| v.as_f64()))
+                .unwrap_or(0.0);
+            if price > 0.0 && price <= threshold { price * size } else { 0.0 }
+        }).sum()
+    }
+
+    let best_ask = best_price(&body, "asks");
+    let best_bid = best_price(&body, "bids");
+    let ask_depth = side_depth(&body, "asks", best_ask, 0.02);
+    let bid_depth = side_depth(&body, "bids", best_bid, 0.02);
+    (ask_depth, bid_depth)
+}
+
 fn best_price(json: &serde_json::Value, side: &str) -> f64 {
     json.get(side)
         .and_then(|v| v.as_array())
@@ -396,8 +476,15 @@ fn extract_price(json: &serde_json::Value) -> Option<f64> {
 }
 
 // ── Old file pruner ───────────────────────────────────────────────────────────
-
+//
+// SAFETY: retain_days = 0 disables pruning entirely (keep ALL historical files).
+// This is the recommended setting for slugs whose directory contains regenerated
+// historical ticks from `to-ticks-multi` — pruning would delete that work.
 async fn prune_old_files(dir: &Path, retain_days: u64) {
+    if retain_days == 0 {
+        // Pruning disabled — preserve all files (e.g. historical regenerated data)
+        return;
+    }
     let cutoff = chrono::Utc::now() - chrono::Duration::days(retain_days as i64);
     let cutoff_str = cutoff.format("%Y-%m-%d").to_string();
     let mut rd = match tokio::fs::read_dir(dir).await {
