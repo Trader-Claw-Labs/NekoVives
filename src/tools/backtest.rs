@@ -5142,17 +5142,40 @@ pub async fn run_archive_candles_backtest(
             }
         });
 
-        // Resolution: track open/close prices (first tick of window = secs_left 299, last = 0)
+        // Resolution: prefer the OFFICIAL Polymarket outcome (window_yes_won, backfilled
+        // from Gamma) whenever the tick carries it. Resolving by binance open/close
+        // instead MANUFACTURES PHANTOM EDGE: the decision price (yes_ask) and the
+        // resolution would then both derive from the same binance series, creating a
+        // spurious correlation the live market (Chainlink-settled) does not have. On the
+        // May 16-23 set this fabricated ~8-12 pts of edge that vanishes on clean P4 data.
+        // Binance open/close is only a last-resort fallback (filled after the loop).
         if tick.window_secs_left == 299 && tick.binance_price > 0.0 {
             entry.btc_open = Some(tick.binance_price);
         }
         if tick.window_secs_left == 0 && tick.binance_price > 0.0 {
             entry.btc_close = Some(tick.binance_price);
-            if let Some(open) = entry.btc_open {
-                entry.resolution = Some(if tick.binance_price > open { "up".to_string() } else { "down".to_string() });
-            }
+        }
+        if let Some(official) = tick.window_yes_won {
+            entry.resolution = Some(if official { "up".to_string() } else { "down".to_string() });
         }
     }
+
+    // Fill any window still lacking an official outcome with the binance fallback, and
+    // report the split so a low official-coverage run is visible (and distrusted).
+    let mut res_official = 0usize;
+    let mut res_binance = 0usize;
+    for w in windows.values_mut() {
+        if w.resolution.is_some() {
+            res_official += 1;
+        } else if let (Some(o), Some(c)) = (w.btc_open, w.btc_close) {
+            w.resolution = Some(if c > o { "up".to_string() } else { "down".to_string() });
+            res_binance += 1;
+        }
+    }
+    tracing::info!(
+        "[ARCHIVE-CANDLES] resolution: {} official (window_yes_won), {} binance-fallback",
+        res_official, res_binance
+    );
 
     // ── P4 (decision price): tick closest to secs_left = decision_offset_secs (60) ──
     // Uses yes_ASK (not yes_mid) — matches what a live trader pays at the CLOB.

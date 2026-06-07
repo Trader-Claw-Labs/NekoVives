@@ -3738,6 +3738,58 @@ pub async fn handle_api_tradingview_scan(
     }
 }
 
+#[derive(Deserialize)]
+pub struct RewardsQuery {
+    /// Max markets to return (after ranking). Default 50.
+    pub limit: Option<usize>,
+    /// Include toxic (crypto / UP-DOWN / hourly) markets. Default false.
+    pub include_toxic: Option<bool>,
+    /// CLOB pages to fetch (1000 markets each). Default 3.
+    pub max_pages: Option<usize>,
+}
+
+/// GET /api/rewards/markets — scan Polymarket liquidity-reward markets, ranked by a
+/// reward/adverse-selection-risk heuristic. Toxic (crypto/UP-DOWN/hourly) markets are
+/// excluded by default since their fast-moving fair value makes maker quoting unsafe.
+pub async fn handle_api_rewards_markets(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<RewardsQuery>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let max_pages = params.max_pages.unwrap_or(3).clamp(1, 20);
+    let include_toxic = params.include_toxic.unwrap_or(false);
+    let limit = params.limit.unwrap_or(50).min(500);
+
+    match market_analyzer::rewards::scan_reward_markets(max_pages).await {
+        Ok(mut markets) => {
+            let total = markets.len();
+            let toxic_count = markets.iter().filter(|m| m.is_toxic).count();
+            if !include_toxic {
+                markets.retain(|m| !m.is_toxic);
+            }
+            let eligible = markets.len();
+            markets.truncate(limit);
+            Json(serde_json::json!({
+                "markets": markets,
+                "total_incentivized": total,
+                "toxic_excluded": toxic_count,
+                "eligible": eligible,
+                "fetched_at": chrono::Utc::now().to_rfc3339(),
+            }))
+            .into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "error": format!("Rewards scan error: {e}") })),
+        )
+            .into_response(),
+    }
+}
+
 // ── Backtesting ──────────────────────────────────────────────────
 
 /// GET /api/backtest/scripts — list .rhai files in /scripts/
