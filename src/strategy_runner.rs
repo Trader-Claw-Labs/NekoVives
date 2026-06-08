@@ -5874,6 +5874,12 @@ async fn tick_runner_loop(
                     ).await;
                     if let Some(c) = renewed { clob_client = Some(c); }
                     if let Some(order) = order_opt {
+                        // Settle on the real fill cost: paper now quotes the live CLOB
+                        // (fill_price = fresh book VWAP), so the payout (stake/entry) must
+                        // use that fill rather than the tick-feed price set in bet_*_impl.
+                        if let Some(fp) = order.fill_price {
+                            if fp > 0.0 { state.lock().unwrap().entry_price = fp; }
+                        }
                         live_orders.push(order);
                         store.persist();
                     } else {
@@ -6128,11 +6134,21 @@ async fn execute_tick_market_order(
             }
         }
     } else {
-        // PAPER
+        // PAPER — quote against the live CLOB exactly like the on_candle path, instead
+        // of reusing the tick-feed price: entry_price = real CLOB ask (/price?side=buy),
+        // fill_price = book-walk VWAP for this stake (captures depth slippage). Falls back
+        // to the feed-derived `entry_price` only when the CLOB is unreachable.
         let order_id = format!("paper-{}", chrono::Utc::now().timestamp_millis());
+        let clob_ask = polymarket_trader::markets::get_market_price(token_id)
+            .await
+            .unwrap_or(entry_price);
+        let (sim_fill, slippage_pct) = simulate_book_fill(token_id, amount_usdc, clob_ask).await;
         append_runner_log(
             store, id,
-            &format!("Paper tick order: {} ${:.0} @ {:.4} (id={})", side_str, amount_usdc, entry_price, order_id),
+            &format!(
+                "Paper tick order: {} ${:.0} clob_ask={:.4} sim_fill={:.4} slip={:.2}% (id={})",
+                side_str, amount_usdc, clob_ask, sim_fill, slippage_pct, order_id
+            ),
         );
         (Some(LiveOrder {
             timestamp: chrono::Utc::now().to_rfc3339(),
@@ -6142,7 +6158,9 @@ async fn execute_tick_market_order(
             amount_usdc,
             order_id,
             status: "LIVE".to_string(),
-            entry_price: Some(entry_price),
+            // entry_price = real CLOB ask; fill_price = book VWAP (live-parity with on_candle)
+            entry_price: Some(clob_ask),
+            fill_price: Some(sim_fill),
             result: None,
             pnl: None,
             stop_loss_triggered: false,

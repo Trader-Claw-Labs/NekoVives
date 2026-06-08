@@ -34,30 +34,41 @@ def http(url):
     return json.load(urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=20))
 
 
-def pick_targets(n=4):
-    """Top non-toxic, far-dated, reward-eligible markets with their YES token + params."""
-    d = http(f"{CLOB}/sampling-markets")
+def pick_targets(n=4, filt=None, min_days=30):
+    """Reward-eligible markets with their YES token + params.
+    filt: optional substring (question/tags) to target a theme, e.g. 'world cup'.
+    Paginates the CLOB sampling-markets so themed markets deeper in the list are found."""
     out = []
-    for m in d.get('data', []):
-        r = m.get('rewards') or {}
-        rate = max([x.get('rewards_daily_rate', 0) for x in (r.get('rates') or [{}])], default=0)
-        q = m.get('question', '').lower()
-        tags = [t.lower() for t in (m.get('tags') or [])]
-        toxic = ('up or down' in q) or ('crypto' in tags) or ('hourly' in tags)
-        if rate <= 0 or toxic or not m.get('accepting_orders'):
-            continue
-        try:
-            days = (dt.datetime.fromisoformat(m['end_date_iso'].replace('Z', '+00:00')) - dt.datetime.now(dt.timezone.utc)).days
-        except Exception:
-            days = -999
-        if days < 30:
-            continue
-        toks = m.get('tokens') or []
-        yes = next((t.get('token_id') for t in toks if t.get('outcome') == 'Yes'), None)
-        if not yes:
-            continue
-        out.append({'q': m.get('question', '')[:46], 'token': yes, 'rate': rate,
-                    'max_spread': r.get('max_spread', 3.5), 'min_size': r.get('min_size', 0), 'days': days})
+    cursor = ''
+    for _ in range(6):
+        url = f"{CLOB}/sampling-markets" + (f"?next_cursor={cursor}" if cursor else "")
+        d = http(url)
+        for m in d.get('data', []):
+            r = m.get('rewards') or {}
+            rate = max([x.get('rewards_daily_rate', 0) for x in (r.get('rates') or [{}])], default=0)
+            q = m.get('question', '').lower()
+            tags = [t.lower() for t in (m.get('tags') or [])]
+            toxic = ('up or down' in q) or ('crypto' in tags) or ('hourly' in tags)
+            if rate <= 0 or toxic or not m.get('accepting_orders'):
+                continue
+            if filt and (filt.lower() not in q and filt.lower() not in ' '.join(tags)
+                         and filt.lower() not in (m.get('market_slug', '') or '').lower()):
+                continue
+            try:
+                days = (dt.datetime.fromisoformat(m['end_date_iso'].replace('Z', '+00:00')) - dt.datetime.now(dt.timezone.utc)).days
+            except Exception:
+                days = -999
+            if days < min_days:
+                continue
+            toks = m.get('tokens') or []
+            yes = next((t.get('token_id') for t in toks if t.get('outcome') == 'Yes'), None)
+            if not yes:
+                continue
+            out.append({'q': m.get('question', '')[:46], 'token': yes, 'rate': rate,
+                        'max_spread': r.get('max_spread', 3.5), 'min_size': r.get('min_size', 0), 'days': days})
+        cursor = d.get('next_cursor', '')
+        if not cursor or cursor == 'LTE=':
+            break
     out.sort(key=lambda x: -x['rate'])
     return out[:n]
 
@@ -74,12 +85,14 @@ def book_mid(token):
         return None
 
 
-def run(hours):
-    targets = pick_targets()
-    print(f"Shadow Dry Run on {len(targets)} markets for {hours}h. Logging → {LOG}")
+def run(hours, filt=None, log=LOG, min_days=30):
+    targets = pick_targets(filt=filt, min_days=min_days)
+    print(f"Shadow Dry Run on {len(targets)} markets ({filt or 'top'}) for {hours}h. Logging → {log}")
     for t in targets:
         print(f"  rate={t['rate']:.0f}/d days={t['days']} max_spread={t['max_spread']}c min=${t['min_size']} | {t['q']}")
-    os.makedirs(os.path.dirname(LOG), exist_ok=True)
+    if not targets:
+        print("No matching markets found."); return
+    os.makedirs(os.path.dirname(log), exist_ok=True)
     end = time.time() + hours * 3600
     # state per market: our resting quote (bid_px, ask_px) + when posted
     quotes = {t['token']: None for t in targets}
@@ -110,16 +123,16 @@ def run(hours):
                    'mid': round(bk['mid'], 4), 'spread_c': round(bk['spread'] * 100, 2),
                    'eligible': eligible, 'adverse_c': round(adverse * 100, 3), 'filled': filled,
                    'min_size': t['min_size']}
-            with open(LOG, 'a') as f:
+            with open(log, 'a') as f:
                 f.write(json.dumps(row) + '\n')
         time.sleep(POLL_S)
     print("Dry Run complete.")
 
 
-def summarize():
-    if not os.path.exists(LOG):
+def summarize(log=LOG):
+    if not os.path.exists(log):
         print("No log yet."); return
-    rows = [json.loads(l) for l in open(LOG)]
+    rows = [json.loads(l) for l in open(log)]
     if not rows:
         print("Empty log."); return
     span_h = (rows[-1]['ts'] - rows[0]['ts']) / 3600
@@ -150,10 +163,13 @@ if __name__ == '__main__':
     ap.add_argument('--run', action='store_true')
     ap.add_argument('--summarize', action='store_true')
     ap.add_argument('--hours', type=float, default=24)
+    ap.add_argument('--filter', default=None, help="theme substring, e.g. 'world cup'")
+    ap.add_argument('--log', default=LOG, help='log file path')
+    ap.add_argument('--min-days', type=int, default=30)
     args = ap.parse_args()
     if args.run:
-        run(args.hours)
+        run(args.hours, filt=args.filter, log=args.log, min_days=args.min_days)
     elif args.summarize:
-        summarize()
+        summarize(log=args.log)
     else:
         ap.print_help()

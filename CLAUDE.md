@@ -88,6 +88,9 @@ Key routes:
 - `POST /api/orderbook/download/cancel`       — cancel running job
 - `GET  /api/orderbook/files`                 — list local parquet files
 - `POST /api/orderbook/query`                 — remote DuckDB query (summary/top-markets/price-series/spread-stats/drift)
+- `GET  /api/polymarket/balance`              — real USDC wallet balance (CLOB API + Polygon RPC, max of both)
+- `POST /api/live/strategies/{id}/sync-onchain` — reconcile untracked onchain trades into runner log
+- `POST /api/live/stop-all-live`              — emergency stop ALL running live runners
 
 ## Backtesting Engine
 - `<workspace>/scripts/`  — .rhai strategy files (agent-written + bundled defaults)
@@ -113,9 +116,20 @@ Key routes:
 | `polymarket_hype_updown_5m_thinmkt.rhai` | ctx-based | HYPE 5m: drift-only (no Binance candles), setup 7 unique to HYPE |
 | `polymarket_all_updown_5m_adaptive.rhai` | ctx-based | Universal ATR-adaptive, NO-side-only (setup 9 YES disabled after dry-run) |
 | `clob_1hz_spread_scalper.rhai` | on_tick-based | CLOB 1 HZ: spread fade — bets NO/YES at extreme prices in final 60 s of each window |
+| `clob_1hz_late_certainty.rhai` | on_tick-based | CLOB 1 HZ: fade uncertainty in final 30-45s. Setups A/B follow clear BTC move; C/D fade wrong-side favourite/underdog. EV-positive on 33d real data |
+| `clob_1hz_early_oracle.rhai` | on_tick-based | CLOB 1 HZ: early oracle-divergence entry |
+| `clob_1hz_volatility_regime.rhai` | on_tick-based | CLOB 1 HZ: regime-gated tick entries |
 
 Cross-asset analysis and setup-by-setup edge tables:
 `src/tools/scripts/POLYMARKET_UPDOWN_5M_CROSS_ASSET.md`
+
+### Backtesting guardrails (live-parity)
+`BacktestRunBody` / `BacktestGuardrails` mirror the live runner's risk controls so backtest
+P&L reflects what would actually happen live. UI-exposed in the Backtesting page Guardrails
+section (polymarket_binary + archive_candles):
+- `kelly_size_cap`, `min_entry_price`, `max_consecutive_losses`, `stop_loss_pct`
+Threaded through `run_backtest_engine` → `run_polymarket_slug_backtest` (applied in the
+trade loop: skip extreme entries, halt sim on loss streak).
 
 ### Rhai script APIs
 
@@ -171,6 +185,9 @@ fn on_tick(ctx) {
     ctx.window_secs_left  // seconds until window resolves
     ctx.second_in_window  // seconds elapsed in current window (0 = first tick)
     ctx.balance / ctx.position / ctx.entry_price
+    ctx.window_open_price  // binance price anchored at window start (engine-set, authoritative)
+    ctx.ask_depth_usd / ctx.bid_depth_usd  // book liquidity within 2% (0 if unavailable)
+    ctx.window_yes_won     // official Polymarket resolution: true/false, or () if unknown
 
     ctx.bet_yes(size)     // size = fraction of balance (0-1). Enters YES bet at yes_ask.
     ctx.bet_no(size)      // Enters NO bet at no_ask.
@@ -179,9 +196,11 @@ fn on_tick(ctx) {
     ctx.get("key", def)
 }
 ```
-Resolution: at `window_secs_left == 0`, compare `binance_price` to `window_open_price`.
-If price went up → YES wins → payout = stake/entry_price; else NO wins (or vice versa).
-Positions auto-resolve each window; only one open position allowed per window.
+Resolution: at `window_secs_left == 0` (and on window-change), prefer the official
+`window_yes_won` from the tick file; fall back to comparing `binance_price` to
+`window_open_price` only when it's None. YES wins → payout = stake/entry_price; else NO wins.
+Fill price = `sim_fill_vwap` (walks 2-level book from `ask_depth_usd`) when depth > 0,
+else best ask. Positions auto-resolve each window; only one open position per window.
 
 **Legacy signal-based API** — script sets `signal = "buy"/"sell"/"hold"` as a variable;
 pre-injected scope vars: `open, high, low, close, volume, rsi, macd, signal, macd_hist,
@@ -192,13 +211,22 @@ access module-level `let` variables (bot_state, config), so this pattern cannot 
 in the backtester. Use the ctx-based API for new strategies.
 
 ## Live Strategy Runner (Polymarket)
-`src/strategy_runner.rs` → `polymarket_runner_loop()`
+`src/strategy_runner.rs`
+
+Two engine loops:
+- `polymarket_runner_loop()` — on_candle engines (drift, midband, adaptive). Decision
+  once per window at the decision candle. Balance = `initial + sum(order.pnl)` (derived).
+- `tick_runner_loop()` — `rhai_tick` engine (e.g. `clob_1hz_late_certainty`). Runs
+  `on_tick(ctx)` every second. Balance lives in `TickRunnerState` (mutated in place);
+  the loop copies it to `RunnerResult.balance` each second for the dashboard.
 
 Key fields in `RunnerConfig`:
 - `chainlink_endpoint_url` — optional Chainlink REST endpoint for oracle comparison
 - `chainlink_api_key`      — optional Bearer token for Chainlink endpoint
 - `chainlink_interval_secs` — Chainlink poll interval (default 5s)
 - `early_fire_secs`         — fire order N seconds before decision candle closes (0 = disabled)
+- `price_mode`             — "historical" (real CLOB ask) | "mid" ((bid+ask)/2). UI-editable.
+- `max_slippage_pct`       — worst_price cap for live market orders (default 5%)
 
 At each decision candle the runner injects into ctx:
 - `ctx.binance_mark` from Binance miniTicker WS (live, ~1s updates)
@@ -208,12 +236,69 @@ At each decision candle the runner injects into ctx:
 Every resolved trade is auto-recorded to the dynamic asset selector
 (`src/tools/asset_selector.rs`) for rolling WR tracking.
 
+### Guardrails (risk controls — `RunnerConfig` fields, all UI-editable)
+After the May-2026 incident (BNB runner lost $3.6k via uncapped kelly, XRP lost $3k via
+no auto-stop), the following guardrails apply to live AND paper runners:
+- `kelly_size_cap` (default 1.5) — caps the `kelly_size` multiplier a script can emit.
+  Was hardcoded 2.0; an uncapped script scaled bets 6.6× → $330 each on BNB.
+- `max_runner_loss_pct` (None=off) — auto-stop + switch to paper when cumulative loss
+  exceeds X% of `initial_balance`.
+- `max_consecutive_losses` (None=off) — auto-stop after N consecutive losses.
+- `min_entry_price` (default 0.05) — skip bets when token ask < this (blocks 3-5¢
+  long-shots; the late-certainty runner was buying NO at 0.04 = 96% against).
+- Regressive sizing — after 3+ consecutive losses, bet is halved (×0.5) until a win.
+- `PortfolioGuard` (`src/portfolio_guard.rs`) — global watchdog; `stop_all_live()` halts
+  every running live runner when the wallet drops past the configured % from baseline.
+
+### Order execution flow (`execute_live_polymarket_signal`)
+- 3 attempts: 2 market orders (`worst_price = mid × (1 + max_slippage_pct)`), then 1
+  limit order fallback at decision mid-price on the final attempt.
+- `spawn_order_monitor` — background task: polls `/data/trades` up to 120s to capture
+  the real fill (`fill_price`/`fill_size`/`tx_hash`); for limit orders it also cancels
+  the order if still unfilled at window close (avoids stale open positions).
+- Immediate `store.persist()` after every order push (was lost on restart before flush).
+- Per-series order queue (`ORDER_QUEUES`, Semaphore(1) per slug) serializes execution so
+  parallel runners on the same slug don't race the book.
+- Global CLOB rate limiter (`CLOB_RATE_LIMIT`, Semaphore(5)) on all CLOB HTTP calls.
+
+### Window resolution — provisional + official oracle monitor
+Polymarket settles via Chainlink ~60-180s AFTER the window closes, but the runner must
+settle a position immediately (first tick of next window). Both engines now:
+1. Settle provisionally with the Binance price comparison (`resolution_source =
+   "binance_provisional"`).
+2. Spawn `spawn_resolution_monitor` — retries the official Gamma resolution every 30s for
+   up to 10 min. When the oracle settles, it patches `order.result` / `order.pnl` /
+   `resolution_source = "polymarket"`, adjusts `live_wins`, and corrects the balance.
+   - on_candle: only patches `order.pnl` (balance is derived → `tick_state = None`).
+   - rhai_tick: patches `TickRunnerState.balance` directly (the loop overwrites
+     `RunnerResult.balance` each second → must fix the internal source of truth).
+Applies to both Live and Dry Run modes.
+
+### Paper / Dry Run mode realism
+- Entry price uses the real CLOB ask via `get_market_price()` (`/price?side=buy`), then
+  `simulate_book_fill()` walks the `/book` ask levels to compute a VWAP that exposes
+  slippage beyond top-of-book. `entry_price` = real ask; `fill_price` = book VWAP.
+- On startup a live runner runs `reconcile_untracked_onchain()` — queries
+  `data-api.polymarket.com/activity` (48h) and inserts any onchain trade missing from
+  `live_orders` as an UNTRACKED record (fixes dashboard-vs-onchain drift from crashes
+  before disk flush).
+
 ## Tick Recorder (`src/tick_recorder.rs`)
 1-Hz recorder for Polymarket binary markets. Writes JSONL rows to
 `<workspace>/data/ticks/<slug>/<YYYY-MM-DD>.jsonl` (7-day retention).
 
 Each row: `ts_ms, yes_bid, yes_ask, no_bid, no_ask, yes_mid, binance_price,
-chainlink_price, oracle_lag_ms, window_ts, window_secs_left`
+chainlink_price, oracle_lag_ms, window_ts, window_secs_left,
+ask_depth_usd, bid_depth_usd, window_yes_won`
+
+New tick fields (all `#[serde(default)]` — backward compatible with old files):
+- `ask_depth_usd` / `bid_depth_usd` — USD liquidity within 2% of best ask/bid. The live
+  recorder fetches CLOB `/book` every 10s; `to-ticks` estimates it from trade-event volume.
+  Used by the on_tick backtester's `sim_fill_vwap` for realistic market-order fills.
+- `window_yes_won` — `Option<bool>`: official Polymarket resolution (True=YES/UP won,
+  False=NO/DOWN, None=not resolved). Written by `to-ticks` / `backfill-resolutions` from the
+  Gamma API. The on_tick backtester prefers this over Binance price comparison when present.
+  Live recorder always writes None (resolution unknown until the market settles).
 
 Global registry accessible from any tool. Tool: `tick_recorder`
 - `action=start slug=btc_5m condition_id=0x... binance_symbol=BTCUSDT`
@@ -251,7 +336,22 @@ python3 tools/orderbook_parser.py to-ticks --market 0x... --slug btc_5m \
 python3 tools/orderbook_parser.py to-candles --market 0x... --slug ob_test \
   --in ~/.traderclaw/workspace/data/orderbook/ \
   --out /tmp/candles_test/ --freq 5min
+
+# Auto-detect all recurring 5/15/60-min series and convert in one shot
+python3 tools/orderbook_parser.py to-ticks-multi --days 40
+
+# Backfill official Polymarket resolution (window_yes_won) into EXISTING tick JSONL files.
+# Queries Gamma API by slug "{series_prefix}-{window_ts}", rewrites JSONL in place.
+# ~5 min per slug (30 concurrent requests/batch). Safe to re-run.
+python3 tools/orderbook_parser.py backfill-resolutions \
+  --slug btc_5m --series btc-updown-5m --window-minutes 5
 ```
+
+**Window resolution (`window_yes_won`):** `to-ticks` and `to-ticks-multi` now call
+`fetch_polymarket_window_resolutions()` (Gamma API) to attach the official outcome per
+window. `to-ticks-multi` derives `window_ts` from each market's `end_ts` and batch-fetches
+in parallel. Series slug prefixes use `-updown-` (e.g. `btc-updown-5m`), NOT `-up-or-down-`.
+Only BTC and ETH have 15m series; 1h exists for BTC only.
 
 **Important quirks:**
 - Cloudflare R2 returns 403 on HEAD requests — use Range GET with User-Agent header
@@ -338,6 +438,24 @@ Gateway requires pairing when `require_pairing = true` in config.
 - ALWAYS validate amounts before signing any tx or order
 - Polymarket wallet must be a dedicated Polygon wallet
 - Rhai scripts run sandboxed — enforce memory + execution time limits
+
+## Live trading risk — lessons from the May-2026 incident
+The Polymarket wallet drained from real losses. Root causes, all now mitigated:
+- **Uncapped kelly** — a BTC-calibrated script run on BNB scaled bets to $330 (kelly 6.6×).
+  → `kelly_size_cap` (default 1.5).
+- **No auto-stop** — an XRP runner placed 219 trades at 17% WR without halting.
+  → `max_runner_loss_pct`, `max_consecutive_losses`, regressive sizing, `PortfolioGuard`.
+- **Extreme entries** — late-certainty runner bought NO at 0.04 (96% against).
+  → `min_entry_price` (default 0.05).
+- **Dashboard ≠ onchain** — crashes before disk flush lost ~64 real trades from the log;
+  resolution mismatch (Binance vs Chainlink oracle) inflated simulated P&L by ~$1.5k.
+  → immediate `store.persist()`, `reconcile_untracked_onchain`, `spawn_resolution_monitor`.
+- **Parallel-runner contention** — 15 runners on the same slug raced the CLOB book.
+  → per-series `ORDER_QUEUES`, global `CLOB_RATE_LIMIT`.
+When in doubt about a runner config, verify against onchain via
+`data-api.polymarket.com/activity?user=<proxy_wallet>` before trusting the dashboard.
+
+New files from this work: `src/portfolio_guard.rs` (global loss watchdog).
 
 ## Key dependencies
 alloy = "1", uniswap-v3-sdk = "5", sol-trade-sdk = "3",
