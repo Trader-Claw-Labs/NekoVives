@@ -98,8 +98,8 @@ winget install Rustlang.Rustup
 
 ```bash
 # Clone
-git clone https://github.com/Neko-Vives-Labs/Neko-Vives.git
-cd Neko-Vives
+git clone https://github.com/Trader-Claw-Labs/NekoVives.git
+cd NekoVives
 
 # Build web dashboard first, then the binary
 cd web && npm run build && cd ..
@@ -126,12 +126,12 @@ cargo build --release
 
 ## Installation (pre-built binaries)
 
-No Rust required — grab a pre-built binary from [GitHub Releases](https://github.com/Neko-Vives-Labs/Neko-Vives/releases).
+No Rust required — grab a pre-built binary from [GitHub Releases](https://github.com/Trader-Claw-Labs/NekoVives/releases).
 
 ### One-liner (Linux / macOS)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Neko-Vives-Labs/Neko-Vives/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Trader-Claw-Labs/NekoVives/main/install.sh | sh
 ```
 
 Installs to `/usr/local/bin/trader-claw`. Detects OS and architecture automatically.
@@ -139,7 +139,7 @@ Installs to `/usr/local/bin/trader-claw`. Detects OS and architecture automatica
 ### One-liner (Windows PowerShell)
 
 ```powershell
-irm https://raw.githubusercontent.com/Neko-Vives-Labs/Neko-Vives/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/Trader-Claw-Labs/NekoVives/main/install.ps1 | iex
 ```
 
 Installs to `%LOCALAPPDATA%\trader-claw\` and adds it to your PATH.
@@ -147,7 +147,7 @@ Installs to `%LOCALAPPDATA%\trader-claw\` and adds it to your PATH.
 ### Homebrew (macOS / Linux)
 
 ```bash
-brew tap Neko-Vives-Labs/neko-vives
+brew tap Trader-Claw-Labs/NekoVives
 brew install neko-vives
 ```
 
@@ -167,11 +167,11 @@ yay -S neko-vives-bin
 
 ### MSI installer (Windows)
 
-Download `neko-vives-windows-x86_64.msi` from the latest [release](https://github.com/Neko-Vives-Labs/Neko-Vives/releases) — installs to `Program Files\Neko Vives\` and adds to system PATH.
+Download `neko-vives-windows-x86_64.msi` from the latest [release](https://github.com/Trader-Claw-Labs/NekoVives/releases) — installs to `Program Files\Neko Vives\` and adds to system PATH.
 
 ### DMG (macOS)
 
-Download `neko-vives-macos-arm64.dmg` (Apple Silicon) or `neko-vives-macos-x86_64.dmg` (Intel) from the latest [release](https://github.com/Neko-Vives-Labs/Neko-Vives/releases). Copy `trader-claw` to `/usr/local/bin/`.
+Download `neko-vives-macos-arm64.dmg` (Apple Silicon) or `neko-vives-macos-x86_64.dmg` (Intel) from the latest [release](https://github.com/Trader-Claw-Labs/NekoVives/releases). Copy `trader-claw` to `/usr/local/bin/`.
 
 > **Gatekeeper note:** macOS may block unsigned binaries. Right-click → Open → Open to allow.
 
