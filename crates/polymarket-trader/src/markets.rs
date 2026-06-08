@@ -528,6 +528,55 @@ pub async fn get_market_resolution(slug: &str) -> Result<MarketResolution> {
     })
 }
 
+/// Resolve a market by its condition_id via the CLOB, reading the per-token `winner`
+/// flag. This is the robust path: Polymarket changed the recurring 5m/15m markets to
+/// date-based Gamma slugs, so the old `{prefix}-{window_ts}` slug lookup silently fails
+/// for every asset (only BTC had official resolution, via the tick backfill). The
+/// condition_id is known to the runner at order time, so this lookup never guesses.
+///
+/// GET https://clob.polymarket.com/markets/<condition_id>
+/// Returns Some(true) if the YES/Up token won, Some(false) if NO/Down won, None if the
+/// market is not yet resolved.
+pub async fn get_resolution_by_condition_id(condition_id: &str) -> Result<Option<bool>> {
+    #[derive(Deserialize)]
+    struct ClobMarket {
+        #[serde(default)]
+        closed: bool,
+        #[serde(default)]
+        tokens: Vec<ClobToken>,
+    }
+    #[derive(Deserialize)]
+    struct ClobToken {
+        #[serde(default)]
+        outcome: String,
+        #[serde(default)]
+        winner: bool,
+    }
+
+    let url = format!("https://clob.polymarket.com/markets/{condition_id}");
+    let m: ClobMarket = reqwest::Client::new()
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+
+    if !m.closed {
+        return Ok(None); // not settled yet
+    }
+    // A resolved market has exactly one winning token. Map Up/Yes → true, Down/No → false.
+    let mut yes_won: Option<bool> = None;
+    for t in &m.tokens {
+        if t.winner {
+            let o = t.outcome.to_ascii_lowercase();
+            yes_won = Some(o == "up" || o == "yes");
+        }
+    }
+    Ok(yes_won)
+}
+
 /// Get YES token price (0.0 to 1.0).
 /// GET https://clob.polymarket.com/price?token_id=<token_id>&side=buy
 pub async fn get_market_price(token_id: &str) -> Result<f64> {

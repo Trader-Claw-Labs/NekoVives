@@ -256,6 +256,14 @@ pub struct LiveOrder {
     /// against the CLOB and Gamma. Allows incremental re-runs.
     #[serde(default)]
     pub backfilled: bool,
+
+    /// Polymarket condition_id of the market this order traded. Captured at order
+    /// time so the resolution monitor can settle via the CLOB by-condition_id
+    /// lookup — the legacy `{prefix}-{window_ts}` Gamma slug no longer resolves
+    /// for recurring 5m/15m markets, which left every non-BTC runner stuck on the
+    /// unreliable binance_provisional resolution.
+    #[serde(default)]
+    pub condition_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2771,7 +2779,15 @@ async fn polymarket_runner_loop(
                     let (resolved_via_poly, went_up_opt, resolution_provisional) =
                         match config.series_id.as_deref() {
                         Some(sid) if !sid.is_empty() => {
-                            match fetch_polymarket_resolution(sid, prev_window).await {
+                            // condition_id stored on the prev-window order → robust CLOB lookup
+                            let prev_cid: Option<String> = {
+                                let map = store.runners.lock().unwrap();
+                                map.get(&id)
+                                    .and_then(|r| r.result.as_ref())
+                                    .and_then(|res| res.live_orders.iter().find(|o| o.window_ts == prev_window))
+                                    .and_then(|o| o.condition_id.clone())
+                            };
+                            match fetch_polymarket_resolution(sid, prev_window, prev_cid.as_deref()).await {
                                 Some(yes_won) => (true, Some(yes_won), false),
                                 None => {
                                     // Not settled yet — use Binance as provisional,
@@ -3760,7 +3776,24 @@ async fn monitor_stop_loss(
 /// This replaces the legacy `resolve_window_outcome` Binance-candle path for
 /// Polymarket settlement — the chain settles via Chainlink, and Polymarket's
 /// `outcomePrices` reflects the on-chain truth.
-async fn fetch_polymarket_resolution(series_id: &str, window_ts: i64) -> Option<bool> {
+async fn fetch_polymarket_resolution(
+    series_id: &str,
+    window_ts: i64,
+    condition_id: Option<&str>,
+) -> Option<bool> {
+    // Primary path: resolve by condition_id via the CLOB. Robust because the runner
+    // captured this id at order time — no slug guessing. The legacy `{prefix}-{ts}`
+    // Gamma slug stopped resolving for recurring markets, which silently broke official
+    // settlement for every non-BTC runner (they got stuck on binance_provisional).
+    if let Some(cid) = condition_id.filter(|c| !c.is_empty()) {
+        if let Ok(Some(yes_won)) =
+            polymarket_trader::markets::get_resolution_by_condition_id(cid).await
+        {
+            return Some(yes_won);
+        }
+    }
+
+    // Fallback: legacy slug lookup (kept for older orders without a stored condition_id).
     let series = crate::tools::series::builtin_series()
         .into_iter()
         .find(|s| s.id == series_id)?;
@@ -3820,7 +3853,18 @@ fn spawn_resolution_monitor(
                 return;
             }
 
-            if let Some(yes_won) = fetch_polymarket_resolution(&series_id, window_ts).await {
+            // Pull the order's stored condition_id (set at order time) for the robust
+            // CLOB-by-condition lookup; falls back to the legacy slug when absent.
+            let order_cid: Option<String> = {
+                let map = store.runners.lock().unwrap();
+                map.get(id)
+                    .and_then(|r| r.result.as_ref())
+                    .and_then(|res| res.live_orders.iter().find(|o| o.window_ts == window_ts))
+                    .and_then(|o| o.condition_id.clone())
+            };
+            if let Some(yes_won) =
+                fetch_polymarket_resolution(&series_id, window_ts, order_cid.as_deref()).await
+            {
                 // Official resolution arrived — patch the matching order in the store
                 let already_correct = {
                     let map = store.runners.lock().unwrap();
@@ -4396,6 +4440,7 @@ async fn execute_live_polymarket_signal(
                             fill_price,
                             fill_size,
                             tx_hash,
+                            condition_id: config.poly_condition_id.clone(),
                             ..Default::default()
                         }), renewed);
                     }
@@ -4474,6 +4519,7 @@ async fn execute_live_polymarket_signal(
                         fill_price,
                         fill_size,
                         tx_hash,
+                        condition_id: config.poly_condition_id.clone(),
                         ..Default::default()
                     }), renewed);
                 }
@@ -4557,6 +4603,7 @@ async fn execute_live_polymarket_signal(
             result: None,
             pnl: None,
             stop_loss_triggered: false,
+            condition_id: config.poly_condition_id.clone(),
             ..Default::default()
         }), None)
     }
