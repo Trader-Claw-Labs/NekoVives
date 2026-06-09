@@ -3838,9 +3838,13 @@ fn spawn_resolution_monitor(
 ) {
     tokio::spawn(async move {
         let id = runner_id.as_str();
-        let deadline = chrono::Utc::now().timestamp() + 600; // 10-minute window
+        // 30-minute window — recurring crypto markets are often marked closed on the
+        // CLOB later than 10 min after window close, which previously left orders stuck
+        // on binance_provisional. The periodic spawn_resolution_sweep catches anything
+        // that resolves even later than this.
+        let deadline = chrono::Utc::now().timestamp() + 1800;
 
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(45));
         interval.tick().await; // skip immediate first tick — already tried once
 
         loop {
@@ -3971,6 +3975,90 @@ fn spawn_resolution_monitor(
                     ),
                 );
                 return; // done — official resolution recorded
+            }
+        }
+    });
+}
+
+/// Global periodic re-resolution sweep. The per-order `spawn_resolution_monitor` gives
+/// up after a fixed window, but the CLOB sometimes marks recurring crypto markets
+/// resolved later than that, which left orders stuck on the unreliable
+/// `binance_provisional` resolution — making Dry Run / live P&L diverge from the real
+/// Polymarket oracle. This task retries the official CLOB-by-condition_id resolution for
+/// ANY still-provisional order that carries a condition_id, with no time limit, so the
+/// books converge to the official outcome.
+///
+/// Scoped to on_candle runners: the tick engine owns its balance in `TickRunnerState`,
+/// which the loop overwrites every second, so patching it out-of-band here would be
+/// clobbered. on_candle balance is derived from `sum(order.pnl)` each loop cycle, so
+/// patching `order.pnl` (and the intermediate `res.balance`) is safe and converges.
+pub fn spawn_resolution_sweep(store: Arc<StrategyRunnerStore>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+        interval.tick().await; // skip the immediate first tick
+        loop {
+            interval.tick().await;
+
+            // Snapshot the provisional on_candle orders that have a condition_id.
+            let todo: Vec<(String, i64, String, f64)> = {
+                let map = store.runners.lock().unwrap();
+                let mut v = Vec::new();
+                for (id, r) in map.iter() {
+                    if r.config.kind.as_deref() == Some("rhai_tick") { continue; }
+                    let fee = r.config.fee_pct;
+                    if let Some(res) = r.result.as_ref() {
+                        for o in &res.live_orders {
+                            if o.resolution_source.as_deref() != Some("polymarket")
+                                && o.pnl.is_some()
+                                && o.result.is_some()
+                            {
+                                if let Some(cid) = o.condition_id.as_ref().filter(|c| !c.is_empty()) {
+                                    v.push((id.clone(), o.window_ts, cid.clone(), fee));
+                                }
+                            }
+                        }
+                    }
+                }
+                v
+            };
+            if todo.is_empty() { continue; }
+
+            let mut patched = 0usize;
+            // Cap per sweep to avoid hammering the CLOB; the rest are caught next cycle.
+            for (id, window_ts, cid, fee) in todo.into_iter().take(40) {
+                let yes_won = match polymarket_trader::markets::get_resolution_by_condition_id(&cid).await {
+                    Ok(Some(v)) => v,
+                    _ => continue, // not settled yet, or lookup failed — retry next cycle
+                };
+                let mut map = store.runners.lock().unwrap();
+                let Some(r) = map.get_mut(&id) else { continue; };
+                let Some(res) = r.result.as_mut() else { continue; };
+                let Some(order) = res.live_orders.iter_mut().find(|o| o.window_ts == window_ts) else { continue; };
+                if order.resolution_source.as_deref() == Some("polymarket") { continue; }
+
+                let entry = order.entry_price.unwrap_or(0.5);
+                let stake = order.amount_usdc;
+                let position = if order.side.starts_with("yes") { 1 } else { -1 };
+                let old_pnl = order.pnl.unwrap_or(0.0);
+                let was_win = old_pnl > 0.0;
+                let won = (position == 1 && yes_won) || (position == -1 && !yes_won);
+                let pnl = if won && entry > 0.0 {
+                    (stake / entry) * (1.0 - fee / 100.0) - stake
+                } else {
+                    -stake
+                };
+                order.resolution_yes_won = Some(yes_won);
+                order.resolution_source = Some("polymarket".to_string());
+                order.result = Some(if won { "WIN".to_string() } else { "LOSS".to_string() });
+                order.pnl = Some(pnl);
+                res.balance += pnl - old_pnl; // intermediate; the loop rebuilds from sum(pnl)
+                if was_win && !won { res.live_wins = res.live_wins.saturating_sub(1); }
+                else if !was_win && won { res.live_wins = res.live_wins.saturating_add(1); }
+                patched += 1;
+            }
+            if patched > 0 {
+                store.persist();
+                tracing::info!("[RESOLUTION-SWEEP] upgraded {patched} provisional orders to official resolution");
             }
         }
     });

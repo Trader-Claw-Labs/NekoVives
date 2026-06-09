@@ -714,6 +714,11 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         tracing::info!("Restarted {} strategy runner(s) from disk", restarted);
     }
 
+    // Periodic re-resolution sweep: upgrades any order stuck on binance_provisional to
+    // the official Polymarket oracle once the CLOB marks its market resolved (which can
+    // be later than the per-order monitor's window). Keeps Dry Run P&L realistic.
+    crate::strategy_runner::spawn_resolution_sweep(Arc::clone(&state.strategy_runner));
+
     // ── Copy-trading: spawn Polymarket fill dispatch loop ─────────────
     //
     // The dispatch loop subscribes to leader-fill events from the
