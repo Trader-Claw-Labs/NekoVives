@@ -3045,10 +3045,35 @@ async fn polymarket_runner_loop(
                 // Live mode: read real USDC balance from the CLOB/exchange
                 fetch_usdc_balance_clob(client).await
             } else {
+                // Adopt any official resolution the sweep / monitor wrote to the store
+                // since this loop last touched `live_orders`. Without this, the
+                // `live_orders.clone()` write-back below clobbers those upgrades back to
+                // binance_provisional (the loop owns a local Vec it overwrites each cycle).
+                {
+                    let map = store.runners.lock().unwrap();
+                    if let Some(stored) = map.get(&id).and_then(|r| r.result.as_ref()) {
+                        for lo in live_orders.iter_mut() {
+                            if lo.resolution_source.as_deref() == Some("polymarket") { continue; }
+                            if let Some(so) = stored.live_orders.iter().find(|s| {
+                                s.window_ts == lo.window_ts && s.order_id == lo.order_id
+                            }) {
+                                if so.resolution_source.as_deref() == Some("polymarket") {
+                                    lo.resolution_source = so.resolution_source.clone();
+                                    lo.resolution_yes_won = so.resolution_yes_won;
+                                    lo.result = so.result.clone();
+                                    lo.pnl = so.pnl;
+                                }
+                            }
+                        }
+                    }
+                }
+                // Recompute the win counter from the (now synced) results so the
+                // dashboard win-rate reflects official outcomes after any flip.
+                live_wins = live_orders.iter()
+                    .filter(|o| o.result.as_deref().map(|r| r.starts_with("WIN")).unwrap_or(false))
+                    .count() as u32;
+
                 // Paper mode: running balance = initial + sum of all settled pnl.
-                // Previously this returned `initial_balance` verbatim, so the UI
-                // showed a stuck $1000. Now it reflects the paper P&L so the
-                // user sees their strategy's realized P&L in the Wallet widget.
                 let settled_pnl: f64 = live_orders.iter().filter_map(|o| o.pnl).sum();
                 Some(config.initial_balance + settled_pnl)
             };
@@ -4019,13 +4044,20 @@ pub fn spawn_resolution_sweep(store: Arc<StrategyRunnerStore>) {
                         }
                     }
                 }
+                // Oldest window first — those are the most likely to be resolved on the
+                // CLOB already, so resolvable orders get patched before the per-cycle cap
+                // is spent. Without this, late-iteration runners (e.g. DOGE/BNB) starved:
+                // the cap was always consumed by other runners' fresher orders and theirs
+                // were never reached.
+                v.sort_by_key(|(_, wts, _, _)| *wts);
                 v
             };
             if todo.is_empty() { continue; }
 
             let mut patched = 0usize;
-            // Cap per sweep to avoid hammering the CLOB; the rest are caught next cycle.
-            for (id, window_ts, cid, fee) in todo.into_iter().take(40) {
+            // Cap raised to cover the realistic resolvable backlog in one pass (most
+            // entries return None — not yet closed — and are retried next cycle).
+            for (id, window_ts, cid, fee) in todo.into_iter().take(400) {
                 let yes_won = match polymarket_trader::markets::get_resolution_by_condition_id(&cid).await {
                     Ok(Some(v)) => v,
                     _ => continue, // not settled yet, or lookup failed — retry next cycle
