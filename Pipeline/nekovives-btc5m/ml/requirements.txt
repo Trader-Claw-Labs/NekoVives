@@ -1,0 +1,10 @@
+numpy>=1.26
+pandas>=2.0
+scipy>=1.11
+scikit-learn>=1.4
+pyarrow>=14
+joblib>=1.3
+# optional, preferred estimator; falls back to sklearn HistGradientBoosting if absent
+lightgbm>=4.0
+websockets>=12.0   # record.py live feeds
+requests>=2.31     # record.py window discovery / price-to-beat

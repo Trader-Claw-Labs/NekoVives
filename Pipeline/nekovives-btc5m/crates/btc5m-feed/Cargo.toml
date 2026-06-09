@@ -1,0 +1,28 @@
+[package]
+name = "btc5m-feed"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Per NekoVives conventions: all shared deps use `workspace = true`. Add these to
+# the root [workspace.dependencies] if not already present (see CLAUDE.md for the
+# concrete versions used to develop this crate).
+[dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "sync"] }
+tokio-tungstenite = { workspace = true, features = ["connect", "native-tls"] }
+futures-util = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
+rhai = { workspace = true, optional = true }
+
+[features]
+default = []
+# Enable to drive P(Up) from a hot-swappable Rhai script instead of Rust.
+rhai = ["dep:rhai"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

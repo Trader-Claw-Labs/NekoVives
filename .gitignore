@@ -35,4 +35,6 @@ strategy/claude_code_blueprint.md
 Trader-Claw/recursing-chandrasekhar-7db93b/
 --in
 --out
-/Pipeline
+/Pipeline/bin
+/Pipeline/lib
+/Pipeline/nekovives-btc5m/ml/__pycache__
