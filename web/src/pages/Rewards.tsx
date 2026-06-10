@@ -3,6 +3,7 @@ import { useQuery } from '@tanstack/react-query'
 import { apiFetch } from '../hooks/useApi'
 import { Coins, Shield, RefreshCw, AlertCircle, AlertTriangle, Save } from 'lucide-react'
 import clsx from 'clsx'
+import ArbScanner from '../components/ArbScanner'
 
 // ── Types ─────────────────────────────────────────────────────────────────
 interface RewardMarket {
@@ -172,6 +173,9 @@ export default function RewardsPage() {
           </span>
         </div>
       </div>
+
+      {/* Structural arb scanner — set-arb + monotonicity violations on slow events */}
+      <ArbScanner />
 
       {/* Scanner controls + summary */}
       <div className="flex flex-wrap items-center gap-3 mb-3">

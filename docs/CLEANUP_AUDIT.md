@@ -92,8 +92,21 @@ El usuario verificó varias en uso. Marcado con su feedback directo:
 - **Fase E — Scripts**: mover los deprecated (payout-explosion) a `scripts/deprecated/`.
 - **Fase F — Métricas**: EV/trade + reconciliación onchain en `/live`.
 
-> Regla: antes de **eliminar** cualquier cosa, la marco/oculto primero (reversible) y
-> confirmas; el borrado duro es el último paso.
+### Fases de exploración de edge nuevo (no son limpieza, son construcción dirigida)
+
+- **Fase G — Escáner de monotonicidad + arb sub-$1 (en curso)**: detectar
+  violaciones de monotonicidad en strikes ordenados (ej. SpaceX >$1.8T ≥ >$2T ≥ >$2.4T)
+  y pares Up+Down con suma <$1 (la versión de wqewqa portada a mercados LENTOS donde no
+  hay HFT). Endpoint scanner + UI en `/rewards`. Valor: el único candidato a edge nuevo
+  con asimetría favorable (matemática estructural, no predicción).
+- **Fase H — Validador de wallets onchain (alimenta Fase C)**: aplicar el
+  `edge_validator` de 3 legs a los fills onchain de cualquier wallet (`data-api/activity`),
+  filtrando HFT por densidad (>X trades/h) y validando si los líderes lentos tienen edge
+  real antes de copiar. Responde la pregunta de Copy Trading con datos.
+- **Fase I — Fear Index defensivo**: recolector de velocidad/z-score por cluster de
+  mercados → API + visual en `/rewards`. Primero como GATE defensivo del rewards-maker
+  (pausar cuando cluster panic). Como señal de fade SOLO si un backtest del overshoot
+  (mediana de retornos en t+5/+30/+2h) confirma que panic revierte significativamente.
 
 > Regla: antes de **eliminar** cualquier cosa, la marco/oculto primero (reversible) y
 > confirmas; el borrado duro es el último paso.

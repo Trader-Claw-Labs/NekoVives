@@ -959,6 +959,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         // ── TradingView ──
         .route("/api/tradingview/scan", get(api::handle_api_tradingview_scan))
         .route("/api/rewards/markets", get(api::handle_api_rewards_markets))
+        .route("/api/arb/scan", get(api::handle_api_arb_scan))
         // ── Backtesting ──
         .route("/api/backtest/series", get(api::handle_api_backtest_series))
         .route("/api/backtest/tick-slugs", get(api::handle_api_backtest_tick_slugs))

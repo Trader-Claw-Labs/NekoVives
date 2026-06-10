@@ -3790,6 +3790,44 @@ pub async fn handle_api_rewards_markets(
     }
 }
 
+#[derive(Deserialize)]
+pub struct ArbScanQuery {
+    /// How many open events to scan (each pulls books for its markets). Default 80.
+    pub max_events: Option<usize>,
+    /// Minimum gross edge in cents to surface. Default 0.5¢ (filters CLOB minutiae).
+    pub threshold_c: Option<f64>,
+}
+
+/// GET /api/arb/scan — structural-arb scanner across multi-market events.
+/// Detects (1) disjoint bucket sets where YES asks sum < $1 (or NO asks < $1) and (2)
+/// monotonicity violations on date-ordered cumulative strikes. Both are PRE-FEE gross
+/// edges; verify book depth and NegRisk fees before posting.
+pub async fn handle_api_arb_scan(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<ArbScanQuery>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let max_events = params.max_events.unwrap_or(80).clamp(5, 500);
+    let threshold_c = params.threshold_c.unwrap_or(0.5);
+    match market_analyzer::arb_scanner::scan_arb_opportunities(max_events, threshold_c).await {
+        Ok(candidates) => Json(serde_json::json!({
+            "candidates": candidates,
+            "scanned_events_max": max_events,
+            "threshold_c": threshold_c,
+            "fetched_at": chrono::Utc::now().to_rfc3339(),
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "error": format!("Arb scan error: {e}") })),
+        )
+            .into_response(),
+    }
+}
+
 // ── Backtesting ──────────────────────────────────────────────────
 
 /// GET /api/backtest/scripts — list .rhai files in /scripts/
