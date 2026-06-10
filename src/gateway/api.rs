@@ -3828,6 +3828,60 @@ pub async fn handle_api_arb_scan(
     }
 }
 
+/// GET /api/fear-index/status — returns the most recent fear index reading and
+/// z-score from the rolling 2h window, computed from the Python collector log.
+/// Acts as a defensive gate signal: z > 2 → pause rewards-maker quotes.
+pub async fn handle_api_fear_index_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+    let log_path = state.config.lock().workspace_dir
+        .join("data").join("fear_index.jsonl");
+    let content = match std::fs::read_to_string(&log_path) {
+        Ok(c) => c,
+        Err(_) => return Json(serde_json::json!({
+            "status": "no_data",
+            "note": "Fear Index collector not running. Start with: python3 scripts/ml/fear_index.py --collect --cluster politics --hours 24"
+        })).into_response(),
+    };
+    let rows: Vec<serde_json::Value> = content.lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    if rows.is_empty() {
+        return Json(serde_json::json!({ "status": "no_data" })).into_response();
+    }
+    // Latest row + rolling 2h z-score
+    let latest = rows.last().unwrap();
+    let ts_now = latest.get("ts").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let two_hours_ago = ts_now - 7200.0;
+    let window: Vec<f64> = rows.iter()
+        .filter_map(|r| {
+            let ts = r.get("ts")?.as_f64()?;
+            if ts >= two_hours_ago { r.get("index")?.as_f64() } else { None }
+        })
+        .collect();
+    let (z_score, state_label) = if window.len() >= 10 {
+        let mu = window.iter().sum::<f64>() / window.len() as f64;
+        let sd = (window.iter().map(|x| (x - mu).powi(2)).sum::<f64>() / window.len() as f64).sqrt();
+        let idx = latest.get("index").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let z = if sd > 1e-9 { (idx - mu) / sd } else { 0.0 };
+        let lbl = if z > 2.0 { "FEAR_SPIKE" } else if z > 1.0 { "ELEVATED" } else { "CALM" };
+        (z, lbl)
+    } else {
+        (0.0, "INSUFFICIENT_DATA")
+    };
+    Json(serde_json::json!({
+        "status": state_label,
+        "z_score": (z_score * 100.0).round() / 100.0,
+        "index": latest.get("index"),
+        "cluster": latest.get("cluster"),
+        "n_window_samples": window.len(),
+        "latest_ts": ts_now as i64,
+        "gate_recommendation": if z_score > 2.0 { "PAUSE quotes" } else { "OK to quote" },
+    })).into_response()
+}
+
 // ── Backtesting ──────────────────────────────────────────────────
 
 /// GET /api/backtest/scripts — list .rhai files in /scripts/
@@ -7588,4 +7642,231 @@ pub async fn handle_api_orderbook_ingest(
             days, body.market, body.slug
         )
     })).into_response()
+}
+
+// ── Wallet Validator ──────────────────────────────────────────────────────────
+
+/// A single activity event returned by the Polymarket data API.
+#[derive(serde::Deserialize, Debug)]
+struct PolyActivity {
+    #[serde(rename = "type")]
+    event_type: String,
+    #[serde(default)]
+    timestamp: Option<i64>,
+    #[serde(rename = "conditionId", default)]
+    condition_id: Option<String>,
+    #[serde(default)]
+    side: Option<String>,
+    #[serde(default)]
+    price: Option<f64>,
+    #[serde(rename = "usdcSize", default)]
+    usdc_size: Option<f64>,
+}
+
+/// Fetch up to `max_events` activity events for `proxy_wallet` from the Polymarket
+/// data API, paginating in batches of 500 until no more pages or the limit is hit.
+/// Returns `Vec<(entry_price, won)>` where entry_price is the average BUY price per
+/// conditionId and won is determined by whether a REDEEM exists for that conditionId
+/// with usdcSize exceeding the total USDC spent on BUYs.
+pub async fn fetch_wallet_trades(
+    proxy_wallet: &str,
+    max_events: usize,
+) -> anyhow::Result<Vec<(f64, bool)>> {
+    let client = reqwest::Client::builder()
+        .user_agent("trader-claw/wallet-validator")
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+
+    let mut all_events: Vec<PolyActivity> = Vec::new();
+    let mut offset = 0usize;
+    let page_size = 500usize;
+
+    loop {
+        if all_events.len() >= max_events {
+            break;
+        }
+        let url = format!(
+            "https://data-api.polymarket.com/activity?user={proxy_wallet}&limit={page_size}&offset={offset}"
+        );
+        let resp = client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Polymarket activity fetch failed: {e}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Polymarket activity API returned {status}: {body}");
+        }
+
+        let page: Vec<PolyActivity> = resp
+            .json()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to parse activity JSON: {e}"))?;
+
+        let page_len = page.len();
+        all_events.extend(page);
+        if page_len < page_size {
+            break; // last page
+        }
+        offset += page_size;
+    }
+
+    // Group BUYs and REDEEMs by conditionId.
+    // buys: conditionId -> (sum_price_weighted, total_usdc_spent)
+    // redeems: conditionId -> total_usdc_received
+    use std::collections::HashMap;
+    let mut buy_price_sum: HashMap<String, f64> = HashMap::new();
+    let mut buy_price_count: HashMap<String, usize> = HashMap::new();
+    let mut buy_usdc: HashMap<String, f64> = HashMap::new();
+    let mut redeem_usdc: HashMap<String, f64> = HashMap::new();
+
+    for event in &all_events {
+        let Some(ref cid) = event.condition_id else { continue; };
+        // data-api uses type="TRADE" with side="BUY"/"SELL", and type="REDEEM"
+        let is_buy = event.event_type == "TRADE"
+            && event.side.as_deref().map(|s| s.eq_ignore_ascii_case("buy")).unwrap_or(false);
+        let is_redeem = event.event_type == "REDEEM";
+        if is_buy {
+            let price = event.price.unwrap_or(0.5);
+            if price > 0.0 && price < 1.0 {
+                let w = event.usdc_size.unwrap_or(1.0).max(1e-9);
+                // weighted mean price accumulation
+                *buy_price_sum.entry(cid.clone()).or_insert(0.0) += price * w;
+                *buy_usdc.entry(cid.clone()).or_insert(0.0) += w;
+                *buy_price_count.entry(cid.clone()).or_insert(0) += 1;
+            }
+        } else if is_redeem {
+            let usdc = event.usdc_size.unwrap_or(0.0);
+            *redeem_usdc.entry(cid.clone()).or_insert(0.0) += usdc;
+        }
+    }
+
+    // Pair each conditionId that has BUYs with an outcome.
+    let mut result: Vec<(f64, bool)> = Vec::new();
+    for (cid, count) in &buy_price_count {
+        if *count == 0 { continue; }
+        let total_usdc = buy_usdc.get(cid).copied().unwrap_or(1.0).max(1e-9);
+        // weighted average price (price * usdcSize / total usdcSize)
+        let avg_price = buy_price_sum.get(cid).copied().unwrap_or(0.5) / total_usdc;
+        let price = crate::strategy_runner::settle_price(Some(avg_price), None);
+        if !(price > 0.01 && price < 0.99) { continue; }
+
+        let spent = total_usdc;
+        let received = redeem_usdc.get(cid).copied().unwrap_or(0.0);
+        // Won if REDEEM exists and returned more than was spent (net positive).
+        let won = received > spent && received > 0.0;
+
+        result.push((price, won));
+    }
+
+    Ok(result)
+}
+
+/// Query parameters for GET /api/validate/wallet
+#[derive(Deserialize)]
+pub struct ValidateWalletQuery {
+    pub address: String,
+}
+
+/// GET /api/validate/wallet?address=<0x...>
+/// Fetches onchain activity for a Polymarket proxy wallet, measures trade
+/// frequency (HFT detection), and runs the 3-leg edge validator.
+pub async fn handle_api_validate_wallet(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<ValidateWalletQuery>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let address = params.address.trim().to_lowercase();
+    if address.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "address query param is required"})),
+        )
+            .into_response();
+    }
+
+    // Fetch up to 10k events
+    // data-api.polymarket.com: max offset is 3000, max usable pages = 3000/500 = 6 pages
+    let trades = match fetch_wallet_trades(&address, 2_500).await {
+        Ok(t) => t,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": format!("Failed to fetch wallet activity: {e}")
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let n_trades = trades.len();
+
+    // Count trades per hour for HFT detection: fetch raw events separately
+    // by counting timestamps. We approximate using n_trades over the observed
+    // time span from the events. Re-use trades here as a proxy: fetch
+    // timestamps via a second call for a quick time-span estimate.
+    // For efficiency we reuse the trades list and estimate window duration.
+    // Since we paginate up to 10k we approximate the span as n_trades / observed_rate.
+    // A simpler proxy: if n_trades > 100 in the first 500 (one page) → likely HFT.
+    // We'll re-fetch a single page to count timestamps for a proper per-hour rate.
+    let trades_per_hour: f64;
+    let is_hft: bool;
+    {
+        // Quick time-span estimate: fetch the first and last activity pages
+        // (already fetched as part of the up-to-10k loop above, but we don't
+        // have timestamps there). Do a minimal re-fetch of 2 pages for ts.
+        let ts_first = fetch_activity_timestamps(&address, 0, 500).await;
+        let ts_last = fetch_activity_timestamps(&address, n_trades.saturating_sub(500), 500).await;
+        if let (Some(first_page), Some(last_page)) = (ts_first.ok(), ts_last.ok()) {
+            let newest = first_page.iter().copied().max().unwrap_or(0);
+            let oldest = last_page.iter().copied().min().unwrap_or(0);
+            let span_hours = if newest > oldest {
+                (newest - oldest) as f64 / 3600.0
+            } else {
+                1.0 // default to 1h to avoid div-by-zero
+            };
+            let span_hours = span_hours.max(1.0);
+            trades_per_hour = n_trades as f64 / span_hours;
+        } else {
+            trades_per_hour = 0.0;
+        }
+        is_hft = trades_per_hour > 100.0;
+    }
+
+    let entries: Vec<f64> = trades.iter().map(|(p, _)| *p).collect();
+    let wons: Vec<bool> = trades.iter().map(|(_, w)| *w).collect();
+    let validation = crate::tools::edge_validator::validate(&entries, &wons, 5000);
+
+    Json(serde_json::json!({
+        "address": address,
+        "n_trades": n_trades,
+        "trades_per_hour": trades_per_hour,
+        "is_hft": is_hft,
+        "result": validation,
+    }))
+    .into_response()
+}
+
+/// Helper: fetch timestamps from a single activity page (offset + limit).
+async fn fetch_activity_timestamps(
+    proxy_wallet: &str,
+    offset: usize,
+    limit: usize,
+) -> anyhow::Result<Vec<i64>> {
+    let client = reqwest::Client::builder()
+        .user_agent("trader-claw/wallet-validator")
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?;
+    let url = format!(
+        "https://data-api.polymarket.com/activity?user={proxy_wallet}&limit={limit}&offset={offset}"
+    );
+    let events: Vec<PolyActivity> = client.get(&url).send().await?.json().await?;
+    Ok(events.into_iter().filter_map(|e| e.timestamp).collect())
 }

@@ -960,6 +960,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/tradingview/scan", get(api::handle_api_tradingview_scan))
         .route("/api/rewards/markets", get(api::handle_api_rewards_markets))
         .route("/api/arb/scan", get(api::handle_api_arb_scan))
+        .route("/api/fear-index/status", get(api::handle_api_fear_index_status))
         // ── Backtesting ──
         .route("/api/backtest/series", get(api::handle_api_backtest_series))
         .route("/api/backtest/tick-slugs", get(api::handle_api_backtest_tick_slugs))
@@ -1004,6 +1005,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         // ── Live Strategy Runner ──
         .route("/api/live/strategies", get(api::handle_api_live_list).post(api::handle_api_live_create))
         .route("/api/validate/runner", get(api::handle_api_validate_runner))
+        .route("/api/validate/wallet", get(api::handle_api_validate_wallet))
         .route("/api/live/strategies/{id}", get(api::handle_api_live_get).patch(api::handle_api_live_patch).delete(api::handle_api_live_delete))
         .route("/api/live/strategies/{id}/stop", post(api::handle_api_live_stop))
         .route("/api/live/strategies/{id}/restart", post(api::handle_api_live_restart))
