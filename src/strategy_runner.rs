@@ -3943,17 +3943,15 @@ fn spawn_resolution_monitor(
                                     let pnl_delta = pnl - old_pnl;
                                     order.pnl = Some(pnl);
 
-                                    // For on_candle engine: balance = initial + sum(pnl),
-                                    // recalculated from orders, so just patching order.pnl
-                                    // is enough — the next update_runner_result call rebuilds it.
-                                    // For tick engine: the loop writes res.balance = TickRunnerState.balance
-                                    // every second, which would overwrite a direct res.balance patch.
-                                    // So we patch tick_state directly when provided.
-                                    if tick_state.is_none() {
-                                        // on_candle path: patch res.balance as intermediate value
-                                        res.balance += pnl_delta;
-                                    }
-                                    // live_wins counter: adjust if win/loss flipped
+                                    // on_candle: do NOT write res.balance here. The loop and
+                                    // the sweep both recompute balance = initial + sum(pnl)
+                                    // (single source of truth); a third incremental writer
+                                    // here is what made the dashboard P&L flicker between the
+                                    // provisional and official values during convergence.
+                                    // The tick engine's balance is corrected via tick_state below.
+                                    //
+                                    // live_wins counter: adjust if win/loss flipped (the loop
+                                    // recomputes it for on_candle; this keeps tick consistent).
                                     let was_win = binance_fallback_yes_won == (position == 1);
                                     let is_win  = won;
                                     if was_win && !is_win {
@@ -4064,28 +4062,32 @@ pub fn spawn_resolution_sweep(store: Arc<StrategyRunnerStore>) {
                 };
                 let mut map = store.runners.lock().unwrap();
                 let Some(r) = map.get_mut(&id) else { continue; };
+                let initial = r.config.initial_balance;
                 let Some(res) = r.result.as_mut() else { continue; };
-                let Some(order) = res.live_orders.iter_mut().find(|o| o.window_ts == window_ts) else { continue; };
-                if order.resolution_source.as_deref() == Some("polymarket") { continue; }
-
-                let entry = order.entry_price.unwrap_or(0.5);
-                let stake = order.amount_usdc;
-                let position = if order.side.starts_with("yes") { 1 } else { -1 };
-                let old_pnl = order.pnl.unwrap_or(0.0);
-                let was_win = old_pnl > 0.0;
-                let won = (position == 1 && yes_won) || (position == -1 && !yes_won);
-                let pnl = if won && entry > 0.0 {
-                    (stake / entry) * (1.0 - fee / 100.0) - stake
-                } else {
-                    -stake
-                };
-                order.resolution_yes_won = Some(yes_won);
-                order.resolution_source = Some("polymarket".to_string());
-                order.result = Some(if won { "WIN".to_string() } else { "LOSS".to_string() });
-                order.pnl = Some(pnl);
-                res.balance += pnl - old_pnl; // intermediate; the loop rebuilds from sum(pnl)
-                if was_win && !won { res.live_wins = res.live_wins.saturating_sub(1); }
-                else if !was_win && won { res.live_wins = res.live_wins.saturating_add(1); }
+                {
+                    let Some(order) = res.live_orders.iter_mut().find(|o| o.window_ts == window_ts) else { continue; };
+                    if order.resolution_source.as_deref() == Some("polymarket") { continue; }
+                    let entry = order.entry_price.unwrap_or(0.5);
+                    let stake = order.amount_usdc;
+                    let position = if order.side.starts_with("yes") { 1 } else { -1 };
+                    let won = (position == 1 && yes_won) || (position == -1 && !yes_won);
+                    let pnl = if won && entry > 0.0 {
+                        (stake / entry) * (1.0 - fee / 100.0) - stake
+                    } else {
+                        -stake
+                    };
+                    order.resolution_yes_won = Some(yes_won);
+                    order.resolution_source = Some("polymarket".to_string());
+                    order.result = Some(if won { "WIN".to_string() } else { "LOSS".to_string() });
+                    order.pnl = Some(pnl);
+                }
+                // Single source of truth: every balance writer recomputes from sum(pnl)
+                // so the loop / sweep / monitor never disagree (the cause of the UI flicker
+                // between the provisional and official P&L during resolution convergence).
+                res.balance = initial + res.live_orders.iter().filter_map(|o| o.pnl).sum::<f64>();
+                res.live_wins = res.live_orders.iter()
+                    .filter(|o| o.result.as_deref().map(|s| s.starts_with("WIN")).unwrap_or(false))
+                    .count() as u32;
                 patched += 1;
             }
             if patched > 0 {
