@@ -54,42 +54,46 @@ defaults sugeridos en la UI. Dejar solo los validados (`drift_v4_safe`,
 
 ---
 
-## 3. Páginas del dashboard — 🟡 verificar antes de tocar
+## 3. Páginas del dashboard — feedback del usuario (jun 2026)
 
-No tengo evidencia de que estén rotas; requieren un pase de verificación (cada una:
-¿carga? ¿el endpoint responde? ¿se usa?). **Verificar, no presumir.**
+El usuario verificó varias en uso. Marcado con su feedback directo:
 
-| Página | Estado | Nota |
-|--------|--------|------|
-| `/` Dashboard, `/wallets`, `/polymarket`, `/live`, `/rewards`, `/backtesting`, `/orderbook`, `/logs`, `/health` | 🟢 en uso esta sesión | mantener |
-| `/strategy-builder` | 🟡 verificar | ¿se usa vs editar .rhai directo? |
-| `/copy-trading`, `/copy-discovery` | 🟡 verificar | el `copy_orchestrator` corre (visto en logs); ¿la UI funciona? |
-| `/telegram` | 🟡 verificar | ¿bot configurado/activo? |
-| `/scheduled-jobs` (Skills/cron) | 🟡 verificar | ¿se usa? |
-| `/risk` (RiskCenter) | 🟡 verificar | ¿refleja los guardrails reales? |
-| `/chat`, `/memory` (no en sidebar actual) | 🟡 verificar | ¿rutas vivas? |
-
-**Método de verificación propuesto (por página):** cargar, revisar que su(s) endpoint(s)
-respondan, y decidir: mantener / reparar / ocultar del sidebar / eliminar.
-
----
+| Página | Estado | Acción |
+|--------|--------|--------|
+| `/` Dashboard, `/wallets`, `/polymarket`, `/live`, `/rewards`, `/backtesting`, `/logs`, `/health` | 🟢 en uso | mantener |
+| **`/risk` (Risk Center)** | 🔴 "no hace nada" | **eliminar** del menú, O integrarlo con los guardrails reales (`PortfolioGuard`, runner risk controls) si aporta. Decidir: integrar vs borrar. |
+| **`/strategy-builder`** | 🔴 "no tiene función real — no se crean estrategias reales" | **eliminar** (las estrategias se editan como `.rhai` directo). Confirmar que no rompe rutas. |
+| **`/copy-trading`** | 🔴 "no funciona" | **Primero evaluar viabilidad del copy-trading** (¿hay edge en copiar líderes?), **excluyendo wallets HFT** (como `@bonereaper`). Si viable → reparar; si no → eliminar. |
+| **`/copy-discovery`** (Discovery) | 🔴 "no funciona" | igual que copy-trading: depende de la evaluación de viabilidad |
+| **`/orderbook` (Orderbook Archive)** | 🟡 reubicar | **Mover/integrar en Backtesting** — el archivo de orderbook es insumo del backtesting, no una sección aparte |
+| `/telegram`, `/scheduled-jobs` | 🟡 verificar | ¿se usan? decidir después |
 
 ## 4. Métricas y métodos engañosos — 🔴 corregir transversalmente
 
-- **Resolución `binance_provisional` como verdad** → ya mitigado (fix condition_id +
-  sweep + clobber/starvation fixes, jun 2026). El dashboard ahora muestra oficial.
+- **Resolución `binance_provisional` como verdad** → ya mitigado (fixes condition_id +
+  sweep + clobber/starvation + `settle_price`, jun 2026). El dashboard muestra oficial
+  y el P&L usa el fill realista (no el entry optimista).
 - **P&L del dashboard ≠ onchain** (estaba 2.6× mal) → añadir botón "Reconciliar onchain"
   (`data-api/activity`) en `/live`.
 - **Retorno compuesto** en cualquier vista → reemplazar por EV/trade + stake fijo.
 
 ---
 
-## Orden de ejecución propuesto (cuando des luz verde)
+## Plan de ejecución por fases (cuando des luz verde a cada una)
 
-1. **Backtesting** (tu prioridad): relabel/ocultar engines irreales + pestaña Validate.
-2. **Scripts**: mover deprecated a su carpeta, limpiar defaults.
-3. **Pase de verificación** de las páginas 🟡 → decidir una por una contigo.
-4. **Métricas**: EV/trade + reconciliación onchain.
+- **Fase A — Backtesting** (en curso): relabel/ocultar engines irreales + pestaña
+  Validate (edge_validator 3 legs) + EV/trade en vez de retorno compuesto.
+- **Fase B — Páginas muertas**: eliminar `/risk` (Risk Center) y `/strategy-builder`
+  (sin función real), o integrarlos si aportan. Reversible primero (ocultar del menú).
+- **Fase C — Copy Trading**: evaluar viabilidad (¿edge en copiar líderes, **excluyendo
+  wallets HFT**?). Si viable → reparar `/copy-trading` + `/copy-discovery`; si no → eliminar.
+- **Fase D — Orderbook → Backtesting**: integrar `/orderbook` (descarga de archivo) dentro
+  de la página de Backtesting; el archivo es insumo del BT, no una sección aparte.
+- **Fase E — Scripts**: mover los deprecated (payout-explosion) a `scripts/deprecated/`.
+- **Fase F — Métricas**: EV/trade + reconciliación onchain en `/live`.
+
+> Regla: antes de **eliminar** cualquier cosa, la marco/oculto primero (reversible) y
+> confirmas; el borrado duro es el último paso.
 
 > Regla: antes de **eliminar** cualquier cosa, la marco/oculto primero (reversible) y
 > confirmas; el borrado duro es el último paso.

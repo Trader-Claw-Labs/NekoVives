@@ -38,6 +38,22 @@ fn clob_semaphore() -> Arc<tokio::sync::Semaphore> {
     CLOB_RATE_LIMIT.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(5))).clone()
 }
 
+/// The price used for P&L settlement, shared by the provisional settle, the official
+/// re-resolution sweep, and the resolution monitor so they never disagree. Prefers the
+/// book-VWAP `fill_price` when it is a sane market-buy fill (in [0.01,0.99] and within
+/// 25% of the decision ask — captures real slippage); otherwise falls back to the
+/// decision `entry_price`, floored to 0.10 (or 0.50 when entry is itself below 0.10).
+/// Using the raw entry ask inflates every win's P&L vs the realistic fill.
+pub(crate) fn settle_price(entry_price: Option<f64>, fill_price: Option<f64>) -> f64 {
+    let decision_ep = entry_price.unwrap_or(0.5);
+    if let Some(fp) = fill_price {
+        if fp >= 0.01 && fp <= 0.99 && (decision_ep <= 0.0 || fp <= decision_ep * 1.25) {
+            return fp;
+        }
+    }
+    if decision_ep < 0.10 { 0.50 } else { decision_ep.max(0.10) }
+}
+
 // ── Types ────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -3905,14 +3921,16 @@ fn spawn_resolution_monitor(
                 };
                 if already_correct { return; }
 
-                // Recalculate P&L with the official resolution
-                let (entry_price, stake, position, old_pnl) = {
+                // Recalculate P&L with the official resolution. Settle on the same price
+                // basis as the provisional settle + sweep (book-VWAP fill when sane, else
+                // entry) — see `settle_price`. Using raw entry here inflated win P&L.
+                let (price, stake, position, old_pnl) = {
                     let map = store.runners.lock().unwrap();
                     map.get(id)
                         .and_then(|r| r.result.as_ref())
                         .and_then(|res| res.live_orders.iter().find(|o| o.window_ts == window_ts))
                         .map(|o| (
-                            o.entry_price.unwrap_or(0.5),
+                            settle_price(o.entry_price, o.fill_price),
                             o.amount_usdc,
                             if o.side.starts_with("yes") { 1i32 } else { -1i32 },
                             o.pnl.unwrap_or(0.0),
@@ -3922,8 +3940,8 @@ fn spawn_resolution_monitor(
 
                 let won = (position == 1 && yes_won) || (position == -1 && !yes_won);
                 // Apply fee_pct to the winning payout (parity with settle-time + backtest).
-                let pnl = if won && entry_price > 0.0 {
-                    (stake / entry_price) * (1.0 - fee_pct / 100.0) - stake
+                let pnl = if won && price > 0.0 {
+                    (stake / price) * (1.0 - fee_pct / 100.0) - stake
                 } else {
                     -stake
                 };
@@ -3975,14 +3993,14 @@ fn spawn_resolution_monitor(
                 if changed {
                     if let Some(ref ts) = tick_state {
                         let mut s = ts.lock().unwrap();
-                        // Remove provisional pnl and credit official pnl
+                        // Remove provisional pnl and credit official pnl (settle price basis)
                         let provisional_pnl = if binance_fallback_yes_won == (position == 1) {
-                            // was a win: payout was stake/entry_price
-                            if entry_price > 0.0 { stake / entry_price } else { 0.0 }
+                            // was a win: payout was stake/price
+                            if price > 0.0 { stake / price } else { 0.0 }
                         } else {
                             0.0 // was a loss: nothing was added
                         };
-                        let official_pnl = if won && entry_price > 0.0 { stake / entry_price } else { 0.0 };
+                        let official_pnl = if won && price > 0.0 { stake / price } else { 0.0 };
                         s.balance = s.balance - provisional_pnl + official_pnl;
                     }
                 }
@@ -4067,12 +4085,16 @@ pub fn spawn_resolution_sweep(store: Arc<StrategyRunnerStore>) {
                 {
                     let Some(order) = res.live_orders.iter_mut().find(|o| o.window_ts == window_ts) else { continue; };
                     if order.resolution_source.as_deref() == Some("polymarket") { continue; }
-                    let entry = order.entry_price.unwrap_or(0.5);
                     let stake = order.amount_usdc;
                     let position = if order.side.starts_with("yes") { 1 } else { -1 };
                     let won = (position == 1 && yes_won) || (position == -1 && !yes_won);
-                    let pnl = if won && entry > 0.0 {
-                        (stake / entry) * (1.0 - fee / 100.0) - stake
+                    // Settle on the SAME price the provisional settle used — the book-VWAP
+                    // fill when sane, else the decision entry. Using entry_price here (the
+                    // cheaper top-of-book ask) inflated every win's P&L vs the realistic
+                    // fill, which is what made the balance jump up on re-resolution.
+                    let price = settle_price(order.entry_price, order.fill_price);
+                    let pnl = if won && price > 0.0 {
+                        (stake / price) * (1.0 - fee / 100.0) - stake
                     } else {
                         -stake
                     };

@@ -5208,6 +5208,51 @@ pub async fn handle_api_live_list(
     Json(serde_json::json!({ "runners": runners })).into_response()
 }
 
+#[derive(Deserialize)]
+pub struct ValidateQuery {
+    /// Runner name substring to validate (aggregates all matching runners).
+    pub name: String,
+}
+
+/// GET /api/validate/runner?name=<substring> — the trusted edge check. Runs the 3-leg
+/// validation (bootstrap CI + random-outcome null + shuffle null) on the matching
+/// runner(s)' OFFICIAL-resolution trades, priced at the realistic settle (fill) price.
+/// Replaces the misleading backtest "edge" numbers from the synthetic/stale engines.
+pub async fn handle_api_validate_runner(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<ValidateQuery>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+    let needle = params.name.to_lowercase();
+    let runners = state.strategy_runner.list();
+    let mut entries: Vec<f64> = Vec::new();
+    let mut wons: Vec<bool> = Vec::new();
+    let mut matched = 0usize;
+    for r in &runners {
+        if !r.config.name.to_lowercase().contains(&needle) { continue; }
+        matched += 1;
+        if let Some(res) = r.result.as_ref() {
+            for o in &res.live_orders {
+                // Only OFFICIAL Polymarket resolution — never binance_provisional.
+                if o.resolution_source.as_deref() != Some("polymarket") { continue; }
+                let Some(result) = o.result.as_deref() else { continue; };
+                let price = crate::strategy_runner::settle_price(o.entry_price, o.fill_price);
+                if !(price > 0.01 && price < 0.99) { continue; }
+                entries.push(price);
+                wons.push(result.trim_end_matches('*') == "WIN");
+            }
+        }
+    }
+    let result = crate::tools::edge_validator::validate(&entries, &wons, 5000);
+    Json(serde_json::json!({
+        "name": params.name,
+        "runners_matched": matched,
+        "result": result,
+    }))
+    .into_response()
+}
+
 /// POST /api/live/strategies — create & start a new runner
 pub async fn handle_api_live_create(
     State(state): State<AppState>,

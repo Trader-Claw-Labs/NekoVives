@@ -7,6 +7,7 @@ import { apiFetch, apiPost, apiDelete } from '../hooks/useApi'
 import { useBacktestState, type BacktestConfig, type ProgressState, type MarketType, type BacktestResult, type TradeLog, type MarketSeries, POLY_BINARY_PRESETS } from '../hooks/useBacktestState'
 import { CreateModal } from './LiveStrategies'
 import EngineParamsForm, { defaultEngineParams } from '../components/EngineParamsForm'
+import ValidatePanel from '../components/ValidatePanel'
 import EngineKindInfoCard from '../components/EngineKindInfoCard'
 import { ENGINE_KINDS, engineKindOptionLabel } from '../components/engineKindMeta'
 import {
@@ -343,6 +344,18 @@ function ResultPanel({
     ? result.all_trades.reduce((sum, t) => sum + Math.abs(t.price * t.size), 0) / result.all_trades.length
     : null
 
+  // Honest metrics (not the compounded return, which explodes a tiny per-trade edge):
+  //   EV/trade = mean per-trade ROI; fixed-stake P&L = same edge at a flat $50 stake.
+  const perTradeRois = (result.all_trades ?? [])
+    .map(t => { const stake = Math.abs(t.price * t.size); return stake > 0 ? t.pnl / stake : null })
+    .filter((x): x is number => x != null)
+  const evPerTradePct = perTradeRois.length
+    ? (perTradeRois.reduce((a, b) => a + b, 0) / perTradeRois.length) * 100
+    : null
+  const fixedStakePnl = perTradeRois.length
+    ? perTradeRois.reduce((a, b) => a + b, 0) * 50 // $50 flat stake per trade
+    : null
+
   useEffect(() => {
     if (result.all_trades && result.all_trades.length > 0) {
       setSelectedTradeIndex(result.all_trades.length - 1)
@@ -360,15 +373,28 @@ function ResultPanel({
       {/* Metrics grid */}
       <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
         <MetricCard
+          label="EV / trade"
+          value={evPerTradePct != null ? `${evPerTradePct >= 0 ? '+' : ''}${fmt(evPerTradePct)}%` : '—'}
+          sub="honest edge metric"
+          color={evPerTradePct != null ? colorFor(evPerTradePct) : 'var(--color-text-muted)'}
+        />
+        <MetricCard
+          label="P&L @ $50 fixed"
+          value={fixedStakePnl != null ? fmtCompact(fixedStakePnl, '$') : '—'}
+          sub="flat stake, no compounding"
+          color={fixedStakePnl != null ? colorFor(fixedStakePnl) : 'var(--color-text-muted)'}
+        />
+        <MetricCard
           label="Total Return"
           value={`${result.total_return_pct >= 0 ? '+' : ''}${fmt(result.total_return_pct)}%`}
-          color={colorFor(result.total_return_pct)}
+          sub="⚠ compounded — misleading"
+          color="var(--color-text-muted)"
         />
         <MetricCard
           label="Final Balance"
           value={fmtCompact(finalBalance, '$')}
-          sub={`from $${initialBalance.toLocaleString('en-US', { maximumFractionDigits: 0 })}`}
-          color={colorFor(finalBalance - initialBalance)}
+          sub={`compounded from $${initialBalance.toLocaleString('en-US', { maximumFractionDigits: 0 })}`}
+          color="var(--color-text-muted)"
         />
         <MetricCard
           label="Avg Ticket"
@@ -1849,6 +1875,9 @@ export default function Backtesting() {
         </button>
       </div>
 
+      {/* Validate — the trusted real-edge check (replaces the misleading backtest "edge") */}
+      <ValidatePanel />
+
       {/* Polymarket historical data sync */}
       <PolyHistoricalSyncPanel
         seriesOptions={allSeries}
@@ -1982,11 +2011,17 @@ export default function Backtesting() {
                 color: 'var(--color-text)',
               }}
             >
-              <option value="crypto">Crypto</option>
-              <option value="polymarket_binary">Polymarket Binary</option>
-              <option value="clob_1hz">Orderbook Archive (on_tick)</option>
-              <option value="archive_candles">Orderbook Archive (on_candle)</option>
+              <option value="crypto">Crypto (Binance candles)</option>
+              <option value="polymarket_binary">⚠ Polymarket Binary — synthetic, NOT edge</option>
+              <option value="clob_1hz">⚠ Orderbook Archive on_tick — stale prices, NOT edge</option>
+              <option value="archive_candles">⚠ Orderbook Archive on_candle — stale prices, NOT edge</option>
             </select>
+            <p className="text-[10px] mt-1" style={{ color: 'var(--color-warning)' }}>
+              ⚠ The Polymarket/Archive engines use synthetic or stale-archive prices and
+              over-state edge (proven vs onchain fills). Use them only to check a script runs —
+              never to measure edge. For real edge, use the <strong>Validate</strong> tab
+              (3-leg test on a runner's official-resolution trades).
+            </p>
           </div>
 
           {/* Script select — hidden for engine kinds */}
