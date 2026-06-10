@@ -73,6 +73,7 @@ mod multimodal;
 mod observability;
 mod onboard;
 mod peripherals;
+mod portfolio_guard;
 mod providers;
 mod runtime;
 mod security;

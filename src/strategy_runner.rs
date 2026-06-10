@@ -4120,6 +4120,54 @@ pub fn spawn_resolution_sweep(store: Arc<StrategyRunnerStore>) {
     });
 }
 
+/// Global portfolio guard loop. Every 5 minutes, reads the REAL Polymarket wallet
+/// balance (via any live runner's CLOB creds) and stops ALL live runners if the wallet
+/// has dropped more than `max_loss_pct` from its baseline. This is the cross-runner
+/// safety net that was missing during the May incident: individual runners each stayed
+/// "within their own limit" while the aggregate drained the wallet. The guard watches
+/// the WALLET, not any single runner.
+///
+/// `max_loss_pct`: 0.5 = halt at -50%. Set to 0 to disable. Baseline = first observed
+/// balance once at least one live runner exists.
+pub fn spawn_portfolio_guard(store: Arc<StrategyRunnerStore>, max_loss_pct: f64) {
+    if max_loss_pct <= 0.0 {
+        tracing::info!("[PORTFOLIO_GUARD] disabled (max_loss_pct=0)");
+        return;
+    }
+    tokio::spawn(async move {
+        let guard = crate::portfolio_guard::PortfolioGuard::new(max_loss_pct);
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+
+            // Grab CLOB creds from any running live runner.
+            let creds = {
+                let map = store.runners.lock().unwrap();
+                map.values()
+                    .find(|r| r.config.mode == "live"
+                        && r.status.status == "running"
+                        && r.config.poly_creds.is_some())
+                    .and_then(|r| r.config.poly_creds.clone())
+            };
+            let Some(creds) = creds else { continue; }; // no live runner → nothing to guard
+
+            let client = polymarket_trader::orders::ClobClient::new(creds);
+            let Some(balance) = fetch_usdc_balance_clob(&client).await else { continue; };
+
+            guard.set_baseline(balance); // no-op after first set
+            if guard.check(balance) {
+                let stopped = store.stop_all_live();
+                store.persist();
+                tracing::error!(
+                    "[PORTFOLIO_GUARD] WALLET DROP BREACH at ${:.2} — stopped {} live runners",
+                    balance, stopped.len()
+                );
+            }
+        }
+    });
+}
+
 /// Poll the CLOB `/data/trades` endpoint to find the on-chain fills for the
 /// freshly-placed order and return (vwap_fill_price, total_size, first_tx_hash).
 ///

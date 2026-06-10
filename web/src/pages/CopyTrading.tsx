@@ -170,20 +170,20 @@ export default function CopyTrading() {
         score: number; is_hft: boolean; n_resolved_trades: number
         result: { verdict: string; ev_per_trade_pct: number; p_random: number; note: string }
       }>(`/api/copy/leaders/${addr}/validate`, {})
-      setValidateResults(prev => ({
-        ...prev,
-        [addr]: {
-          score: d.score,
-          is_hft: d.is_hft,
-          n: d.n_resolved_trades,
-          verdict: d.result.verdict,
-          ev: d.result.ev_per_trade_pct,
-          p_random: d.result.p_random,
-        }
-      }))
+      const vr = {
+        score: d.score,
+        is_hft: d.is_hft,
+        n: d.n_resolved_trades,
+        verdict: d.result.verdict,
+        ev: d.result.ev_per_trade_pct,
+        p_random: d.result.p_random,
+      }
+      setValidateResults(prev => ({ ...prev, [addr]: vr }))
       invalidateLeaders()
+      return vr
     } catch (e) {
       console.error('validate failed', e)
+      return undefined
     } finally {
       setValidating(null)
     }
@@ -214,6 +214,19 @@ export default function CopyTrading() {
       await apiPatch(`/api/copy/leaders/${addr}`, { live_mode: false })
       invalidateLeaders()
     } else {
+      // Before allowing Live, validate the wallet: block HFT and warn on no-edge.
+      const v = validateResults[addr] ?? await runValidate(addr)
+      if (v) {
+        if (v.is_hft) {
+          alert(`⛔ Cannot go Live: this wallet is HFT (${v.n} trades, high frequency). ` +
+            `Its edge is latency-based and not copyable at your latency.`)
+          return
+        }
+        if (v.verdict === 'NO_EDGE') {
+          if (!confirm(`⚠️ This wallet shows NO EDGE (EV ${v.ev.toFixed(1)}%, random-null p=${v.p_random.toFixed(2)}). ` +
+            `Copying it is unlikely to be profitable. Go Live anyway?`)) return
+        }
+      }
       setLiveModalAddr(addr)  // open guardrails modal; confirm applies live_mode=true
     }
   }

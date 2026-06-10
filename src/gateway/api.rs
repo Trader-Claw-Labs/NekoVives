@@ -6998,6 +6998,45 @@ pub async fn handle_api_risk_status(
     })).into_response()
 }
 
+/// GET /api/portfolio-guard/status — Polymarket wallet-level guard state for the /live
+/// widget. Reads the REAL balance, compares to the earliest balance snapshot (baseline),
+/// and reports drawdown + how many live runners are running. The guard halts all live
+/// runners at -50% (see spawn_portfolio_guard).
+pub async fn handle_api_portfolio_guard_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+
+    // Live runner count
+    let runners = state.strategy_runner.list();
+    let live_running = runners.iter()
+        .filter(|r| r.config.mode == "live" && r.status.status == "running")
+        .count();
+
+    // Current + baseline balance from snapshots
+    let snap_path = state.config.lock().workspace_dir.join("data").join("balance_snapshots.jsonl");
+    let (baseline, current) = std::fs::read_to_string(&snap_path).ok()
+        .map(|c| {
+            let bals: Vec<f64> = c.lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .filter_map(|v| v.get("balance").and_then(|b| b.as_f64()))
+                .collect();
+            (bals.first().copied().unwrap_or(0.0), bals.last().copied().unwrap_or(0.0))
+        })
+        .unwrap_or((0.0, 0.0));
+    let drawdown_pct = if baseline > 0.0 { (baseline - current) / baseline * 100.0 } else { 0.0 };
+
+    Json(serde_json::json!({
+        "live_runners_running": live_running,
+        "baseline_usdc": baseline,
+        "current_usdc": current,
+        "drawdown_pct": drawdown_pct,
+        "halt_threshold_pct": 50.0,
+        "status": if drawdown_pct >= 50.0 { "BREACH" } else if drawdown_pct >= 30.0 { "WARNING" } else { "OK" },
+    })).into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

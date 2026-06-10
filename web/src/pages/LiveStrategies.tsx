@@ -3,6 +3,7 @@ import { useLocation } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch, apiPost, apiDelete, apiPatch } from '../hooks/useApi'
 import { type MarketSeries, POLY_BINARY_PRESETS } from '../hooks/useBacktestState'
+import PortfolioGuardWidget from '../components/PortfolioGuardWidget'
 import EngineParamsForm, { defaultEngineParams } from '../components/EngineParamsForm'
 import EngineKindInfoCard from '../components/EngineKindInfoCard'
 import { ENGINE_KINDS, engineKindOptionLabel } from '../components/engineKindMeta'
@@ -3780,6 +3781,9 @@ export default function LiveStrategies() {
           </button>
         </div>
       </div>
+
+      {/* Wallet-level portfolio guard — cross-runner safety net (halts all live at -50%) */}
+      <PortfolioGuardWidget />
 
       {/* Stats row — split Live vs Dry Run with colour coding.
           Dry Run uses indigo (#818cf8) to signal paper/preview context.

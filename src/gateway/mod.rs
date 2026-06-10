@@ -719,6 +719,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     // be later than the per-order monitor's window). Keeps Dry Run P&L realistic.
     crate::strategy_runner::spawn_resolution_sweep(Arc::clone(&state.strategy_runner));
 
+    // Cross-runner portfolio guard: halts ALL live runners if the wallet drops >50%
+    // from baseline (the safety net missing during the May incident). 0.5 = -50%.
+    crate::strategy_runner::spawn_portfolio_guard(Arc::clone(&state.strategy_runner), 0.5);
+
     // ── Copy-trading: spawn Polymarket fill dispatch loop ─────────────
     //
     // The dispatch loop subscribes to leader-fill events from the
@@ -958,6 +962,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/risk/halt", post(api::handle_api_risk_halt))
         .route("/api/risk/resume", post(api::handle_api_risk_resume))
         .route("/api/risk/status", get(api::handle_api_risk_status))
+        .route("/api/portfolio-guard/status", get(api::handle_api_portfolio_guard_status))
         // ── TradingView ──
         .route("/api/tradingview/scan", get(api::handle_api_tradingview_scan))
         .route("/api/rewards/markets", get(api::handle_api_rewards_markets))
