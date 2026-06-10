@@ -2352,12 +2352,89 @@ pub async fn handle_api_polymarket_balance(
         }
     };
 
+    // Append a balance snapshot (hourly granularity) for the rewards-history diff.
+    // Polymarket pays liquidity rewards in USDC directly to the proxy wallet at
+    // midnight UTC; there is no public rewards API, so the balance delta across
+    // midnight (minus realized fills P&L) is the reward proxy. See docs/GAPS_PLAN.md.
+    {
+        let snap_path = state.config.lock().workspace_dir
+            .join("data").join("balance_snapshots.jsonl");
+        let _ = std::fs::create_dir_all(snap_path.parent().unwrap());
+        let now = chrono::Utc::now();
+        // Only append if the last snapshot is >50 min old (avoids spamming on every poll).
+        let should_append = std::fs::read_to_string(&snap_path).ok()
+            .and_then(|c| c.lines().last().map(str::to_string))
+            .and_then(|l| serde_json::from_str::<serde_json::Value>(&l).ok())
+            .and_then(|v| v.get("ts").and_then(|t| t.as_i64()))
+            .map(|last_ts| now.timestamp() - last_ts > 3000)
+            .unwrap_or(true);
+        if should_append {
+            let row = serde_json::json!({ "ts": now.timestamp(), "balance": balance });
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&snap_path) {
+                use std::io::Write;
+                let _ = writeln!(f, "{}", row);
+            }
+        }
+    }
+
     Json(serde_json::json!({
         "balance": balance,
         "wallet_address": creds.wallet_address,
         "currency": "USDC"
     }))
     .into_response()
+}
+
+/// GET /api/rewards/history — daily USDC balance deltas as a reward proxy.
+/// Reads balance_snapshots.jsonl (appended on each balance poll) and computes the
+/// change across each UTC midnight. Positive deltas not explained by fills ≈ rewards.
+pub async fn handle_api_rewards_history(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+    let snap_path = state.config.lock().workspace_dir
+        .join("data").join("balance_snapshots.jsonl");
+    let content = match std::fs::read_to_string(&snap_path) {
+        Ok(c) => c,
+        Err(_) => return Json(serde_json::json!({
+            "status": "no_data",
+            "note": "No balance snapshots yet. They accrue each time the Polymarket balance is polled. Daily reward deltas appear after the first UTC midnight crossing."
+        })).into_response(),
+    };
+    let snaps: Vec<(i64, f64)> = content.lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter_map(|v| Some((v.get("ts")?.as_i64()?, v.get("balance")?.as_f64()?)))
+        .collect();
+    if snaps.len() < 2 {
+        return Json(serde_json::json!({ "status": "insufficient", "snapshots": snaps.len() })).into_response();
+    }
+    // Group by UTC day, take first and last balance of each day.
+    use std::collections::BTreeMap;
+    let mut by_day: BTreeMap<String, (f64, f64)> = BTreeMap::new();
+    for (ts, bal) in &snaps {
+        let day = chrono::DateTime::from_timestamp(*ts, 0)
+            .map(|d| d.format("%Y-%m-%d").to_string())
+            .unwrap_or_default();
+        by_day.entry(day).and_modify(|e| e.1 = *bal).or_insert((*bal, *bal));
+    }
+    // Daily delta = (this day's last) - (previous day's last). Cross-midnight change.
+    let days: Vec<_> = by_day.into_iter().collect();
+    let mut history = Vec::new();
+    for i in 1..days.len() {
+        let (ref day, (_, last)) = days[i];
+        let (_, (_, prev_last)) = &days[i - 1];
+        history.push(serde_json::json!({
+            "date": day,
+            "balance_end": last,
+            "delta": last - prev_last,
+        }));
+    }
+    Json(serde_json::json!({
+        "status": "ok",
+        "history": history,
+        "note": "delta = balance change across UTC midnight. Positive deltas not explained by fill P&L ≈ liquidity rewards. No public rewards API exists; this is the onchain proxy."
+    })).into_response()
 }
 
 // ── Polymarket orders / positions helpers ────────────────────────
@@ -5869,6 +5946,10 @@ pub async fn handle_api_copy_leaders(
         "consensus_weight": e.consensus_weight,
         "wallet_score": e.wallet_score,
         "size_factor": e.size_factor,
+        "live_mode": e.live_mode,
+        "max_notional_per_trade": e.max_notional_per_trade,
+        "max_daily_loss": e.max_daily_loss,
+        "max_open_positions": e.max_open_positions,
     })).collect();
 
     Json(serde_json::json!({ "leaders": leaders })).into_response()
@@ -5944,6 +6025,7 @@ pub async fn handle_api_copy_leader_add(
         size_factor: req.size_factor,
         wallet_score: req.wallet_score.unwrap_or(0.0),
         added_at: chrono::Utc::now().to_rfc3339(),
+        ..Default::default()  // live_mode=false (Dry Run), guardrails None
     };
 
     {
@@ -5965,6 +6047,15 @@ pub struct PatchLeaderRequest {
     pub category: Option<Option<String>>,
     #[serde(default)]
     pub mirror_enabled: Option<bool>,
+    // Dry Run / Live mode + per-leader guardrails (only enforced in Live)
+    #[serde(default)]
+    pub live_mode: Option<bool>,
+    #[serde(default)]
+    pub max_notional_per_trade: Option<f64>,
+    #[serde(default)]
+    pub max_daily_loss: Option<f64>,
+    #[serde(default)]
+    pub max_open_positions: Option<u32>,
 }
 
 /// PATCH /api/copy/leaders/{addr} — edit leader knobs
@@ -5985,6 +6076,12 @@ pub async fn handle_api_copy_leader_patch(
         req.category,
         req.mirror_enabled,
     );
+    // Apply Dry Run / Live mode + guardrails if provided
+    if req.live_mode.is_some() || req.max_notional_per_trade.is_some()
+        || req.max_daily_loss.is_some() || req.max_open_positions.is_some() {
+        watchlist.set_mode(&addr, req.live_mode, req.max_notional_per_trade,
+            req.max_daily_loss, req.max_open_positions);
+    }
     if !updated {
         return (
             StatusCode::NOT_FOUND,
@@ -6218,6 +6315,7 @@ pub async fn handle_api_copy_discovery_graduate(
         size_factor: 0.5,
         wallet_score: candidate.discovery_score,
         added_at: chrono::Utc::now().to_rfc3339(),
+        ..Default::default()
     };
 
     {

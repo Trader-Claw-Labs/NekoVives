@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// A watched leader wallet with its configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WatchlistEntry {
     pub address: String,
     pub venue: String,
@@ -12,6 +12,18 @@ pub struct WatchlistEntry {
     pub size_factor: f64,
     pub wallet_score: f64,
     pub added_at: String,
+    /// Execution mode for this leader's mirror. false = Dry Run (simulated fills,
+    /// no real orders — the default and current behaviour); true = Live (real orders,
+    /// requires guardrails). Defaults to Dry Run so nothing executes by accident.
+    #[serde(default)]
+    pub live_mode: bool,
+    /// Per-leader guardrails, only enforced in Live mode.
+    #[serde(default)]
+    pub max_notional_per_trade: Option<f64>,
+    #[serde(default)]
+    pub max_daily_loss: Option<f64>,
+    #[serde(default)]
+    pub max_open_positions: Option<u32>,
 }
 
 /// Active watchlist of graduated leader wallets.
@@ -102,6 +114,23 @@ impl Watchlist {
     pub fn update_score(&mut self, address: &str, score: f64) -> bool {
         let Some(e) = self.entries.get_mut(address) else { return false; };
         e.wallet_score = score.clamp(0.0, 100.0);
+        true
+    }
+
+    /// Update execution mode (Dry Run / Live) and per-leader guardrails.
+    pub fn set_mode(
+        &mut self,
+        address: &str,
+        live_mode: Option<bool>,
+        max_notional_per_trade: Option<f64>,
+        max_daily_loss: Option<f64>,
+        max_open_positions: Option<u32>,
+    ) -> bool {
+        let Some(e) = self.entries.get_mut(address) else { return false; };
+        if let Some(v) = live_mode { e.live_mode = v; }
+        if max_notional_per_trade.is_some() { e.max_notional_per_trade = max_notional_per_trade; }
+        if max_daily_loss.is_some() { e.max_daily_loss = max_daily_loss; }
+        if max_open_positions.is_some() { e.max_open_positions = max_open_positions; }
         true
     }
 }

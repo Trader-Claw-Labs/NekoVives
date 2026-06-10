@@ -24,6 +24,12 @@ export default function RewardsPositions() {
     refetchInterval: 60_000,
   })
 
+  const { data: historyData } = useQuery<{ status: string; history?: { date: string; delta: number; balance_end: number }[] }>({
+    queryKey: ['rewards-history'],
+    queryFn: () => apiFetch('/api/rewards/history'),
+    staleTime: 5 * 60_000,
+  })
+
   const cancelMutation = useMutation({
     mutationFn: (id: string) => apiDelete(`/api/polymarket/order/${id}`),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['poly-orders-rewards'] }),
@@ -92,9 +98,29 @@ export default function RewardsPositions() {
         </div>
       )}
 
+      {/* Daily reward proxy: USDC balance delta across UTC midnight */}
+      {historyData?.history && historyData.history.length > 0 && (
+        <div className="mt-3 pt-3 border-t" style={{ borderColor: 'var(--color-border)' }}>
+          <div className="text-[11px] font-semibold mb-1.5" style={{ color: 'var(--color-text)' }}>
+            Daily balance delta (reward proxy)
+          </div>
+          <div className="space-y-0.5">
+            {historyData.history.slice(-7).reverse().map(h => (
+              <div key={h.date} className="flex items-center justify-between text-[11px]">
+                <span style={{ color: 'var(--color-text-muted)' }}>{h.date}</span>
+                <span className="font-mono" style={{ color: h.delta >= 0 ? 'var(--color-accent)' : '#f87171' }}>
+                  {h.delta >= 0 ? '+' : ''}{h.delta.toFixed(2)} USDC
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       <p className="text-[10px] mt-2" style={{ color: 'var(--color-text-muted)' }}>
-        Reward payout: daily at midnight UTC to your proxy wallet. Check your wallet balance
-        the next morning — that USDC delta is your actual reward.
+        Reward payout: daily at midnight UTC to your proxy wallet. The daily delta above is
+        the balance change (≈ rewards minus fill P&L). No public rewards API exists — this is
+        the onchain proxy.
       </p>
     </div>
   )

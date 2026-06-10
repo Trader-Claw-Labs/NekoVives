@@ -168,11 +168,45 @@ pub fn spawn_polymarket_dispatch_loop(
                         "[Orchestrator] dispatched fill leader={} slug={} result={:?} in_watchlist={}",
                         event.leader, event.symbol, result, in_watchlist
                     );
-                    // Persist the fill to wallet_trades so Fill Audit is populated.
+
                     let side_str = match event.side {
                         wallet_tracker::traits::Side::Buy => "buy",
                         wallet_tracker::traits::Side::Sell => "sell",
                     };
+
+                    // On a Mirror signal: open a simulated mirror position. In Dry Run
+                    // (the default) this is paper-only — entry = the leader's fill price,
+                    // sized like the dispatcher computed. Live execution (real place_order)
+                    // is intentionally NOT wired yet; Dry Run must validate first.
+                    if let dispatcher::DispatchResult::Mirrored(ref id) = result {
+                        let live_mode = {
+                            let wl = orchestrator.watchlist.lock().await;
+                            wl.get(&event.leader).map(|e| e.live_mode).unwrap_or(false)
+                        };
+                        let capital = *orchestrator.capital.lock().await;
+                        let my_notional = (event.notional / capital.max(1.0)) * capital * 0.5;
+                        let mut mirror = orchestrator.mirror.lock().await;
+                        mirror.open(mirror::MirrorPosition {
+                            leader_address: event.leader.clone(),
+                            leader_fill_id: id.clone(),
+                            my_order_id: None, // None = simulated (Dry Run); set when Live executes
+                            venue: event.venue.to_string(),
+                            symbol: event.symbol.clone(),
+                            side: side_str.to_string(),
+                            notional: my_notional,
+                            entry_price: event.price,
+                            status: mirror::PositionStatus::Open,
+                            opened_at: event.timestamp.to_rfc3339(),
+                            closed_at: None,
+                            pnl: None,
+                        });
+                        tracing::info!(
+                            "[Orchestrator] {} mirror position opened: {} ${:.2} @ {:.4}",
+                            if live_mode { "LIVE" } else { "DRY-RUN" },
+                            event.symbol, my_notional, event.price
+                        );
+                    }
+                    // Persist the fill to wallet_trades so Fill Audit is populated.
                     if let Err(e) = indexer.record_fill(
                         &event.leader,
                         &event.venue.to_string(),

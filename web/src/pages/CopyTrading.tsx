@@ -30,6 +30,10 @@ interface Leader {
   consensus_weight: number
   wallet_score: number
   size_factor: number
+  live_mode?: boolean
+  max_notional_per_trade?: number | null
+  max_daily_loss?: number | null
+  max_open_positions?: number | null
 }
 
 interface MirrorPosition {
@@ -143,6 +147,12 @@ export default function CopyTrading() {
     },
   })
 
+  // Live-mode guardrails modal
+  const [liveModalAddr, setLiveModalAddr] = useState<string | null>(null)
+  const [grMaxNotional, setGrMaxNotional] = useState('10')
+  const [grMaxDailyLoss, setGrMaxDailyLoss] = useState('50')
+  const [grMaxOpen, setGrMaxOpen] = useState('3')
+
   // Validate state: addr → result
   const [validating, setValidating] = useState<string | null>(null)
   const [validateResults, setValidateResults] = useState<Record<string, {
@@ -197,6 +207,27 @@ export default function CopyTrading() {
     },
     onError: (err: Error) => setFormError(err.message),
   })
+
+  // Switch a leader to Dry Run (no modal — instant) or open the guardrails modal for Live.
+  async function setLeaderMode(addr: string, toLive: boolean) {
+    if (!toLive) {
+      await apiPatch(`/api/copy/leaders/${addr}`, { live_mode: false })
+      invalidateLeaders()
+    } else {
+      setLiveModalAddr(addr)  // open guardrails modal; confirm applies live_mode=true
+    }
+  }
+  async function confirmLive() {
+    if (!liveModalAddr) return
+    await apiPatch(`/api/copy/leaders/${liveModalAddr}`, {
+      live_mode: true,
+      max_notional_per_trade: Number(grMaxNotional) || 10,
+      max_daily_loss: Number(grMaxDailyLoss) || 50,
+      max_open_positions: Number(grMaxOpen) || 3,
+    })
+    setLiveModalAddr(null)
+    invalidateLeaders()
+  }
 
   const patchMutation = useMutation({
     mutationFn: (vars: { addr: string; body: Record<string, unknown> }) =>
@@ -754,6 +785,21 @@ export default function CopyTrading() {
                               )}
                               {leader.mirror_enabled ? 'Mirror ON' : 'Mirror OFF'}
                             </button>
+                            {/* Dry Run / Live mode toggle */}
+                            <button
+                              onClick={() => setLeaderMode(leader.address, !leader.live_mode)}
+                              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium"
+                              title={leader.live_mode
+                                ? 'LIVE — real orders with guardrails. Click to switch to Dry Run.'
+                                : 'DRY RUN — simulated fills only (default). Click to go Live (opens guardrails).'}
+                              style={{
+                                backgroundColor: leader.live_mode ? 'rgba(239,68,68,0.15)' : 'var(--color-base)',
+                                color: leader.live_mode ? '#ef4444' : 'var(--color-text-muted)',
+                                border: '1px solid var(--color-border)',
+                              }}
+                            >
+                              {leader.live_mode ? '🔴 LIVE' : '🧪 Dry Run'}
+                            </button>
                             <button
                               onClick={() => setScoreAddr(leader.address)}
                               className="p-1.5 rounded-lg hover:bg-white/5"
@@ -1082,6 +1128,54 @@ export default function CopyTrading() {
                   </tbody>
                 </table>
               )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Go-Live guardrails modal */}
+      {liveModalAddr && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" onClick={() => setLiveModalAddr(null)}>
+          <div className="rounded-xl border w-full max-w-md" style={{ backgroundColor: 'var(--color-surface)', borderColor: '#ef4444' }} onClick={(e) => e.stopPropagation()}>
+            <div className="p-4 border-b" style={{ borderColor: 'var(--color-border)' }}>
+              <h3 className="text-sm font-semibold" style={{ color: '#ef4444' }}>🔴 Switch to LIVE — real orders</h3>
+              <p className="text-xs mt-1" style={{ color: 'var(--color-text-muted)' }}>
+                This leader's mirrors will place REAL orders with your capital. Set guardrails
+                before enabling. <strong>Live execution is not yet wired</strong> — validate in
+                Dry Run first; these limits are stored for when it activates.
+              </p>
+            </div>
+            <div className="p-4 space-y-3">
+              <label className="block text-xs" style={{ color: 'var(--color-text-muted)' }}>
+                Max notional per trade ($)
+                <input type="number" value={grMaxNotional} onChange={e => setGrMaxNotional(e.target.value)}
+                  className="w-full mt-1 px-2 py-1.5 rounded border text-xs"
+                  style={{ backgroundColor: 'var(--color-base)', borderColor: 'var(--color-border)', color: 'var(--color-text)' }} />
+              </label>
+              <label className="block text-xs" style={{ color: 'var(--color-text-muted)' }}>
+                Max daily loss ($) — halt this leader's mirroring for the day
+                <input type="number" value={grMaxDailyLoss} onChange={e => setGrMaxDailyLoss(e.target.value)}
+                  className="w-full mt-1 px-2 py-1.5 rounded border text-xs"
+                  style={{ backgroundColor: 'var(--color-base)', borderColor: 'var(--color-border)', color: 'var(--color-text)' }} />
+              </label>
+              <label className="block text-xs" style={{ color: 'var(--color-text-muted)' }}>
+                Max open positions
+                <input type="number" value={grMaxOpen} onChange={e => setGrMaxOpen(e.target.value)}
+                  className="w-full mt-1 px-2 py-1.5 rounded border text-xs"
+                  style={{ backgroundColor: 'var(--color-base)', borderColor: 'var(--color-border)', color: 'var(--color-text)' }} />
+              </label>
+            </div>
+            <div className="flex gap-2 p-4 border-t" style={{ borderColor: 'var(--color-border)' }}>
+              <button onClick={() => setLiveModalAddr(null)}
+                className="flex-1 px-3 py-2 rounded text-xs font-medium"
+                style={{ backgroundColor: 'var(--color-base)', color: 'var(--color-text)', border: '1px solid var(--color-border)' }}>
+                Cancel
+              </button>
+              <button onClick={confirmLive}
+                className="flex-1 px-3 py-2 rounded text-xs font-semibold"
+                style={{ backgroundColor: '#ef4444', color: '#fff' }}>
+                Enable Live
+              </button>
             </div>
           </div>
         </div>
