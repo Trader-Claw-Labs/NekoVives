@@ -37,17 +37,18 @@ const mainNavItems: NavItem[] = [
   { to: '/', icon: <LayoutDashboard size={18} />, label: 'Dashboard' },
   { to: '/wallets', icon: <Wallet size={18} />, label: 'Web3 Wallets' },
   { to: '/polymarket', icon: <BarChart2 size={18} />, label: 'Polymarket' },
-  { to: '/telegram', icon: <Send size={18} />, label: 'Telegram' },
-  { to: '/strategy-builder', icon: <Blocks size={18} />, label: 'Strategy Builder' },
   { to: '/backtesting', icon: <FlaskConical size={18} />, label: 'Backtesting' },
   { to: '/live', icon: <Bot size={18} />, label: 'Live Strategies' },
-  { to: '/risk', icon: <Shield size={18} />, label: 'Risk Center' },
   { to: '/copy-trading', icon: <Users size={18} />, label: 'Copy Trading' },
-  { to: '/copy-discovery', icon: <Search size={18} />, label: 'Discovery' },
-  { to: '/orderbook', icon: <Database size={18} />, label: 'Orderbook' },
   { to: '/rewards', icon: <Coins size={18} />, label: 'Liquidity Rewards' },
+  { to: '/telegram', icon: <Send size={18} />, label: 'Telegram' },
   { to: '/scheduled-jobs', icon: <Activity size={18} />, label: 'Scheduled Jobs' },
   { to: '/help', icon: <HelpCircle size={18} />, label: 'Help' },
+  // Hidden from sidebar (still accessible via direct URL):
+  // /strategy-builder → accessible from Backtesting page as a sub-feature
+  // /copy-discovery → merged into Copy Trading
+  // /orderbook → merged into Backtesting
+  // /risk → accessible from /settings/config until it connects to real balance
 ]
 
 const settingsNavItems: NavItem[] = [

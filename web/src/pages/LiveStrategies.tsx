@@ -3418,6 +3418,19 @@ function RunnerCard({ runner, onStop, onRestart, onDelete, onToggleHidden, onUpd
                     ) : (
                       <span style={{ color: 'var(--color-text-muted)' }}>—</span>
                     )}
+                    {/* Resolution quality badge */}
+                    {(order as any).resolution_source && (
+                      <span
+                        className="ml-1 text-[8px] px-1 rounded"
+                        title={(order as any).resolution_source}
+                        style={{
+                          background: (order as any).resolution_source === 'polymarket' ? 'rgba(74,222,128,0.15)' : 'rgba(251,191,36,0.12)',
+                          color: (order as any).resolution_source === 'polymarket' ? '#4ade80' : '#fbbf24',
+                        }}
+                      >
+                        {(order as any).resolution_source === 'polymarket' ? '✓' : '~'}
+                      </span>
+                    )}
                   </td>
                 </tr>
               ))}

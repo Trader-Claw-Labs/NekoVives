@@ -1873,6 +1873,15 @@ export default function Backtesting() {
           <CloudDownload size={13} />
           Archive Dataset
         </button>
+        <a
+          href="/orderbook"
+          className="flex items-center gap-1.5 px-3 py-2 rounded text-xs font-semibold"
+          style={{ backgroundColor: 'var(--color-surface-2)', border: '1px solid var(--color-border)', color: 'var(--color-text)' }}
+          title="Download & browse CLOB orderbook archive data"
+        >
+          <Database size={13} />
+          Orderbook Archive
+        </a>
       </div>
 
       {/* Validate — the trusted real-edge check (replaces the misleading backtest "edge") */}

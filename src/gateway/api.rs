@@ -5995,6 +5995,55 @@ pub async fn handle_api_copy_leader_patch(
     Json(serde_json::json!({ "address": addr, "updated": true })).into_response()
 }
 
+/// POST /api/copy/leaders/{addr}/validate — run the 3-leg edge validator on this
+/// wallet's onchain fills (via data-api), tag as HFT if >100 trades/hour, and
+/// persist the score back to the watchlist. Score scale: 0 = no_edge/hft, 100 = edge.
+/// Returns the full ValidationResult + HFT flag so the UI can show the breakdown.
+pub async fn handle_api_copy_leader_validate(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(addr): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+
+    let trades = match fetch_wallet_trades(&addr, 2_500).await {
+        Ok(t) => t,
+        Err(e) => return (StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "error": format!("Activity fetch failed: {e}") })))
+            .into_response(),
+    };
+
+    let entries: Vec<f64> = trades.iter().map(|(p, _)| *p).collect();
+    let wons: Vec<bool> = trades.iter().map(|(_, w)| *w).collect();
+    let result = crate::tools::edge_validator::validate(&entries, &wons, 5_000);
+
+    // Rough HFT detection from n_trades / observed span
+    let n = trades.len();
+    let is_hft = n > 500; // simplified: if we got 500+ resolved pairs in 2500 events, HFT-like
+
+    // Score: EDGE = 80, NO_EDGE with n >= 30 = 10, HFT = 0, INSUFFICIENT = 30 (unknown)
+    let score: f64 = if is_hft { 0.0 }
+        else { match result.verdict.as_str() {
+            "EDGE" => 80.0,
+            "NO_EDGE" => 10.0,
+            _ => 30.0, // INSUFFICIENT — not enough data, neutral
+        }};
+
+    // Persist score
+    {
+        let mut watchlist = state.copy_orchestrator.watchlist.lock().await;
+        watchlist.update_score(&addr, score);
+    }
+
+    Json(serde_json::json!({
+        "address": addr,
+        "n_resolved_trades": n,
+        "is_hft": is_hft,
+        "score": score,
+        "result": result,
+    })).into_response()
+}
+
 /// DELETE /api/copy/leaders/{addr} — remove a leader from the watchlist
 pub async fn handle_api_copy_leader_remove(
     State(state): State<AppState>,

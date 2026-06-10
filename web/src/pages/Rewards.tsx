@@ -4,6 +4,7 @@ import { apiFetch } from '../hooks/useApi'
 import { Coins, Shield, RefreshCw, AlertCircle, AlertTriangle, Save } from 'lucide-react'
 import clsx from 'clsx'
 import ArbScanner from '../components/ArbScanner'
+import RewardsPositions from '../components/RewardsPositions'
 
 // ── Types ─────────────────────────────────────────────────────────────────
 interface RewardMarket {
@@ -173,6 +174,9 @@ export default function RewardsPage() {
           </span>
         </div>
       </div>
+
+      {/* Active maker quotes + balance */}
+      <RewardsPositions />
 
       {/* Structural arb scanner — set-arb + monotonicity violations on slow events */}
       <ArbScanner />

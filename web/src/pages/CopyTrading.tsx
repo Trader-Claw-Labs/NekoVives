@@ -143,8 +143,41 @@ export default function CopyTrading() {
     },
   })
 
+  // Validate state: addr → result
+  const [validating, setValidating] = useState<string | null>(null)
+  const [validateResults, setValidateResults] = useState<Record<string, {
+    score: number; is_hft: boolean; n: number
+    verdict: string; ev: number; p_random: number
+  }>>({})
+
   const invalidateLeaders = () =>
     queryClient.invalidateQueries({ queryKey: ['copy-leaders'] })
+
+  async function runValidate(addr: string) {
+    setValidating(addr)
+    try {
+      const d = await apiPost<{
+        score: number; is_hft: boolean; n_resolved_trades: number
+        result: { verdict: string; ev_per_trade_pct: number; p_random: number; note: string }
+      }>(`/api/copy/leaders/${addr}/validate`, {})
+      setValidateResults(prev => ({
+        ...prev,
+        [addr]: {
+          score: d.score,
+          is_hft: d.is_hft,
+          n: d.n_resolved_trades,
+          verdict: d.result.verdict,
+          ev: d.result.ev_per_trade_pct,
+          p_random: d.result.p_random,
+        }
+      }))
+      invalidateLeaders()
+    } catch (e) {
+      console.error('validate failed', e)
+    } finally {
+      setValidating(null)
+    }
+  }
 
   const toggleMutation = useMutation({
     mutationFn: (addr: string) =>
@@ -580,6 +613,24 @@ export default function CopyTrading() {
                               {leader.wallet_score.toFixed(1)}
                             </span>
                           </span>
+                          {/* Validate button + inline result */}
+                          <button
+                            onClick={() => runValidate(leader.address)}
+                            disabled={validating === leader.address}
+                            className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-medium"
+                            style={{ background: 'var(--color-surface-2)', color: 'var(--color-accent)', border: '1px solid var(--color-border)' }}
+                          >
+                            {validating === leader.address ? '⏳ validating…' : '🔍 Validate'}
+                          </button>
+                          {validateResults[leader.address] && (() => {
+                            const vr = validateResults[leader.address]
+                            const color = vr.verdict === 'EDGE' ? '#22c55e' : vr.verdict === 'INSUFFICIENT' ? '#eab308' : '#ef4444'
+                            return (
+                              <span style={{ color }} className="font-medium text-[10px]">
+                                {vr.is_hft ? '🤖 HFT' : vr.verdict} n={vr.n} EV={vr.ev >= 0 ? '+' : ''}{vr.ev.toFixed(1)}% p={vr.p_random.toFixed(2)}
+                              </span>
+                            )
+                          })()}
                           {isEditing ? (
                             <>
                               <label

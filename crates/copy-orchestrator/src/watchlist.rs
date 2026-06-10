@@ -96,4 +96,12 @@ impl Watchlist {
         }
         true
     }
+
+    /// Update the wallet_score for a leader from the edge-validator result.
+    /// score = 0-100 scale: 0 = no_edge/hft, 100 = confirmed edge.
+    pub fn update_score(&mut self, address: &str, score: f64) -> bool {
+        let Some(e) = self.entries.get_mut(address) else { return false; };
+        e.wallet_score = score.clamp(0.0, 100.0);
+        true
+    }
 }
