@@ -3905,6 +3905,75 @@ pub async fn handle_api_arb_scan(
     }
 }
 
+/// GET /api/capital/allocator — honest capital allocation across runners.
+/// For each runner with ≥30 official-resolution trades, runs the 3-leg validator and
+/// assigns weight ∝ max(0, EV/trade) / CI_width (fractional-Kelly-style: reward scaled by
+/// confidence). Runners that fail validation (NO_EDGE / INSUFFICIENT) get weight 0 — capital
+/// flows ONLY to statistically-confirmed edge, not to raw P&L. This closes the loop between
+/// validation and sizing (the Rec-3 allocator).
+pub async fn handle_api_capital_allocator(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+    let runners = state.strategy_runner.list();
+
+    #[derive(serde::Serialize)]
+    struct Alloc {
+        name: String,
+        n: usize,
+        verdict: String,
+        ev_per_trade_pct: f64,
+        ci_lo: f64,
+        ci_hi: f64,
+        raw_weight: f64,
+        weight_pct: f64,
+    }
+
+    let mut allocs: Vec<Alloc> = Vec::new();
+    for r in &runners {
+        // Aggregate this runner's official-resolution trades
+        let (mut entries, mut wons) = (Vec::new(), Vec::new());
+        if let Some(res) = r.result.as_ref() {
+            for o in &res.live_orders {
+                if o.resolution_source.as_deref() != Some("polymarket") { continue; }
+                let Some(rs) = o.result.as_deref() else { continue; };
+                let p = crate::strategy_runner::settle_price(o.entry_price, o.fill_price);
+                if p > 0.01 && p < 0.99 { entries.push(p); wons.push(rs.trim_end_matches('*') == "WIN"); }
+            }
+        }
+        if entries.len() < 30 { continue; }
+        let v = crate::tools::edge_validator::validate(&entries, &wons, 3000);
+        // Weight only confirmed edge; reward ∝ EV, confidence ∝ 1/CI-width.
+        let ci_width = (v.ci_hi - v.ci_lo).max(1.0);
+        let raw_weight = if v.verdict == "EDGE" && v.ev_per_trade_pct > 0.0 {
+            (v.ev_per_trade_pct / ci_width).max(0.0)
+        } else { 0.0 };
+        allocs.push(Alloc {
+            name: r.config.name.clone(),
+            n: v.n,
+            verdict: v.verdict.clone(),
+            ev_per_trade_pct: v.ev_per_trade_pct,
+            ci_lo: v.ci_lo,
+            ci_hi: v.ci_hi,
+            raw_weight,
+            weight_pct: 0.0,
+        });
+    }
+    // Normalize weights to percentages
+    let total: f64 = allocs.iter().map(|a| a.raw_weight).sum();
+    if total > 0.0 {
+        for a in &mut allocs { a.weight_pct = a.raw_weight / total * 100.0; }
+    }
+    allocs.sort_by(|a, b| b.weight_pct.partial_cmp(&a.weight_pct).unwrap_or(std::cmp::Ordering::Equal));
+
+    Json(serde_json::json!({
+        "allocations": allocs,
+        "note": "weight ∝ validated EV / CI-width. Only EDGE-verdict runners get capital. \
+                 NO_EDGE/INSUFFICIENT → 0%. This sizes on confirmed edge, never raw P&L.",
+    })).into_response()
+}
+
 /// GET /api/fear-index/status — returns the most recent fear index reading and
 /// z-score from the rolling 2h window, computed from the Python collector log.
 /// Acts as a defensive gate signal: z > 2 → pause rewards-maker quotes.
@@ -5023,6 +5092,9 @@ pub struct CreateRunnerBody {
     pub fee_pct: Option<f64>,
     pub warmup_days: Option<u32>,
     pub auto_restart: Option<bool>,
+    /// Override the Rec-1 validation gate when going Live with a NO_EDGE strategy.
+    #[serde(default)]
+    pub force_live: Option<bool>,
     pub series_id: Option<String>,
     pub resolution_logic: Option<String>,
     pub threshold: Option<f64>,
@@ -5453,7 +5525,38 @@ pub async fn handle_api_live_create(
     let is_live = body.mode == "live";
     if is_live {
         if body.market_type == "polymarket_binary" {
-            // Polymarket live — ok
+            // Rec 1 — validation-first gate. If a paper/live runner with this script
+            // already has official-resolution history, run the 3-leg validator and
+            // BLOCK the live start when it shows NO_EDGE, unless the body carries
+            // `force_live: true`. This stops un-validated strategies from reaching
+            // real capital (the root cause of the May incident).
+            if !body.force_live.unwrap_or(false) {
+                let script_needle = body.script.rsplit('/').next().unwrap_or(&body.script).to_string();
+                let (mut entries, mut wons) = (Vec::new(), Vec::new());
+                for r in state.strategy_runner.list() {
+                    if !r.config.script.contains(&script_needle) { continue; }
+                    if let Some(res) = r.result.as_ref() {
+                        for o in &res.live_orders {
+                            if o.resolution_source.as_deref() != Some("polymarket") { continue; }
+                            let Some(rs) = o.result.as_deref() else { continue; };
+                            let p = crate::strategy_runner::settle_price(o.entry_price, o.fill_price);
+                            if p > 0.01 && p < 0.99 { entries.push(p); wons.push(rs.trim_end_matches('*') == "WIN"); }
+                        }
+                    }
+                }
+                if entries.len() >= 30 {
+                    let v = crate::tools::edge_validator::validate(&entries, &wons, 5000);
+                    if v.verdict == "NO_EDGE" {
+                        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                            "error": format!(
+                                "Validation gate: '{}' shows NO EDGE on {} official trades (EV {:.1}%/trade, random-null p={:.2}). \
+                                 Live blocked. Pass force_live:true to override.",
+                                script_needle, v.n, v.ev_per_trade_pct, v.p_random),
+                            "verdict": v,
+                        }))).into_response();
+                    }
+                }
+            }
         } else if body.market_type == "funding_arb" {
             // Funding arb requires BOTH Hyperliquid wallet AND Binance credentials
             let hl_cfg = state.config.lock().hyperliquid.clone();

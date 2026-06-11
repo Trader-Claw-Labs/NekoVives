@@ -969,6 +969,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/arb/scan", get(api::handle_api_arb_scan))
         .route("/api/fear-index/status", get(api::handle_api_fear_index_status))
         .route("/api/rewards/history", get(api::handle_api_rewards_history))
+        .route("/api/capital/allocator", get(api::handle_api_capital_allocator))
         // ── Backtesting ──
         .route("/api/backtest/series", get(api::handle_api_backtest_series))
         .route("/api/backtest/tick-slugs", get(api::handle_api_backtest_tick_slugs))

@@ -115,9 +115,14 @@ export default function App() {
 
   async function checkOnboarding() {
     try {
+      // Respect a local "skipped" flag so users who chose to start with Dry Run
+      // (without an LLM key) aren't re-prompted on every reload.
+      if (localStorage.getItem('onboarding_skipped') === '1') return
       const status = await fetchOnboardingStatus()
-      // Show onboarding if: not yet completed OR api_key not set
-      if (!status.onboarded || !status.api_key_set) {
+      // Show onboarding only if it was never completed. The LLM API key is OPTIONAL
+      // (it powers the chat assistant, not Dry Run strategies), so we no longer
+      // force it via `!api_key_set`.
+      if (!status.onboarded) {
         setShowOnboarding(true)
       }
     } catch {
@@ -132,6 +137,8 @@ export default function App() {
   }
 
   function handleOnboardingDone() {
+    // Mark skipped locally so we don't re-prompt if they didn't set an API key.
+    localStorage.setItem('onboarding_skipped', '1')
     setShowOnboarding(false)
   }
 

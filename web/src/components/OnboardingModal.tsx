@@ -191,18 +191,24 @@ export default function OnboardingModal({ onDone }: Props) {
               </div>
               <h2 className="text-xl font-bold mb-2">Welcome to Neko Vives</h2>
               <p className="text-sm max-w-sm" style={{ color: 'var(--color-text-muted)' }}>
-                Let's get you set up in a few steps. You'll choose your AI provider and configure your API key so the agent can start working.
+                A trading platform for crypto and Polymarket prediction markets — with an
+                honest twist: every strategy is <strong style={{ color: 'var(--color-text)' }}>statistically
+                validated</strong> before it touches real money. Most "edges" are luck; we prove which ones aren't.
               </p>
               <div
                 className="mt-5 px-4 py-3 rounded-lg text-xs text-left w-full max-w-sm"
                 style={{ backgroundColor: 'rgba(0,255,136,0.06)', border: '1px solid rgba(0,255,136,0.2)', color: 'var(--color-text-muted)' }}
               >
-                <p className="font-semibold mb-1" style={{ color: 'var(--color-accent)' }}>What you'll configure:</p>
+                <p className="font-semibold mb-1" style={{ color: 'var(--color-accent)' }}>How it works:</p>
                 <ul className="space-y-0.5">
-                  <li>• AI provider &amp; model (GPT-4o, Claude, Gemini…)</li>
-                  <li>• API key for your chosen provider</li>
-                  <li>• Optional: Polymarket, Telegram, Wallets</li>
+                  <li>1. Run a strategy in <strong style={{ color: 'var(--color-text)' }}>Dry Run</strong> (paper, zero risk)</li>
+                  <li>2. NekoVives validates its edge (3 independent tests)</li>
+                  <li>3. Only edge-confirmed strategies can go Live</li>
                 </ul>
+                <p className="mt-2" style={{ color: 'var(--color-text-muted)' }}>
+                  The AI provider below is <strong style={{ color: 'var(--color-text)' }}>optional</strong> —
+                  it powers the chat assistant. You can skip it and start with Dry Run strategies right away.
+                </p>
               </div>
             </div>
           )}
@@ -383,7 +389,8 @@ export default function OnboardingModal({ onDone }: Props) {
                 Model: <span style={{ color: 'var(--color-accent)' }}>{selectedModel}</span>
               </p>
               <p className="text-xs mt-4 max-w-xs" style={{ color: 'var(--color-text-muted)' }}>
-                You can update your API key, provider, and model anytime from <strong>LLM Settings</strong>.
+                Next: create your first <strong style={{ color: 'var(--color-accent)' }}>Dry Run</strong> strategy
+                — it's paper-traded with zero risk, and NekoVives will validate whether it has a real edge.
               </p>
             </div>
           )}
@@ -406,6 +413,18 @@ export default function OnboardingModal({ onDone }: Props) {
             <ChevronLeft size={15} />
             Back
           </button>
+
+          {/* Skip — the AI provider is optional; let users go straight to Dry Run. */}
+          {step > 0 && step < 4 && (
+            <button
+              onClick={onDone}
+              className="text-xs px-3 py-1.5 rounded-lg ml-auto mr-2"
+              style={{ color: 'var(--color-text-muted)' }}
+              title="Skip AI setup — you can configure it later in LLM Settings"
+            >
+              Skip — start with Dry Run
+            </button>
+          )}
 
           {/* Next / Save / Enter */}
           {step < 3 && (
@@ -434,11 +453,11 @@ export default function OnboardingModal({ onDone }: Props) {
 
           {step === 4 && (
             <button
-              onClick={onDone}
+              onClick={() => { onDone(); window.location.href = '/live?create=1' }}
               className="flex items-center gap-1.5 px-5 py-2 rounded-lg text-sm font-semibold"
               style={{ backgroundColor: 'var(--color-accent)', color: '#000' }}
             >
-              Open Dashboard
+              Create First Strategy
               <ChevronRight size={15} />
             </button>
           )}

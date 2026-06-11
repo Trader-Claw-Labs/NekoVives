@@ -263,6 +263,26 @@ export default function Dashboard() {
         </div>
       </div>
 
+      {/* First-run CTA: no strategies yet → guide the user to create one in Dry Run. */}
+      {liveCount === 0 && (
+        <div className="mb-4 px-4 py-3 rounded-lg border flex items-center gap-3"
+          style={{ backgroundColor: 'rgba(0,255,136,0.06)', borderColor: 'rgba(0,255,136,0.3)' }}>
+          <Bot size={18} style={{ color: 'var(--color-accent)' }} />
+          <div className="flex-1">
+            <p className="text-sm font-semibold" style={{ color: 'var(--color-text)' }}>Get started</p>
+            <p className="text-xs" style={{ color: 'var(--color-text-muted)' }}>
+              Create your first strategy in <strong>Dry Run</strong> (paper, zero risk). NekoVives validates
+              whether it has a real edge before you ever risk capital.
+            </p>
+          </div>
+          <Link to="/live?create=1"
+            className="px-3 py-2 rounded text-sm font-semibold whitespace-nowrap"
+            style={{ backgroundColor: 'var(--color-accent)', color: '#000' }}>
+            + Create Strategy
+          </Link>
+        </div>
+      )}
+
       {error && (
         <div
           className="mb-4 px-4 py-3 rounded text-sm border"

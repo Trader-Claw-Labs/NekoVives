@@ -4,6 +4,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch, apiPost, apiDelete, apiPatch } from '../hooks/useApi'
 import { type MarketSeries, POLY_BINARY_PRESETS } from '../hooks/useBacktestState'
 import PortfolioGuardWidget from '../components/PortfolioGuardWidget'
+import CapitalAllocator from '../components/CapitalAllocator'
 import EngineParamsForm, { defaultEngineParams } from '../components/EngineParamsForm'
 import EngineKindInfoCard from '../components/EngineKindInfoCard'
 import { ENGINE_KINDS, engineKindOptionLabel } from '../components/engineKindMeta'
@@ -779,7 +780,7 @@ function EngineMarketPicker({
           )}
 
           <p className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
-            Mercados activos de Polymarket. <b>Top liquidity</b> ordena por book depth y permite ventanas &lt; 1 día.
+            Active Polymarket markets. <b>Top liquidity</b> sorts by book depth and allows windows &lt; 1 day.
           </p>
         </>
       )}
@@ -853,11 +854,15 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript, prefil
     max_pos_pct: 15,
     funding_poll_secs: 60,
     fee_buffer_bps: 12,
+    force_live: false,  // override the validation gate (Rec-1) when going Live on a NO_EDGE strategy
     engine_params: (prefill?.engine_params ?? {}) as Record<string, unknown>,
   })
 
   const isRhaiTick = form.kind === 'rhai_tick'
   const isEngineKind = form.kind !== 'rhai_candle' && !isRhaiTick
+  // Quick Start: hide the advanced risk/timing controls behind a disclosure so a
+  // new user's first Dry Run only needs Engine + Script + Series + Mode.
+  const [showAdvanced, setShowAdvanced] = useState(false)
 
   // Guard against the React controlled-<select> trap: when `form.script` is
   // '' (or doesn't match any rendered <option>), the browser shows the first
@@ -921,6 +926,10 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript, prefil
 
   function friendlyCreateError(message: string) {
     const m = message.toLowerCase()
+    // Rec-1 validation gate: the strategy showed NO EDGE on its history. Offer the override.
+    if (m.includes('validation gate') || (m.includes('no edge') && m.includes('blocked'))) {
+      return `🛡 ${message}\n\nTo go Live anyway, check "Override validation gate" below and resubmit.`
+    }
     if (m.includes('wallet_address')) {
       return 'Live mode needs your Polymarket wallet address. Go to Settings → Config and set polymarket.wallet_address, then try again.'
     }
@@ -1180,6 +1189,15 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript, prefil
                     </option>
                   ))}
               </select>
+              {/* Show the selected script's description so the user knows what it does. */}
+              {(() => {
+                const sel = scripts.find(s => s.path === form.script)
+                return sel?.description ? (
+                  <p className="text-[11px] mt-1.5 px-2 py-1.5 rounded" style={{ background: 'var(--color-surface-2)', color: 'var(--color-text-muted)' }}>
+                    {sel.description}
+                  </p>
+                ) : null
+              })()}
               {isRhaiTick && (
                 <p className="text-[10px] mt-1" style={{ color: 'var(--color-text-muted)' }}>
                   Only <span className="font-mono">clob_1hz_*</span> scripts are listed (they implement <span className="font-mono">on_tick(ctx)</span> for 1Hz CLOB execution).
@@ -1238,6 +1256,14 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript, prefil
                 activeColor={form.mode === 'live' ? 'var(--color-warning)' : 'var(--color-accent)'}
                 disabled={!isEngineKind && !isRhaiTick && form.market_type !== 'polymarket_binary'}
               />
+              {/* Validation-gate override — only relevant in Live mode */}
+              {form.mode === 'live' && (
+                <label className="flex items-center gap-1.5 mt-1.5 text-[10px] cursor-pointer" style={{ color: 'var(--color-text-muted)' }}>
+                  <input type="checkbox" checked={form.force_live}
+                    onChange={e => set('force_live', e.target.checked)} />
+                  Override validation gate (go Live even if NO_EDGE)
+                </label>
+              )}
             </div>
           </div>
 
@@ -1302,11 +1328,15 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript, prefil
               </label>
               <input
                 type="number"
+                min={1}
                 className="w-full rounded px-3 py-2 text-sm"
                 value={form.initial_balance}
                 readOnly={form.mode === 'live' && balanceFetching}
                 onChange={e => set('initial_balance', Number(e.target.value))}
               />
+              {form.initial_balance <= 0 && (
+                <p className="text-xs mt-1" style={{ color: 'var(--color-danger)' }}>Initial balance must be greater than 0.</p>
+              )}
               {form.mode === 'live' && balanceFetchError && (
                 <p className="text-xs mt-1" style={{ color: 'var(--color-danger)' }}>{balanceFetchError}</p>
               )}
@@ -1628,6 +1658,14 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript, prefil
             </div>
           )}
 
+          {/* ── Advanced settings disclosure (guardrails, hour gate, RV floor, tick recorder) ── */}
+          <button type="button" onClick={() => setShowAdvanced(v => !v)}
+            className="flex items-center gap-1.5 text-xs font-medium mt-1"
+            style={{ color: 'var(--color-text-muted)' }}>
+            {showAdvanced ? '▾' : '▸'} Advanced settings (guardrails, hour gate, tick recorder)
+          </button>
+          <div style={{ display: showAdvanced ? 'block' : 'none' }} className="space-y-3">
+
           {/* Slippage Cap (live mode only — controls worst_price on market orders) */}
           {form.market_type === 'polymarket_binary' && form.mode === 'live' && (
             <div>
@@ -1918,6 +1956,8 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript, prefil
             </div>
           )}
 
+          </div>{/* ── end Advanced settings disclosure ── */}
+
           {/* Live mode notice */}
           {form.mode === 'live' && (
             <div
@@ -1959,7 +1999,8 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript, prefil
               needsScript ||
               !hasMarketTarget ||
               mutation.isPending ||
-              !liveMarketSupported
+              !liveMarketSupported ||
+              form.initial_balance <= 0
             return (
               <button
                 onClick={() => mutation.mutate()}
@@ -3560,7 +3601,9 @@ function RunnerCard({ runner, onStop, onRestart, onDelete, onToggleHidden, onUpd
 export default function LiveStrategies() {
   const location = useLocation()
   const routePrefill = (location.state as { prefill?: BacktestPrefill } | null)?.prefill
-  const [showCreate, setShowCreate] = useState(() => !!routePrefill)
+  // Open the create modal automatically when arriving from onboarding (?create=1).
+  const autoCreate = typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('create') === '1'
+  const [showCreate, setShowCreate] = useState(() => !!routePrefill || autoCreate)
   const [upgradePrefill, setUpgradePrefill] = useState<BacktestPrefill | null>(null)
   const [showCelebrationSettings, setShowCelebrationSettings] = useState(false)
   const { settings, setSettings } = useProfitCelebration()
@@ -3784,6 +3827,9 @@ export default function LiveStrategies() {
 
       {/* Wallet-level portfolio guard — cross-runner safety net (halts all live at -50%) */}
       <PortfolioGuardWidget />
+
+      {/* Capital allocator — sizes on validated edge, not raw P&L */}
+      <CapitalAllocator />
 
       {/* Stats row — split Live vs Dry Run with colour coding.
           Dry Run uses indigo (#818cf8) to signal paper/preview context.
