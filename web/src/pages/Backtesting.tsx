@@ -2439,6 +2439,67 @@ export default function Backtesting() {
             />
           </div>
 
+          {/* Latency (ms) — clob_1hz / archive_candles only */}
+          {(config.market_type === 'clob_1hz' || config.market_type === 'archive_candles') && (
+            <div className="lg:col-span-2">
+              <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>
+                Latency (ms)
+                <span
+                  className="ml-1 px-1 rounded text-[9px]"
+                  style={{ backgroundColor: 'var(--color-surface-2)', color: 'var(--color-text-muted)' }}
+                  title="Simulated order latency. 0 = same-tick fill (no latency). 110 = VPS Newark. Fill executes at signal_ts + latency_ms."
+                >
+                  0 = no lag
+                </span>
+              </label>
+              <input
+                type="number"
+                min={0}
+                max={5000}
+                step={10}
+                value={config.latency_ms ?? 0}
+                onChange={(e) => set('latency_ms', e.target.value === '' || Number(e.target.value) === 0 ? undefined : Number(e.target.value))}
+                placeholder="0"
+                className="w-full rounded px-2 py-2 text-sm font-mono"
+                style={{
+                  backgroundColor: 'var(--color-surface-2)',
+                  border: '1px solid var(--color-border)',
+                  color: 'var(--color-text)',
+                }}
+              />
+              <div className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
+                {config.latency_ms ? `Fill delayed ${config.latency_ms}ms from signal` : 'Same-tick fill (no latency simulation)'}
+              </div>
+            </div>
+          )}
+
+          {/* Fee model — clob_1hz / archive_candles only */}
+          {(config.market_type === 'clob_1hz' || config.market_type === 'archive_candles') && (
+            <div className="lg:col-span-2">
+              <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>
+                Fee Model
+              </label>
+              <select
+                value={config.fee_model ?? 'pct'}
+                onChange={(e) => set('fee_model', e.target.value === 'pct' ? undefined : e.target.value as 'crypto_taker')}
+                className="w-full rounded px-2 py-2 text-sm"
+                style={{
+                  backgroundColor: 'var(--color-surface-2)',
+                  border: '1px solid var(--color-border)',
+                  color: 'var(--color-text)',
+                }}
+              >
+                <option value="pct">Flat % (fee_pct field)</option>
+                <option value="crypto_taker">Crypto taker — 1.8%×p×(1-p)</option>
+              </select>
+              <div className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
+                {config.fee_model === 'crypto_taker'
+                  ? 'Polymarket real fee formula. At p=0.5: ~0.45% of stake.'
+                  : 'Flat fee deducted from stake at entry (default).'}
+              </div>
+            </div>
+          )}
+
           {/* Max Position USD — only for Polymarket binary */}
           {config.market_type === 'polymarket_binary' && (
             <div className="lg:col-span-2">

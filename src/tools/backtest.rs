@@ -353,7 +353,7 @@ impl Tool for BacktestRunTool {
         // Run the real Rhai backtest engine
         let metrics = run_backtest_engine(
             &script_path, market_type, symbol, interval, from_date, to_date,
-            initial_balance, fee_pct, "price_up", None, None, None, "percent", 1.0, "historical", &self.workspace_dir, &[], None, None, None, None, None, None
+            initial_balance, fee_pct, "price_up", None, None, None, "percent", 1.0, "historical", &self.workspace_dir, &[], None, None, None, None, None, None, None, None
         ).await;
 
         let worst_trades_text = metrics
@@ -436,6 +436,17 @@ pub struct TickGates {
     pub max_entry_price: Option<f64>,
     pub min_entry_price: Option<f64>,
     pub allowed_hours: Vec<u8>,
+}
+
+/// One row in a latency-sweep result table.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LatencySweepRow {
+    pub latency_ms: u64,
+    pub total_return_pct: f64,
+    pub win_rate_pct: f64,
+    pub total_trades: u32,
+    /// Expected value per trade in USD (total_return × initial_balance / total_trades).
+    pub ev_per_trade_usd: f64,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -3235,6 +3246,8 @@ pub async fn run_backtest_engine(
     min_entry_price: Option<f64>,
     max_consecutive_losses: Option<u32>,
     stop_loss_pct: Option<f64>,
+    latency_ms: Option<u64>,
+    fee_model: Option<&str>,
 ) -> BacktestMetrics {
     tracing::info!(
         "[BACKTEST] Starting backtest: script={}, market={}, symbol={}, interval={}, from={}, to={}, balance={}, fee={}%",
@@ -3276,6 +3289,8 @@ pub async fn run_backtest_engine(
             script_path, symbol, from_date, to_date,
             initial_balance, fee_pct, workspace_dir, max_position_usd,
             tick_gates,
+            latency_ms.unwrap_or(0),
+            fee_model.unwrap_or("pct"),
         ).await;
     }
 
@@ -3291,6 +3306,8 @@ pub async fn run_backtest_engine(
             resolution_logic, threshold, max_position_usd, max_entry_price,
             sizing_mode, sizing_value, price_mode, allowed_hours,
             max_spread_pct, rv_min_btc,
+            latency_ms.unwrap_or(0),
+            fee_model.unwrap_or("pct"),
         ).await;
     }
 
@@ -4522,6 +4539,8 @@ pub fn run_clob_1hz_backtest(
     fee_pct: f64,
     max_position_usd: Option<f64>,
     gates: TickGates,
+    latency_ms: u64,
+    is_crypto_taker: bool,
 ) -> anyhow::Result<BacktestMetrics> {
     use rhai::{Dynamic, Engine, Map, Scope};
     use std::sync::{Arc, Mutex};
@@ -4550,8 +4569,8 @@ pub fn run_clob_1hz_backtest(
         current_window_ts: i64,  // ts of window we're tracking
         trades:           Vec<Trade>,
         kv:               std::collections::HashMap<String, f64>,
-        pending_yes:      Option<f64>,  // size to bet YES (set by script)
-        pending_no:       Option<f64>,  // size to bet NO
+        pending_yes:      Option<(f64, i64)>,  // (size_frac, signal_ts_ms) — deferred fill
+        pending_no:       Option<(f64, i64)>,  // (size_frac, signal_ts_ms) — deferred fill
         resolved_official: u32,  // trades settled via official window_yes_won
         resolved_binance:  u32,  // trades settled via Binance price fallback
     }
@@ -4599,6 +4618,7 @@ pub fn run_clob_1hz_backtest(
     let current_bid_depth   = Arc::new(Mutex::new(0.0f64)); // bid_depth_usd
     let current_spread_pct  = Arc::new(Mutex::new(0.0f64)); // (yes_ask-yes_bid)*100 in ¢
     let current_hour        = Arc::new(Mutex::new(0u8));     // UTC hour of current tick
+    let current_ts_ms       = Arc::new(Mutex::new(0i64));    // current tick timestamp (ms)
     // Gate config (shared into closures by value via Arc clone of immutable copy)
     let gates_arc = Arc::new(gates);
 
@@ -4618,6 +4638,15 @@ pub fn run_clob_1hz_backtest(
         false
     }
 
+    // Fee helper: computes effective fee fraction given entry ask price and fee model.
+    fn effective_fee_frac(ask: f64, fee_pct: f64, is_crypto_taker: bool) -> f64 {
+        if is_crypto_taker {
+            0.018 * ask * (1.0 - ask)
+        } else {
+            fee_pct / 100.0
+        }
+    }
+
     // bet_yes_impl
     let sim_yes = sim.clone();
     let yes_ask_ref   = current_yes_ask.clone();
@@ -4628,7 +4657,10 @@ pub fn run_clob_1hz_backtest(
     let max_pos_ref   = max_pos_usd.clone();
     let spread_ref    = current_spread_pct.clone();
     let hour_ref      = current_hour.clone();
+    let ts_ref_yes    = current_ts_ms.clone();
     let gates_yes     = gates_arc.clone();
+    let latency_val   = latency_ms;
+    let crypto_taker  = is_crypto_taker;
     eng.register_fn("bet_yes_impl", move |size: f64| {
         let ya    = *yes_ask_ref.lock().unwrap();
         let yb    = *yes_bid_ref.lock().unwrap();
@@ -4638,18 +4670,26 @@ pub fn run_clob_1hz_backtest(
         let max_pos = *max_pos_ref.lock().unwrap();
         let spread = *spread_ref.lock().unwrap();
         let hour   = *hour_ref.lock().unwrap();
+        let sig_ts = *ts_ref_yes.lock().unwrap();
         let mut s = sim_yes.lock().unwrap();
-        if s.position != 0 { return; }
+        if s.position != 0 || s.pending_yes.is_some() || s.pending_no.is_some() { return; }
         if ya < 0.03 || ya >= 1.0 { return; } // min 3¢ entry — prevent payout explosion
         if tick_gate_blocks(&gates_yes, ya, spread, hour) { return; }
         let frac = size.clamp(0.0, 1.0);
-        let stake_amt = (bal * frac * (1.0 - f / 100.0)).min(max_pos);
-        if stake_amt <= 0.01 { return; }
-        let fill_price = sim_fill_vwap(ya, yb, depth, stake_amt);
-        s.balance -= stake_amt;
-        s.position = 1;
-        s.entry_price = fill_price;
-        s.stake = stake_amt;
+        if latency_val > 0 {
+            // Deferred fill: store signal; fill will execute on a future tick
+            s.pending_yes = Some((frac, sig_ts));
+        } else {
+            // Immediate fill (latency == 0, backward-compatible)
+            let fee_f = effective_fee_frac(ya, f, crypto_taker);
+            let stake_amt = (bal * frac * (1.0 - fee_f)).min(max_pos);
+            if stake_amt <= 0.01 { return; }
+            let fill_price = sim_fill_vwap(ya, yb, depth, stake_amt);
+            s.balance -= stake_amt;
+            s.position = 1;
+            s.entry_price = fill_price;
+            s.stake = stake_amt;
+        }
     });
 
     // bet_no_impl
@@ -4667,7 +4707,10 @@ pub fn run_clob_1hz_backtest(
     let max_pos_ref2  = max_pos_usd.clone();
     let spread_ref2   = current_spread_pct.clone();
     let hour_ref2     = current_hour.clone();
+    let ts_ref_no     = current_ts_ms.clone();
     let gates_no      = gates_arc.clone();
+    let latency_val2  = latency_ms;
+    let crypto_taker2 = is_crypto_taker;
     eng.register_fn("bet_no_impl", move |size: f64| {
         let na    = *no_ask_ref.lock().unwrap();
         // yes_ask proxies as no_bid for the spread calculation
@@ -4679,18 +4722,26 @@ pub fn run_clob_1hz_backtest(
         let max_pos = *max_pos_ref2.lock().unwrap();
         let spread = *spread_ref2.lock().unwrap();
         let hour   = *hour_ref2.lock().unwrap();
+        let sig_ts = *ts_ref_no.lock().unwrap();
         let mut s = sim_no.lock().unwrap();
-        if s.position != 0 { return; }
+        if s.position != 0 || s.pending_yes.is_some() || s.pending_no.is_some() { return; }
         if na < 0.03 || na >= 1.0 { return; } // min 3¢ entry — prevent payout explosion
         if tick_gate_blocks(&gates_no, na, spread, hour) { return; }
         let frac = size.clamp(0.0, 1.0);
-        let stake_amt = (bal * frac * (1.0 - f / 100.0)).min(max_pos);
-        if stake_amt <= 0.01 { return; }
-        let fill_price = sim_fill_vwap(na, no_bid, depth, stake_amt);
-        s.balance -= stake_amt;
-        s.position = -1;
-        s.entry_price = fill_price;
-        s.stake = stake_amt;
+        if latency_val2 > 0 {
+            // Deferred fill: store signal; fill will execute on a future tick
+            s.pending_no = Some((frac, sig_ts));
+        } else {
+            // Immediate fill (latency == 0, backward-compatible)
+            let fee_f = effective_fee_frac(na, f, crypto_taker2);
+            let stake_amt = (bal * frac * (1.0 - fee_f)).min(max_pos);
+            if stake_amt <= 0.01 { return; }
+            let fill_price = sim_fill_vwap(na, no_bid, depth, stake_amt);
+            s.balance -= stake_amt;
+            s.position = -1;
+            s.entry_price = fill_price;
+            s.stake = stake_amt;
+        }
     });
 
     // set_impl / get_impl
@@ -4708,6 +4759,77 @@ pub fn run_clob_1hz_backtest(
     });
 
     for (tick_idx, tick) in ticks.iter().enumerate() {
+        // ── Deferred fill: execute pending orders when latency has elapsed ──────
+        if latency_ms > 0 {
+            let (has_pending_yes, has_pending_no) = {
+                let s = sim.lock().unwrap();
+                (s.pending_yes, s.pending_no)
+            };
+            // Pending YES
+            if let Some((frac, sig_ts)) = has_pending_yes {
+                if tick.ts_ms >= sig_ts + latency_ms as i64 {
+                    let ya    = tick.yes_ask;
+                    let yb    = tick.yes_bid;
+                    let depth = tick.ask_depth_usd;
+                    let spread_pct_val = if yb > 0.0 { (ya - yb) * 100.0 } else { 0.0 };
+                    let hour = {
+                        use chrono::{TimeZone, Timelike, Utc};
+                        Utc.timestamp_millis_opt(tick.ts_ms).single()
+                            .map(|dt| dt.hour() as u8).unwrap_or(0)
+                    };
+                    let mut s = sim.lock().unwrap();
+                    if s.position == 0 && ya >= 0.03 && ya < 1.0
+                        && !tick_gate_blocks(&gates_arc, ya, spread_pct_val, hour)
+                    {
+                        let fee_f = effective_fee_frac(ya, fee_pct, is_crypto_taker);
+                        let bal = s.balance;
+                        let stake_amt = (bal * frac * (1.0 - fee_f))
+                            .min(*max_pos_usd.lock().unwrap());
+                        if stake_amt > 0.01 {
+                            let fill_price = sim_fill_vwap(ya, yb, depth, stake_amt);
+                            s.balance -= stake_amt;
+                            s.position = 1;
+                            s.entry_price = fill_price;
+                            s.stake = stake_amt;
+                        }
+                    }
+                    s.pending_yes = None; // always clear, even if fill was skipped
+                }
+            }
+            // Pending NO (symmetric)
+            if let Some((frac, sig_ts)) = has_pending_no {
+                if tick.ts_ms >= sig_ts + latency_ms as i64 {
+                    let na = tick.no_ask;
+                    let ya = tick.yes_ask;
+                    let no_bid = (1.0 - ya).clamp(0.0, 1.0);
+                    let depth = tick.bid_depth_usd;
+                    let spread_pct_val = if tick.yes_bid > 0.0 { (ya - tick.yes_bid) * 100.0 } else { 0.0 };
+                    let hour = {
+                        use chrono::{TimeZone, Timelike, Utc};
+                        Utc.timestamp_millis_opt(tick.ts_ms).single()
+                            .map(|dt| dt.hour() as u8).unwrap_or(0)
+                    };
+                    let mut s = sim.lock().unwrap();
+                    if s.position == 0 && na >= 0.03 && na < 1.0
+                        && !tick_gate_blocks(&gates_arc, na, spread_pct_val, hour)
+                    {
+                        let fee_f = effective_fee_frac(na, fee_pct, is_crypto_taker);
+                        let bal = s.balance;
+                        let stake_amt = (bal * frac * (1.0 - fee_f))
+                            .min(*max_pos_usd.lock().unwrap());
+                        if stake_amt > 0.01 {
+                            let fill_price = sim_fill_vwap(na, no_bid, depth, stake_amt);
+                            s.balance -= stake_amt;
+                            s.position = -1;
+                            s.entry_price = fill_price;
+                            s.stake = stake_amt;
+                        }
+                    }
+                    s.pending_no = None; // always clear, even if fill was skipped
+                }
+            }
+        }
+
         // ── Window-transition resolution ─────────────────────────────────────
         // Resolve any open position whenever the window changes. This handles two cases:
         //   (a) Archive JSONL: window_ts changes at each 5-min boundary; the exact
@@ -4749,6 +4871,9 @@ pub fn run_clob_1hz_backtest(
                     s.position = 0; s.entry_price = 0.0; s.stake = 0.0;
                 }
                 s.window_open_price = 0.0;
+                // Discard any pending order that didn't fill before window close
+                s.pending_yes = None;
+                s.pending_no  = None;
             }
             if tick.window_ts != s.current_window_ts {
                 s.current_window_ts = tick.window_ts;
@@ -4809,6 +4934,9 @@ pub fn run_clob_1hz_backtest(
             }
             // Reset for next window
             s.window_open_price = 0.0;
+            // Discard any pending order that didn't fill before window close
+            s.pending_yes = None;
+            s.pending_no  = None;
         }
 
         // ── Run on_tick(ctx) ─────────────────────────────────────────────────
@@ -4841,6 +4969,7 @@ pub fn run_clob_1hz_backtest(
             Utc.timestamp_millis_opt(tick.ts_ms).single()
                 .map(|dt| dt.hour() as u8).unwrap_or(0)
         };
+        *current_ts_ms.lock().unwrap() = tick.ts_ms;
 
         // Build ctx map and invoke pre-compiled on_tick
         let mut ctx_map = Map::new();
@@ -4987,11 +5116,22 @@ pub fn run_clob_1hz_backtest(
         )
     };
 
+    let latency_note = if latency_ms > 0 {
+        format!("\nSimulated order latency: {} ms.", latency_ms)
+    } else {
+        String::new()
+    };
+    let fee_note = if is_crypto_taker {
+        "\nFee model: crypto_taker (1.8%×p×(1−p)).".to_string()
+    } else {
+        String::new()
+    };
+
     let analysis = format!(
         "CLOB 1 HZ backtest: {} ticks, {} trades. \
         Win rate {:.1}%, return {:.2}%, Sharpe {:.2}, max drawdown {:.2}%.\n\
         Strategy: on_tick() API — positions resolved each time window_secs_left = 0.\n\
-        P&L computed assuming $1 payout per YES/NO token at resolution.{}",
+        P&L computed assuming $1 payout per YES/NO token at resolution.{}{}{}",
         ticks.len(),
         total_trades,
         win_rate_pct,
@@ -4999,6 +5139,8 @@ pub fn run_clob_1hz_backtest(
         sharpe,
         max_dd,
         resolution_note,
+        latency_note,
+        fee_note,
     );
 
     Ok(BacktestMetrics {
@@ -5046,6 +5188,8 @@ pub async fn run_archive_candles_backtest(
     allowed_hours: &[u8],
     max_spread_pct: Option<f64>,
     rv_min_btc: Option<f64>,
+    latency_ms: u64,
+    fee_model: &str,
 ) -> BacktestMetrics {
     use std::collections::HashMap;
 
@@ -5182,11 +5326,17 @@ pub async fn run_archive_candles_backtest(
     // Uses window_secs_left proximity so we stay within the correct market's data
     // rather than mixing prices from 288 simultaneous markets by timestamp.
     //
+    // When latency_ms > 0, the fill happens latency_secs later than the decision candle,
+    // i.e. closer to the window close. We shift the effective offset accordingly so the
+    // entry price is sampled at the tick where the order would actually fill.
+    let latency_secs = (latency_ms / 1000) as i64;
+    let effective_decision_offset_secs = (decision_offset_secs - latency_secs).max(0);
+    //
     // wts → (yes_ask, no_ask, spread_pct, secs_left_lag)
     let mut window_decision_prices: HashMap<i64, (f64, f64, f64, i64)> = HashMap::new();
     for tick in &ticks {
         if tick.window_ts == 0 || tick.yes_ask <= 0.0 { continue; }
-        let secs_lag = (tick.window_secs_left - decision_offset_secs).abs();
+        let secs_lag = (tick.window_secs_left - effective_decision_offset_secs).abs();
         let no_ask = if tick.yes_bid > 0.0 {
             (1.0 - tick.yes_bid).clamp(0.01, 0.99)
         } else {
@@ -5291,6 +5441,7 @@ pub async fn run_archive_candles_backtest(
     let allowed_hours_owned = allowed_hours.to_vec();
     let spread_skipped_owned = spread_skipped;
 
+    let fee_model_owned = fee_model.to_string();
     match tokio::task::spawn_blocking(move || {
         run_polymarket_slug_backtest(
             script_content, candles, initial_balance, fee_pct,
@@ -5306,6 +5457,13 @@ pub async fn run_archive_candles_backtest(
     }).await {
         Ok(Ok(mut m)) => {
             m.windows_with_real_price = Some(windows_with_price as u32);
+            // Append latency and fee model notes
+            if latency_ms > 0 {
+                m.analysis.push_str(&format!("\nSimulated order latency: {} ms.", latency_ms));
+            }
+            if fee_model_owned == "crypto_taker" {
+                m.analysis.push_str("\nFee model: crypto_taker (1.8%×p×(1−p)).");
+            }
             m
         }
         Ok(Err(e)) => BacktestMetrics {
@@ -5330,6 +5488,8 @@ pub async fn run_clob_1hz_backtest_from_files(
     workspace_dir: &std::path::Path,
     max_position_usd: Option<f64>,
     gates: TickGates,
+    latency_ms: u64,
+    fee_model: &str,
 ) -> BacktestMetrics {
     let script_content = match std::fs::read_to_string(script_path) {
         Ok(s) => s,
@@ -5351,8 +5511,9 @@ pub async fn run_clob_1hz_backtest_from_files(
     let initial_bal = initial_balance;
     let fee = fee_pct;
     let max_pos = max_position_usd;
+    let is_crypto_taker = fee_model == "crypto_taker";
     match tokio::task::spawn_blocking(move || {
-        run_clob_1hz_backtest(&script_for_task, ticks, initial_bal, fee, max_pos, gates)
+        run_clob_1hz_backtest(&script_for_task, ticks, initial_bal, fee, max_pos, gates, latency_ms, is_crypto_taker)
     }).await {
         Ok(Ok(m))  => m,
         Ok(Err(e)) => BacktestMetrics {

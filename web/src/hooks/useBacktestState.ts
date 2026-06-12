@@ -88,6 +88,10 @@ export interface BacktestConfig {
   min_entry_price?: number
   max_consecutive_losses?: number
   stop_loss_pct?: number
+  // Latency simulation (clob_1hz / archive_candles): fill at signal_ts + latency_ms.
+  latency_ms?: number
+  // Fee model: "pct" = flat fee_pct%, "crypto_taker" = 1.8%×p×(1-p) Polymarket formula.
+  fee_model?: 'pct' | 'crypto_taker'
 }
 
 export interface TradeLog {
