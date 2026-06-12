@@ -4311,6 +4311,14 @@ pub struct BacktestRunBody {
     /// Stop-loss per trade: exit early if token drops this fraction from entry.
     #[serde(default)]
     pub stop_loss_pct: Option<f64>,
+    /// Simulated order latency in milliseconds. 0 = same-tick fill (default, backward-compat).
+    /// clob_1hz: fill at the first tick where ts_ms >= signal_ts + latency_ms.
+    /// archive_candles: shifts the entry price to the tick latency_ms after the decision candle.
+    #[serde(default)]
+    pub latency_ms: Option<u64>,
+    /// Fee model: "pct" = flat fee_pct% (default), "crypto_taker" = 1.8%×p×(1-p).
+    #[serde(default)]
+    pub fee_model: Option<String>,
 }
 
 fn default_market_type() -> String {
@@ -4506,6 +4514,8 @@ pub async fn handle_api_backtest_run(
         body.min_entry_price,
         body.max_consecutive_losses,
         body.stop_loss_pct,
+        body.latency_ms,
+        body.fee_model.as_deref(),
     )
     .await;
 
@@ -4563,6 +4573,149 @@ pub async fn handle_api_backtest_run(
         "recommended_max_stake_usd": metrics.recommended_max_stake_usd,
         "flat_debugs": metrics.flat_debugs,
         "final_balance": body.initial_balance * (1.0 + metrics.total_return_pct / 100.0),
+        "latency_ms": body.latency_ms.unwrap_or(0),
+        "fee_model": body.fee_model.as_deref().unwrap_or("pct"),
+    }))
+    .into_response()
+}
+
+/// POST /api/backtest/latency-sweep — run the same backtest at multiple latency values.
+/// Returns a table of results keyed by latency_ms.
+#[derive(serde::Deserialize)]
+pub struct LatencySweepBody {
+    // Core params (same as BacktestRunBody)
+    #[serde(default)]
+    pub script: String,
+    #[serde(default = "default_market_type")]
+    pub market_type: String,
+    pub symbol: String,
+    #[serde(default = "default_interval")]
+    pub interval: String,
+    pub from_date: String,
+    pub to_date: String,
+    pub initial_balance: f64,
+    pub fee_pct: f64,
+    pub series_id: Option<String>,
+    pub resolution_logic: Option<String>,
+    pub threshold: Option<f64>,
+    pub max_position_usd: Option<f64>,
+    pub max_entry_price: Option<f64>,
+    pub sizing_mode: Option<String>,
+    pub sizing_value: Option<f64>,
+    pub price_mode: Option<String>,
+    #[serde(default)]
+    pub allowed_hours: Vec<u8>,
+    #[serde(default)]
+    pub max_spread_pct: Option<f64>,
+    #[serde(default)]
+    pub rv_min_btc: Option<f64>,
+    #[serde(default)]
+    pub kelly_size_cap: Option<f64>,
+    #[serde(default)]
+    pub min_entry_price: Option<f64>,
+    #[serde(default)]
+    pub max_consecutive_losses: Option<u32>,
+    #[serde(default)]
+    pub stop_loss_pct: Option<f64>,
+    #[serde(default)]
+    pub fee_model: Option<String>,
+    /// Latency values (ms) to sweep. E.g. [0, 100, 250, 500, 1000].
+    pub latency_values: Vec<u64>,
+}
+
+pub async fn handle_api_backtest_latency_sweep(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<LatencySweepBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    if body.latency_values.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "latency_values must be a non-empty array of u64 milliseconds."
+        }))).into_response();
+    }
+
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+
+    let scripts_dir = workspace_dir.join("scripts");
+    let script_path = if body.script.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "script field is required for latency sweep."
+        }))).into_response();
+    } else if std::path::Path::new(&body.script).is_absolute() {
+        std::path::PathBuf::from(&body.script)
+    } else {
+        scripts_dir.join(&body.script)
+    };
+
+    if !script_path.exists() {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "error": format!("Script not found: {}", script_path.display())
+        }))).into_response();
+    }
+
+    let sizing_mode = body.sizing_mode.as_deref().unwrap_or("percent");
+    let sizing_value = body.sizing_value.unwrap_or(1.0);
+    let price_mode = body.price_mode.as_deref().unwrap_or("historical");
+    let resolution_logic = body.resolution_logic.clone().unwrap_or_else(|| "price_up".into());
+
+    let mut rows: Vec<crate::tools::backtest::LatencySweepRow> = Vec::new();
+    for &lat_ms in &body.latency_values {
+        let metrics = crate::tools::backtest::run_backtest_engine(
+            &script_path,
+            &body.market_type,
+            &body.symbol,
+            &body.interval,
+            &body.from_date,
+            &body.to_date,
+            body.initial_balance,
+            body.fee_pct,
+            &resolution_logic,
+            body.threshold,
+            body.max_position_usd,
+            body.max_entry_price,
+            sizing_mode,
+            sizing_value,
+            price_mode,
+            &workspace_dir,
+            &body.allowed_hours,
+            body.max_spread_pct,
+            body.rv_min_btc,
+            body.kelly_size_cap,
+            body.min_entry_price,
+            body.max_consecutive_losses,
+            body.stop_loss_pct,
+            Some(lat_ms),
+            body.fee_model.as_deref(),
+        )
+        .await;
+
+        let ev_per_trade_usd = if metrics.total_trades > 0 {
+            metrics.total_return_pct / 100.0 * body.initial_balance / metrics.total_trades as f64
+        } else {
+            0.0
+        };
+
+        rows.push(crate::tools::backtest::LatencySweepRow {
+            latency_ms: lat_ms,
+            total_return_pct: metrics.total_return_pct,
+            win_rate_pct: metrics.win_rate_pct,
+            total_trades: metrics.total_trades,
+            ev_per_trade_usd,
+        });
+    }
+
+    Json(serde_json::json!({
+        "symbol": body.symbol,
+        "market_type": body.market_type,
+        "from_date": body.from_date,
+        "to_date": body.to_date,
+        "initial_balance": body.initial_balance,
+        "fee_model": body.fee_model.as_deref().unwrap_or("pct"),
+        "rows": rows,
     }))
     .into_response()
 }
