@@ -121,9 +121,12 @@ def load_csv(path):
 
 # ── The three legs ──────────────────────────────────────────────────────────────
 def validate(entries, wons, iters=10000):
+    """Run the three legs. Returns a dict {n, ev, legs, edge} so other scripts
+    (phase0_backtest.py) can gate on the verdict programmatically."""
     n = len(entries)
     if n < 30:
-        print(f"  Sample too small (n={n}); cannot validate."); return
+        print(f"  Sample too small (n={n}); cannot validate.")
+        return {'n': n, 'ev': float('nan'), 'legs': (False, False, False), 'edge': False}
     real_ev = ev_per_trade(entries, wons)
     obs = real_ev.mean()
     wr = wons.mean() * 100
@@ -167,6 +170,7 @@ def validate(entries, wons, iters=10000):
     else:
         print("  ►► VERDICT: NO EDGE — consistent with luck/fees. Do NOT commit capital.")
     print()
+    return {'n': n, 'ev': obs, 'legs': (leg1, leg2, leg3), 'edge': leg1 and leg2 and leg3}
 
 
 if __name__ == '__main__':
