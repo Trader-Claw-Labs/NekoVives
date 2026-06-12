@@ -40,6 +40,9 @@ pub struct RewardMarket {
     pub score: f64,
     /// "high" | "medium" | "low" | "toxic" — qualitative safety of maker quoting here.
     pub safety: String,
+    /// CLOB token ids for posting maker quotes (YES then NO). Empty if unavailable.
+    pub yes_token_id: Option<String>,
+    pub no_token_id: Option<String>,
 }
 
 // ── CLOB sampling-markets deserialization ───────────────────────────────────────
@@ -72,6 +75,16 @@ struct RawMarket {
     rewards: Option<RawRewards>,
     #[serde(default)]
     tags: Option<Vec<String>>,
+    #[serde(default)]
+    tokens: Option<Vec<RawToken>>,
+}
+
+#[derive(Deserialize)]
+struct RawToken {
+    #[serde(default)]
+    token_id: String,
+    #[serde(default)]
+    outcome: String,
 }
 
 #[derive(Deserialize)]
@@ -181,6 +194,9 @@ pub async fn scan_reward_markets(max_pages: usize) -> Result<Vec<RewardMarket>> 
             let toxic = is_toxic(&m.question, &tags);
             let days = days_to_end(&m.end_date_iso);
             let (score, safety) = score_market(daily_rate, rewards.max_spread, days, toxic);
+            let toks = m.tokens.unwrap_or_default();
+            let yes_token_id = toks.iter().find(|t| t.outcome.eq_ignore_ascii_case("yes")).map(|t| t.token_id.clone());
+            let no_token_id = toks.iter().find(|t| t.outcome.eq_ignore_ascii_case("no")).map(|t| t.token_id.clone());
             out.push(RewardMarket {
                 condition_id: m.condition_id,
                 question: m.question,
@@ -195,6 +211,8 @@ pub async fn scan_reward_markets(max_pages: usize) -> Result<Vec<RewardMarket>> 
                 days_to_end: days,
                 score,
                 safety,
+                yes_token_id,
+                no_token_id,
             });
         }
 

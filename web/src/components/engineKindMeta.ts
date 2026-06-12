@@ -75,6 +75,15 @@ export const ENGINE_KINDS: EngineKindMeta[] = [
     example: 'Best on slow-moving markets with a stable spread (e.g. weekly sports or politics) — not for fast 5-minute crypto windows.',
     risk: 'high',
   },
+  {
+    id: 'rewards_maker',
+    label: 'Liquidity Rewards Maker',
+    summary: 'keeps a two-sided resting quote alive on a reward market to farm Polymarket liquidity rewards.',
+    description:
+      'Continuously posts a BUY YES + BUY NO pair near the mid, re-posting whichever side fills and re-centering when the mid drifts. Earns Polymarket liquidity rewards (paid in USDC at midnight UTC) for providing bilateral liquidity — it does NOT predict direction. The manual approach fails because a human can\'t keep the pair alive; this engine does.',
+    example: 'Use ONLY on slow markets (politics, SpaceX FDV, far-dated events) where adverse selection is low. NEVER on crypto 5m/15m (toxic). Start in Dry Run.',
+    risk: 'low',
+  },
 ]
 
 export function engineKindMeta(id: string): EngineKindMeta | undefined {

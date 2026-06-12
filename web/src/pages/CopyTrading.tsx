@@ -90,6 +90,7 @@ export default function CopyTrading() {
   const [newWeight, setNewWeight] = useState('1.0')
   const [newScore, setNewScore] = useState('')
   const [newMirror, setNewMirror] = useState(false)
+  const [newAutoValidate, setNewAutoValidate] = useState(true) // validate (HFT + edge) right after adding
   const [formError, setFormError] = useState<string | null>(null)
 
   const { data: leadersData, isLoading: leadersLoading } = useQuery({
@@ -163,6 +164,17 @@ export default function CopyTrading() {
   const invalidateLeaders = () =>
     queryClient.invalidateQueries({ queryKey: ['copy-leaders'] })
 
+  const [validatingAll, setValidatingAll] = useState(false)
+  async function validateAll() {
+    const addrs = (leadersData?.leaders ?? []).map(l => l.address)
+    setValidatingAll(true)
+    // Sequential to avoid hammering data-api; each validate paginates onchain activity.
+    for (const a of addrs) {
+      await runValidate(a)
+    }
+    setValidatingAll(false)
+  }
+
   async function runValidate(addr: string) {
     setValidating(addr)
     try {
@@ -196,14 +208,20 @@ export default function CopyTrading() {
   })
 
   const addMutation = useMutation({
-    mutationFn: (body: Record<string, unknown>) => apiPost('/api/copy/leaders', body),
-    onSuccess: () => {
+    mutationFn: (body: Record<string, unknown>) => apiPost('/api/copy/leaders', body).then(() => body),
+    onSuccess: (body) => {
+      const addr = (body as { address?: string }).address
       setShowAdd(false)
       setNewAddr('')
       setNewCategory('')
       setNewScore('')
       setFormError(null)
       invalidateLeaders()
+      // Auto-validate the new wallet (HFT + edge check) so the user immediately
+      // sees whether it's worth copying — the default-on behaviour.
+      if (newAutoValidate && addr) {
+        runValidate(addr)
+      }
     },
     onError: (err: Error) => setFormError(err.message),
   })
@@ -325,17 +343,28 @@ export default function CopyTrading() {
         </div>
         <div className="flex items-center gap-2">
           {activeTab === 'leaders' && (
-            <button
-              onClick={() => {
-                setShowAdd((v) => !v)
-                setFormError(null)
-              }}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium"
-              style={{ backgroundColor: 'var(--color-accent)', color: '#000' }}
-            >
-              <Plus size={14} />
-              Add leader
-            </button>
+            <>
+              <button
+                onClick={() => {
+                  setShowAdd((v) => !v)
+                  setFormError(null)
+                }}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium"
+                style={{ backgroundColor: 'var(--color-accent)', color: '#000' }}
+              >
+                <Plus size={14} />
+                Add leader
+              </button>
+              <button
+                onClick={validateAll}
+                disabled={validatingAll}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium"
+                style={{ background: 'var(--color-surface-2)', color: 'var(--color-accent)', border: '1px solid var(--color-border)' }}
+                title="Run the HFT + edge validator on every leader"
+              >
+                🔍 {validatingAll ? 'Validating all…' : 'Validate All'}
+              </button>
+            </>
           )}
           <div className="flex items-center gap-2 flex-wrap">
             {/* Capital under management */}
@@ -541,6 +570,18 @@ export default function CopyTrading() {
                 }}
               />
             </div>
+            <label
+              className="flex items-center gap-2 text-xs px-3 py-1.5"
+              style={{ color: 'var(--color-text-muted)' }}
+              title="Run the HFT + edge validator right after adding"
+            >
+              <input
+                type="checkbox"
+                checked={newAutoValidate}
+                onChange={(e) => setNewAutoValidate(e.target.checked)}
+              />
+              Validate (HFT + edge) on add
+            </label>
             <label
               className="flex items-center gap-2 text-xs px-3 py-1.5"
               style={{ color: 'var(--color-text-muted)' }}

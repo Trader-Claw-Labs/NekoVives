@@ -21,7 +21,12 @@
 //   C. YES > 0.75 but BTC DOWN   → buy NO  (fade wrong-side favourite)
 //   D. YES < 0.25 but BTC UP     → buy YES (fade wrong-side underdog)
 //
-// Sizing: 10% of balance (higher confidence = slightly larger stake).
+// Sizing: 5% of balance per bet, further capped by the runner's live_sizing
+// value (cap_per_bet in tick_runner_loop). For the $50 pilot this means
+// stake = min(5% × balance, cap_per_bet). Set the runner to Fixed $1-$2 to
+// keep ~30-40 trades of margin for statistical validation.
+// NOTE: kelly_size_cap does NOT apply to the tick runner — only cap_per_bet
+// (derived from live_sizing_mode) bounds the stake here.
 
 fn on_tick(ctx) {
     if ctx.position != 0 { return; }
@@ -49,9 +54,10 @@ fn on_tick(ctx) {
     if ctx.yes_ask < 0.03 || ctx.no_ask < 0.03 { return; }
 
     let change_pct = (ctx.binance_price - wopen) / wopen * 100.0;
-    // Sizing: 35% of balance (capped at $600 by the backtest engine's
-    // max_position_usd setting — actual stake will be min(35% balance, $600))
-    let stake = 0.35;
+    // Sizing: 5% of balance. Actual stake = min(5% × balance, cap_per_bet),
+    // where cap_per_bet comes from the runner's live_sizing_value. For the
+    // $50 pilot set the runner to Fixed $1-$2 to preserve trade count.
+    let stake = 0.05;
 
     // ── Setup A: BTC clearly UP, YES not at ceiling ──
     if change_pct > 0.04 && ctx.yes_ask < 0.80 {

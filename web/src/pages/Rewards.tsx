@@ -1,13 +1,15 @@
 import { useState, useEffect } from 'react'
-import { useQuery } from '@tanstack/react-query'
-import { apiFetch } from '../hooks/useApi'
-import { Coins, Shield, RefreshCw, AlertCircle, AlertTriangle, Save } from 'lucide-react'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { apiFetch, apiPost } from '../hooks/useApi'
+import { Coins, Shield, RefreshCw, AlertCircle, AlertTriangle, Save, X } from 'lucide-react'
 import clsx from 'clsx'
 import ArbScanner from '../components/ArbScanner'
 import RewardsPositions from '../components/RewardsPositions'
 
 // ── Types ─────────────────────────────────────────────────────────────────
 interface RewardMarket {
+  yes_token_id?: string | null
+  no_token_id?: string | null
   condition_id: string
   question: string
   market_slug: string
@@ -73,6 +75,33 @@ export default function RewardsPage() {
   const [limit, setLimit] = useState(60)
   const [cfg, setCfg] = useState<RewardsConfig>(loadConfig)
   const [saved, setSaved] = useState(false)
+  // Quote modal state
+  const [quoteMarket, setQuoteMarket] = useState<RewardMarket | null>(null)
+  const [quoteSize, setQuoteSize] = useState('')
+  const [quoteOffset, setQuoteOffset] = useState('1.0')
+  const [quoteBusy, setQuoteBusy] = useState(false)
+  const [quoteResult, setQuoteResult] = useState<string | null>(null)
+  const qc = useQueryClient()
+
+  async function submitQuote() {
+    if (!quoteMarket?.yes_token_id || !quoteMarket?.no_token_id) return
+    setQuoteBusy(true); setQuoteResult(null)
+    try {
+      const r = await apiPost<{ both_placed: boolean; yes: Record<string, unknown>; no: Record<string, unknown> }>(
+        '/api/rewards/quote', {
+          yes_token_id: quoteMarket.yes_token_id,
+          no_token_id: quoteMarket.no_token_id,
+          size_usd: Number(quoteSize) || quoteMarket.min_size,
+          offset_c: Number(quoteOffset) || 1.0,
+        })
+      setQuoteResult(r.both_placed ? '✓ Both quotes placed and resting in the book.' : '⚠ Partial: ' + JSON.stringify(r))
+      qc.invalidateQueries({ queryKey: ['poly-orders-rewards'] })
+    } catch (e) {
+      setQuoteResult('✗ ' + (e as Error).message)
+    } finally {
+      setQuoteBusy(false)
+    }
+  }
 
   const { data, isLoading, isError, error, refetch, isFetching } = useQuery<RewardsResponse>({
     queryKey: ['rewards', includeToxic, maxPages, limit],
@@ -227,7 +256,7 @@ export default function RewardsPage() {
           style={{ borderColor: 'var(--color-border)', background: 'var(--color-surface)' }}>
           <div className="grid text-[11px] font-semibold px-3 py-2 border-b"
             style={{
-              gridTemplateColumns: '1fr 70px 80px 70px 70px 70px',
+              gridTemplateColumns: '1fr 70px 80px 70px 70px 70px 64px',
               borderColor: 'var(--color-border)', color: 'var(--color-text-muted)',
             }}>
             <span>Market</span>
@@ -236,12 +265,13 @@ export default function RewardsPage() {
             <span className="text-right">Min size</span>
             <span className="text-right">Days left</span>
             <span className="text-right">Safety</span>
+            <span className="text-right">Quote</span>
           </div>
           {markets.map((m, i) => (
             <div key={m.condition_id + i}
               className="grid text-xs items-center px-3 py-2.5 border-b hover:bg-white/5"
               style={{
-                gridTemplateColumns: '1fr 70px 80px 70px 70px 70px',
+                gridTemplateColumns: '1fr 70px 80px 70px 70px 70px 64px',
                 borderColor: 'var(--color-border)', color: 'var(--color-text)',
               }}>
               <div className="flex items-center gap-1.5 pr-2 min-w-0">
@@ -268,6 +298,18 @@ export default function RewardsPage() {
                   {m.safety}
                 </span>
               </span>
+              <span className="text-right">
+                {m.yes_token_id && m.no_token_id ? (
+                  <button
+                    onClick={() => { setQuoteMarket(m); setQuoteSize(String(m.min_size)); setQuoteResult(null) }}
+                    className="px-2 py-0.5 rounded text-[10px] font-semibold"
+                    style={{ background: 'var(--color-accent)', color: '#000' }}
+                    title="Post a two-sided maker quote"
+                  >Quote</button>
+                ) : (
+                  <span className="text-[10px]" style={{ color: 'var(--color-text-muted)' }}>—</span>
+                )}
+              </span>
             </div>
           ))}
           {markets.length === 0 && (
@@ -275,6 +317,56 @@ export default function RewardsPage() {
               No markets match the current safety filter.
             </div>
           )}
+        </div>
+      )}
+
+      {/* Quote modal — post a two-sided maker quote */}
+      {quoteMarket && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" onClick={() => setQuoteMarket(null)}>
+          <div className="rounded-xl border w-full max-w-md" style={{ background: 'var(--color-surface)', borderColor: 'var(--color-border)' }} onClick={e => e.stopPropagation()}>
+            <div className="flex items-center justify-between p-4 border-b" style={{ borderColor: 'var(--color-border)' }}>
+              <span className="text-sm font-semibold" style={{ color: 'var(--color-text)' }}>Post Maker Quote</span>
+              <button onClick={() => setQuoteMarket(null)}><X size={14} style={{ color: 'var(--color-text-muted)' }} /></button>
+            </div>
+            <div className="p-4 space-y-3">
+              <p className="text-xs" style={{ color: 'var(--color-text-muted)' }}>{quoteMarket.question}</p>
+              <div className="text-[11px] flex gap-3" style={{ color: 'var(--color-text-muted)' }}>
+                <span>reward {quoteMarket.daily_rate.toFixed(0)}/d</span>
+                <span>band {quoteMarket.max_spread}¢</span>
+                <span>min ${quoteMarket.min_size}</span>
+                {quoteMarket.is_toxic && <span style={{ color: SAFETY_COLOR.toxic }}>⚠ toxic</span>}
+              </div>
+              <label className="block text-xs" style={{ color: 'var(--color-text-muted)' }}>
+                Size per side ($) — total = 2× this
+                <input type="number" value={quoteSize} onChange={e => setQuoteSize(e.target.value)} min={quoteMarket.min_size}
+                  className="w-full mt-1 px-2 py-1.5 rounded border text-xs"
+                  style={{ background: 'var(--color-surface-2)', borderColor: 'var(--color-border)', color: 'var(--color-text)' }} />
+                {Number(quoteSize) < quoteMarket.min_size && (
+                  <span style={{ color: 'var(--color-warning)' }}>Below min_size ${quoteMarket.min_size} — won't earn rewards.</span>
+                )}
+              </label>
+              <label className="block text-xs" style={{ color: 'var(--color-text-muted)' }}>
+                Offset inside band (¢) — distance from mid each side
+                <input type="number" value={quoteOffset} onChange={e => setQuoteOffset(e.target.value)} min={0.1} step={0.1} max={quoteMarket.max_spread / 2}
+                  className="w-full mt-1 px-2 py-1.5 rounded border text-xs"
+                  style={{ background: 'var(--color-surface-2)', borderColor: 'var(--color-border)', color: 'var(--color-text)' }} />
+              </label>
+              {quoteResult && (
+                <p className="text-xs p-2 rounded" style={{
+                  background: quoteResult.startsWith('✓') ? 'rgba(74,222,128,0.1)' : 'rgba(239,68,68,0.1)',
+                  color: quoteResult.startsWith('✓') ? '#4ade80' : '#f87171' }}>{quoteResult}</p>
+              )}
+            </div>
+            <div className="flex gap-2 p-4 border-t" style={{ borderColor: 'var(--color-border)' }}>
+              <button onClick={() => setQuoteMarket(null)} className="flex-1 px-3 py-2 rounded text-xs"
+                style={{ background: 'var(--color-base)', color: 'var(--color-text)', border: '1px solid var(--color-border)' }}>Close</button>
+              <button onClick={submitQuote} disabled={quoteBusy}
+                className="flex-1 px-3 py-2 rounded text-xs font-semibold"
+                style={{ background: 'var(--color-accent)', color: '#000' }}>
+                {quoteBusy ? 'Placing…' : 'Place 2-sided quote'}
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>

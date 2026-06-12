@@ -850,6 +850,9 @@ async fn runner_loop(
         strategy_core::engines::RHAI_TICK => {
             tick_runner_loop(store, config, workspace_dir).await;
         }
+        strategy_core::engines::REWARDS_MAKER => {
+            crate::engines::rewards_maker::run_rewards_maker_loop(store, config, workspace_dir).await;
+        }
         // "rhai_candle" or None → legacy path (unchanged behaviour)
         _ => {
             if config.market_type == "polymarket_binary" {
@@ -5188,7 +5191,7 @@ async fn persist_polymarket_creds(
     Ok(())
 }
 
-fn append_runner_log(store: &Arc<StrategyRunnerStore>, id: &str, msg: &str) {
+pub(crate) fn append_runner_log(store: &Arc<StrategyRunnerStore>, id: &str, msg: &str) {
     let mut map = store.runners.lock().unwrap();
     if let Some(r) = map.get_mut(id) {
         // Append to error field as a log (reuse for simplicity; shown in UI)
@@ -5664,12 +5667,15 @@ async fn tick_runner_loop(
     let cur_fee       = Arc::new(Mutex::new(config.fee_pct));
     let cur_ask_depth = Arc::new(Mutex::new(0f64));
     let cur_bid_depth = Arc::new(Mutex::new(0f64));
+    // Tick-runner per-bet cap. Floor is $1 (not $5 like the on_candle path)
+    // so small-capital pilots ($50) can run enough trades for statistical
+    // validation — at $5/trade a $50 bankroll only survives ~10 trades.
     let cap_per_bet: f64 = match config.live_sizing_mode {
-        LiveSizingMode::Fixed => config.live_sizing_value.max(5.0),
+        LiveSizingMode::Fixed => config.live_sizing_value.max(1.0),
         LiveSizingMode::Percent => {
             // live_sizing_value stored as 0–100 percent of initial_balance
             let frac = (config.live_sizing_value / 100.0).clamp(0.0, 1.0);
-            (config.initial_balance * frac).max(5.0)
+            (config.initial_balance * frac).max(1.0)
         }
     };
     let max_pos_usd_arc = Arc::new(Mutex::new(cap_per_bet));

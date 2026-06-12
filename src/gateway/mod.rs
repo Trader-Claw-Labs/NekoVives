@@ -897,6 +897,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             "/api/polymarket/order",
             post(api::handle_api_polymarket_order_create),
         )
+        .route("/api/rewards/quote", post(api::handle_api_rewards_quote))
         .route(
             "/api/polymarket/order/{id}",
             delete(api::handle_api_polymarket_order_cancel),

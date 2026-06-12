@@ -2393,6 +2393,35 @@ pub async fn handle_api_rewards_history(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+
+    // Preferred: the OFFICIAL Polymarket rewards earnings per UTC day (last 7 days),
+    // via the authenticated CLOB endpoint. Falls back to the balance-delta proxy below
+    // if creds are missing or the API errors.
+    if let Some(creds) = get_poly_creds(&state).filter(|c| !c.api_key.is_empty()) {
+        let client = polymarket_trader::orders::ClobClient::new(creds);
+        let mut official = Vec::new();
+        let mut any_ok = false;
+        for back in 0..7 {
+            let date = (chrono::Utc::now() - chrono::Duration::days(back))
+                .format("%Y-%m-%d").to_string();
+            match client.get_rewards_earnings(&date).await {
+                Ok(usd) => { any_ok = true; official.push(serde_json::json!({ "date": date, "earned_usdc": usd })); }
+                Err(_) => {}
+            }
+        }
+        if any_ok {
+            let total: f64 = official.iter()
+                .filter_map(|r| r.get("earned_usdc").and_then(|v| v.as_f64())).sum();
+            return Json(serde_json::json!({
+                "status": "official",
+                "source": "polymarket /rewards/user/markets",
+                "total_7d_usdc": total,
+                "history": official,
+                "note": "Official Polymarket liquidity-reward earnings per UTC day (paid at midnight UTC)."
+            })).into_response();
+        }
+    }
+
     let snap_path = state.config.lock().workspace_dir
         .join("data").join("balance_snapshots.jsonl");
     let content = match std::fs::read_to_string(&snap_path) {
@@ -2461,6 +2490,26 @@ fn get_poly_wallet_address(state: &AppState) -> Option<String> {
         .wallet_address
         .clone()
         .filter(|w| !w.trim().is_empty())
+}
+
+/// Resolve (yes_token_id, no_token_id) for a fixed market by condition_id via the CLOB.
+/// Used by the rewards_maker engine which quotes one market, not a rolling series.
+async fn resolve_tokens_for_condition(condition_id: &str) -> anyhow::Result<(String, String)> {
+    let url = format!("https://clob.polymarket.com/markets/{condition_id}");
+    let v: serde_json::Value = reqwest::Client::new()
+        .get(&url).header("User-Agent", "trader-claw")
+        .timeout(std::time::Duration::from_secs(15))
+        .send().await?.json().await?;
+    let tokens = v.get("tokens").and_then(|t| t.as_array())
+        .ok_or_else(|| anyhow::anyhow!("no tokens for condition {condition_id}"))?;
+    let mut yes = None; let mut no = None;
+    for t in tokens {
+        let outcome = t.get("outcome").and_then(|o| o.as_str()).unwrap_or("").to_lowercase();
+        let tid = t.get("token_id").and_then(|i| i.as_str()).map(str::to_string);
+        if outcome == "yes" { yes = tid; } else if outcome == "no" { no = tid; }
+    }
+    Ok((yes.ok_or_else(|| anyhow::anyhow!("no YES token"))?,
+        no.ok_or_else(|| anyhow::anyhow!("no NO token"))?))
 }
 
 async fn resolve_live_token_ids(series_id: Option<&str>) -> anyhow::Result<(String, String)> {
@@ -2922,6 +2971,70 @@ pub async fn handle_api_polymarket_order_create(
         )
             .into_response(),
     }
+}
+
+#[derive(Deserialize)]
+pub struct RewardsQuoteBody {
+    pub yes_token_id: String,
+    pub no_token_id: String,
+    /// USD size per side (each leg). Must be >= the market's min_size to earn rewards.
+    pub size_usd: f64,
+    /// Cents inside the eligible band to rest each side (e.g. 1.0). Lower = closer to mid
+    /// (higher reward score, more adverse-selection risk).
+    #[serde(default = "default_offset_c")]
+    pub offset_c: f64,
+}
+fn default_offset_c() -> f64 { 1.0 }
+
+/// POST /api/rewards/quote — place a two-sided maker quote for liquidity rewards.
+/// Reads the live YES mid, posts a BUY YES limit at (mid - offset) and a BUY NO limit
+/// at (1 - mid - offset), each sized `size_usd`. Both rest in the book (maker) → eligible
+/// for rewards. Returns both order ids. This is the "add position" action for /rewards.
+pub async fn handle_api_rewards_quote(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<RewardsQuoteBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+    let creds = match get_poly_creds(&state) {
+        Some(c) if !c.api_key.is_empty() => c,
+        _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "Polymarket credentials not configured (Settings → Config)."
+        }))).into_response(),
+    };
+    let client = polymarket_trader::orders::ClobClient::new(creds);
+    use polymarket_trader::orders::Side;
+
+    // Live YES mid from the CLOB.
+    let yes_ask = polymarket_trader::markets::get_market_price(&body.yes_token_id).await.unwrap_or(0.0);
+    if !(yes_ask > 0.02 && yes_ask < 0.98) {
+        return (StatusCode::BAD_GATEWAY, Json(serde_json::json!({
+            "error": format!("Could not read a sane YES price (got {yes_ask:.3}). Try again.")
+        }))).into_response();
+    }
+    let off = (body.offset_c / 100.0).max(0.0);
+    let yes_px = ((yes_ask - off) * 100.0).round() / 100.0;
+    let no_px = ((1.0 - yes_ask - off) * 100.0).round() / 100.0;
+    if yes_px <= 0.01 || no_px <= 0.01 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "Computed quote price <= 0.01; offset too large for this market."
+        }))).into_response();
+    }
+    let yes_shares = (body.size_usd / yes_px).round();
+    let no_shares = (body.size_usd / no_px).round();
+
+    let yes_res = client.create_limit_order(&body.yes_token_id, Side::Buy, yes_px, yes_shares).await;
+    let no_res = client.create_limit_order(&body.no_token_id, Side::Buy, no_px, no_shares).await;
+
+    let fmt = |r: &anyhow::Result<polymarket_trader::orders::OrderResponse>| match r {
+        Ok(resp) => serde_json::json!({ "order_id": resp.order_id, "status": resp.status }),
+        Err(e) => serde_json::json!({ "error": e.to_string() }),
+    };
+    Json(serde_json::json!({
+        "yes": { "price": yes_px, "shares": yes_shares, "result": fmt(&yes_res) },
+        "no": { "price": no_px, "shares": no_shares, "result": fmt(&no_res) },
+        "both_placed": yes_res.is_ok() && no_res.is_ok(),
+    })).into_response()
 }
 
 /// DELETE /api/polymarket/order/:id — cancel an open order
@@ -5162,6 +5275,10 @@ pub struct CreateRunnerBody {
     /// Minimum entry price. Skip orders when token ask < this value. Default 0.05.
     #[serde(default)]
     pub min_entry_price: Option<f64>,
+    /// Polymarket condition_id — used by the rewards_maker engine to resolve the
+    /// YES/NO token ids at startup (the maker quotes a single fixed market, not a series).
+    #[serde(default)]
+    pub poly_condition_id: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -5266,7 +5383,21 @@ async fn hydrate_live_runtime_config(
         anyhow::bail!("Live mode requires polymarket.private_key for EIP-712 order signing. Go to Settings → Polymarket and set your wallet private key.");
     }
 
-    let (yes_token_id, no_token_id) = resolve_live_token_ids(config.series_id.as_deref()).await?;
+    // The rewards_maker engine resolves its own YES/NO tokens from the condition_id
+    // (stored in `symbol`/`poly_condition_id`) — it quotes one fixed market, not a
+    // rolling series, so it must NOT go through the series-based token resolver.
+    let (yes_token_id, no_token_id) = if config.kind.as_deref() == Some(strategy_core::engines::REWARDS_MAKER) {
+        let cid = config.poly_condition_id.clone()
+            .or_else(|| if config.symbol.starts_with("0x") { Some(config.symbol.clone()) } else { None })
+            .ok_or_else(|| anyhow::anyhow!("rewards_maker live mode needs poly_condition_id"))?;
+        match polymarket_trader::markets::get_resolution_by_condition_id(&cid).await {
+            // get_resolution returns Option<bool>; we need the token ids, so fetch the
+            // CLOB market directly here for YES/NO.
+            _ => resolve_tokens_for_condition(&cid).await?,
+        }
+    } else {
+        resolve_live_token_ids(config.series_id.as_deref()).await?
+    };
     let min_live_usdc = 1.0;
     if config.mode == "live" {
         let proxy_for_check = poly.proxy_address.clone().filter(|k| !k.trim().is_empty());
@@ -5610,7 +5741,7 @@ pub async fn handle_api_live_create(
         poly_creds: None,
         poly_token_id: None,
         poly_no_token_id: None,
-        poly_condition_id: None,
+        poly_condition_id: body.poly_condition_id,
         wallet_address: None,
         chainlink_endpoint_url: None,
         chainlink_api_key: None,

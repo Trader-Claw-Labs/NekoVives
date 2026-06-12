@@ -545,6 +545,61 @@ impl ClobClient {
         Ok(out)
     }
 
+    /// GET /rewards/user/markets?date=YYYY-MM-DD — the OFFICIAL liquidity-rewards
+    /// earnings for the authenticated user on a given UTC day. Returns total USDC
+    /// earned across all reward markets that day. This is the real reward number
+    /// (not the balance-delta proxy) — the `earnings` field summed across markets.
+    pub async fn get_rewards_earnings(&self, date: &str) -> anyhow::Result<f64> {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE};
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        type HmacSha256 = Hmac<Sha256>;
+
+        let address = {
+            let pk_hex = self.creds.private_key.as_deref()
+                .ok_or_else(|| anyhow::anyhow!("private_key required for /rewards"))?;
+            let signer = LocalSigner::from_str(pk_hex)?.with_chain_id(Some(POLYGON));
+            signer.address()
+        };
+        let path = "/rewards/user/markets";
+        let qs = format!("?date={date}");
+        let url = format!("{CLOB_BASE_URL}{path}{qs}");
+        let ts = chrono::Utc::now().timestamp();
+        let message = format!("{ts}GET{path}");
+        let decoded_secret = URL_SAFE.decode(self.creds.secret.as_bytes())
+            .map_err(|e| anyhow::anyhow!("Invalid base64 CLOB secret: {e}"))?;
+        let mut mac = HmacSha256::new_from_slice(&decoded_secret)
+            .map_err(|e| anyhow::anyhow!("HMAC init failed: {e}"))?;
+        mac.update(message.as_bytes());
+        let signature = URL_SAFE.encode(mac.finalize().into_bytes());
+
+        let http = reqwest::Client::new();
+        let resp = http.get(&url)
+            .header("POLY_ADDRESS",    address.to_checksum(None))
+            .header("POLY_API_KEY",    &self.creds.api_key)
+            .header("POLY_PASSPHRASE", &self.creds.passphrase)
+            .header("POLY_SIGNATURE",  signature)
+            .header("POLY_TIMESTAMP",  ts.to_string())
+            .timeout(std::time::Duration::from_secs(20))
+            .send().await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("/rewards/user/markets returned {}", resp.status());
+        }
+        let json: serde_json::Value = resp.json().await?;
+        let rows = json.get("data").and_then(|v| v.as_array()).cloned()
+            .or_else(|| json.as_array().cloned()).unwrap_or_default();
+        // Sum the `earnings` array across all markets.
+        let mut total = 0.0_f64;
+        for m in &rows {
+            if let Some(earnings) = m.get("earnings").and_then(|v| v.as_array()) {
+                for e in earnings {
+                    total += e.get("earnings").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                }
+            }
+        }
+        Ok(total)
+    }
+
     /// GET /data/trades — paginated history of the authenticated user's
     /// executed trades. Each entry includes the **real on-chain fill price**,
     /// match time, and transaction hash — the data we need to correct the
