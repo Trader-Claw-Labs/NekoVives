@@ -29,6 +29,12 @@ keywords = ["ai", "agent", "cli", "assistant", "chatbot"]
 categories = ["command-line-utilities", "api-bindings"]
 rust-version = "1.86"
 
+# Headless single-strategy runner for VPS deploys (docs/VPS_EXECUTION_PLAN.md Fase 1).
+# Build: cargo build --release --bin nv-runner
+[[bin]]
+name = "nv-runner"
+path = "src/bin/nv_runner.rs"
+
 [dependencies]
 # CLI - minimal and fast
 clap = { version = "4.5", features = ["derive"] }

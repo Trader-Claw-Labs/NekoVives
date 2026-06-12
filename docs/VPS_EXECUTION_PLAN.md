@@ -81,6 +81,38 @@ Sobre los 33-41 días de ticks reales:
 
 ---
 
+## Cómo ejecutar (tooling implementado)
+
+### Fase 0 — en la laptop, donde viven los ticks
+```bash
+# 0a + 0b sobre btc_5m con latencia simulada de 220ms y resolución oficial:
+python3 scripts/ml/phase0_backtest.py
+
+# Variantes:
+python3 scripts/ml/phase0_backtest.py --phase 0a --slug btc_5m --slug eth_5m --move-bps 8
+python3 scripts/ml/phase0_backtest.py --phase 0b --latency-ms 110
+```
+Imprime los gates (0a: EV>0 con n≥500; 0b: 3 legs PASS) y la decisión de Fase 0.
+Exporta los trades a `/tmp/phase0_*.csv` para re-validar con `edge_validator.py --source csv`.
+Requiere `window_yes_won` backfilleado (`tools/orderbook_parser.py backfill-resolutions`).
+
+### Fase 1 — binario headless `nv-runner`
+```bash
+# Compilar LOCAL (la VPS de 4GB no compila Rust) y subir:
+cargo build --release --bin nv-runner
+scp target/release/nv-runner vps:/opt/nv/
+
+# Config de ejemplo + unidad systemd:
+scripts/deploy/nv-runner.rewards_maker.example.json   # condition_id en `symbol`
+scripts/deploy/nv-runner.service                       # journalctl -u nv-runner -f
+```
+Secrets SOLO por env (`POLY_*` en `/opt/nv/nv-runner.env`, chmod 600) — nunca en el
+config JSON. `systemctl stop` manda SIGTERM y el runner cancela sus quotes resting
+antes de salir (gracia de 75s para rewards_maker). Estado en
+`<workspace>/live_strategies.json`, el mismo formato del dashboard.
+
+---
+
 ## Regla de la casa (la que nos ha salvado)
 Ningún capital se escala por un TARGET de profit. Se escala por un GATE de validación
 cumplido. El profit es consecuencia de un edge real medido, no una meta que se persigue.

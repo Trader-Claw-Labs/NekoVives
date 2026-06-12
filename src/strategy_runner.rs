@@ -818,7 +818,10 @@ pub fn start_runner(
 
 // ── Background runner loop ────────────────────────────────────────────────────
 
-async fn runner_loop(
+/// Public so the headless `nv-runner` binary can drive a single engine loop
+/// directly and keep the JoinHandle for graceful shutdown (the dashboard path
+/// goes through `start_runner`, which only keeps an AbortHandle).
+pub async fn runner_loop(
     store: Arc<StrategyRunnerStore>,
     config: RunnerConfig,
     workspace_dir: PathBuf,

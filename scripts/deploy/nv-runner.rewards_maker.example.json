@@ -1,0 +1,21 @@
+{
+  "_comment": "RunnerConfig de ejemplo para nv-runner — rewards_maker (Fase 1 del VPS plan). El condition_id del mercado a cotizar va en `symbol` (0x…, así sobrevive reinicios). live_sizing_value = USD por lado. Cambiar mode a 'live' SOLO con las env POLY_* cargadas y después de validar en paper.",
+  "id": "vps-rewards-maker-1",
+  "name": "rewards_maker VPS $100 pilot",
+  "script": "",
+  "market_type": "polymarket_binary",
+  "symbol": "0xPONER_CONDITION_ID_AQUI",
+  "interval": "1m",
+  "mode": "paper",
+  "initial_balance": 100.0,
+  "fee_pct": 0.0,
+  "warmup_days": 0,
+  "auto_restart": false,
+  "kind": "rewards_maker",
+  "live_sizing_mode": "fixed",
+  "live_sizing_value": 50.0,
+  "kelly_size_cap": 1.5,
+  "min_entry_price": 0.05,
+  "max_runner_loss_pct": 0.2,
+  "max_consecutive_losses": 5
+}
