@@ -340,17 +340,25 @@ python3 tools/orderbook_parser.py to-candles --market 0x... --slug ob_test \
 # Auto-detect all recurring 5/15/60-min series and convert in one shot
 python3 tools/orderbook_parser.py to-ticks-multi --days 40
 
+# List ALL markets in local parquets (crypto + politics + sports + esports),
+# ranked by event volume. --enrich adds question/slug via the CLOB endpoint;
+# --filter searches by keyword. Feeds `to-events --market`.
+python3 tools/orderbook_parser.py list-markets --in ~/.traderclaw/workspace/data/orderbook/ --limit 30 --enrich
+python3 tools/orderbook_parser.py list-markets --in ~/.traderclaw/workspace/data/orderbook/ --filter election
+
 # Convert downloaded parquets → sub-second (ms) EVENT stream for the clob_events
 # engine (BACKTEST_ENGINE_PLAN.md Fase A). Keeps every event at ms resolution
 # (no 1Hz decimation) and BOTH the YES and NO books separately (real two-sided
-# book, not no = 1 − yes). Output: data/events/<slug>/YYYY-MM-DD.jsonl.gz.
-# Single arbitrary market:
-python3 tools/orderbook_parser.py to-events --market 0x... --slug btc_5m_ev \
-  --binance-symbol BTCUSDT \
+# book, not no = 1 − yes). Consecutive unchanged book-tops are deduped by default
+# (the archive re-emits ~93% unchanged); pass --no-dedup to keep them all.
+# Output: data/events/<slug>/YYYY-MM-DD.jsonl.gz.
+# Single arbitrary market (works for politics/sports/etc., not just crypto):
+python3 tools/orderbook_parser.py to-events --market 0x... --slug republicans_2028 \
   --in ~/.traderclaw/workspace/data/orderbook/ \
   --out ~/.traderclaw/workspace/data/events/
 # Rolling updown series (discovers each window's condition_id):
 python3 tools/orderbook_parser.py to-events --series-prefix btc-updown-5m --slug btc_5m_ev \
+  --binance-symbol BTCUSDT \
   --in ~/.traderclaw/workspace/data/orderbook/ --out ~/.traderclaw/workspace/data/events/
 
 # Backfill official Polymarket resolution (window_yes_won) into EXISTING tick JSONL files.
@@ -371,6 +379,11 @@ Only BTC and ETH have 15m series; 1h exists for BTC only.
 - DuckDB `custom_user_agent` must be set at connection creation (not via `SET` after open)
 - Archive files have gaps (missing hours) — `filter_available_urls()` pre-checks each URL
 - NO price = 1 − YES price: `no_bid = 1 − yes_ask`, `no_ask = 1 − yes_bid`
+- **Gamma `/markets?condition_id=` SILENTLY IGNORES the filter** and returns an arbitrary
+  market — never use it for per-market lookup. Use the CLOB `/markets/{condition_id}`
+  endpoint (`fetch_clob_market()`), a true key-value lookup that also exposes per-token
+  `winner` flags for official resolution. Gamma `?slug=` filtering DOES work (used by
+  `backfill-resolutions`), so existing tick `window_yes_won` values are correct.
 
 **Gateway API routes** (all require Bearer auth):
 - `POST /api/orderbook/query`            — remote DuckDB query (modes: summary, top-markets, price-series, spread-stats, drift)
