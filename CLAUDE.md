@@ -492,6 +492,28 @@ rewards pilot got wrong. engine_params: `offset_cents`, `reprice_threshold`, `si
   and a held-out test split, validates each, and reports `holds_out_of_sample`. An edge
   that only survives in-sample is overfit, not edge.
 
+### Batch validation — `trader-claw validate-all`
+CLI subcommand (`src/tools/validate_all.rs`) that runs EVERY `.rhai` in
+`<workspace>/scripts/` through its matching engine (on_candle→archive_candles,
+on_tick→clob_1hz, on_event→clob_events) over the available data with the crypto_taker
+fee + official resolution, then the 3-leg edge_validator on each. Prints a table ordered
+by verdict (EDGE / NO_EDGE / INSUFFICIENT / N/A). Slug routing: per-asset scripts
+(eth/sol/xrp/…) map to that asset's 5m slug, else btc_5m; on_event uses `_ev` slugs.
+`--include-events` adds on_event scripts (needs data/events/<slug>).
+**Result (jun-2026): 0 EDGE of 59 — all binary strategies pass Leg1/Leg2 but fail the
+shuffle-null (Leg3); the 5m market is calibrated, no residual directional edge.**
+
+### Parametrized latency sweep (on_event)
+`clob_events_latency_sweep_export` test, env-overridable for any on_event script / VPS:
+```
+NV_SWEEP_SCRIPT=clob_events_late_certainty.rhai NV_SWEEP_LATS=0,30,50,80,110 \
+  cargo test --lib clob_events_latency_sweep_export -- --ignored --nocapture
+```
+⚠ The clob_events engine zeroes out trades when the event stream has a large DATE GAP
+in [from,to] (a stray day far from the contiguous block, esp. one generated without
+`--binance-symbol`). Run sweeps over a contiguous range. See
+`scripts/clob_events_late_certainty_sweep/README.md`.
+
 ## Dynamic Asset Selector (`src/tools/asset_selector.rs`)
 Rolling 30-day win-rate tracker per (script × symbol). Automatically records
 every resolved live trade. Capital allocation weights are proportional to rolling WR.
