@@ -491,6 +491,25 @@ Examples:
         to: String,
     },
 
+    /// Validate EVERY strategy script through its engine + the 3-leg edge_validator.
+    ///
+    /// Runs each .rhai in <workspace>/scripts/ over the available historical data
+    /// (on_candle→archive_candles, on_tick→clob_1hz, on_event→clob_events) with the
+    /// crypto_taker fee model + official resolution, then the bootstrap-CI /
+    /// random-null / shuffle-null tests. Prints a table ordered by verdict.
+    ///
+    /// Example:
+    ///   trader-claw validate-all
+    ///   trader-claw validate-all --include-events   (once data/events/ is populated)
+    ValidateAll {
+        /// Also validate on_event (clob_events) scripts. Requires data/events/<slug>.
+        #[arg(long, default_value_t = false)]
+        include_events: bool,
+        /// Starting balance for each backtest.
+        #[arg(long, default_value_t = 1000.0)]
+        balance: f64,
+    },
+
     /// Reconcile live_strategies.json against the real Polymarket CLOB &
     /// Gamma APIs: replaces midpoint entry_price with on-chain VWAP fill
     /// price, replaces Binance-derived outcomes with Polymarket
@@ -1160,6 +1179,16 @@ async fn main() -> Result<()> {
                     std::process::exit(1);
                 }
             }
+        }
+
+        Commands::ValidateAll { include_events, balance } => {
+            println!("Validating all strategies through their engines + 3-leg edge_validator...");
+            println!("(crypto_taker fee, official resolution; this runs every script over available data)\n");
+            let report = tools::validate_all::run_validate_all(
+                &config.workspace_dir, balance, include_events,
+            ).await;
+            tools::validate_all::print_report(&report);
+            Ok(())
         }
 
         Commands::BackfillStrategies { dry_run, runner_id, force } => {

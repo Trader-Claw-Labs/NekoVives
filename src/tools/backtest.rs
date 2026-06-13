@@ -50,6 +50,7 @@ const CLOB_1HZ_EARLY_ORACLE_SCRIPT:    &str = include_str!("scripts/clob_1hz_ear
 const CLOB_1HZ_LATE_CERTAINTY_SCRIPT:  &str = include_str!("scripts/clob_1hz_late_certainty.rhai");
 const CLOB_1HZ_VOLATILITY_REGIME_SCRIPT: &str = include_str!("scripts/clob_1hz_volatility_regime.rhai");
 const CLOB_EVENTS_LATENCY_ARB_SCRIPT: &str = include_str!("scripts/clob_events_latency_arb.rhai");
+const CLOB_EVENTS_LATE_CERTAINTY_SCRIPT: &str = include_str!("scripts/clob_events_late_certainty.rhai");
 
 // ── Classic Indicators ────────────────────────────────────────────────────────
 const RSI_STRATEGY_SCRIPT: &str = include_str!("scripts/rsi_strategy.rhai");
@@ -57,7 +58,7 @@ const RSI_STRATEGY_SCRIPT: &str = include_str!("scripts/rsi_strategy.rhai");
 /// Write bundled default scripts to `<workspace>/scripts/` if they don't exist yet.
 /// Called by both backtest tools so the scripts are always available on first run.
 /// All bundled default scripts as (filename, content) pairs.
-const DEFAULT_SCRIPTS: [(&str, &str); 32] = [
+const DEFAULT_SCRIPTS: [(&str, &str); 33] = [
     // ── Polymarket binary ──────────────────────────────────────────────────────
     ("polymarket_btc_binary.rhai",              POLYMARKET_BTC_BINARY_SCRIPT),
     ("polymarket_5min.rhai",                    POLYMARKET_5MIN_SCRIPT),
@@ -96,6 +97,7 @@ const DEFAULT_SCRIPTS: [(&str, &str); 32] = [
     ("clob_1hz_volatility_regime.rhai",         CLOB_1HZ_VOLATILITY_REGIME_SCRIPT),
     // ── clob_events sub-second (on_event) strategies ─────────────────────────
     ("clob_events_latency_arb.rhai",            CLOB_EVENTS_LATENCY_ARB_SCRIPT),
+    ("clob_events_late_certainty.rhai",         CLOB_EVENTS_LATE_CERTAINTY_SCRIPT),
     // ── Reference & templates ─────────────────────────────────────────────────
     ("strategy.rhai",                           STRATEGY_SCRIPT),
 ];
@@ -6680,35 +6682,49 @@ mod tests {
     async fn clob_events_latency_sweep_export() {
         use std::io::Write;
         let ws = directories::UserDirs::new().unwrap().home_dir().join(".traderclaw/workspace");
-        let slug = "btc_5m_ev";
-        let script = ws.join("scripts/clob_events_latency_arb.rhai");
+        let slug = std::env::var("NV_SWEEP_SLUG").unwrap_or_else(|_| "btc_5m_ev".into());
+        // Script + latencies are env-overridable so the same harness validates any
+        // on_event script at any VPS's real round-trip without a recompile:
+        //   NV_SWEEP_SCRIPT=clob_events_late_certainty.rhai NV_SWEEP_LATS=0,30,50,80,110 \
+        //     cargo test --lib clob_events_latency_sweep_export -- --ignored --nocapture
+        let script_name = std::env::var("NV_SWEEP_SCRIPT")
+            .unwrap_or_else(|_| "clob_events_latency_arb.rhai".into());
+        let script = ws.join("scripts").join(&script_name);
+        let lats: Vec<u64> = std::env::var("NV_SWEEP_LATS")
+            .ok()
+            .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+            .unwrap_or_else(|| vec![0, 110, 220, 500, 1000]);
+        let tag = script_name.trim_end_matches(".rhai").to_string();
         let slugs = list_event_slugs(&ws);
-        let (from_date, to_date) = match slugs.iter().find(|(s, _, _)| s == slug) {
+        let (from_date, to_date) = match slugs.iter().find(|(s, _, _)| s == &slug) {
             Some((_, dates, _)) if !dates.is_empty() =>
                 (dates.first().unwrap().clone(), dates.last().unwrap().clone()),
             _ => panic!("No event stream for '{slug}' under {}/data/events/ — run to-events first.", ws.display()),
         };
-        println!("[sweep] slug={slug} range={from_date}..{to_date}");
-        for lat in [0u64, 110, 220, 500, 1000] {
+        println!("[sweep] script={script_name} slug={slug} range={from_date}..{to_date}");
+        for lat in lats {
             let m = run_clob_events_backtest_from_files(
-                &script, slug, &from_date, &to_date,
+                &script, &slug, &from_date, &to_date,
                 1000.0, 0.0, &ws, None, TickGates::default(),
                 0, lat, "crypto_taker",
             ).await;
-            let csv_path = format!("/tmp/clob_events_lat_{lat}.csv");
+            let csv_path = format!("/tmp/sweep_{tag}_lat_{lat}.csv");
             let mut f = std::fs::File::create(&csv_path).unwrap();
             writeln!(f, "entry_price,won").unwrap();
-            let mut wins = 0u32;
+            // Only binary betting trades carry an entry price the validator can use.
+            let mut wins = 0u32; let mut n = 0u32;
             for t in &m.all_trades {
+                let bin = matches!(t.side.as_str(), "bet_yes"|"bet_no"|"yes"|"no")
+                    || t.side.starts_with("yes_") || t.side.starts_with("no_");
+                if !bin || !(t.price > 0.01 && t.price < 0.99) { continue; }
                 let won = if t.pnl > 0.0 { 1 } else { 0 };
-                wins += won;
+                wins += won; n += 1;
                 writeln!(f, "{},{}", t.price, won).unwrap();
             }
-            let n = m.all_trades.len();
             let wr = if n > 0 { wins as f64 / n as f64 * 100.0 } else { 0.0 };
-            println!("[sweep lat={lat}ms] trades={} WR={:.1}% ret={:+.2}% → {csv_path}",
-                m.total_trades, wr, m.total_return_pct);
+            println!("[sweep lat={lat}ms] n={n} WR={:.1}% ret={:+.2}% → {csv_path}",
+                wr, m.total_return_pct);
         }
-        println!("[sweep] validate: python3 scripts/ml/edge_validator.py --source csv --csv /tmp/clob_events_lat_<lat>.csv");
+        println!("[sweep] validate each: python3 scripts/ml/edge_validator.py --source csv --csv /tmp/sweep_{tag}_lat_<lat>.csv");
     }
 }
