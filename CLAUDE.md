@@ -76,6 +76,7 @@ Key routes:
 - `GET  /api/backtest/scripts`                — list .rhai files from /scripts/
 - `POST /api/backtest/run`                    — run backtest (Rhai engine)
 - `GET  /api/backtest/tick-slugs`             — list available tick JSONL slugs for archive backtesting
+- `GET  /api/backtest/event-slugs`            — list available ms event-stream slugs (clob_events / on_event)
 - `GET  /api/wallets`                         — list wallets
 - `POST /api/wallets/create`                  — create wallet (EVM/Solana/TON)
 - `GET  /api/polymarket/markets`              — list markets
@@ -119,6 +120,7 @@ Key routes:
 | `clob_1hz_late_certainty.rhai` | on_tick-based | CLOB 1 HZ: fade uncertainty in final 30-45s. Setups A/B follow clear BTC move; C/D fade wrong-side favourite/underdog. EV-positive on 33d real data |
 | `clob_1hz_early_oracle.rhai` | on_tick-based | CLOB 1 HZ: early oracle-divergence entry |
 | `clob_1hz_volatility_regime.rhai` | on_tick-based | CLOB 1 HZ: regime-gated tick entries |
+| `clob_events_latency_arb.rhai` | on_event-based | CLOB EVENTS (sub-second): latency-arb demo — takes the correct side in the final 35s when Binance has moved but the book lags. Shows the on_event API |
 
 Cross-asset analysis and setup-by-setup edge tables:
 `src/tools/scripts/POLYMARKET_UPDOWN_5M_CROSS_ASSET.md`
@@ -428,12 +430,40 @@ Runs `on_candle(ctx)` scripts through the same engine as `polymarket_binary`.
 3. Pick slug, pick any `on_candle(ctx)` script
 4. Run
 
-**Key functions in `src/tools/backtest.rs`:**
-- `run_clob_1hz_backtest()` / `run_clob_1hz_backtest_from_files()` — on_tick path
-- `run_archive_candles_backtest()` — on_candle path (new)
-- `load_ticks_for_range()` — shared tick loader used by both paths
+### `clob_events` — "Orderbook Archive (on_event)" — sub-second / HFT (BACKTEST_ENGINE_PLAN Fase C)
+Replays the **millisecond** event stream from `to-events`
+(`<workspace>/data/events/<slug>/*.jsonl.gz`) through `on_event(ctx)` scripts.
+Unlike clob_1hz (1 tick/s, same-tick fill), this keeps a **live two-sided book**
+(YES & NO reconstructed from events) and models latency with **two independent clocks**:
+- `feed_latency_ms` — when the strategy PERCEIVES each event (shifts `ctx.ts_ms`)
+- `latency_ms` (= order latency) — the order fills against the FUTURE book at t+lat,
+  or is discarded if the window closes first.
 
-**Gateway API:** `GET /api/backtest/tick-slugs` — returns available slugs with date ranges.
+`on_event(ctx)` API (in addition to the clob_1hz fields):
+```rhai
+fn on_event(ctx) {
+    ctx.event_kind   // "book" | "trade"          ctx.event_token  // "yes"|"no"|"unknown"
+    ctx.event_price  // trade price / book ask     ctx.ts_ms        // perceived time (incl. feed latency)
+    ctx.yes_bid/ctx.yes_ask/ctx.yes_mid  ctx.no_bid/ctx.no_ask     // live reconstructed book
+    ctx.binance_price  ctx.window_secs_left  ctx.window_ts  ctx.spread_pct
+    ctx.balance  ctx.position  ctx.entry_price  ctx.window_yes_won
+    ctx.bet_yes(frac)  ctx.bet_no(frac)  ctx.set(k,v)  ctx.get(k,def)
+}
+```
+**Workflow:** `to-events --slug X …` → Market = "Orderbook Archive (on_event)" →
+pick slug (from `GET /api/backtest/event-slugs`) → pick an `on_event(ctx)` script
+(e.g. `clob_events_latency_arb.rhai`) → set Latency (ms) → Run. The latency-sweep
+endpoint produces the EV-vs-latency curve that answers "does the edge survive VPS latency?".
+
+**Key functions in `src/tools/backtest.rs`:**
+- `run_clob_1hz_backtest()` / `run_clob_1hz_backtest_from_files()` — on_tick path (1Hz)
+- `run_archive_candles_backtest()` — on_candle path
+- `run_clob_events_backtest()` / `run_clob_events_backtest_from_files()` — on_event path (ms)
+- `load_ticks_for_range()` — shared tick loader (clob_1hz/archive_candles)
+- `load_events_for_range()` — gzip event-stream loader (clob_events)
+
+**Gateway API:** `GET /api/backtest/tick-slugs` (clob_1hz/archive_candles slugs) ·
+`GET /api/backtest/event-slugs` (clob_events slugs) — both return slugs + date ranges.
 
 ## Dynamic Asset Selector (`src/tools/asset_selector.rs`)
 Rolling 30-day win-rate tracker per (script × symbol). Automatically records

@@ -135,6 +135,7 @@ postgres = { version = "0.19", features = ["with-chrono-0_4"], optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 chrono-tz = "0.10"
 cron = "0.15"
+flate2 = "1"   # gunzip the to-events .jsonl.gz event streams (clob_events backtest engine)
 gray_matter = "0.2"   # YAML/TOML frontmatter parsing for Obsidian-style session .md files
 
 # Interactive CLI prompts

@@ -248,6 +248,7 @@ mod tests {
             stop_loss_pct: None, early_fire_secs: None, max_entry_price: None,
             price_mode: None, max_spread_pct: None,
             kind: Some(kind.to_string()),
+            ..Default::default()
         };
 
         let result = RunnerResult {
@@ -267,6 +268,7 @@ mod tests {
             live_orders: vec![],
             live_wins: 3,
             live_total_trades: 5,
+            live_kv_state: std::collections::HashMap::new(),
         };
 
         StoredRunner {
@@ -280,6 +282,7 @@ mod tests {
                 error: None,
             },
             result: Some(result),
+            hidden: false,
         }
     }
 

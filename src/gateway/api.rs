@@ -4244,6 +4244,30 @@ pub async fn handle_api_backtest_tick_slugs(
     Json(serde_json::json!({ "slugs": response })).into_response()
 }
 
+/// GET /api/backtest/event-slugs — list available clob_events stream slugs.
+///
+/// Returns slugs with at least one `.jsonl.gz` under `data/events/<slug>/`,
+/// each with its date coverage. Feeds the `clob_events` market type in the UI.
+pub async fn handle_api_backtest_event_slugs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let slugs = crate::tools::backtest::list_event_slugs(&workspace_dir);
+    let response: Vec<serde_json::Value> = slugs.into_iter().map(|(slug, dates, _)| {
+        serde_json::json!({
+            "slug": slug,
+            "dates": dates,
+            "from_date": dates.first().cloned().unwrap_or_default(),
+            "to_date": dates.last().cloned().unwrap_or_default(),
+        })
+    }).collect();
+    Json(serde_json::json!({ "slugs": response })).into_response()
+}
+
 #[derive(serde::Deserialize)]
 pub struct BacktestRunBody {
     /// Rhai script path — required for rhai_candle, ignored for other engine kinds.
@@ -4319,6 +4343,10 @@ pub struct BacktestRunBody {
     /// Fee model: "pct" = flat fee_pct% (default), "crypto_taker" = 1.8%×p×(1-p).
     #[serde(default)]
     pub fee_model: Option<String>,
+    /// clob_events only: feed latency in ms — how late the strategy PERCEIVES each
+    /// event (separate from latency_ms, which is the ORDER arrival latency).
+    #[serde(default)]
+    pub feed_latency_ms: Option<u64>,
 }
 
 fn default_market_type() -> String {
@@ -4516,6 +4544,7 @@ pub async fn handle_api_backtest_run(
         body.stop_loss_pct,
         body.latency_ms,
         body.fee_model.as_deref(),
+        body.feed_latency_ms,
     )
     .await;
 
@@ -4619,6 +4648,9 @@ pub struct LatencySweepBody {
     pub stop_loss_pct: Option<f64>,
     #[serde(default)]
     pub fee_model: Option<String>,
+    /// clob_events only: constant feed-perception latency (ms) held across the sweep.
+    #[serde(default)]
+    pub feed_latency_ms: Option<u64>,
     /// Latency values (ms) to sweep. E.g. [0, 100, 250, 500, 1000].
     pub latency_values: Vec<u64>,
 }
@@ -4690,6 +4722,7 @@ pub async fn handle_api_backtest_latency_sweep(
             body.stop_loss_pct,
             Some(lat_ms),
             body.fee_model.as_deref(),
+            body.feed_latency_ms,
         )
         .await;
 

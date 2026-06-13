@@ -190,15 +190,28 @@ actuales; los modos viejos se mantienen hasta que el nuevo reproduzca sus result
   sin huecos) conserva el 100% de los eventos a ms, etiqueta ambos tokens, dedup 2.8M→78k.
   ✅ flujo política end-to-end (Republicans 2028). ❌ Pendiente: Chainlink histórico.
 
-### Fase C — Motor event-driven `clob_events` (4-6 días)
-- Replayer de `MarketEvent` con dos relojes (feed_latency + order_latency).
-- `ExecutionSimulator` taker: VWAP contra el book futuro; cap por depth observado;
-  reporte de consumo de book.
-- Soporta scripts `on_tick` existentes (muestreo 1Hz sintético desde eventos = compat
-  total) Y un nuevo `on_event(ctx)` para HFT real.
-- **Validación:** `clob_events` con muestreo 1Hz y lat=0 reproduce `clob_1hz` (±ruido de
-  agregación documentado); latency sweep de basis/imbalance sobre eventos reproduce la
-  conclusión de `basis_analysis.py`.
+### Fase C — Motor event-driven `clob_events` (✅ implementado)
+- ✅ Replayer de `MarketEvent` (`load_events_for_range` lee los `.jsonl.gz` de Fase A,
+  gunzip + sort por ts_ms) con **dos relojes**: `feed_latency_ms` (cuándo el script
+  PERCIBE el evento → `ctx.ts_ms` desplazado) y `order_latency_ms` (la orden se llena
+  contra el book FUTURO en t+lat, o se descarta si la ventana cierra antes).
+- ✅ Motor `run_clob_events_backtest` con **book de dos lados reconstruido** desde los
+  eventos (yes/no bid/ask vivos) + API `on_event(ctx)`. Settlement por ventana con
+  resolución oficial (`window_yes_won` por su propio cid — bug de resolución cruzada
+  encontrado y corregido en la validación). Fee `pct`/`crypto_taker`, mismos gates y
+  `sim_fill_vwap` que clob_1hz (live-parity).
+- ✅ Dispatch `market_type = "clob_events"` en `run_backtest_engine`; `feed_latency_ms`
+  nuevo en `BacktestRunBody`/`LatencySweepBody`; ruta `GET /api/backtest/event-slugs`;
+  script de ejemplo `clob_events_latency_arb.rhai` (bundled).
+- ✅ **Validación:** 2 tests unitarios (settlement oficial + miss por order-latency) +
+  smoke sobre datos REALES (btc_5m, 78k eventos/h): latency sweep 0ms→250ms muestra el
+  edge degradándose (+17.07% → +16.73%), 100% resolución oficial. ⚠️ n=4 trades en 1h =
+  validación de MECÁNICA, no evidencia de edge — eso lo decide el edge_validator sobre
+  el mes completo.
+- ❌ Pendiente (no bloqueante): cap por depth observado + reporte de consumo de book
+  (hoy `sim_fill_vwap` con depth=0 → fill a best ask); compat `on_tick` por muestreo 1Hz
+  desde eventos (los scripts on_tick siguen usando el motor clob_1hz, que queda intacto
+  como gate de paridad).
 
 ### Fase D — Modelo MAKER (3-5 días)
 - Resting limit orders: entra al book al precio elegido; queue position aproximada

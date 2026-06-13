@@ -49,6 +49,7 @@ const CLOB_1HZ_SPREAD_SCALPER_SCRIPT:  &str = include_str!("scripts/clob_1hz_spr
 const CLOB_1HZ_EARLY_ORACLE_SCRIPT:    &str = include_str!("scripts/clob_1hz_early_oracle.rhai");
 const CLOB_1HZ_LATE_CERTAINTY_SCRIPT:  &str = include_str!("scripts/clob_1hz_late_certainty.rhai");
 const CLOB_1HZ_VOLATILITY_REGIME_SCRIPT: &str = include_str!("scripts/clob_1hz_volatility_regime.rhai");
+const CLOB_EVENTS_LATENCY_ARB_SCRIPT: &str = include_str!("scripts/clob_events_latency_arb.rhai");
 
 // ── Classic Indicators ────────────────────────────────────────────────────────
 const RSI_STRATEGY_SCRIPT: &str = include_str!("scripts/rsi_strategy.rhai");
@@ -56,7 +57,7 @@ const RSI_STRATEGY_SCRIPT: &str = include_str!("scripts/rsi_strategy.rhai");
 /// Write bundled default scripts to `<workspace>/scripts/` if they don't exist yet.
 /// Called by both backtest tools so the scripts are always available on first run.
 /// All bundled default scripts as (filename, content) pairs.
-const DEFAULT_SCRIPTS: [(&str, &str); 31] = [
+const DEFAULT_SCRIPTS: [(&str, &str); 32] = [
     // ── Polymarket binary ──────────────────────────────────────────────────────
     ("polymarket_btc_binary.rhai",              POLYMARKET_BTC_BINARY_SCRIPT),
     ("polymarket_5min.rhai",                    POLYMARKET_5MIN_SCRIPT),
@@ -93,6 +94,8 @@ const DEFAULT_SCRIPTS: [(&str, &str); 31] = [
     ("clob_1hz_early_oracle.rhai",              CLOB_1HZ_EARLY_ORACLE_SCRIPT),
     ("clob_1hz_late_certainty.rhai",            CLOB_1HZ_LATE_CERTAINTY_SCRIPT),
     ("clob_1hz_volatility_regime.rhai",         CLOB_1HZ_VOLATILITY_REGIME_SCRIPT),
+    // ── clob_events sub-second (on_event) strategies ─────────────────────────
+    ("clob_events_latency_arb.rhai",            CLOB_EVENTS_LATENCY_ARB_SCRIPT),
     // ── Reference & templates ─────────────────────────────────────────────────
     ("strategy.rhai",                           STRATEGY_SCRIPT),
 ];
@@ -353,7 +356,7 @@ impl Tool for BacktestRunTool {
         // Run the real Rhai backtest engine
         let metrics = run_backtest_engine(
             &script_path, market_type, symbol, interval, from_date, to_date,
-            initial_balance, fee_pct, "price_up", None, None, None, "percent", 1.0, "historical", &self.workspace_dir, &[], None, None, None, None, None, None, None, None
+            initial_balance, fee_pct, "price_up", None, None, None, "percent", 1.0, "historical", &self.workspace_dir, &[], None, None, None, None, None, None, None, None, None
         ).await;
 
         let worst_trades_text = metrics
@@ -3248,6 +3251,7 @@ pub async fn run_backtest_engine(
     stop_loss_pct: Option<f64>,
     latency_ms: Option<u64>,
     fee_model: Option<&str>,
+    feed_latency_ms: Option<u64>,
 ) -> BacktestMetrics {
     tracing::info!(
         "[BACKTEST] Starting backtest: script={}, market={}, symbol={}, interval={}, from={}, to={}, balance={}, fee={}%",
@@ -3289,6 +3293,26 @@ pub async fn run_backtest_engine(
             script_path, symbol, from_date, to_date,
             initial_balance, fee_pct, workspace_dir, max_position_usd,
             tick_gates,
+            latency_ms.unwrap_or(0),
+            fee_model.unwrap_or("pct"),
+        ).await;
+    }
+
+    // ── clob_events: event-driven (sub-second) backtest from to-events .jsonl.gz ─
+    // `symbol` is the event-stream slug (e.g. "btc_5m_ev"). `latency_ms` is the
+    // ORDER latency (fill vs future book); `feed_latency_ms` is the perception lag.
+    if market_type == "clob_events" {
+        let tick_gates = TickGates {
+            max_spread_pct,
+            max_entry_price,
+            min_entry_price,
+            allowed_hours: allowed_hours.to_vec(),
+        };
+        return run_clob_events_backtest_from_files(
+            script_path, symbol, from_date, to_date,
+            initial_balance, fee_pct, workspace_dir, max_position_usd,
+            tick_gates,
+            feed_latency_ms.unwrap_or(0),
             latency_ms.unwrap_or(0),
             fee_model.unwrap_or("pct"),
         ).await;
@@ -5527,6 +5551,660 @@ pub async fn run_clob_1hz_backtest_from_files(
     }
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// clob_events — event-driven (sub-second) backtest engine (BACKTEST_ENGINE_PLAN Fase C)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Replays the millisecond-resolution MarketEvent stream produced by
+// `orderbook_parser.py to-events` (data/events/<slug>/YYYY-MM-DD.jsonl.gz) through
+// an `on_event(ctx)` Rhai script. Unlike clob_1hz (one tick/second, same-tick fill),
+// this engine:
+//   • sees every book/trade event at its real ms timestamp,
+//   • keeps a live two-sided book (YES & NO bid/ask) reconstructed from events,
+//   • models latency with TWO independent clocks (the plan's core requirement):
+//       feed_latency_ms  — when the strategy SEES an event (delays on_event delivery)
+//       order_latency_ms — when an order ARRIVES (fill vs the FUTURE book at t+lat).
+//
+// Window resolution reuses the official `window_yes_won` from the meta header
+// (per condition_id), falling back to Binance price compare only when absent.
+
+/// One decoded market event from a to-events stream.
+#[derive(Clone, Debug)]
+struct MarketEvent {
+    ts_ms: i64,
+    kind: EvKind,
+    /// "yes" | "no" | "unknown" — which token's book/trade this is.
+    token: u8, // 0 = yes, 1 = no, 2 = unknown
+    cid: String,
+    bid: f64,
+    ask: f64,
+    binance_price: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum EvKind { Book, Trade }
+
+/// Per-condition_id metadata from the meta header line.
+#[derive(Clone, Debug, Default)]
+struct EvMarketMeta {
+    yes_won: Option<bool>,
+    end_ts: i64,
+}
+
+/// Decoded event stream for a slug over a date range.
+struct EventStream {
+    events: Vec<MarketEvent>,
+    /// condition_id → metadata (resolution, window end).
+    markets: std::collections::HashMap<String, EvMarketMeta>,
+    window_minutes: i64,
+}
+
+fn token_code(s: &str) -> u8 {
+    match s {
+        "yes" => 0,
+        "no" => 1,
+        _ => 2,
+    }
+}
+
+/// Load + decode to-events `.jsonl.gz` files for a slug within [from_date, to_date].
+/// Events are returned in ascending ts_ms order (each file is already ordered; we
+/// merge by simply concatenating since files are per-day and date-sorted).
+fn load_events_for_range(
+    workspace_dir: &std::path::Path,
+    slug: &str,
+    from_date: &str,
+    to_date: &str,
+) -> anyhow::Result<EventStream> {
+    use std::io::Read;
+    let dir = workspace_dir.join("data").join("events").join(slug);
+    if !dir.exists() {
+        anyhow::bail!(
+            "No event stream for slug '{}'. Generate it with: \
+             orderbook_parser.py to-events --slug {} …",
+            slug, slug
+        );
+    }
+    let mut files: Vec<_> = std::fs::read_dir(&dir)?
+        .flatten()
+        .filter(|e| {
+            e.path().file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.ends_with(".jsonl.gz"))
+                .unwrap_or(false)
+        })
+        .collect();
+    files.sort_by_key(|e| e.file_name());
+
+    let mut events: Vec<MarketEvent> = Vec::new();
+    let mut markets: std::collections::HashMap<String, EvMarketMeta> = std::collections::HashMap::new();
+    let mut window_minutes: i64 = 5;
+
+    for f in &files {
+        // file stem = "YYYY-MM-DD.jsonl.gz" → date is the first 10 chars
+        let fname = f.file_name();
+        let name = fname.to_str().unwrap_or("");
+        let date = &name[..name.len().min(10)];
+        if date < from_date || date > to_date {
+            continue;
+        }
+        let raw = std::fs::read(f.path())?;
+        let mut gz = flate2::read::GzDecoder::new(&raw[..]);
+        let mut content = String::new();
+        gz.read_to_string(&mut content)
+            .map_err(|e| anyhow::anyhow!("gunzip {} failed: {e}", name))?;
+
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() { continue; }
+            let v: serde_json::Value = match serde_json::from_str(line) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let kind = v.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+            if kind == "meta" {
+                window_minutes = v.get("window_minutes").and_then(|w| w.as_i64()).unwrap_or(5);
+                if let Some(mkts) = v.get("markets").and_then(|m| m.as_object()) {
+                    for (cid, meta) in mkts {
+                        let yes_won = meta.get("yes_won").and_then(|y| y.as_bool());
+                        let end_ts = meta.get("end_ts").and_then(|e| e.as_i64()).unwrap_or(0);
+                        markets.insert(cid.clone(), EvMarketMeta { yes_won, end_ts });
+                    }
+                }
+                continue;
+            }
+            let ev_kind = match kind {
+                "book" => EvKind::Book,
+                "trade" => EvKind::Trade,
+                _ => continue,
+            };
+            let ts_ms = v.get("ts_ms").and_then(|t| t.as_i64()).unwrap_or(0);
+            if ts_ms == 0 { continue; }
+            let token = token_code(v.get("token").and_then(|t| t.as_str()).unwrap_or("unknown"));
+            let cid = v.get("cid").and_then(|c| c.as_str()).unwrap_or("").to_string();
+            let (bid, ask) = if ev_kind == EvKind::Book {
+                (
+                    v.get("bid").and_then(|b| b.as_f64()).unwrap_or(0.0),
+                    v.get("ask").and_then(|a| a.as_f64()).unwrap_or(0.0),
+                )
+            } else {
+                // trade: store price in both for convenience (engine reads ev_price)
+                let p = v.get("price").and_then(|p| p.as_f64()).unwrap_or(0.0);
+                (p, p)
+            };
+            let binance_price = v.get("binance_price").and_then(|b| b.as_f64()).unwrap_or(0.0);
+            events.push(MarketEvent { ts_ms, kind: ev_kind, token, cid, bid, ask, binance_price });
+        }
+    }
+
+    // The streams are per-day ordered, but interleave by ts across files only at
+    // day boundaries; a stable sort by ts_ms guarantees a single global ordering.
+    events.sort_by_key(|e| e.ts_ms);
+    tracing::info!(
+        "[CLOB_EVENTS] Loaded {} events for slug '{}' ({}→{}), {} markets",
+        events.len(), slug, from_date, to_date, markets.len()
+    );
+    Ok(EventStream { events, markets, window_minutes })
+}
+
+/// Window-open unix-seconds for an event, given the window length. The to-events
+/// `end_ts` per market is the window CLOSE; windows align to the grid, so
+/// window_ts = floor(ts_s / window_secs) * window_secs.
+fn event_window_ts(ts_ms: i64, window_secs: i64) -> i64 {
+    let ts_s = ts_ms / 1000;
+    ts_s - (ts_s % window_secs)
+}
+
+/// Event-driven backtest. Mirrors clob_1hz's settlement + fee + fill model, but
+/// driven by the ms event stream with two-clock latency.
+#[allow(clippy::too_many_arguments)]
+pub fn run_clob_events_backtest(
+    script_content: &str,
+    stream: EventStream,
+    initial_balance: f64,
+    fee_pct: f64,
+    max_position_usd: Option<f64>,
+    gates: TickGates,
+    feed_latency_ms: u64,
+    order_latency_ms: u64,
+    is_crypto_taker: bool,
+) -> anyhow::Result<BacktestMetrics> {
+    use rhai::{Dynamic, Engine, Map, Scope};
+    use std::sync::{Arc, Mutex};
+
+    let EventStream { events, markets, window_minutes } = stream;
+    if events.is_empty() {
+        anyhow::bail!("No events loaded — generate the stream with `to-events` first.");
+    }
+    let window_secs = window_minutes * 60;
+
+    // Validate script has on_event
+    let engine_check = Engine::new();
+    let ast_check = engine_check.compile(script_content)
+        .map_err(|e| anyhow::anyhow!("Script compile error: {e}"))?;
+    if !ast_check.iter_functions().any(|f| f.name == "on_event") {
+        anyhow::bail!("clob_events strategy requires an `on_event(ctx)` function. \
+            Use `ctx.bet_yes(size)` / `ctx.bet_no(size)` to place bets.");
+    }
+
+    // ── Live book state (reconstructed from events), per token ──────────────────
+    #[derive(Clone, Default)]
+    struct Book { yes_bid: f64, yes_ask: f64, no_bid: f64, no_ask: f64, binance: f64 }
+
+    #[derive(Clone)]
+    struct Sim {
+        balance: f64,
+        position: i64,        // 0 flat, 1 YES, -1 NO
+        entry_price: f64,
+        stake: f64,
+        window_open_price: f64,
+        current_window_ts: i64,
+        trades: Vec<Trade>,
+        kv: std::collections::HashMap<String, f64>,
+        pending_yes: Option<(f64, i64)>, // (frac, signal_ts_ms)
+        pending_no: Option<(f64, i64)>,
+        resolved_official: u32,
+        resolved_binance: u32,
+    }
+
+    let sim = Arc::new(Mutex::new(Sim {
+        balance: initial_balance, position: 0, entry_price: 0.0, stake: 0.0,
+        window_open_price: 0.0, current_window_ts: 0, trades: Vec::new(),
+        kv: std::collections::HashMap::new(), pending_yes: None, pending_no: None,
+        resolved_official: 0, resolved_binance: 0,
+    }));
+
+    let book = Arc::new(Mutex::new(Book::default()));
+    let max_pos_usd = max_position_usd.unwrap_or(f64::MAX);
+    let gates_arc = Arc::new(gates);
+
+    // Shared scalars read by the bet closures (current book + ts).
+    let cur_ts = Arc::new(Mutex::new(0i64));
+    let book_for_yes = book.clone();
+    let book_for_no = book.clone();
+
+    fn tick_gate_blocks(gates: &TickGates, entry_price: f64, spread_pct: f64, hour: u8) -> bool {
+        if let Some(max_sp) = gates.max_spread_pct {
+            if max_sp > 0.0 && spread_pct / 100.0 > max_sp { return true; }
+        }
+        if !gates.allowed_hours.is_empty() && !gates.allowed_hours.contains(&hour) { return true; }
+        if let Some(max_ep) = gates.max_entry_price {
+            if entry_price > max_ep { return true; }
+        }
+        if let Some(min_ep) = gates.min_entry_price {
+            if min_ep > 0.0 && entry_price < min_ep { return true; }
+        }
+        false
+    }
+    fn effective_fee_frac(ask: f64, fee_pct: f64, is_crypto_taker: bool) -> f64 {
+        if is_crypto_taker { 0.018 * ask * (1.0 - ask) } else { fee_pct / 100.0 }
+    }
+    fn hour_of(ts_ms: i64) -> u8 {
+        use chrono::{TimeZone, Timelike, Utc};
+        Utc.timestamp_millis_opt(ts_ms).single().map(|dt| dt.hour() as u8).unwrap_or(0)
+    }
+
+    // Pre-compile the script (patch ctx.method() → free fns, same trick as clob_1hz).
+    let mut eng = Engine::new();
+    eng.set_max_operations(200_000);
+    eng.set_max_call_levels(32);
+    let patched = script_content
+        .replace("ctx.bet_yes(", "bet_yes_impl(")
+        .replace("ctx.bet_no(", "bet_no_impl(")
+        .replace("ctx.set(", "set_impl(")
+        .replace("ctx.get(", "get_impl(");
+    let ast = eng.compile(&patched)
+        .map_err(|e| anyhow::anyhow!("Script compile error: {e}"))?;
+
+    // bet_yes_impl — order_latency_ms > 0 defers the fill to a future event.
+    let sim_yes = sim.clone();
+    let ts_yes = cur_ts.clone();
+    let gates_yes = gates_arc.clone();
+    let order_lat_y = order_latency_ms;
+    let crypto_y = is_crypto_taker;
+    eng.register_fn("bet_yes_impl", move |size: f64| {
+        let b = book_for_yes.lock().unwrap().clone();
+        let sig_ts = *ts_yes.lock().unwrap();
+        let mut s = sim_yes.lock().unwrap();
+        if s.position != 0 || s.pending_yes.is_some() || s.pending_no.is_some() { return; }
+        let ya = b.yes_ask;
+        if ya < 0.03 || ya >= 1.0 { return; }
+        let spread = if b.yes_bid > 0.0 { (ya - b.yes_bid) * 100.0 } else { 0.0 };
+        if tick_gate_blocks(&gates_yes, ya, spread, hour_of(sig_ts)) { return; }
+        let frac = size.clamp(0.0, 1.0);
+        if order_lat_y > 0 {
+            s.pending_yes = Some((frac, sig_ts));
+        } else {
+            let fee_f = effective_fee_frac(ya, fee_pct, crypto_y);
+            let stake_amt = (s.balance * frac * (1.0 - fee_f)).min(max_pos_usd);
+            if stake_amt <= 0.01 { return; }
+            let fill = sim_fill_vwap(ya, b.yes_bid, 0.0, stake_amt);
+            s.balance -= stake_amt;
+            s.position = 1; s.entry_price = fill; s.stake = stake_amt;
+        }
+    });
+
+    // bet_no_impl
+    let sim_no = sim.clone();
+    let ts_no = cur_ts.clone();
+    let gates_no = gates_arc.clone();
+    let order_lat_n = order_latency_ms;
+    let crypto_n = is_crypto_taker;
+    eng.register_fn("bet_no_impl", move |size: f64| {
+        let b = book_for_no.lock().unwrap().clone();
+        let sig_ts = *ts_no.lock().unwrap();
+        let mut s = sim_no.lock().unwrap();
+        if s.position != 0 || s.pending_yes.is_some() || s.pending_no.is_some() { return; }
+        let na = b.no_ask;
+        if na < 0.03 || na >= 1.0 { return; }
+        let spread = if b.no_bid > 0.0 { (na - b.no_bid) * 100.0 } else { 0.0 };
+        if tick_gate_blocks(&gates_no, na, spread, hour_of(sig_ts)) { return; }
+        let frac = size.clamp(0.0, 1.0);
+        if order_lat_n > 0 {
+            s.pending_no = Some((frac, sig_ts));
+        } else {
+            let fee_f = effective_fee_frac(na, fee_pct, crypto_n);
+            let stake_amt = (s.balance * frac * (1.0 - fee_f)).min(max_pos_usd);
+            if stake_amt <= 0.01 { return; }
+            let fill = sim_fill_vwap(na, b.no_bid, 0.0, stake_amt);
+            s.balance -= stake_amt;
+            s.position = -1; s.entry_price = fill; s.stake = stake_amt;
+        }
+    });
+
+    let sim_set = sim.clone();
+    eng.register_fn("set_impl", move |key: String, val: rhai::Dynamic| {
+        if let Some(f) = dynamic_to_f64(&val) { sim_set.lock().unwrap().kv.insert(key, f); }
+    });
+    let sim_get = sim.clone();
+    eng.register_fn("get_impl", move |key: String, default: rhai::Dynamic| -> f64 {
+        let def = dynamic_to_f64(&default).unwrap_or(0.0);
+        sim_get.lock().unwrap().kv.get(&key).copied().unwrap_or(def)
+    });
+
+    let mut portfolio_values: Vec<f64> = vec![initial_balance];
+    let mut peak = initial_balance;
+    let mut max_dd = 0.0_f64;
+
+    // Settle the open position for a window that just closed (official > binance).
+    let settle = |s: &mut Sim, close_binance: f64, ts_ms: i64, official: Option<bool>| {
+        if s.position == 0 || s.window_open_price <= 0.0 { return; }
+        let yes_won = match official {
+            Some(o) => { s.resolved_official += 1; o }
+            None => {
+                s.resolved_binance += 1;
+                let close_p = if close_binance > 0.0 { close_binance } else { s.window_open_price };
+                close_p > s.window_open_price
+            }
+        };
+        let (won, side_label) = match s.position {
+            1 => (yes_won, "bet_yes"),
+            -1 => (!yes_won, "bet_no"),
+            _ => (false, "flat"),
+        };
+        let ts = chrono::DateTime::from_timestamp_millis(ts_ms)
+            .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+            .unwrap_or_else(|| ts_ms.to_string());
+        let pnl = if won {
+            let payout = s.stake / s.entry_price;
+            s.balance += payout;
+            payout - s.stake
+        } else { -s.stake };
+        let ep = s.entry_price; let sk = s.stake;
+        s.trades.push(Trade { timestamp: ts, side: side_label.to_string(),
+            price: ep, size: sk, pnl, debug: None });
+        s.position = 0; s.entry_price = 0.0; s.stake = 0.0;
+    };
+
+    // Map window_ts → official resolution, so a window settles with ITS OWN
+    // resolution (not the cid of the event that triggered the boundary, which
+    // already belongs to the NEXT window). Each window is a distinct cid.
+    let mut official_by_window: std::collections::HashMap<i64, bool> = std::collections::HashMap::new();
+    for ev in &events {
+        if let Some(yw) = markets.get(&ev.cid).and_then(|m| m.yes_won) {
+            official_by_window.entry(event_window_ts(ev.ts_ms, window_secs)).or_insert(yw);
+        }
+    }
+
+    // ── Main event loop ─────────────────────────────────────────────────────────
+    for ev in &events {
+        // 1. Update the live book BEFORE the strategy sees this event.
+        if ev.kind == EvKind::Book {
+            let mut b = book.lock().unwrap();
+            match ev.token {
+                0 => { b.yes_bid = ev.bid; b.yes_ask = ev.ask; }
+                1 => { b.no_bid = ev.bid; b.no_ask = ev.ask; }
+                _ => {}
+            }
+            if ev.binance_price > 0.0 { b.binance = ev.binance_price; }
+        } else if ev.binance_price > 0.0 {
+            book.lock().unwrap().binance = ev.binance_price;
+        }
+
+        let wts = event_window_ts(ev.ts_ms, window_secs);
+        let official_for_window = markets.get(&ev.cid).and_then(|m| m.yes_won);
+
+        // 2. Window boundary: settle the previous window's open position using
+        //    the CLOSING window's own resolution.
+        {
+            let cur_binance = book.lock().unwrap().binance;
+            let mut s = sim.lock().unwrap();
+            if wts != s.current_window_ts && s.current_window_ts != 0 {
+                let closing_official = official_by_window.get(&s.current_window_ts).copied();
+                settle(&mut s, cur_binance, ev.ts_ms, closing_official);
+                s.window_open_price = 0.0;
+                s.pending_yes = None;
+                s.pending_no = None;
+            }
+            if wts != s.current_window_ts {
+                s.current_window_ts = wts;
+            }
+            if s.window_open_price <= 0.0 && cur_binance > 0.0 {
+                s.window_open_price = cur_binance;
+            }
+        }
+
+        // 3. order_latency fills: execute any pending order whose latency elapsed.
+        if order_latency_ms > 0 {
+            let (py, pn) = { let s = sim.lock().unwrap(); (s.pending_yes, s.pending_no) };
+            if let Some((frac, sig_ts)) = py {
+                if ev.ts_ms >= sig_ts + order_latency_ms as i64 {
+                    let b = book.lock().unwrap().clone();
+                    let mut s = sim.lock().unwrap();
+                    if s.position == 0 && b.yes_ask >= 0.03 && b.yes_ask < 1.0 {
+                        let fee_f = effective_fee_frac(b.yes_ask, fee_pct, is_crypto_taker);
+                        let stake_amt = (s.balance * frac * (1.0 - fee_f)).min(max_pos_usd);
+                        if stake_amt > 0.01 {
+                            let fill = sim_fill_vwap(b.yes_ask, b.yes_bid, 0.0, stake_amt);
+                            s.balance -= stake_amt;
+                            s.position = 1; s.entry_price = fill; s.stake = stake_amt;
+                        }
+                    }
+                    s.pending_yes = None;
+                }
+            }
+            if let Some((frac, sig_ts)) = pn {
+                if ev.ts_ms >= sig_ts + order_latency_ms as i64 {
+                    let b = book.lock().unwrap().clone();
+                    let mut s = sim.lock().unwrap();
+                    if s.position == 0 && b.no_ask >= 0.03 && b.no_ask < 1.0 {
+                        let fee_f = effective_fee_frac(b.no_ask, fee_pct, is_crypto_taker);
+                        let stake_amt = (s.balance * frac * (1.0 - fee_f)).min(max_pos_usd);
+                        if stake_amt > 0.01 {
+                            let fill = sim_fill_vwap(b.no_ask, b.no_bid, 0.0, stake_amt);
+                            s.balance -= stake_amt;
+                            s.position = -1; s.entry_price = fill; s.stake = stake_amt;
+                        }
+                    }
+                    s.pending_no = None;
+                }
+            }
+        }
+
+        // 4. feed_latency: the strategy sees the event at ts + feed_latency_ms.
+        //    With a historical replay this is equivalent to delivering on_event at
+        //    the event ts but tagging ctx.ts_ms as the perceived (delayed) time, so
+        //    downstream timing logic in the script sees the lag. Book state shown is
+        //    the latest known (no future peeking) — conservative.
+        let perceived_ts = ev.ts_ms + feed_latency_ms as i64;
+        *cur_ts.lock().unwrap() = ev.ts_ms; // bet uses true ts for order_latency math
+
+        // 5. Invoke on_event(ctx).
+        let (bal, pos, entry) = { let s = sim.lock().unwrap(); (s.balance, s.position, s.entry_price) };
+        let b = book.lock().unwrap().clone();
+        let secs_left = window_secs - (ev.ts_ms / 1000 - wts);
+        let spread_pct = if b.yes_bid > 0.0 && b.yes_ask > 0.0 { (b.yes_ask - b.yes_bid) * 100.0 } else { 0.0 };
+
+        let mut ctx_map = Map::new();
+        ctx_map.insert("ts_ms".into(), Dynamic::from(perceived_ts));
+        ctx_map.insert("event_ts_ms".into(), Dynamic::from(ev.ts_ms));
+        ctx_map.insert("event_kind".into(), Dynamic::from(
+            if ev.kind == EvKind::Trade { "trade" } else { "book" }.to_string()));
+        ctx_map.insert("event_token".into(), Dynamic::from(
+            match ev.token { 0 => "yes", 1 => "no", _ => "unknown" }.to_string()));
+        ctx_map.insert("event_price".into(), Dynamic::from(ev.ask)); // trade price or book ask
+        ctx_map.insert("yes_bid".into(), Dynamic::from(b.yes_bid));
+        ctx_map.insert("yes_ask".into(), Dynamic::from(b.yes_ask));
+        ctx_map.insert("yes_mid".into(), Dynamic::from(if b.yes_bid > 0.0 && b.yes_ask > 0.0 { (b.yes_bid + b.yes_ask) / 2.0 } else { 0.0 }));
+        ctx_map.insert("no_bid".into(), Dynamic::from(b.no_bid));
+        ctx_map.insert("no_ask".into(), Dynamic::from(b.no_ask));
+        ctx_map.insert("spread_pct".into(), Dynamic::from(spread_pct));
+        ctx_map.insert("binance_price".into(), Dynamic::from(b.binance));
+        ctx_map.insert("window_ts".into(), Dynamic::from(wts));
+        ctx_map.insert("window_secs_left".into(), Dynamic::from(secs_left));
+        ctx_map.insert("balance".into(), Dynamic::from(bal));
+        ctx_map.insert("position".into(), Dynamic::from(pos));
+        ctx_map.insert("entry_price".into(), Dynamic::from(entry));
+        ctx_map.insert("window_yes_won".into(), match official_for_window {
+            Some(true) => Dynamic::from(true),
+            Some(false) => Dynamic::from(false),
+            None => Dynamic::UNIT,
+        });
+
+        let mut scope = Scope::new();
+        if let Err(e) = eng.call_fn::<Dynamic>(&mut scope, &ast, "on_event", (ctx_map,)) {
+            tracing::trace!("[CLOB_EVENTS] on_event error: {e}");
+        }
+
+        let cur_bal = sim.lock().unwrap().balance;
+        portfolio_values.push(cur_bal);
+        if cur_bal > peak { peak = cur_bal; }
+        let dd = (peak - cur_bal) / peak * 100.0;
+        if dd > max_dd { max_dd = dd; }
+    }
+
+    // Settle/close any open position at end of stream using the last window's official.
+    {
+        let last = events.last().unwrap();
+        let cur_binance = book.lock().unwrap().binance;
+        let mut s = sim.lock().unwrap();
+        if s.position != 0 {
+            let official = official_by_window.get(&s.current_window_ts).copied();
+            settle(&mut s, cur_binance, last.ts_ms, official);
+        }
+    }
+
+    let s = sim.lock().unwrap();
+    let final_balance = s.balance;
+    let trades = s.trades.clone();
+    let kv_state = s.kv.clone();
+    let resolved_official = s.resolved_official;
+    let resolved_binance = s.resolved_binance;
+    drop(s);
+
+    let total_return_pct = (final_balance / initial_balance - 1.0) * 100.0;
+    let total_trades = trades.len() as u32;
+    let winners = trades.iter().filter(|t| t.pnl > 0.0).count();
+    let win_rate_pct = if total_trades == 0 { 0.0 } else { winners as f64 / total_trades as f64 * 100.0 };
+
+    let mut sorted = trades.clone();
+    sorted.sort_by(|a, b| a.pnl.partial_cmp(&b.pnl).unwrap_or(std::cmp::Ordering::Equal));
+    let worst_trades: Vec<WorstTrade> = sorted.iter().take(5).map(|t| WorstTrade {
+        timestamp: t.timestamp.clone(), side: t.side.clone(), price: t.price, pnl: t.pnl,
+    }).collect();
+    let all_trades: Vec<AllTrade> = {
+        let mut bal = initial_balance;
+        trades.iter().map(|t| {
+            bal += t.pnl;
+            AllTrade { timestamp: t.timestamp.clone(), side: t.side.clone(),
+                price: t.price, size: t.size, pnl: t.pnl, balance: bal, debug: None }
+        }).collect()
+    };
+
+    let sharpe = if portfolio_values.len() > 1 {
+        let returns: Vec<f64> = portfolio_values.windows(2).map(|w| w[1] / w[0] - 1.0).collect();
+        let mean = returns.iter().sum::<f64>() / returns.len() as f64;
+        let variance = returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / returns.len() as f64;
+        let sd = variance.sqrt();
+        if sd > 0.0 { (mean / sd) * (86400.0_f64 * 365.0).sqrt() } else { 0.0 }
+    } else { 0.0 };
+
+    let total_resolved = resolved_official + resolved_binance;
+    let official_pct = if total_resolved > 0 { resolved_official as f64 / total_resolved as f64 * 100.0 } else { 0.0 };
+    let resolution_note = if total_resolved == 0 {
+        String::new()
+    } else if resolved_binance == 0 {
+        "\nResolution: 100% official Polymarket oracle (full live-parity).".to_string()
+    } else if resolved_official == 0 {
+        "\n⚠ Resolution: 100% Binance fallback — run `to-events` after `backfill-resolutions` for live-parity.".to_string()
+    } else {
+        format!("\n⚠ Resolution: {:.0}% official / {:.0}% Binance fallback.", official_pct, 100.0 - official_pct)
+    };
+    let lat_note = format!("\nLatency: feed={}ms order={}ms.", feed_latency_ms, order_latency_ms);
+    let fee_note = if is_crypto_taker { "\nFee model: crypto_taker (1.8%×p×(1−p)).".to_string() } else { String::new() };
+
+    let analysis = format!(
+        "clob_events backtest: {} events, {} trades. Win rate {:.1}%, return {:.2}%, Sharpe {:.2}, max DD {:.2}%.\n\
+        Strategy: on_event() — live two-sided book reconstructed from the ms event stream.{}{}{}",
+        events.len(), total_trades, win_rate_pct, total_return_pct, sharpe, max_dd,
+        resolution_note, lat_note, fee_note,
+    );
+
+    Ok(BacktestMetrics {
+        total_return_pct,
+        sharpe_ratio: sharpe,
+        max_drawdown_pct: max_dd,
+        win_rate_pct,
+        total_trades,
+        worst_trades,
+        all_trades,
+        analysis,
+        kv_state,
+        windows_with_real_price: Some(resolved_official),
+        windows_with_estimated_price: Some(resolved_binance),
+        ..Default::default()
+    })
+}
+
+/// Async entry point for clob_events: loads the event stream then runs the backtest.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_clob_events_backtest_from_files(
+    script_path: &std::path::Path,
+    slug: &str,
+    from_date: &str,
+    to_date: &str,
+    initial_balance: f64,
+    fee_pct: f64,
+    workspace_dir: &std::path::Path,
+    max_position_usd: Option<f64>,
+    gates: TickGates,
+    feed_latency_ms: u64,
+    order_latency_ms: u64,
+    fee_model: &str,
+) -> BacktestMetrics {
+    let script_content = match std::fs::read_to_string(script_path) {
+        Ok(s) => s,
+        Err(e) => return BacktestMetrics { analysis: format!("Error reading script: {e}"), ..Default::default() },
+    };
+    let stream = match load_events_for_range(workspace_dir, slug, from_date, to_date) {
+        Ok(s) => s,
+        Err(e) => return BacktestMetrics { analysis: e.to_string(), ..Default::default() },
+    };
+    let is_crypto_taker = fee_model == "crypto_taker";
+    match tokio::task::spawn_blocking(move || {
+        run_clob_events_backtest(&script_content, stream, initial_balance, fee_pct,
+            max_position_usd, gates, feed_latency_ms, order_latency_ms, is_crypto_taker)
+    }).await {
+        Ok(Ok(m)) => m,
+        Ok(Err(e)) => BacktestMetrics { analysis: format!("clob_events backtest error: {e}"), ..Default::default() },
+        Err(e) => BacktestMetrics { analysis: format!("Task join error: {e}"), ..Default::default() },
+    }
+}
+
+/// List available event-stream slugs under data/events/, with date coverage.
+pub fn list_event_slugs(workspace_dir: &std::path::Path) -> Vec<(String, Vec<String>, usize)> {
+    let dir = workspace_dir.join("data").join("events");
+    let mut result = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() { continue; }
+            let slug = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+            if slug.is_empty() { continue; }
+            let mut dates = Vec::new();
+            if let Ok(files) = std::fs::read_dir(&path) {
+                let mut fl: Vec<_> = files.flatten()
+                    .filter(|e| e.path().file_name().and_then(|n| n.to_str())
+                        .map(|n| n.ends_with(".jsonl.gz")).unwrap_or(false))
+                    .collect();
+                fl.sort_by_key(|e| e.file_name());
+                for f in &fl {
+                    let n = f.file_name();
+                    let name = n.to_str().unwrap_or("");
+                    let date = name[..name.len().min(10)].to_string();
+                    if !date.is_empty() { dates.push(date); }
+                }
+            }
+            if !dates.is_empty() {
+                // event count not cheap to compute (gzip) — report 0 (slug + dates is enough for UI)
+                result.push((slug, dates, 0));
+            }
+        }
+    }
+    result.sort_by(|a, b| a.0.cmp(&b.0));
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5711,7 +6389,7 @@ mod tests {
             "price_up", None, None, None,
             "fixed", 10.0, "historical",
             Some(p4), Some(p3), &[],
-            &std::collections::HashSet::new(), None,
+            &std::collections::HashSet::new(), None, None,
         ).expect("backtest must succeed");
 
         assert!(metrics.total_trades >= 3, "expected ≥3 trades, got {}", metrics.total_trades);
@@ -5767,7 +6445,7 @@ mod tests {
             "price_up", None, None, None,
             "fixed", 10.0, "historical",
             Some(p4), None, &[],
-            &std::collections::HashSet::new(), None,
+            &std::collections::HashSet::new(), None, None,
         ).expect("backtest must succeed");
 
         for trade in metrics.all_trades.iter() {
@@ -5803,7 +6481,7 @@ mod tests {
             "price_up", None, None, None,
             "fixed", 10.0, "historical",
             Some(p4), Some(p3), &[],
-            &std::collections::HashSet::new(), None,
+            &std::collections::HashSet::new(), None, None,
         ).expect("backtest must succeed");
 
         let mut trades = metrics.all_trades;
@@ -5873,5 +6551,120 @@ mod tests {
             tmp.path(), "btc_5m"
         ).expect("missing file must not be a hard error");
         assert!(map.is_empty());
+    }
+
+    // ── clob_events engine tests ─────────────────────────────────────────────
+
+    /// Write a gzipped event stream (meta header + events) to a temp workspace so
+    /// `load_events_for_range` can read it back, exercising the real gzip+parse path.
+    fn write_event_stream(ws: &std::path::Path, slug: &str, date: &str, lines: &[String]) {
+        use std::io::Write;
+        let dir = ws.join("data").join("events").join(slug);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        for l in lines { writeln!(enc, "{}", l).unwrap(); }
+        let bytes = enc.finish().unwrap();
+        std::fs::write(dir.join(format!("{date}.jsonl.gz")), bytes).unwrap();
+    }
+
+    /// One 5-min window that resolves YES (UP). A book that opens with YES cheap
+    /// and a clear up-move should let an on_event strategy take YES and win.
+    #[tokio::test]
+    async fn clob_events_settles_with_official_resolution() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path();
+        // window opens at ts_s = 1778415600 (a 300s boundary). cid carries yes_won=true.
+        let cid = "0xWIN";
+        let w_ms: i64 = 1778415600_000;
+        let mut lines = vec![format!(
+            r#"{{"kind":"meta","slug":"ev","window_minutes":5,"markets":{{"{cid}":{{"yes_token_id":"y","no_token_id":"n","yes_won":true,"end_ts":1778415900}}}}}}"#
+        )];
+        // Emit book events through the window. binance rises (UP). YES ask stays 0.55.
+        // Events at seconds 10, 280 (decision window), and the close at 300.
+        for (sec, binance) in [(10i64, 100000.0f64), (280, 100050.0)] {
+            let ts = w_ms + sec * 1000;
+            lines.push(format!(r#"{{"ts_ms":{ts},"kind":"book","token":"yes","cid":"{cid}","bid":0.54,"ask":0.55,"binance_price":{binance}}}"#));
+            lines.push(format!(r#"{{"ts_ms":{ts},"kind":"book","token":"no","cid":"{cid}","bid":0.45,"ask":0.46,"binance_price":{binance}}}"#));
+        }
+        // Next window's first event triggers settlement of the prior window.
+        let next_ms = w_ms + 300_000;
+        lines.push(format!(r#"{{"ts_ms":{next_ms},"kind":"book","token":"yes","cid":"0xNEXT","bid":0.50,"ask":0.51,"binance_price":100050.0}}"#));
+        write_event_stream(ws, "ev", "2026-05-10", &lines);
+
+        // Strategy: buy YES on the first decision-window book event.
+        let script = r#"
+            fn on_event(ctx) {
+                if ctx.position != 0 { return; }
+                if ctx.event_kind == "book" && ctx.window_secs_left <= 35 && ctx.window_secs_left > 3 && ctx.yes_ask < 0.80 {
+                    ctx.bet_yes(0.5);
+                }
+            }
+        "#;
+        std::fs::create_dir_all(ws.join("scripts")).unwrap();
+        std::fs::write(ws.join("scripts/ev_test.rhai"), script).unwrap();
+
+        let m = run_clob_events_backtest_from_files(
+            &ws.join("scripts/ev_test.rhai"), "ev", "2026-05-10", "2026-05-10",
+            1000.0, 0.0, ws, None, TickGates::default(), 0, 0, "pct",
+        ).await;
+
+        assert_eq!(m.total_trades, 1, "should take exactly one YES bet");
+        assert!(m.total_return_pct > 0.0, "YES won (official) → positive return, got {}", m.total_return_pct);
+        // 100% official resolution (window_yes_won present).
+        assert_eq!(m.windows_with_real_price, Some(1));
+        assert_eq!(m.windows_with_estimated_price, Some(0));
+    }
+
+    /// order_latency_ms defers the fill: with a huge latency past window close,
+    /// the pending order never fills → zero trades.
+    #[tokio::test]
+    async fn clob_events_order_latency_can_miss_fill() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path();
+        let cid = "0xWIN";
+        let w_ms: i64 = 1778415600_000;
+        let mut lines = vec![format!(
+            r#"{{"kind":"meta","slug":"ev","window_minutes":5,"markets":{{"{cid}":{{"yes_token_id":"y","no_token_id":"n","yes_won":true,"end_ts":1778415900}}}}}}"#
+        )];
+        let ts = w_ms + 280_000;
+        lines.push(format!(r#"{{"ts_ms":{ts},"kind":"book","token":"yes","cid":"{cid}","bid":0.54,"ask":0.55,"binance_price":100050.0}}"#));
+        lines.push(format!(r#"{{"ts_ms":{ts},"kind":"book","token":"no","cid":"{cid}","bid":0.45,"ask":0.46,"binance_price":100050.0}}"#));
+        let next_ms = w_ms + 300_000;
+        lines.push(format!(r#"{{"ts_ms":{next_ms},"kind":"book","token":"yes","cid":"0xNEXT","bid":0.50,"ask":0.51,"binance_price":100050.0}}"#));
+        write_event_stream(ws, "ev2", "2026-05-10", &lines);
+
+        let script = r#"fn on_event(ctx) { if ctx.position == 0 && ctx.event_kind == "book" && ctx.yes_ask < 0.80 { ctx.bet_yes(0.5); } }"#;
+        std::fs::create_dir_all(ws.join("scripts")).unwrap();
+        std::fs::write(ws.join("scripts/ev2.rhai"), script).unwrap();
+
+        // order_latency = 60s: the signal at sec 280 would fill at sec 340, but the
+        // window closes at 300 and discards the pending order → no trade.
+        let m = run_clob_events_backtest_from_files(
+            &ws.join("scripts/ev2.rhai"), "ev2", "2026-05-10", "2026-05-10",
+            1000.0, 0.0, ws, None, TickGates::default(), 0, 60_000, "pct",
+        ).await;
+        assert_eq!(m.total_trades, 0, "60s order latency past window close → no fill");
+    }
+
+    /// Real-data smoke test (ignored in CI — needs a generated event stream in the
+    /// user's workspace). Run with:
+    ///   cargo test --lib clob_events_real_data_smoke -- --ignored --nocapture
+    /// Prerequisite:
+    ///   orderbook_parser.py to-events --series-prefix btc-updown-5m --slug btc_5m_ev_val …
+    #[tokio::test]
+    #[ignore]
+    async fn clob_events_real_data_smoke() {
+        let ws = directories::UserDirs::new().unwrap().home_dir().join(".traderclaw/workspace");
+        let script = ws.join("scripts/clob_events_latency_arb.rhai");
+        // latency sweep: 0ms vs 250ms order latency on the real stream.
+        for lat in [0u64, 250] {
+            let m = run_clob_events_backtest_from_files(
+                &script, "btc_5m_ev_val", "2026-05-10", "2026-05-10",
+                1000.0, 0.0, &ws, None, TickGates::default(), 0, lat, "crypto_taker",
+            ).await;
+            println!("[REAL lat={lat}ms] trades={} WR={:.1}% ret={:.2}% off/bin={:?}/{:?}\n  {}",
+                m.total_trades, m.win_rate_pct, m.total_return_pct,
+                m.windows_with_real_price, m.windows_with_estimated_price, m.analysis);
+        }
     }
 }
