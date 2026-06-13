@@ -340,6 +340,19 @@ python3 tools/orderbook_parser.py to-candles --market 0x... --slug ob_test \
 # Auto-detect all recurring 5/15/60-min series and convert in one shot
 python3 tools/orderbook_parser.py to-ticks-multi --days 40
 
+# Convert downloaded parquets → sub-second (ms) EVENT stream for the clob_events
+# engine (BACKTEST_ENGINE_PLAN.md Fase A). Keeps every event at ms resolution
+# (no 1Hz decimation) and BOTH the YES and NO books separately (real two-sided
+# book, not no = 1 − yes). Output: data/events/<slug>/YYYY-MM-DD.jsonl.gz.
+# Single arbitrary market:
+python3 tools/orderbook_parser.py to-events --market 0x... --slug btc_5m_ev \
+  --binance-symbol BTCUSDT \
+  --in ~/.traderclaw/workspace/data/orderbook/ \
+  --out ~/.traderclaw/workspace/data/events/
+# Rolling updown series (discovers each window's condition_id):
+python3 tools/orderbook_parser.py to-events --series-prefix btc-updown-5m --slug btc_5m_ev \
+  --in ~/.traderclaw/workspace/data/orderbook/ --out ~/.traderclaw/workspace/data/events/
+
 # Backfill official Polymarket resolution (window_yes_won) into EXISTING tick JSONL files.
 # Queries Gamma API by slug "{series_prefix}-{window_ts}", rewrites JSONL in place.
 # ~5 min per slug (30 concurrent requests/batch). Safe to re-run.

@@ -166,16 +166,22 @@ actuales; los modos viejos se mantienen hasta que el nuevo reproduzca sus result
   Rust↔Python).
 
 ### Fase A — Cimientos de datos (2-4 días, paralelizable con B0)
-- `to-events`: parquet → `data/events/<condition_id>/*.jsonl.gz` con TODOS los eventos
-  (ms, sin decimar). Genérico para cualquier mercado, no solo updown.
-- `summary` de event_types del v2 → confirmar si existe snapshot L2 (mejoraría el fill model).
-- Resoluciones genéricas: `backfill-resolutions --condition-id 0x…` vía Gamma para
-  mercados arbitrarios (no solo series updown).
-- **Chainlink histórico**: script que baja rounds del aggregator (Polygon RPC con archivo)
+- ✅ `to-events` (`tools/orderbook_parser.py`): parquet → `data/events/<slug>/YYYY-MM-DD.jsonl.gz`
+  con TODOS los eventos en resolución **ms (sin decimar)** y **ambos tokens YES/NO con su
+  book real** (no `no = 1 − yes`). Modo `--market 0x…` (mercado arbitrario, deriva YES/NO
+  por conteo si Gamma no responde) o `--series-prefix btc-updown-5m` (descubre cada ventana).
+  Header `kind:"meta"` por archivo con tokens + resolución oficial. Eventos:
+  `{ts_ms, kind:"book"|"trade", token, cid, …}`.
+- ❌ `summary` de event_types del v2 → confirmar si existe snapshot L2 (mejoraría el fill model).
+- ❌ Resoluciones genéricas: `backfill-resolutions --condition-id 0x…` vía Gamma para
+  mercados arbitrarios (no solo series updown). *(to-events ya trae la resolución en el
+  meta header vía `resolve_market_tokens`; falta el patcher de JSONL 1Hz existente.)*
+- ❌ **Chainlink histórico**: script que baja rounds del aggregator (Polygon RPC con archivo)
   por rango de fechas → `data/chainlink/<feed>/*.jsonl`; merge como `OracleMark` en el
   stream y backfill de `chainlink_price` en los ticks existentes.
-- **Validación:** para 3 ventanas conocidas, la resolución reconstruida de Chainlink
-  coincide con `window_yes_won` oficial.
+- **Validación:** ✅ `to-events` sobre parquet sintético conserva el 100% de los eventos a
+  resolución ms y etiqueta ambos tokens. ❌ Pendiente: para 3 ventanas conocidas, la
+  resolución reconstruida de Chainlink coincide con `window_yes_won` oficial.
 
 ### Fase C — Motor event-driven `clob_events` (4-6 días)
 - Replayer de `MarketEvent` con dos relojes (feed_latency + order_latency).

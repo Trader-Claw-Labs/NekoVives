@@ -1284,6 +1284,280 @@ def cmd_to_ticks(args: argparse.Namespace) -> None:
     }))
 
 
+# ── Event-level (sub-second) export — Fase A del BACKTEST_ENGINE_PLAN ─────────
+
+def resolve_market_tokens(condition_id: str) -> dict:
+    """
+    Resolve YES/NO token ids + resolution for an arbitrary condition_id via Gamma.
+    Returns {yes_token_id, no_token_id, yes_won (bool|None), end_ts (int|0)}.
+    Empty strings / None on failure — the caller falls back to event-derived YES.
+    """
+    base = "https://gamma-api.polymarket.com"
+    ua = {"User-Agent": "orderbook-parser/1.0"}
+    url = f"{base}/markets?condition_id={condition_id}&limit=1"
+    try:
+        req = urllib.request.Request(url, headers=ua)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+    except Exception as e:
+        print(f"[to-events] Gamma token lookup failed for {condition_id[:16]}…: {e}", file=sys.stderr)
+        return {"yes_token_id": "", "no_token_id": "", "yes_won": None, "end_ts": 0}
+    if not data:
+        return {"yes_token_id": "", "no_token_id": "", "yes_won": None, "end_ts": 0}
+    m = data[0]
+    raw_ids = m.get("clobTokenIds", [])
+    if isinstance(raw_ids, str):
+        try:
+            raw_ids = json.loads(raw_ids)
+        except Exception:
+            raw_ids = []
+    closed = m.get("closed", False) or m.get("resolved", False)
+    outcome_prices = m.get("outcomePrices")
+    if isinstance(outcome_prices, str):
+        try:
+            outcome_prices = json.loads(outcome_prices)
+        except Exception:
+            outcome_prices = None
+    yes_won = None
+    if closed and outcome_prices and len(outcome_prices) >= 2:
+        try:
+            yes_won = float(outcome_prices[0]) >= 0.5
+        except (ValueError, TypeError):
+            pass
+    end_ts = 0
+    end_date_str = m.get("endDate") or m.get("end_date_iso")
+    if end_date_str:
+        try:
+            if "T" in str(end_date_str):
+                dt = datetime.fromisoformat(str(end_date_str).replace("Z", "+00:00"))
+            else:
+                dt = datetime.strptime(str(end_date_str)[:10], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            end_ts = int(dt.timestamp())
+        except Exception:
+            pass
+    return {
+        "yes_token_id": raw_ids[0] if raw_ids else "",
+        "no_token_id":  raw_ids[1] if len(raw_ids) > 1 else "",
+        "yes_won":      yes_won,
+        "end_ts":       end_ts,
+    }
+
+
+def cmd_to_events(args: argparse.Namespace) -> None:
+    """
+    Convert local Parquet files into a sub-second MarketEvent stream (Fase A).
+
+    Unlike `to-ticks`, this does NOT decimate to 1 Hz — every price_change and
+    last_trade_price event keeps its millisecond `timestamp_received`. It also
+    preserves BOTH the YES and NO token books separately (real two-sided book,
+    not the `no = 1 - yes` derivation) so that arb / maker engines can be
+    backtested honestly.
+
+    Output: <out>/<slug>/YYYY-MM-DD.jsonl.gz — one JSON event per line, ordered
+    by ts_ms. Each event is one of:
+      {ts_ms, kind:"book", token:"yes"|"no", bid, ask}
+      {ts_ms, kind:"trade", token:"yes"|"no", price, size, side}
+    Plus a header line (kind:"meta") per file with market identifiers and the
+    official resolution.
+
+    For a single market pass --market 0x… ; for a rolling updown series pass
+    --series-prefix btc-updown-5m (resolves every window's condition_id +
+    YES/NO tokens via the same discovery path as to-ticks-multi).
+    """
+    import gzip
+
+    data_dir = Path(args.input_dir)
+    out_base = Path(args.out)
+    slug = args.slug
+    window_minutes = getattr(args, "window_minutes", 5)
+    binance_symbol = getattr(args, "binance_symbol", None)
+    series_prefix = getattr(args, "series_prefix", None)
+    workspace_dir = Path(args.workspace) if getattr(args, "workspace", None) else None
+
+    files = sorted(data_dir.glob("*.parquet"))
+    if not files:
+        print(json.dumps({"error": f"No .parquet files in {data_dir}"}))
+        return
+
+    # ── Resolve the set of (condition_id → YES/NO tokens, resolution) to export ──
+    # markets_meta: {condition_id: {yes_token_id, no_token_id, yes_won, end_ts}}
+    markets_meta: dict[str, dict] = {}
+
+    def parse_file_ts(f: Path) -> "datetime | None":
+        try:
+            return datetime.strptime(f.stem, "%Y-%m-%dT%H").replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+
+    file_dts = [dt for f in files if (dt := parse_file_ts(f))]
+    range_start = min(file_dts) if file_dts else datetime.now(tz=timezone.utc)
+    range_end = (max(file_dts) + timedelta(hours=1)) if file_dts else range_start
+    start_ts, end_ts_range = int(range_start.timestamp()), int(range_end.timestamp())
+
+    if series_prefix:
+        # Rolling series: discover every window's condition_id + tokens (reuses
+        # the same JSONL/Gamma path as to-ticks-multi).
+        series_slug = next((s["slug"] for s in MULTI_SERIES if s["prefix"] == series_prefix), slug)
+        markets_info = load_markets_from_historical_jsonl(series_slug, start_ts, end_ts_range, workspace_dir)
+        if not markets_info:
+            markets_info = fetch_gamma_markets_via_events(series_prefix, start_ts, end_ts_range, window_minutes)
+        win_res = fetch_polymarket_window_resolutions(
+            [m["condition_id"] for m in markets_info], window_secs=window_minutes * 60
+        )
+        for m in markets_info:
+            cid = m["condition_id"]
+            wts = m.get("end_ts", 0) - window_minutes * 60
+            markets_meta[cid] = {
+                "yes_token_id": m.get("yes_token_id", ""),
+                "no_token_id":  m.get("no_token_id", ""),
+                "yes_won":      win_res.get(int(wts)) if wts else None,
+                "end_ts":       m.get("end_ts", 0),
+            }
+        print(f"[to-events] series {series_prefix}: {len(markets_meta)} condition IDs", file=sys.stderr)
+    elif args.market:
+        markets_meta[args.market] = resolve_market_tokens(args.market)
+        print(f"[to-events] single market {args.market[:20]}…", file=sys.stderr)
+    else:
+        print(json.dumps({"error": "Pass either --market or --series-prefix"}))
+        return
+
+    if not markets_meta:
+        print(json.dumps({"error": "No markets resolved to export"}))
+        return
+
+    # token_id → ("yes"|"no", condition_id) lookup for labelling events
+    token_role: dict[str, tuple] = {}
+    for cid, meta in markets_meta.items():
+        if meta.get("yes_token_id"):
+            token_role[str(meta["yes_token_id"])] = ("yes", cid)
+        if meta.get("no_token_id"):
+            token_role[str(meta["no_token_id"])] = ("no", cid)
+
+    con = get_con()
+    cids_sql = ", ".join(f"'{c}'" for c in markets_meta.keys())
+
+    # Fallback: a single arbitrary market with no Gamma token metadata. Derive
+    # YES = most-active asset_id, NO = the other, so events aren't all "unknown".
+    if not token_role and len(markets_meta) == 1:
+        only_cid = next(iter(markets_meta))
+        all_files_sql = "[" + ", ".join(f"'{f}'" for f in files) + "]"
+        try:
+            tok_counts = con.execute(f"""
+            SELECT CAST(asset_id AS VARCHAR) AS asset_id, COUNT(*) AS n
+            FROM read_parquet({all_files_sql}, hive_partitioning=false, union_by_name=true)
+            WHERE event_type = 'price_change' AND CAST(market AS VARCHAR) = '{only_cid}'
+            GROUP BY asset_id ORDER BY n DESC LIMIT 2
+            """).df()
+            tokens = list(tok_counts["asset_id"])
+            if tokens:
+                token_role[str(tokens[0])] = ("yes", only_cid)
+                markets_meta[only_cid]["yes_token_id"] = str(tokens[0])
+            if len(tokens) > 1:
+                token_role[str(tokens[1])] = ("no", only_cid)
+                markets_meta[only_cid]["no_token_id"] = str(tokens[1])
+            print(f"[to-events] derived YES/NO from event counts: {tokens}", file=sys.stderr)
+        except Exception as e:
+            print(f"[to-events] token derivation failed: {e}", file=sys.stderr)
+
+    # Optional Binance feed (reuses the 1m-kline fetch; second-resolution proxy).
+    binance_prices: dict = {}
+
+    out_base.mkdir(parents=True, exist_ok=True)
+    out_dir = out_base / slug
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── Process day by day to bound memory (mirrors to-ticks-multi) ─────────────
+    file_by_day: dict[str, list] = {}
+    for f in files:
+        dt = parse_file_ts(f)
+        if dt:
+            file_by_day.setdefault(dt.strftime("%Y-%m-%d"), []).append(f)
+
+    total_events = 0
+    days_written = 0
+    for day_str in sorted(file_by_day.keys()):
+        day_files = sorted(file_by_day[day_str])
+        day_file_list = "[" + ", ".join(f"'{f}'" for f in day_files) + "]"
+
+        # price_change (book top) + last_trade_price (trades), ms-resolution, BOTH tokens.
+        try:
+            df = con.execute(f"""
+            SELECT
+                CAST(epoch_ms(timestamp_received) AS BIGINT) AS ts_ms,
+                event_type,
+                CAST(asset_id AS VARCHAR) AS asset_id,
+                CAST(best_bid AS DOUBLE)  AS best_bid,
+                CAST(best_ask AS DOUBLE)  AS best_ask,
+                CAST(price    AS DOUBLE)  AS price,
+                CAST(size     AS DOUBLE)  AS size,
+                CAST(side     AS VARCHAR) AS side
+            FROM read_parquet({day_file_list}, hive_partitioning=false, union_by_name=true)
+            WHERE event_type IN ('price_change', 'last_trade_price')
+              AND CAST(market AS VARCHAR) IN ({cids_sql})
+            ORDER BY ts_ms
+            """).df()
+        except Exception as e:
+            print(f"[to-events] {day_str}: DuckDB error: {e}", file=sys.stderr)
+            continue
+
+        if df.empty:
+            continue
+
+        if binance_symbol:
+            ts_lo, ts_hi = int(df["ts_ms"].min()), int(df["ts_ms"].max())
+            day_binance = fetch_binance_prices(binance_symbol, ts_lo, ts_hi + 60_000)
+            binance_prices.update(day_binance)
+
+        out_file = out_dir / f"{day_str}.jsonl.gz"
+        n = 0
+        with gzip.open(out_file, "wt") as fh:
+            # Meta header: every market/resolution touched this day.
+            fh.write(json.dumps({
+                "kind": "meta", "slug": slug, "date": day_str,
+                "window_minutes": window_minutes,
+                "markets": {cid: {"yes_token_id": meta.get("yes_token_id", ""),
+                                  "no_token_id": meta.get("no_token_id", ""),
+                                  "yes_won": meta.get("yes_won"),
+                                  "end_ts": meta.get("end_ts", 0)}
+                            for cid, meta in markets_meta.items()},
+            }) + "\n")
+            for _, r in df.iterrows():
+                aid = str(r["asset_id"])
+                role_cid = token_role.get(aid)
+                # If tokens weren't resolved (single arbitrary market without Gamma
+                # metadata), label by most-active asset later; for now mark unknown.
+                role = role_cid[0] if role_cid else "unknown"
+                cid = role_cid[1] if role_cid else ""
+                ts = int(r["ts_ms"])
+                if r["event_type"] == "price_change":
+                    ev = {"ts_ms": ts, "kind": "book", "token": role, "cid": cid,
+                          "bid": round(float(r["best_bid"]), 6), "ask": round(float(r["best_ask"]), 6)}
+                else:
+                    ev = {"ts_ms": ts, "kind": "trade", "token": role, "cid": cid,
+                          "price": round(float(r["price"]), 6),
+                          "size": round(float(r["size"]), 4),
+                          "side": (str(r["side"]).upper() if r["side"] is not None else "")}
+                if binance_symbol:
+                    bp = binance_prices.get(ts // 1000, 0.0)
+                    if bp:
+                        ev["binance_price"] = round(bp, 4)
+                fh.write(json.dumps(ev) + "\n")
+                n += 1
+        total_events += n
+        days_written += 1
+        print(f"  {day_str} → {n:,} events ({out_file.name})", file=sys.stderr)
+
+    print(json.dumps({
+        "ok": True,
+        "slug": slug,
+        "markets": len(markets_meta),
+        "days": days_written,
+        "total_events": total_events,
+        "out_dir": str(out_dir),
+        "note": "Sub-second event stream (.jsonl.gz). Feeds the clob_events engine (Fase C).",
+    }))
+
+
 def cmd_to_ticks_multi(args: argparse.Namespace) -> None:
     """
     Convert all recurring UP/DOWN markets (5m, 15m, 1h) from local Parquet files
@@ -2052,6 +2326,23 @@ def main() -> None:
                    help="Trader-Claw workspace dir (default: ~/.traderclaw/workspace). "
                         "Used to locate polymarket_historical/*.jsonl for condition ID lookup.")
 
+    # to-events — convert parquet → sub-second MarketEvent stream (Fase A)
+    p = sub.add_parser(
+        "to-events",
+        help="Convert local Parquet to a sub-second (ms) event stream JSONL.gz for the clob_events engine",
+    )
+    p.add_argument("--in", dest="input_dir", required=True, help="Directory with local *.parquet files")
+    p.add_argument("--slug", required=True, help="Slug name (used as output folder)")
+    p.add_argument("--market", default=None, help="Single condition ID (0x…). Mutually exclusive with --series-prefix")
+    p.add_argument("--series-prefix", dest="series_prefix", default=None,
+                   help="Rolling series prefix (e.g. btc-updown-5m) — discovers every window's condition_id")
+    p.add_argument("--out", required=True, help="Base output directory (slug subdir created automatically)")
+    p.add_argument("--binance-symbol", dest="binance_symbol", default=None,
+                   help="Binance symbol (e.g. BTCUSDT) to attach binance_price per event")
+    p.add_argument("--window-minutes", type=int, default=5, help="Window duration in minutes (default 5)")
+    p.add_argument("--workspace", default=None,
+                   help="Workspace dir for historical condition-ID lookup (default ~/.traderclaw/workspace)")
+
     # to-candles — convert parquet → OHLC JSON (for on_candle(ctx) backtester)
     p = sub.add_parser(
         "to-candles",
@@ -2085,6 +2376,7 @@ def main() -> None:
         "analyze-local":        cmd_analyze_local,
         "to-ticks":             cmd_to_ticks,
         "to-ticks-multi":       cmd_to_ticks_multi,
+        "to-events":            cmd_to_events,
         "to-candles":           cmd_to_candles,
         "backfill-resolutions": cmd_backfill_resolutions,
     }
