@@ -5570,33 +5570,34 @@ pub async fn run_clob_1hz_backtest_from_files(
 
 /// One decoded market event from a to-events stream.
 #[derive(Clone, Debug)]
-struct MarketEvent {
-    ts_ms: i64,
-    kind: EvKind,
+pub(crate) struct MarketEvent {
+    pub(crate) ts_ms: i64,
+    pub(crate) kind: EvKind,
     /// "yes" | "no" | "unknown" — which token's book/trade this is.
-    token: u8, // 0 = yes, 1 = no, 2 = unknown
-    cid: String,
-    bid: f64,
-    ask: f64,
-    binance_price: f64,
+    pub(crate) token: u8, // 0 = yes, 1 = no, 2 = unknown
+    pub(crate) cid: String,
+    pub(crate) bid: f64,
+    pub(crate) ask: f64,
+    pub(crate) binance_price: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum EvKind { Book, Trade }
+pub(crate) enum EvKind { Book, Trade }
 
 /// Per-condition_id metadata from the meta header line.
 #[derive(Clone, Debug, Default)]
-struct EvMarketMeta {
-    yes_won: Option<bool>,
-    end_ts: i64,
+pub(crate) struct EvMarketMeta {
+    pub(crate) yes_won: Option<bool>,
+    #[allow(dead_code)]
+    pub(crate) end_ts: i64,
 }
 
 /// Decoded event stream for a slug over a date range.
-struct EventStream {
-    events: Vec<MarketEvent>,
+pub(crate) struct EventStream {
+    pub(crate) events: Vec<MarketEvent>,
     /// condition_id → metadata (resolution, window end).
-    markets: std::collections::HashMap<String, EvMarketMeta>,
-    window_minutes: i64,
+    pub(crate) markets: std::collections::HashMap<String, EvMarketMeta>,
+    pub(crate) window_minutes: i64,
 }
 
 fn token_code(s: &str) -> u8 {
@@ -5610,7 +5611,7 @@ fn token_code(s: &str) -> u8 {
 /// Load + decode to-events `.jsonl.gz` files for a slug within [from_date, to_date].
 /// Events are returned in ascending ts_ms order (each file is already ordered; we
 /// merge by simply concatenating since files are per-day and date-sorted).
-fn load_events_for_range(
+pub(crate) fn load_events_for_range(
     workspace_dir: &std::path::Path,
     slug: &str,
     from_date: &str,
@@ -5710,7 +5711,7 @@ fn load_events_for_range(
 /// Window-open unix-seconds for an event, given the window length. The to-events
 /// `end_ts` per market is the window CLOSE; windows align to the grid, so
 /// window_ts = floor(ts_s / window_secs) * window_secs.
-fn event_window_ts(ts_ms: i64, window_secs: i64) -> i64 {
+pub(crate) fn event_window_ts(ts_ms: i64, window_secs: i64) -> i64 {
     let ts_s = ts_ms / 1000;
     ts_s - (ts_s % window_secs)
 }
@@ -6666,5 +6667,48 @@ mod tests {
                 m.total_trades, m.win_rate_pct, m.total_return_pct,
                 m.windows_with_real_price, m.windows_with_estimated_price, m.analysis);
         }
+    }
+
+    /// Full latency sweep on the REAL btc_5m_ev stream (ignored — needs a generated
+    /// stream). Runs clob_events_latency_arb.rhai at several ORDER latencies and
+    /// exports each run's trades to /tmp/clob_events_lat_<lat>.csv (entry_price,won)
+    /// for the 3-leg edge_validator. This only produces the CSVs; the EDGE verdict
+    /// comes from edge_validator.py on them, not from this test. Run with:
+    ///   cargo test --lib clob_events_latency_sweep_export -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn clob_events_latency_sweep_export() {
+        use std::io::Write;
+        let ws = directories::UserDirs::new().unwrap().home_dir().join(".traderclaw/workspace");
+        let slug = "btc_5m_ev";
+        let script = ws.join("scripts/clob_events_latency_arb.rhai");
+        let slugs = list_event_slugs(&ws);
+        let (from_date, to_date) = match slugs.iter().find(|(s, _, _)| s == slug) {
+            Some((_, dates, _)) if !dates.is_empty() =>
+                (dates.first().unwrap().clone(), dates.last().unwrap().clone()),
+            _ => panic!("No event stream for '{slug}' under {}/data/events/ — run to-events first.", ws.display()),
+        };
+        println!("[sweep] slug={slug} range={from_date}..{to_date}");
+        for lat in [0u64, 110, 220, 500, 1000] {
+            let m = run_clob_events_backtest_from_files(
+                &script, slug, &from_date, &to_date,
+                1000.0, 0.0, &ws, None, TickGates::default(),
+                0, lat, "crypto_taker",
+            ).await;
+            let csv_path = format!("/tmp/clob_events_lat_{lat}.csv");
+            let mut f = std::fs::File::create(&csv_path).unwrap();
+            writeln!(f, "entry_price,won").unwrap();
+            let mut wins = 0u32;
+            for t in &m.all_trades {
+                let won = if t.pnl > 0.0 { 1 } else { 0 };
+                wins += won;
+                writeln!(f, "{},{}", t.price, won).unwrap();
+            }
+            let n = m.all_trades.len();
+            let wr = if n > 0 { wins as f64 / n as f64 * 100.0 } else { 0.0 };
+            println!("[sweep lat={lat}ms] trades={} WR={:.1}% ret={:+.2}% → {csv_path}",
+                m.total_trades, wr, m.total_return_pct);
+        }
+        println!("[sweep] validate: python3 scripts/ml/edge_validator.py --source csv --csv /tmp/clob_events_lat_<lat>.csv");
     }
 }

@@ -77,6 +77,7 @@ Key routes:
 - `POST /api/backtest/run`                    — run backtest (Rhai engine)
 - `GET  /api/backtest/tick-slugs`             — list available tick JSONL slugs for archive backtesting
 - `GET  /api/backtest/event-slugs`            — list available ms event-stream slugs (clob_events / on_event)
+- `POST /api/backtest/walk-forward`           — train/test split + 3-leg edge_validator on each (catches overfit; ?train_frac=0.7)
 - `GET  /api/wallets`                         — list wallets
 - `POST /api/wallets/create`                  — create wallet (EVM/Solana/TON)
 - `GET  /api/polymarket/markets`              — list markets
@@ -464,6 +465,32 @@ endpoint produces the EV-vs-latency curve that answers "does the edge survive VP
 
 **Gateway API:** `GET /api/backtest/tick-slugs` (clob_1hz/archive_candles slugs) ·
 `GET /api/backtest/event-slugs` (clob_events slugs) — both return slugs + date ranges.
+
+### Native engines on real event data (Fase E)
+`clob_events` + an engine `kind` (arb_binary / fair_value / fv_momentum / arb_hedge)
+runs the strategy-core engine via `on_book` over a REAL two-sided book (YES & NO
+reconstructed independently from the ms event stream, NOT `no = 1-yes`) with official
+per-window resolution. `run_engine_clob_events_backtest()` in `engine_backtest.rs`.
+This supersedes the synthetic-candle (`run_engine_backtest`) and 1Hz-tick
+(`run_engine_clob_1hz_backtest`) paths for honesty.
+
+### Maker backtest (Fase D)
+`clob_events` + `kind=rewards_maker|minting_mm` → `run_maker_backtest()`: replays a
+bilateral resting quote (mid ± offset, re-center on drift) over the event stream and
+reports **eligible uptime %**, **adverse selection %** (mid moved against us within 10s
+of a fill), and YES/NO fill counts in `maker_stats`. Fill model = top-of-book queue
+approximation (a resting BUY fills when a trade prints at/through its price). Rewards
+pool earnings are NOT modeled — this measures fill quality + uptime, what the manual
+rewards pilot got wrong. engine_params: `offset_cents`, `reprice_threshold`, `size_usd`.
+
+### Edge validation + walk-forward (Fase F)
+- `POST /api/backtest/run` with `"validate_edge": true` → attaches `edge_validation`
+  (native 3-leg validator: bootstrap CI, random-side null, shuffle-null → EDGE /
+  NO_EDGE / INSUFFICIENT) computed on the backtest's own trades. Passing the backtest
+  is NOT edge; this is the gate.
+- `POST /api/backtest/walk-forward?train_frac=0.7` → runs the backtest on a train split
+  and a held-out test split, validates each, and reports `holds_out_of_sample`. An edge
+  that only survives in-sample is overfit, not edge.
 
 ## Dynamic Asset Selector (`src/tools/asset_selector.rs`)
 Rolling 30-day win-rate tracker per (script × symbol). Automatically records
