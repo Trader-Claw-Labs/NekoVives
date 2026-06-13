@@ -4244,6 +4244,30 @@ pub async fn handle_api_backtest_tick_slugs(
     Json(serde_json::json!({ "slugs": response })).into_response()
 }
 
+/// GET /api/backtest/event-slugs — list available clob_events stream slugs.
+///
+/// Returns slugs with at least one `.jsonl.gz` under `data/events/<slug>/`,
+/// each with its date coverage. Feeds the `clob_events` market type in the UI.
+pub async fn handle_api_backtest_event_slugs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let slugs = crate::tools::backtest::list_event_slugs(&workspace_dir);
+    let response: Vec<serde_json::Value> = slugs.into_iter().map(|(slug, dates, _)| {
+        serde_json::json!({
+            "slug": slug,
+            "dates": dates,
+            "from_date": dates.first().cloned().unwrap_or_default(),
+            "to_date": dates.last().cloned().unwrap_or_default(),
+        })
+    }).collect();
+    Json(serde_json::json!({ "slugs": response })).into_response()
+}
+
 #[derive(serde::Deserialize)]
 pub struct BacktestRunBody {
     /// Rhai script path — required for rhai_candle, ignored for other engine kinds.
@@ -4319,6 +4343,20 @@ pub struct BacktestRunBody {
     /// Fee model: "pct" = flat fee_pct% (default), "crypto_taker" = 1.8%×p×(1-p).
     #[serde(default)]
     pub fee_model: Option<String>,
+    /// clob_events only: feed latency in ms — how late the strategy PERCEIVES each
+    /// event (separate from latency_ms, which is the ORDER arrival latency).
+    #[serde(default)]
+    pub feed_latency_ms: Option<u64>,
+    /// When true, run the native 3-leg edge_validator on the backtest's trades and
+    /// attach the verdict (CI, random-null, shuffle-null) to the response.
+    #[serde(default)]
+    pub validate_edge: bool,
+    /// Walk-forward split: when set (0.0-1.0), the backtest is run twice — on the
+    /// first `walk_forward_train_frac` of the date range (train) and the remainder
+    /// (test) — and both result sets are returned so the user can check the edge
+    /// holds out-of-sample. None/0 = single full-range run (default).
+    #[serde(default)]
+    pub walk_forward_train_frac: Option<f64>,
 }
 
 fn default_market_type() -> String {
@@ -4344,6 +4382,96 @@ pub async fn handle_api_backtest_run(
     // ── Strategy-core engine backtest (non-Rhai path) ─────────────────────────
     let engine_kind = body.kind.as_deref().unwrap_or("rhai_candle");
     if engine_kind != "rhai_candle" && !engine_kind.is_empty() {
+        // MAKER backtest (Fase D): rewards_maker / minting_mm are resting-quote
+        // makers — they don't fit the taker on_book path. Replay the ms event
+        // stream through the maker fill model (fills, adverse selection, uptime).
+        if body.market_type == "clob_events"
+            && matches!(engine_kind, "rewards_maker" | "minting_mm")
+        {
+            let slug = body.symbol.trim();
+            if slug.is_empty() {
+                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                    "error": "maker backtest requires an event-stream slug in `symbol` (e.g. btc_5m_ev)."
+                }))).into_response();
+            }
+            // engine_params overrides: offset_cents, reprice_threshold, size_usd.
+            let ep = body.engine_params.as_ref();
+            let getf = |k: &str, d: f64| ep.and_then(|v| v.get(k)).and_then(|x| x.as_f64()).unwrap_or(d);
+            let params = crate::tools::engine_backtest::MakerBacktestParams {
+                slug,
+                offset_cents: getf("offset_cents", 1.0),
+                reprice_threshold: getf("reprice_threshold", 0.02),
+                size_usd: body.max_position_usd.unwrap_or_else(|| getf("size_usd", 50.0)),
+                from_date: &body.from_date,
+                to_date: &body.to_date,
+                initial_balance: body.initial_balance,
+                workspace_dir: &workspace_dir,
+            };
+            let metrics = crate::tools::engine_backtest::run_maker_backtest(params).await;
+            let all_trades: Vec<serde_json::Value> = metrics.all_trades.iter().map(|t| {
+                serde_json::json!({
+                    "timestamp": t.timestamp, "side": t.side, "price": t.price,
+                    "size": t.size, "pnl": t.pnl, "balance": t.balance,
+                })
+            }).collect();
+            return Json(serde_json::json!({
+                "script":           format!("engine:{engine_kind}"),
+                "market_type":      "clob_events",
+                "symbol":           slug,
+                "total_return_pct": metrics.total_return_pct,
+                "win_rate_pct":     metrics.win_rate_pct,
+                "total_trades":     metrics.total_trades,
+                "analysis":         metrics.analysis,
+                "maker_stats":      metrics.kv_state,
+                "worst_trades":     serde_json::Value::Array(vec![]),
+                "all_trades":       all_trades,
+            })).into_response();
+        }
+
+        // CLOB EVENTS (sub-second): feed the engine a REAL two-sided book from
+        // the ms event stream + official resolution (Fase E). Book-driven engines
+        // (arb_binary, fair_value, fv_momentum, arb_hedge) via on_book.
+        if body.market_type == "clob_events" {
+            let slug = body.symbol.trim();
+            if slug.is_empty() {
+                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                    "error": "clob_events market type requires an event-stream slug in `symbol` (e.g. btc_5m_ev)."
+                }))).into_response();
+            }
+            let params = crate::tools::engine_backtest::EngineClobEventsParams {
+                kind: engine_kind,
+                slug,
+                threshold: body.threshold,
+                engine_params: body.engine_params.clone(),
+                from_date: &body.from_date,
+                to_date: &body.to_date,
+                initial_balance: body.initial_balance,
+                fee_pct: body.fee_pct,
+                workspace_dir: &workspace_dir,
+            };
+            let metrics = crate::tools::engine_backtest::run_engine_clob_events_backtest(params).await;
+            let all_trades: Vec<serde_json::Value> = metrics.all_trades.iter().map(|t| {
+                serde_json::json!({
+                    "timestamp": t.timestamp, "side": t.side, "price": t.price,
+                    "size": t.size, "pnl": t.pnl, "balance": t.balance,
+                })
+            }).collect();
+            return Json(serde_json::json!({
+                "script":           format!("engine:{engine_kind}"),
+                "market_type":      "clob_events",
+                "symbol":           slug,
+                "total_return_pct": metrics.total_return_pct,
+                "sharpe_ratio":     metrics.sharpe_ratio,
+                "max_drawdown_pct": metrics.max_drawdown_pct,
+                "win_rate_pct":     metrics.win_rate_pct,
+                "total_trades":     metrics.total_trades,
+                "analysis":         metrics.analysis,
+                "markets_tested":   metrics.markets_tested,
+                "worst_trades":     serde_json::Value::Array(vec![]),
+                "all_trades":       all_trades,
+            })).into_response();
+        }
+
         // CLOB 1 HZ tick replay: route engine kinds to the recorded-tick
         // backtester so they get real Polymarket YES/NO order book data
         // instead of synthetic candles.
@@ -4516,6 +4644,7 @@ pub async fn handle_api_backtest_run(
         body.stop_loss_pct,
         body.latency_ms,
         body.fee_model.as_deref(),
+        body.feed_latency_ms,
     )
     .await;
 
@@ -4543,9 +4672,29 @@ pub async fn handle_api_backtest_run(
         }))
         .collect();
 
+    // ── Fase F: optional 3-leg edge validation on the backtest's own trades ──────
+    // Extract (entry_price, won) from real betting trades — skip "equity"/"expired"
+    // bookkeeping rows that carry no entry price. Only meaningful for binary modes.
+    let edge_validation = if body.validate_edge {
+        let entries: Vec<f64> = metrics.all_trades.iter()
+            .filter(|t| matches!(t.side.as_str(), "bet_yes" | "bet_no" | "yes" | "no"))
+            .filter(|t| t.price > 0.01 && t.price < 0.99)
+            .map(|t| t.price)
+            .collect();
+        let wons: Vec<bool> = metrics.all_trades.iter()
+            .filter(|t| matches!(t.side.as_str(), "bet_yes" | "bet_no" | "yes" | "no"))
+            .filter(|t| t.price > 0.01 && t.price < 0.99)
+            .map(|t| t.pnl > 0.0)
+            .collect();
+        Some(crate::tools::edge_validator::validate(&entries, &wons, 5000))
+    } else {
+        None
+    };
+
     Json(serde_json::json!({
         "script": body.script,
         "market_type": body.market_type,
+        "edge_validation": edge_validation,
         "symbol": body.symbol,
         "interval": body.interval,
         "from_date": body.from_date,
@@ -4619,6 +4768,9 @@ pub struct LatencySweepBody {
     pub stop_loss_pct: Option<f64>,
     #[serde(default)]
     pub fee_model: Option<String>,
+    /// clob_events only: constant feed-perception latency (ms) held across the sweep.
+    #[serde(default)]
+    pub feed_latency_ms: Option<u64>,
     /// Latency values (ms) to sweep. E.g. [0, 100, 250, 500, 1000].
     pub latency_values: Vec<u64>,
 }
@@ -4690,6 +4842,7 @@ pub async fn handle_api_backtest_latency_sweep(
             body.stop_loss_pct,
             Some(lat_ms),
             body.fee_model.as_deref(),
+            body.feed_latency_ms,
         )
         .await;
 
@@ -4716,6 +4869,128 @@ pub async fn handle_api_backtest_latency_sweep(
         "initial_balance": body.initial_balance,
         "fee_model": body.fee_model.as_deref().unwrap_or("pct"),
         "rows": rows,
+    }))
+    .into_response()
+}
+
+/// Split [from_date, to_date] (inclusive, YYYY-MM-DD) at `train_frac` of the day
+/// span. Returns ((train_from, train_to), (test_from, test_to)). The test range
+/// starts the day AFTER train_to so the two windows never overlap.
+fn split_date_range(from: &str, to: &str, train_frac: f64) -> Option<((String, String), (String, String))> {
+    let f = chrono::NaiveDate::parse_from_str(from, "%Y-%m-%d").ok()?;
+    let t = chrono::NaiveDate::parse_from_str(to, "%Y-%m-%d").ok()?;
+    if t < f { return None; }
+    let total_days = (t - f).num_days();
+    if total_days < 1 { return None; }
+    let frac = train_frac.clamp(0.1, 0.9);
+    let train_days = ((total_days as f64) * frac).round() as i64;
+    let train_to = f + chrono::Duration::days(train_days);
+    let test_from = train_to + chrono::Duration::days(1);
+    if test_from > t { return None; }
+    Some((
+        (from.to_string(), train_to.format("%Y-%m-%d").to_string()),
+        (test_from.format("%Y-%m-%d").to_string(), to.to_string()),
+    ))
+}
+
+/// POST /api/backtest/walk-forward — run the SAME backtest on a train split and a
+/// held-out test split, validating each with the 3-leg edge_validator. The point
+/// is to catch overfit: an edge that only survives in-sample is not an edge.
+/// Reuses `LatencySweepBody` (same fields); `latency_values[0]` (if any) sets the
+/// order latency, and `walk_forward_train_frac` is read from the query string.
+pub async fn handle_api_backtest_walk_forward(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+    Json(body): Json<LatencySweepBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let train_frac = q.get("train_frac").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.7);
+    let (train, test) = match split_date_range(&body.from_date, &body.to_date, train_frac) {
+        Some(v) => v,
+        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "date range too short to split (need ≥2 days)."
+        }))).into_response(),
+    };
+
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let scripts_dir = workspace_dir.join("scripts");
+    let script_path = if body.script.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "script field is required for walk-forward."
+        }))).into_response();
+    } else if std::path::Path::new(&body.script).is_absolute() {
+        std::path::PathBuf::from(&body.script)
+    } else {
+        scripts_dir.join(&body.script)
+    };
+    if !script_path.exists() {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "error": format!("Script not found: {}", script_path.display())
+        }))).into_response();
+    }
+
+    let sizing_mode = body.sizing_mode.as_deref().unwrap_or("percent");
+    let sizing_value = body.sizing_value.unwrap_or(1.0);
+    let price_mode = body.price_mode.as_deref().unwrap_or("historical");
+    let resolution_logic = body.resolution_logic.clone().unwrap_or_else(|| "price_up".into());
+    let latency_ms = body.latency_values.first().copied();
+
+    // Run one split → (metrics, edge_validation JSON).
+    async fn run_split(
+        script_path: &std::path::Path, body: &LatencySweepBody, from: &str, to: &str,
+        resolution_logic: &str, sizing_mode: &str, sizing_value: f64, price_mode: &str,
+        workspace_dir: &std::path::Path, latency_ms: Option<u64>,
+    ) -> serde_json::Value {
+        let m = crate::tools::backtest::run_backtest_engine(
+            script_path, &body.market_type, &body.symbol, &body.interval, from, to,
+            body.initial_balance, body.fee_pct, resolution_logic, body.threshold,
+            body.max_position_usd, body.max_entry_price, sizing_mode, sizing_value, price_mode,
+            workspace_dir, &body.allowed_hours, body.max_spread_pct, body.rv_min_btc,
+            body.kelly_size_cap, body.min_entry_price, body.max_consecutive_losses,
+            body.stop_loss_pct, latency_ms, body.fee_model.as_deref(), body.feed_latency_ms,
+        ).await;
+        let entries: Vec<f64> = m.all_trades.iter()
+            .filter(|t| matches!(t.side.as_str(), "bet_yes" | "bet_no" | "yes" | "no"))
+            .filter(|t| t.price > 0.01 && t.price < 0.99).map(|t| t.price).collect();
+        let wons: Vec<bool> = m.all_trades.iter()
+            .filter(|t| matches!(t.side.as_str(), "bet_yes" | "bet_no" | "yes" | "no"))
+            .filter(|t| t.price > 0.01 && t.price < 0.99).map(|t| t.pnl > 0.0).collect();
+        let validation = crate::tools::edge_validator::validate(&entries, &wons, 5000);
+        serde_json::json!({
+            "from_date": from, "to_date": to,
+            "total_return_pct": m.total_return_pct,
+            "sharpe_ratio": m.sharpe_ratio,
+            "max_drawdown_pct": m.max_drawdown_pct,
+            "win_rate_pct": m.win_rate_pct,
+            "total_trades": m.total_trades,
+            "analysis": m.analysis,
+            "edge_validation": validation,
+        })
+    }
+
+    let train_res = run_split(&script_path, &body, &train.0, &train.1, &resolution_logic,
+        sizing_mode, sizing_value, price_mode, &workspace_dir, latency_ms).await;
+    let test_res = run_split(&script_path, &body, &test.0, &test.1, &resolution_logic,
+        sizing_mode, sizing_value, price_mode, &workspace_dir, latency_ms).await;
+
+    // The headline: did the edge survive out-of-sample?
+    let train_edge = train_res.get("edge_validation").and_then(|v| v.get("verdict")).and_then(|v| v.as_str()).unwrap_or("");
+    let test_edge = test_res.get("edge_validation").and_then(|v| v.get("verdict")).and_then(|v| v.as_str()).unwrap_or("");
+    let holds_oos = train_edge == "EDGE" && test_edge == "EDGE";
+
+    Json(serde_json::json!({
+        "symbol": body.symbol,
+        "market_type": body.market_type,
+        "train_frac": train_frac,
+        "train": train_res,
+        "test": test_res,
+        "holds_out_of_sample": holds_oos,
+        "verdict": if holds_oos { "EDGE survives out-of-sample" }
+                   else if train_edge == "EDGE" { "OVERFIT — edge in train only, gone in test" }
+                   else { "NO EDGE in train" },
     }))
     .into_response()
 }

@@ -3,7 +3,7 @@ import { apiPost, apiFetch } from './useApi'
 
 // ── Types ─────────────────────────────────────────────────────
 
-export type MarketType = 'crypto' | 'polymarket' | 'polymarket_binary' | 'clob_1hz' | 'archive_candles'
+export type MarketType = 'crypto' | 'polymarket' | 'polymarket_binary' | 'clob_1hz' | 'archive_candles' | 'clob_events'
 
 // A recurring Polymarket binary market series (loaded from /api/backtest/series)
 export interface MarketSeries {
@@ -88,8 +88,12 @@ export interface BacktestConfig {
   min_entry_price?: number
   max_consecutive_losses?: number
   stop_loss_pct?: number
-  // Latency simulation (clob_1hz / archive_candles): fill at signal_ts + latency_ms.
+  // Latency simulation (clob_1hz / archive_candles / clob_events): order latency —
+  // fill at signal_ts + latency_ms (clob_events: the order arrives this late).
   latency_ms?: number
+  // clob_events only: feed latency — how late the strategy PERCEIVES each event
+  // (ctx.ts_ms shifted forward). Separate from latency_ms (order arrival latency).
+  feed_latency_ms?: number
   // Fee model: "pct" = flat fee_pct%, "crypto_taker" = 1.8%×p×(1-p) Polymarket formula.
   fee_model?: 'pct' | 'crypto_taker'
 }
@@ -309,7 +313,9 @@ export function useBacktestState() {
       updateState({
         progress: {
           step: 'fetching',
-          message: (cfg.market_type === 'clob_1hz' || cfg.market_type === 'archive_candles')
+          message: cfg.market_type === 'clob_events'
+            ? `Replaying Orderbook Archive event stream '${cfg.clob_slug ?? cfg.symbol}' (${cfg.from_date} → ${cfg.to_date})…`
+            : (cfg.market_type === 'clob_1hz' || cfg.market_type === 'archive_candles')
             ? `Loading Orderbook Archive tick data for '${cfg.clob_slug ?? cfg.symbol}' (${cfg.from_date} → ${cfg.to_date})…`
             : cfg.market_type === 'polymarket_binary'
             ? `Fetching ${cfg.symbol} 1m candles from Binance (${cfg.from_date} → ${cfg.to_date})…`
@@ -352,11 +358,12 @@ export function useBacktestState() {
         console.log('[Backtest] Normalized legacy sizing_value', cfg.sizing_value, '→', cfgToSend.sizing_value)
       }
 
-      // 2. archive modes use `symbol` as the tick-slug directory name (e.g. "btc_5m"),
-      // NOT as a Binance ticker. If the user switched market_type without re-selecting
-      // the slug, `symbol` may still be "BTCUSDT" from polymarket_binary mode → backend
-      // looks for ticks in data/ticks/BTCUSDT/ (doesn't exist) → 0 trades. Fix here.
-      if (cfg.market_type === 'clob_1hz' || cfg.market_type === 'archive_candles') {
+      // 2. archive modes use `symbol` as the slug directory name (e.g. "btc_5m" for
+      // tick modes, "btc_5m_ev" for the event stream), NOT as a Binance ticker. If the
+      // user switched market_type without re-selecting the slug, `symbol` may still be
+      // "BTCUSDT" from polymarket_binary mode → backend looks for data/ticks/BTCUSDT/
+      // (or data/events/BTCUSDT/) which doesn't exist → 0 trades. Fix here.
+      if (cfg.market_type === 'clob_1hz' || cfg.market_type === 'archive_candles' || cfg.market_type === 'clob_events') {
         const slug = cfg.clob_slug ?? cfg.series_id
         if (slug && cfg.symbol !== slug) {
           cfgToSend.symbol = slug

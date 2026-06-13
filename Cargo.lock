@@ -8826,6 +8826,7 @@ dependencies = [
  "directories",
  "evm-trader",
  "fantoccini",
+ "flate2",
  "futures-util",
  "glob",
  "gray_matter",

@@ -166,55 +166,99 @@ actuales; los modos viejos se mantienen hasta que el nuevo reproduzca sus result
   Rust↔Python).
 
 ### Fase A — Cimientos de datos (2-4 días, paralelizable con B0)
-- `to-events`: parquet → `data/events/<condition_id>/*.jsonl.gz` con TODOS los eventos
-  (ms, sin decimar). Genérico para cualquier mercado, no solo updown.
-- `summary` de event_types del v2 → confirmar si existe snapshot L2 (mejoraría el fill model).
-- Resoluciones genéricas: `backfill-resolutions --condition-id 0x…` vía Gamma para
-  mercados arbitrarios (no solo series updown).
-- **Chainlink histórico**: script que baja rounds del aggregator (Polygon RPC con archivo)
+- ✅ `to-events` (`tools/orderbook_parser.py`): parquet → `data/events/<slug>/YYYY-MM-DD.jsonl.gz`
+  con TODOS los eventos en resolución **ms (sin decimar)** y **ambos tokens YES/NO con su
+  book real** (no `no = 1 − yes`). Modo `--market 0x…` (mercado arbitrario, deriva YES/NO
+  por conteo si no hay metadata) o `--series-prefix btc-updown-5m` (descubre cada ventana).
+  Header `kind:"meta"` por archivo con tokens + resolución oficial. Eventos:
+  `{ts_ms, kind:"book"|"trade", token, cid, …}`. **Dedup de book-top sin cambio por defecto**
+  (el archivo re-emite ~93% sin cambio → 36× menos eventos; `--no-dedup` para conservarlos).
+- ✅ `list-markets`: enumera TODOS los condition_ids de los parquets locales (crypto,
+  política, deportes, esports) por volumen; `--enrich` añade título/slug vía CLOB,
+  `--filter <kw>` busca por keyword. Hace descubrible cualquier mercado para `to-events --market`.
+- ✅ **Fix de resolución oficial**: Gamma `/markets?condition_id=` ignora el filtro y devolvía
+  un mercado arbitrario → `fetch_polymarket_window_resolutions`, `resolve_market_tokens` y
+  el path de `to-ticks-multi` ahora usan el CLOB `/markets/{cid}` (`fetch_clob_market`, con
+  `winner` por token). Verificado: 8/8 ventanas conocidas coinciden. Los ticks ya generados
+  vía `backfill-resolutions` (que usa `?slug=`, sí funciona) estaban correctos.
+- ❌ `summary` de event_types del v2 → confirmar si existe snapshot L2 (mejoraría el fill model).
+- ❌ Resoluciones genéricas para mercados arbitrarios en JSONL 1Hz existentes (patcher).
+- ❌ **Chainlink histórico**: script que baja rounds del aggregator (Polygon RPC con archivo)
   por rango de fechas → `data/chainlink/<feed>/*.jsonl`; merge como `OracleMark` en el
   stream y backfill de `chainlink_price` en los ticks existentes.
-- **Validación:** para 3 ventanas conocidas, la resolución reconstruida de Chainlink
-  coincide con `window_yes_won` oficial.
+- **Validación:** ✅ `to-events` sobre parquet REAL (archivo pmxt v2, 23-abr→25-may, 777 horas
+  sin huecos) conserva el 100% de los eventos a ms, etiqueta ambos tokens, dedup 2.8M→78k.
+  ✅ flujo política end-to-end (Republicans 2028). ❌ Pendiente: Chainlink histórico.
 
-### Fase C — Motor event-driven `clob_events` (4-6 días)
-- Replayer de `MarketEvent` con dos relojes (feed_latency + order_latency).
-- `ExecutionSimulator` taker: VWAP contra el book futuro; cap por depth observado;
-  reporte de consumo de book.
-- Soporta scripts `on_tick` existentes (muestreo 1Hz sintético desde eventos = compat
-  total) Y un nuevo `on_event(ctx)` para HFT real.
-- **Validación:** `clob_events` con muestreo 1Hz y lat=0 reproduce `clob_1hz` (±ruido de
-  agregación documentado); latency sweep de basis/imbalance sobre eventos reproduce la
-  conclusión de `basis_analysis.py`.
+### Fase C — Motor event-driven `clob_events` (✅ implementado)
+- ✅ Replayer de `MarketEvent` (`load_events_for_range` lee los `.jsonl.gz` de Fase A,
+  gunzip + sort por ts_ms) con **dos relojes**: `feed_latency_ms` (cuándo el script
+  PERCIBE el evento → `ctx.ts_ms` desplazado) y `order_latency_ms` (la orden se llena
+  contra el book FUTURO en t+lat, o se descarta si la ventana cierra antes).
+- ✅ Motor `run_clob_events_backtest` con **book de dos lados reconstruido** desde los
+  eventos (yes/no bid/ask vivos) + API `on_event(ctx)`. Settlement por ventana con
+  resolución oficial (`window_yes_won` por su propio cid — bug de resolución cruzada
+  encontrado y corregido en la validación). Fee `pct`/`crypto_taker`, mismos gates y
+  `sim_fill_vwap` que clob_1hz (live-parity).
+- ✅ Dispatch `market_type = "clob_events"` en `run_backtest_engine`; `feed_latency_ms`
+  nuevo en `BacktestRunBody`/`LatencySweepBody`; ruta `GET /api/backtest/event-slugs`;
+  script de ejemplo `clob_events_latency_arb.rhai` (bundled).
+- ✅ **Validación:** 2 tests unitarios (settlement oficial + miss por order-latency) +
+  smoke sobre datos REALES (btc_5m, 78k eventos/h): latency sweep 0ms→250ms muestra el
+  edge degradándose (+17.07% → +16.73%), 100% resolución oficial. ⚠️ n=4 trades en 1h =
+  validación de MECÁNICA, no evidencia de edge — eso lo decide el edge_validator sobre
+  el mes completo.
+- ❌ Pendiente (no bloqueante): cap por depth observado + reporte de consumo de book
+  (hoy `sim_fill_vwap` con depth=0 → fill a best ask); compat `on_tick` por muestreo 1Hz
+  desde eventos (los scripts on_tick siguen usando el motor clob_1hz, que queda intacto
+  como gate de paridad).
 
-### Fase D — Modelo MAKER (3-5 días)
-- Resting limit orders: entra al book al precio elegido; queue position aproximada
-  (volumen tradeado a tu precio después de tu colocación te va consumiendo); cancel con
-  `order_latency_ms`; fills parciales.
-- Adverse selection medible (¿el mid se movió en tu contra tras tu fill?).
-- Modelo de **rewards earnings** (uptime bilateral × share del pool — calibrable con los
-  datos reales que produzca la Fase 2 del VPS plan).
-- Desbloquea: backtest honesto de `rewards_maker` y `minting_mm`.
-- **Validación:** replay de los días del pilot manual de rewards reproduce (±) los fills
-  adversos y la elegibilidad observados.
+### Fase D — Modelo MAKER (✅ implementado)
+- ✅ `run_maker_backtest` (`engine_backtest.rs`): replica el `rewards_maker` (quote
+  bilateral a `mid ± offset`, re-center on drift) sobre el event stream ms. Fill model:
+  una BUY resting se llena cuando un `trade` imprime a precio ≤ tu quote (aprox. top-of-book,
+  asume front-of-queue cuando eres el mejor precio). Mide **adverse selection** (movimiento
+  del YES-mid 10s post-fill en tu contra), **eligible uptime** (% de book events con ambas
+  patas dentro de `reprice_threshold` del mid), y fills YES/NO.
+- ✅ Dispatch: `market_type=clob_events` + `kind=rewards_maker|minting_mm` → maker backtest,
+  con `maker_stats` (eligible_uptime_pct, adverse_selection_pct, fills) en el response.
+- ⚠️ **rewards earnings NO modelado** (depende del pool de rewards de Polymarket; se calibra
+  con datos reales del pilot). Este modelo mide FILL QUALITY + UPTIME — lo que el pilot
+  manual hizo mal. Queue position es aproximada (sin order-by-order data); cancel-latency y
+  fills parciales quedan como mejora futura.
 
-### Fase E — Engines nativos sobre datos reales (2-4 días)
-- Adapter `BookSnapshot` desde el event stream → `arb_binary`, `arb_hedge`, `fair_value`,
-  `fv_momentum`, `rotation_compounder` corren sobre histórico real (reemplaza el sintético
-  de `engine_backtest.rs`).
-- **Validación:** arb_binary sobre histórico encuentra los arbs YES+NO<1 que se ven a ojo
-  en los datos; EV neto tras fees reportado por mercado.
+### Fase E — Engines nativos sobre datos reales (✅ implementado)
+- ✅ `run_engine_clob_events_backtest`: alimenta `arb_binary`, `fair_value`, `fv_momentum`,
+  `arb_hedge` con un `BookSnapshot` de **dos lados REAL** (YES y NO reconstruidos
+  independientemente del event stream, NO `no=1-yes`) a resolución ms, vía `on_book`.
+  Settlement por ventana con resolución oficial (`window_yes_won` por su cid).
+- Mejora sobre `run_engine_clob_1hz_backtest` (que usaba ticks 1Hz, NO book derivado, depth
+  fijo, resolución Binance). El 1Hz queda como path alterno.
+- ⚠️ Pendiente: cap por depth observado (hoy depth fijo 1000); `rotation_compounder`/`minting_mm`
+  no soportados en este path (no son book-takers puros).
 
-### Fase F — Validación estadística y UI (2-3 días)
-- edge_validator (3 legs) integrado como paso final opcional de todo backtest (export
-  CSV ya existe; añadir el verdict al response).
-- Latency sweep + curva EV-vs-latencia en la UI; comparador A/B de configs.
-- Walk-forward split (train/test por fechas) como opción del run.
-- Docs + CLAUDE.md actualizado.
+### Fase F — Validación estadística y UI (✅ implementado)
+- ✅ edge_validator nativo (3 legs, `src/tools/edge_validator.rs`) integrado en
+  `POST /api/backtest/run` vía `validate_edge: true` → `edge_validation` en el response
+  (CI bootstrap, random-null, shuffle-null, verdict EDGE/NO_EDGE/INSUFFICIENT).
+- ✅ Walk-forward: `POST /api/backtest/walk-forward?train_frac=0.7` parte el rango en
+  train/test, corre el backtest en cada uno + edge_validator, y reporta `holds_out_of_sample`
+  (cazа overfit: edge que solo sobrevive in-sample no es edge).
+- ✅ UI: modo "Orderbook Archive (on_event)" en la página Backtesting (slug picker desde
+  `/api/backtest/event-slugs`, campos Order/Feed latency, fee model selector).
+- ✅ Latency sweep ya existía (`/api/backtest/latency-sweep`); el agente lo corrió sobre
+  datos reales (ver `scripts/clob_events_latency_sweep/`).
+- ⚠️ Pendiente: curva EV-vs-latencia graficada en la UI; comparador A/B de configs.
 
-**Orden recomendado:** B0 → A → C → (D ∥ E) → F.
-**Esfuerzo total estimado:** ~3-4 semanas de trabajo efectivo, con valor utilizable desde
-la primera semana (B0+A ya responden la pregunta del VPS plan con datos event-level).
+**Orden recomendado:** B0 → A → C → (D ∥ E) → F. **(todas las fases implementadas)**
+
+### Hallazgo de la primera corrida real (latency sweep + edge_validator)
+El script demo `clob_events_latency_arb` sobre 3 días reales de btc_5m_ev (n=375):
+**NO EDGE a ninguna latencia (0-1000ms).** Pasa Leg 1 (CI>0) y Leg 2 (random-null) pero
+**falla Leg 3 (shuffle-null, p≈1.0)** — la ganancia aparente viene de qué ventanas ganaron
+en este sample corto, no de skill repetible. Latencia-insensible (375→373 trades a 1s). Es
+exactamente el tipo de falso-edge que esta infraestructura existe para rechazar barato.
+Detalle en `scripts/clob_events_latency_sweep/`. (n corto: re-correr sobre el mes completo.)
 
 ---
 

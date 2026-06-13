@@ -797,6 +797,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     let backtest_run_router = Router::new()
         .route("/api/backtest/run", post(api::handle_api_backtest_run))
         .route("/api/backtest/latency-sweep", post(api::handle_api_backtest_latency_sweep))
+        .route("/api/backtest/walk-forward", post(api::handle_api_backtest_walk_forward))
         .with_state(state.clone())
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
@@ -975,6 +976,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         // ── Backtesting ──
         .route("/api/backtest/series", get(api::handle_api_backtest_series))
         .route("/api/backtest/tick-slugs", get(api::handle_api_backtest_tick_slugs))
+        .route("/api/backtest/event-slugs", get(api::handle_api_backtest_event_slugs))
         .route("/api/backtest/scripts", get(api::handle_api_backtest_scripts).delete(api::handle_api_backtest_scripts_delete))
         .route("/api/backtest/scripts/rename", post(api::handle_api_backtest_scripts_rename))
         .route("/api/backtest/scripts/description", post(api::handle_api_backtest_scripts_description))

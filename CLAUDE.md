@@ -76,6 +76,8 @@ Key routes:
 - `GET  /api/backtest/scripts`                — list .rhai files from /scripts/
 - `POST /api/backtest/run`                    — run backtest (Rhai engine)
 - `GET  /api/backtest/tick-slugs`             — list available tick JSONL slugs for archive backtesting
+- `GET  /api/backtest/event-slugs`            — list available ms event-stream slugs (clob_events / on_event)
+- `POST /api/backtest/walk-forward`           — train/test split + 3-leg edge_validator on each (catches overfit; ?train_frac=0.7)
 - `GET  /api/wallets`                         — list wallets
 - `POST /api/wallets/create`                  — create wallet (EVM/Solana/TON)
 - `GET  /api/polymarket/markets`              — list markets
@@ -119,6 +121,7 @@ Key routes:
 | `clob_1hz_late_certainty.rhai` | on_tick-based | CLOB 1 HZ: fade uncertainty in final 30-45s. Setups A/B follow clear BTC move; C/D fade wrong-side favourite/underdog. EV-positive on 33d real data |
 | `clob_1hz_early_oracle.rhai` | on_tick-based | CLOB 1 HZ: early oracle-divergence entry |
 | `clob_1hz_volatility_regime.rhai` | on_tick-based | CLOB 1 HZ: regime-gated tick entries |
+| `clob_events_latency_arb.rhai` | on_event-based | CLOB EVENTS (sub-second): latency-arb demo — takes the correct side in the final 35s when Binance has moved but the book lags. Shows the on_event API |
 
 Cross-asset analysis and setup-by-setup edge tables:
 `src/tools/scripts/POLYMARKET_UPDOWN_5M_CROSS_ASSET.md`
@@ -340,6 +343,27 @@ python3 tools/orderbook_parser.py to-candles --market 0x... --slug ob_test \
 # Auto-detect all recurring 5/15/60-min series and convert in one shot
 python3 tools/orderbook_parser.py to-ticks-multi --days 40
 
+# List ALL markets in local parquets (crypto + politics + sports + esports),
+# ranked by event volume. --enrich adds question/slug via the CLOB endpoint;
+# --filter searches by keyword. Feeds `to-events --market`.
+python3 tools/orderbook_parser.py list-markets --in ~/.traderclaw/workspace/data/orderbook/ --limit 30 --enrich
+python3 tools/orderbook_parser.py list-markets --in ~/.traderclaw/workspace/data/orderbook/ --filter election
+
+# Convert downloaded parquets → sub-second (ms) EVENT stream for the clob_events
+# engine (BACKTEST_ENGINE_PLAN.md Fase A). Keeps every event at ms resolution
+# (no 1Hz decimation) and BOTH the YES and NO books separately (real two-sided
+# book, not no = 1 − yes). Consecutive unchanged book-tops are deduped by default
+# (the archive re-emits ~93% unchanged); pass --no-dedup to keep them all.
+# Output: data/events/<slug>/YYYY-MM-DD.jsonl.gz.
+# Single arbitrary market (works for politics/sports/etc., not just crypto):
+python3 tools/orderbook_parser.py to-events --market 0x... --slug republicans_2028 \
+  --in ~/.traderclaw/workspace/data/orderbook/ \
+  --out ~/.traderclaw/workspace/data/events/
+# Rolling updown series (discovers each window's condition_id):
+python3 tools/orderbook_parser.py to-events --series-prefix btc-updown-5m --slug btc_5m_ev \
+  --binance-symbol BTCUSDT \
+  --in ~/.traderclaw/workspace/data/orderbook/ --out ~/.traderclaw/workspace/data/events/
+
 # Backfill official Polymarket resolution (window_yes_won) into EXISTING tick JSONL files.
 # Queries Gamma API by slug "{series_prefix}-{window_ts}", rewrites JSONL in place.
 # ~5 min per slug (30 concurrent requests/batch). Safe to re-run.
@@ -358,6 +382,11 @@ Only BTC and ETH have 15m series; 1h exists for BTC only.
 - DuckDB `custom_user_agent` must be set at connection creation (not via `SET` after open)
 - Archive files have gaps (missing hours) — `filter_available_urls()` pre-checks each URL
 - NO price = 1 − YES price: `no_bid = 1 − yes_ask`, `no_ask = 1 − yes_bid`
+- **Gamma `/markets?condition_id=` SILENTLY IGNORES the filter** and returns an arbitrary
+  market — never use it for per-market lookup. Use the CLOB `/markets/{condition_id}`
+  endpoint (`fetch_clob_market()`), a true key-value lookup that also exposes per-token
+  `winner` flags for official resolution. Gamma `?slug=` filtering DOES work (used by
+  `backfill-resolutions`), so existing tick `window_yes_won` values are correct.
 
 **Gateway API routes** (all require Bearer auth):
 - `POST /api/orderbook/query`            — remote DuckDB query (modes: summary, top-markets, price-series, spread-stats, drift)
@@ -402,12 +431,66 @@ Runs `on_candle(ctx)` scripts through the same engine as `polymarket_binary`.
 3. Pick slug, pick any `on_candle(ctx)` script
 4. Run
 
-**Key functions in `src/tools/backtest.rs`:**
-- `run_clob_1hz_backtest()` / `run_clob_1hz_backtest_from_files()` — on_tick path
-- `run_archive_candles_backtest()` — on_candle path (new)
-- `load_ticks_for_range()` — shared tick loader used by both paths
+### `clob_events` — "Orderbook Archive (on_event)" — sub-second / HFT (BACKTEST_ENGINE_PLAN Fase C)
+Replays the **millisecond** event stream from `to-events`
+(`<workspace>/data/events/<slug>/*.jsonl.gz`) through `on_event(ctx)` scripts.
+Unlike clob_1hz (1 tick/s, same-tick fill), this keeps a **live two-sided book**
+(YES & NO reconstructed from events) and models latency with **two independent clocks**:
+- `feed_latency_ms` — when the strategy PERCEIVES each event (shifts `ctx.ts_ms`)
+- `latency_ms` (= order latency) — the order fills against the FUTURE book at t+lat,
+  or is discarded if the window closes first.
 
-**Gateway API:** `GET /api/backtest/tick-slugs` — returns available slugs with date ranges.
+`on_event(ctx)` API (in addition to the clob_1hz fields):
+```rhai
+fn on_event(ctx) {
+    ctx.event_kind   // "book" | "trade"          ctx.event_token  // "yes"|"no"|"unknown"
+    ctx.event_price  // trade price / book ask     ctx.ts_ms        // perceived time (incl. feed latency)
+    ctx.yes_bid/ctx.yes_ask/ctx.yes_mid  ctx.no_bid/ctx.no_ask     // live reconstructed book
+    ctx.binance_price  ctx.window_secs_left  ctx.window_ts  ctx.spread_pct
+    ctx.balance  ctx.position  ctx.entry_price  ctx.window_yes_won
+    ctx.bet_yes(frac)  ctx.bet_no(frac)  ctx.set(k,v)  ctx.get(k,def)
+}
+```
+**Workflow:** `to-events --slug X …` → Market = "Orderbook Archive (on_event)" →
+pick slug (from `GET /api/backtest/event-slugs`) → pick an `on_event(ctx)` script
+(e.g. `clob_events_latency_arb.rhai`) → set Latency (ms) → Run. The latency-sweep
+endpoint produces the EV-vs-latency curve that answers "does the edge survive VPS latency?".
+
+**Key functions in `src/tools/backtest.rs`:**
+- `run_clob_1hz_backtest()` / `run_clob_1hz_backtest_from_files()` — on_tick path (1Hz)
+- `run_archive_candles_backtest()` — on_candle path
+- `run_clob_events_backtest()` / `run_clob_events_backtest_from_files()` — on_event path (ms)
+- `load_ticks_for_range()` — shared tick loader (clob_1hz/archive_candles)
+- `load_events_for_range()` — gzip event-stream loader (clob_events)
+
+**Gateway API:** `GET /api/backtest/tick-slugs` (clob_1hz/archive_candles slugs) ·
+`GET /api/backtest/event-slugs` (clob_events slugs) — both return slugs + date ranges.
+
+### Native engines on real event data (Fase E)
+`clob_events` + an engine `kind` (arb_binary / fair_value / fv_momentum / arb_hedge)
+runs the strategy-core engine via `on_book` over a REAL two-sided book (YES & NO
+reconstructed independently from the ms event stream, NOT `no = 1-yes`) with official
+per-window resolution. `run_engine_clob_events_backtest()` in `engine_backtest.rs`.
+This supersedes the synthetic-candle (`run_engine_backtest`) and 1Hz-tick
+(`run_engine_clob_1hz_backtest`) paths for honesty.
+
+### Maker backtest (Fase D)
+`clob_events` + `kind=rewards_maker|minting_mm` → `run_maker_backtest()`: replays a
+bilateral resting quote (mid ± offset, re-center on drift) over the event stream and
+reports **eligible uptime %**, **adverse selection %** (mid moved against us within 10s
+of a fill), and YES/NO fill counts in `maker_stats`. Fill model = top-of-book queue
+approximation (a resting BUY fills when a trade prints at/through its price). Rewards
+pool earnings are NOT modeled — this measures fill quality + uptime, what the manual
+rewards pilot got wrong. engine_params: `offset_cents`, `reprice_threshold`, `size_usd`.
+
+### Edge validation + walk-forward (Fase F)
+- `POST /api/backtest/run` with `"validate_edge": true` → attaches `edge_validation`
+  (native 3-leg validator: bootstrap CI, random-side null, shuffle-null → EDGE /
+  NO_EDGE / INSUFFICIENT) computed on the backtest's own trades. Passing the backtest
+  is NOT edge; this is the gate.
+- `POST /api/backtest/walk-forward?train_frac=0.7` → runs the backtest on a train split
+  and a held-out test split, validates each, and reports `holds_out_of_sample`. An edge
+  that only survives in-sample is overfit, not edge.
 
 ## Dynamic Asset Selector (`src/tools/asset_selector.rs`)
 Rolling 30-day win-rate tracker per (script × symbol). Automatically records

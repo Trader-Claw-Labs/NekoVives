@@ -1413,6 +1413,22 @@ export default function Backtesting() {
   })
   const tickSlugs: TickSlugInfo[] = tickSlugsData?.slugs ?? []
 
+  // Load available clob_events (on_event) stream slugs from data/events/<slug>/.
+  // Same shape as tick-slugs minus tick_count (gzip stream — count not cheap to compute).
+  interface EventSlugInfo {
+    slug: string
+    dates: string[]
+    from_date: string
+    to_date: string
+  }
+  const { data: eventSlugsData, refetch: refetchEventSlugs } = useQuery<{ slugs: EventSlugInfo[] }>({
+    queryKey: ['backtest-event-slugs'],
+    queryFn: () => apiFetch('/api/backtest/event-slugs'),
+    staleTime: 30 * 1000,
+    enabled: config.market_type === 'clob_events',
+  })
+  const eventSlugs: EventSlugInfo[] = eventSlugsData?.slugs ?? []
+
   // Migrate stale 'polymarket' CLOB state to 'polymarket_binary'
   useEffect(() => {
     if ((config.market_type as string) === 'polymarket') {
@@ -1629,7 +1645,9 @@ export default function Backtesting() {
 
   const isBatchMode = selectedScripts.length > 1
   const isArchiveMode = config.market_type === 'clob_1hz' || config.market_type === 'archive_candles'
-  const hasClob1HzSlug = !isArchiveMode || !!(config.clob_slug ?? config.symbol)
+  const isEventMode = config.market_type === 'clob_events'
+  // A slug must be selected before a slug-based run (archive tick modes OR the event stream).
+  const hasClob1HzSlug = (!isArchiveMode && !isEventMode) || !!(config.clob_slug ?? config.symbol)
   const canRun = (isBatchMode || !!config.script || isEngineKind) && hasClob1HzSlug && !isRunning && !batchProgress
 
   // Sort scripts by selected metric descending
@@ -2002,6 +2020,21 @@ export default function Backtesting() {
                     symbol: slug,
                   })
                   refetchTickSlugs()
+                } else if (newType === 'clob_events') {
+                  // Event-driven replay (on_event(ctx) scripts) from data/events/<slug>/.
+                  // Sub-second ms-resolution stream; latency is a first-class parameter
+                  // (Latency = order arrival, Feed latency = perception delay).
+                  // symbol must equal the event-stream slug (e.g. "btc_5m_ev").
+                  const slug = config.clob_slug ?? 'btc_5m_ev'
+                  setFullConfig({
+                    ...config,
+                    market_type: newType,
+                    interval: '5m',
+                    fee_pct: 1.5,
+                    clob_slug: slug,
+                    symbol: slug,
+                  })
+                  refetchEventSlugs()
                 } else {
                   setFullConfig({
                     ...config,
@@ -2024,6 +2057,7 @@ export default function Backtesting() {
               <option value="polymarket_binary">⚠ Polymarket Binary — synthetic, NOT edge</option>
               <option value="clob_1hz">⚠ Orderbook Archive on_tick — stale prices, NOT edge</option>
               <option value="archive_candles">⚠ Orderbook Archive on_candle — stale prices, NOT edge</option>
+              <option value="clob_events">⚠ Orderbook Archive on_event — sub-second, latency-paramd, NOT edge</option>
             </select>
             <p className="text-[10px] mt-1" style={{ color: 'var(--color-warning)' }}>
               ⚠ The Polymarket/Archive engines use synthetic or stale-archive prices and
@@ -2165,8 +2199,64 @@ export default function Backtesting() {
 
           {/* Symbol / Market selector — adapts to market type. For archive modes we
               always show the recorded-tick slug picker (Rhai on_tick/on_candle scripts
-              and engine kinds both consume the same recorded ticks). */}
-          {isArchiveMode ? (
+              and engine kinds both consume the same recorded ticks). The clob_events
+              mode uses a separate picker fed by the sub-second event streams. */}
+          {isEventMode ? (
+            <div className="col-span-2 lg:col-span-4">
+              <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>Event Stream Slug</label>
+              {eventSlugs.length === 0 ? (
+                <div
+                  className="rounded px-3 py-2 text-xs space-y-2"
+                  style={{
+                    backgroundColor: 'var(--color-surface-2)',
+                    border: '1px solid var(--color-border)',
+                    color: 'var(--color-text-muted)',
+                  }}
+                >
+                  <div>
+                    <span className="font-semibold" style={{ color: 'var(--color-text)' }}>No event streams yet.</span>{' '}
+                    The on_event engine replays sub-second (ms) order-book events from <code className="text-[10px]" style={{ color: 'var(--color-accent)' }}>data/events/&lt;slug&gt;/</code>.
+                    Generate one from local archive parquets with{' '}
+                    <code className="text-[10px]" style={{ color: 'var(--color-accent)' }}>orderbook_parser.py to-events --series-prefix btc-updown-5m --slug btc_5m_ev</code>.
+                  </div>
+                </div>
+              ) : (
+                <select
+                  value={config.clob_slug ?? config.symbol ?? ''}
+                  onChange={(e) => {
+                    const slug = e.target.value
+                    const info = eventSlugs.find(s => s.slug === slug)
+                    setFullConfig({
+                      ...config,
+                      clob_slug: slug,
+                      symbol: slug,
+                      from_date: info?.from_date ?? config.from_date,
+                      to_date: info?.to_date ?? config.to_date,
+                    })
+                  }}
+                  className="w-full rounded px-2 py-2 text-sm font-mono"
+                  style={{
+                    backgroundColor: 'var(--color-surface-2)',
+                    border: '1px solid var(--color-border)',
+                    color: 'var(--color-text)',
+                  }}
+                >
+                  <option value="">Select an event stream…</option>
+                  {eventSlugs.map(s => (
+                    <option key={s.slug} value={s.slug}>
+                      {s.slug} — {s.dates.length} day(s) ({s.from_date} → {s.to_date})
+                    </option>
+                  ))}
+                </select>
+              )}
+              {config.clob_slug && eventSlugs.find(s => s.slug === config.clob_slug) && (
+                <p className="text-[10px] mt-1" style={{ color: 'var(--color-text-muted)' }}>
+                  {eventSlugs.find(s => s.slug === config.clob_slug)!.dates.length} day(s) of ms-resolution events
+                  · Script must use <code style={{ color: 'var(--color-accent)' }}>on_event(ctx)</code>
+                </p>
+              )}
+            </div>
+          ) : isArchiveMode ? (
             <div className="col-span-2 lg:col-span-4">
               <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>Tick Slug</label>
               {tickSlugs.length === 0 ? (
@@ -2333,8 +2423,9 @@ export default function Backtesting() {
             </div>
           ) : null}
 
-          {/* Interval / Window — hidden for engine kinds and archive tick modes */}
-          {!isEngineKind && !isArchiveMode && <div className={config.market_type === 'crypto' ? 'lg:col-span-3' : 'lg:col-span-2'}>
+          {/* Interval / Window — hidden for engine kinds, archive tick modes, and the
+              event stream (clob_events carries its own window cadence in the stream meta) */}
+          {!isEngineKind && !isArchiveMode && !isEventMode && <div className={config.market_type === 'crypto' ? 'lg:col-span-3' : 'lg:col-span-2'}>
             <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>
               {config.market_type === 'polymarket_binary' ? 'Window' : 'Interval'}
             </label>
@@ -2439,15 +2530,17 @@ export default function Backtesting() {
             />
           </div>
 
-          {/* Latency (ms) — clob_1hz / archive_candles only */}
-          {(config.market_type === 'clob_1hz' || config.market_type === 'archive_candles') && (
+          {/* Latency (ms) — clob_1hz / archive_candles / clob_events.
+              For clob_events this is the ORDER arrival latency (latency_ms): the order
+              fills against the FUTURE book at signal_ts + latency_ms. */}
+          {(config.market_type === 'clob_1hz' || config.market_type === 'archive_candles' || isEventMode) && (
             <div className="lg:col-span-2">
               <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>
-                Latency (ms)
+                {isEventMode ? 'Order latency (ms)' : 'Latency (ms)'}
                 <span
                   className="ml-1 px-1 rounded text-[9px]"
                   style={{ backgroundColor: 'var(--color-surface-2)', color: 'var(--color-text-muted)' }}
-                  title="Simulated order latency. 0 = same-tick fill (no latency). 110 = VPS Newark. Fill executes at signal_ts + latency_ms."
+                  title="Simulated order latency. 0 = same-tick fill (no latency). 110 = VPS Newark. Fill executes against the book at signal_ts + latency_ms."
                 >
                   0 = no lag
                 </span>
@@ -2468,13 +2561,50 @@ export default function Backtesting() {
                 }}
               />
               <div className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
-                {config.latency_ms ? `Fill delayed ${config.latency_ms}ms from signal` : 'Same-tick fill (no latency simulation)'}
+                {config.latency_ms
+                  ? (isEventMode ? `Order fills against book ${config.latency_ms}ms after signal` : `Fill delayed ${config.latency_ms}ms from signal`)
+                  : 'Same-tick fill (no latency simulation)'}
               </div>
             </div>
           )}
 
-          {/* Fee model — clob_1hz / archive_candles only */}
-          {(config.market_type === 'clob_1hz' || config.market_type === 'archive_candles') && (
+          {/* Feed latency (ms) — clob_events only. How late the strategy PERCEIVES each
+              event (ctx.ts_ms shifted forward). Separate from order latency above. */}
+          {isEventMode && (
+            <div className="lg:col-span-2">
+              <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>
+                Feed latency (ms)
+                <span
+                  className="ml-1 px-1 rounded text-[9px]"
+                  style={{ backgroundColor: 'var(--color-surface-2)', color: 'var(--color-text-muted)' }}
+                  title="How late the strategy perceives each event. ctx.ts_ms is shifted forward by this much; the script reacts to events feed_latency_ms after they actually occurred."
+                >
+                  perception delay
+                </span>
+              </label>
+              <input
+                type="number"
+                min={0}
+                max={5000}
+                step={10}
+                value={config.feed_latency_ms ?? 0}
+                onChange={(e) => set('feed_latency_ms', e.target.value === '' || Number(e.target.value) === 0 ? undefined : Number(e.target.value))}
+                placeholder="0"
+                className="w-full rounded px-2 py-2 text-sm font-mono"
+                style={{
+                  backgroundColor: 'var(--color-surface-2)',
+                  border: '1px solid var(--color-border)',
+                  color: 'var(--color-text)',
+                }}
+              />
+              <div className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
+                {config.feed_latency_ms ? `Events perceived ${config.feed_latency_ms}ms late` : 'Events perceived at their real timestamp'}
+              </div>
+            </div>
+          )}
+
+          {/* Fee model — clob_1hz / archive_candles / clob_events */}
+          {(config.market_type === 'clob_1hz' || config.market_type === 'archive_candles' || isEventMode) && (
             <div className="lg:col-span-2">
               <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>
                 Fee Model

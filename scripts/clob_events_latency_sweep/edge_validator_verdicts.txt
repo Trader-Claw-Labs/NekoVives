@@ -1,0 +1,65 @@
+==================== LATENCY 0ms ====================
+Validating 375 trades.
+
+  n=375  WR=76.3%  avg_entry(break-even)=49.6%  total_PnL/$1stake=+255.68
+  Observed EV/trade = +68.18%
+
+  LEG 1 — Bootstrap 95% CI on EV/trade: [+53.18%, +85.32%]   PASS (lower>0)
+  LEG 2 — Random-side null: p=0.000 (EV beats 100.0% of sk-less strategies)   PASS
+  LEG 3 — Shuffled-outcome null: p=0.999   FAIL (edge within outcome-shuffle noise)
+
+  ►► VERDICT: NO EDGE — consistent with luck/fees. Do NOT commit capital.
+
+
+==================== LATENCY 110ms ====================
+Validating 368 trades.
+
+  n=368  WR=76.1%  avg_entry(break-even)=52.0%  total_PnL/$1stake=+220.38
+  Observed EV/trade = +59.89%
+
+  LEG 1 — Bootstrap 95% CI on EV/trade: [+47.30%, +72.82%]   PASS (lower>0)
+  LEG 2 — Random-side null: p=0.000 (EV beats 100.0% of sk-less strategies)   PASS
+  LEG 3 — Shuffled-outcome null: p=1.000   FAIL (edge within outcome-shuffle noise)
+
+  ►► VERDICT: NO EDGE — consistent with luck/fees. Do NOT commit capital.
+
+
+==================== LATENCY 220ms ====================
+Validating 365 trades.
+
+  n=365  WR=76.2%  avg_entry(break-even)=52.1%  total_PnL/$1stake=+215.86
+  Observed EV/trade = +59.14%
+
+  LEG 1 — Bootstrap 95% CI on EV/trade: [+46.94%, +71.71%]   PASS (lower>0)
+  LEG 2 — Random-side null: p=0.000 (EV beats 100.0% of sk-less strategies)   PASS
+  LEG 3 — Shuffled-outcome null: p=1.000   FAIL (edge within outcome-shuffle noise)
+
+  ►► VERDICT: NO EDGE — consistent with luck/fees. Do NOT commit capital.
+
+
+==================== LATENCY 500ms ====================
+Validating 367 trades.
+
+  n=367  WR=76.3%  avg_entry(break-even)=52.8%  total_PnL/$1stake=+246.48
+  Observed EV/trade = +67.16%
+
+  LEG 1 — Bootstrap 95% CI on EV/trade: [+48.97%, +90.99%]   PASS (lower>0)
+  LEG 2 — Random-side null: p=0.000 (EV beats 100.0% of sk-less strategies)   PASS
+  LEG 3 — Shuffled-outcome null: p=1.000   FAIL (edge within outcome-shuffle noise)
+
+  ►► VERDICT: NO EDGE — consistent with luck/fees. Do NOT commit capital.
+
+
+==================== LATENCY 1000ms ====================
+Validating 359 trades.
+
+  n=359  WR=75.8%  avg_entry(break-even)=53.4%  total_PnL/$1stake=+224.57
+  Observed EV/trade = +62.55%
+
+  LEG 1 — Bootstrap 95% CI on EV/trade: [+45.81%, +81.43%]   PASS (lower>0)
+  LEG 2 — Random-side null: p=0.000 (EV beats 100.0% of sk-less strategies)   PASS
+  LEG 3 — Shuffled-outcome null: p=1.000   FAIL (edge within outcome-shuffle noise)
+
+  ►► VERDICT: NO EDGE — consistent with luck/fees. Do NOT commit capital.
+
+
