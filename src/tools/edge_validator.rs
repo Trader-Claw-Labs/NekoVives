@@ -46,6 +46,35 @@ pub struct ValidationResult {
     pub note: String,
 }
 
+/// True if a trade's `side` label denotes a BINARY bet the validator can use.
+/// Engines disagree on the label: clob_1hz/clob_events emit `bet_yes`/`bet_no`,
+/// the strategy-core engine paths emit `yes`/`no`, and the on_candle path
+/// (archive_candles / polymarket_binary) emits `{yes|no}_{win|loss}`. Missing
+/// any of these (the cause of BUG-2) silently zeroed the validator on the most-
+/// used on_candle path. Crypto buy/sell sides are NOT binary → excluded.
+pub fn is_binary_side(side: &str) -> bool {
+    matches!(side, "bet_yes" | "bet_no" | "yes" | "no")
+        || side.starts_with("yes_")
+        || side.starts_with("no_")
+}
+
+/// Extract `(entries, wons)` from a backtest's trades for the validator, across
+/// ALL engine side-label conventions. `won` is `pnl > 0.0`. Entry prices outside
+/// (0.01, 0.99) are dropped (non-binary / degenerate).
+pub fn extract_binary_trades(
+    trades: &[crate::tools::backtest::AllTrade],
+) -> (Vec<f64>, Vec<bool>) {
+    let mut entries = Vec::new();
+    let mut wons = Vec::new();
+    for t in trades {
+        if is_binary_side(&t.side) && t.price > 0.01 && t.price < 0.99 {
+            entries.push(t.price);
+            wons.push(t.pnl > 0.0);
+        }
+    }
+    (entries, wons)
+}
+
 /// Run the 3-leg validation. `entries` = the price actually paid per trade (the
 /// settle/fill price), `wons` = official outcome. `iters` bootstrap/permutation samples.
 pub fn validate(entries: &[f64], wons: &[bool], iters: usize) -> ValidationResult {

@@ -3075,10 +3075,15 @@ fn run_polymarket_slug_backtest(
             let raw_stake = base_stake * kelly_mult;
             // Enforce Polymarket position limit: stake cannot exceed available market liquidity.
             // Real 5-min binary markets typically have $500-$3,000 USDC of liquidity per window.
-            let stake = if let Some(max_s) = max_stake_usd {
-                raw_stake.min(max_s)
-            } else {
-                raw_stake
+            // When no explicit cap is given, fall back to a sane default tied to the
+            // INITIAL balance (not the live one). Without this, percent-mode sizing
+            // reinvests an exponentially growing balance and produces absurd returns
+            // (+10^33%) that no real market liquidity could ever fill. 25% of initial
+            // mirrors the engine_backtest default and keeps the headline metric honest.
+            let default_cap = (initial_balance * 0.25).max(5.0);
+            let stake = match max_stake_usd {
+                Some(max_s) => raw_stake.min(max_s),
+                None => raw_stake.min(default_cap),
             };
             // Also enforce minimum order size ($5 USDC per Polymarket API)
             if stake < 5.0 { continue; }
