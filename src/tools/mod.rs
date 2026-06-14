@@ -17,6 +17,7 @@
 
 pub mod backtest;
 pub mod edge_validator;
+pub mod validate_all;
 pub mod binance_perps;
 pub mod event_backtest;
 pub mod historical_data;

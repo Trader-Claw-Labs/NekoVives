@@ -4673,19 +4673,10 @@ pub async fn handle_api_backtest_run(
         .collect();
 
     // ── Fase F: optional 3-leg edge validation on the backtest's own trades ──────
-    // Extract (entry_price, won) from real betting trades — skip "equity"/"expired"
-    // bookkeeping rows that carry no entry price. Only meaningful for binary modes.
+    // Uses the shared extractor so it recognizes EVERY engine's side labels
+    // (bet_yes/bet_no, yes/no, yes_win/no_loss…) — see BUG-2.
     let edge_validation = if body.validate_edge {
-        let entries: Vec<f64> = metrics.all_trades.iter()
-            .filter(|t| matches!(t.side.as_str(), "bet_yes" | "bet_no" | "yes" | "no"))
-            .filter(|t| t.price > 0.01 && t.price < 0.99)
-            .map(|t| t.price)
-            .collect();
-        let wons: Vec<bool> = metrics.all_trades.iter()
-            .filter(|t| matches!(t.side.as_str(), "bet_yes" | "bet_no" | "yes" | "no"))
-            .filter(|t| t.price > 0.01 && t.price < 0.99)
-            .map(|t| t.pnl > 0.0)
-            .collect();
+        let (entries, wons) = crate::tools::edge_validator::extract_binary_trades(&metrics.all_trades);
         Some(crate::tools::edge_validator::validate(&entries, &wons, 5000))
     } else {
         None
@@ -4952,12 +4943,7 @@ pub async fn handle_api_backtest_walk_forward(
             body.kelly_size_cap, body.min_entry_price, body.max_consecutive_losses,
             body.stop_loss_pct, latency_ms, body.fee_model.as_deref(), body.feed_latency_ms,
         ).await;
-        let entries: Vec<f64> = m.all_trades.iter()
-            .filter(|t| matches!(t.side.as_str(), "bet_yes" | "bet_no" | "yes" | "no"))
-            .filter(|t| t.price > 0.01 && t.price < 0.99).map(|t| t.price).collect();
-        let wons: Vec<bool> = m.all_trades.iter()
-            .filter(|t| matches!(t.side.as_str(), "bet_yes" | "bet_no" | "yes" | "no"))
-            .filter(|t| t.price > 0.01 && t.price < 0.99).map(|t| t.pnl > 0.0).collect();
+        let (entries, wons) = crate::tools::edge_validator::extract_binary_trades(&m.all_trades);
         let validation = crate::tools::edge_validator::validate(&entries, &wons, 5000);
         serde_json::json!({
             "from_date": from, "to_date": to,

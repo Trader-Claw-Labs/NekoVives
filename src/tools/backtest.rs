@@ -50,6 +50,7 @@ const CLOB_1HZ_EARLY_ORACLE_SCRIPT:    &str = include_str!("scripts/clob_1hz_ear
 const CLOB_1HZ_LATE_CERTAINTY_SCRIPT:  &str = include_str!("scripts/clob_1hz_late_certainty.rhai");
 const CLOB_1HZ_VOLATILITY_REGIME_SCRIPT: &str = include_str!("scripts/clob_1hz_volatility_regime.rhai");
 const CLOB_EVENTS_LATENCY_ARB_SCRIPT: &str = include_str!("scripts/clob_events_latency_arb.rhai");
+const CLOB_EVENTS_LATE_CERTAINTY_SCRIPT: &str = include_str!("scripts/clob_events_late_certainty.rhai");
 
 // ── Classic Indicators ────────────────────────────────────────────────────────
 const RSI_STRATEGY_SCRIPT: &str = include_str!("scripts/rsi_strategy.rhai");
@@ -57,7 +58,7 @@ const RSI_STRATEGY_SCRIPT: &str = include_str!("scripts/rsi_strategy.rhai");
 /// Write bundled default scripts to `<workspace>/scripts/` if they don't exist yet.
 /// Called by both backtest tools so the scripts are always available on first run.
 /// All bundled default scripts as (filename, content) pairs.
-const DEFAULT_SCRIPTS: [(&str, &str); 32] = [
+const DEFAULT_SCRIPTS: [(&str, &str); 33] = [
     // ── Polymarket binary ──────────────────────────────────────────────────────
     ("polymarket_btc_binary.rhai",              POLYMARKET_BTC_BINARY_SCRIPT),
     ("polymarket_5min.rhai",                    POLYMARKET_5MIN_SCRIPT),
@@ -96,6 +97,7 @@ const DEFAULT_SCRIPTS: [(&str, &str); 32] = [
     ("clob_1hz_volatility_regime.rhai",         CLOB_1HZ_VOLATILITY_REGIME_SCRIPT),
     // ── clob_events sub-second (on_event) strategies ─────────────────────────
     ("clob_events_latency_arb.rhai",            CLOB_EVENTS_LATENCY_ARB_SCRIPT),
+    ("clob_events_late_certainty.rhai",         CLOB_EVENTS_LATE_CERTAINTY_SCRIPT),
     // ── Reference & templates ─────────────────────────────────────────────────
     ("strategy.rhai",                           STRATEGY_SCRIPT),
 ];
@@ -3075,10 +3077,15 @@ fn run_polymarket_slug_backtest(
             let raw_stake = base_stake * kelly_mult;
             // Enforce Polymarket position limit: stake cannot exceed available market liquidity.
             // Real 5-min binary markets typically have $500-$3,000 USDC of liquidity per window.
-            let stake = if let Some(max_s) = max_stake_usd {
-                raw_stake.min(max_s)
-            } else {
-                raw_stake
+            // When no explicit cap is given, fall back to a sane default tied to the
+            // INITIAL balance (not the live one). Without this, percent-mode sizing
+            // reinvests an exponentially growing balance and produces absurd returns
+            // (+10^33%) that no real market liquidity could ever fill. 25% of initial
+            // mirrors the engine_backtest default and keeps the headline metric honest.
+            let default_cap = (initial_balance * 0.25).max(5.0);
+            let stake = match max_stake_usd {
+                Some(max_s) => raw_stake.min(max_s),
+                None => raw_stake.min(default_cap),
             };
             // Also enforce minimum order size ($5 USDC per Polymarket API)
             if stake < 5.0 { continue; }
@@ -4617,6 +4624,36 @@ pub fn run_clob_1hz_backtest(
     let mut portfolio_values: Vec<f64> = vec![initial_balance];
     let mut peak = initial_balance;
     let mut max_dd = 0.0_f64;
+
+    // ── BUG-1 fix: per-window resolution + last price, keyed by window_ts ──────────
+    // The window-transition settle path runs when the FIRST tick of the NEXT window
+    // arrives — at which point `tick.window_yes_won`/`tick.binance_price` belong to
+    // the next window, not the one closing. Resolving with those silently flips
+    // wins↔losses on windows that lack a `secs_left==0` boundary tick (e.g. across a
+    // day gap). Pre-index each window's OWN official outcome and its LAST seen Binance
+    // price so the closing window settles with its own data.
+    let mut official_by_window: std::collections::HashMap<i64, bool> = std::collections::HashMap::new();
+    let mut last_binance_by_window: std::collections::HashMap<i64, f64> = std::collections::HashMap::new();
+    let mut max_secs_left: i64 = 0;
+    for t in &ticks {
+        if let Some(yw) = t.window_yes_won {
+            official_by_window.entry(t.window_ts).or_insert(yw);
+        }
+        if t.binance_price > 0.0 {
+            last_binance_by_window.insert(t.window_ts, t.binance_price);
+        }
+        if t.window_secs_left > max_secs_left { max_secs_left = t.window_secs_left; }
+    }
+    // BUG-5 fix: `second_in_window` used a hardcoded 300s, breaking 15m/1h slugs
+    // (where window_secs_left runs to 900/3600 → second_in_window went negative).
+    // Infer the window length from the data: round the observed max secs_left up to
+    // the nearest minute. Defaults to 300 when no ticks carry a positive secs_left.
+    let window_secs_total: i64 = if max_secs_left > 0 {
+        ((max_secs_left + 59) / 60) * 60
+    } else {
+        300
+    };
+
     // ── Pre-compile script once (was compiling per-tick — catastrophic for 1M+ ticks)
     let mut eng = Engine::new();
     eng.set_max_operations(200_000);
@@ -4637,7 +4674,9 @@ pub fn run_clob_1hz_backtest(
     let current_yes_bid     = Arc::new(Mutex::new(0.0f64));
     let current_balance     = Arc::new(Mutex::new(0.0f64));
     let current_fee         = Arc::new(Mutex::new(fee_pct));
-    let max_pos_usd         = Arc::new(Mutex::new(max_position_usd.unwrap_or(f64::MAX)));
+    // BUG-3 (also here): default cap = 25% of initial balance, not f64::MAX, so the
+    // stake can't reinvest an exploding balance into absurd returns.
+    let max_pos_usd         = Arc::new(Mutex::new(max_position_usd.unwrap_or_else(|| (initial_balance * 0.25).max(5.0))));
     let current_ask_depth   = Arc::new(Mutex::new(0.0f64)); // ask_depth_usd
     let current_bid_depth   = Arc::new(Mutex::new(0.0f64)); // bid_depth_usd
     let current_spread_pct  = Arc::new(Mutex::new(0.0f64)); // (yes_ask-yes_bid)*100 in ¢
@@ -4863,15 +4902,16 @@ pub fn run_clob_1hz_backtest(
         {
             let mut s = sim.lock().unwrap();
             if tick.window_ts != s.current_window_ts && s.current_window_ts != 0 {
-                // window just closed — settle any open position using the previous tick's price.
-                // Use official Polymarket resolution (window_yes_won) when available;
-                // fall back to Binance price comparison only when not yet resolved.
+                // window just closed — settle with the CLOSING window's OWN resolution
+                // and last price (NOT this tick's, which belongs to the next window).
                 if s.position != 0 && s.window_open_price > 0.0 {
-                    let prev_close = if tick.binance_price > 0.0 { tick.binance_price }
-                                     else { s.window_open_price };
-                    let yes_won = if let Some(official) = tick.window_yes_won {
+                    let closing_ts = s.current_window_ts;
+                    let prev_close = last_binance_by_window.get(&closing_ts).copied()
+                        .filter(|&p| p > 0.0)
+                        .unwrap_or(s.window_open_price);
+                    let yes_won = if let Some(official) = official_by_window.get(&closing_ts).copied() {
                         s.resolved_official += 1;
-                        official // Use Polymarket's official Chainlink-based resolution
+                        official // Polymarket's official Chainlink-based resolution for THIS window
                     } else {
                         s.resolved_binance += 1;
                         prev_close > s.window_open_price // Fallback: Binance price comparison
@@ -4898,6 +4938,12 @@ pub fn run_clob_1hz_backtest(
                 // Discard any pending order that didn't fill before window close
                 s.pending_yes = None;
                 s.pending_no  = None;
+                // BUG-6 fix: drop per-window kv scratch keys (convention "*_<window_ts>")
+                // so they don't bleed into later windows or leak unboundedly over a
+                // multi-day run. Global keys (no window_ts suffix) are preserved.
+                let closed = s.current_window_ts;
+                let suffix = format!("_{closed}");
+                s.kv.retain(|k, _| !k.ends_with(&suffix));
             }
             if tick.window_ts != s.current_window_ts {
                 s.current_window_ts = tick.window_ts;
@@ -4964,9 +5010,9 @@ pub fn run_clob_1hz_backtest(
         }
 
         // ── Run on_tick(ctx) ─────────────────────────────────────────────────
-        let (cur_balance, cur_position, cur_entry_price) = {
+        let (cur_balance, cur_position, cur_entry_price, cur_window_open) = {
             let s = sim.lock().unwrap();
-            (s.balance, s.position, s.entry_price)
+            (s.balance, s.position, s.entry_price, s.window_open_price)
         };
 
         let spread_pct = if tick.yes_bid > 0.0 && tick.yes_ask > 0.0 {
@@ -4975,7 +5021,7 @@ pub fn run_clob_1hz_backtest(
             0.0
         };
         let second_in_window = if tick.window_secs_left >= 0 {
-            300_i64.saturating_sub(tick.window_secs_left)
+            window_secs_total.saturating_sub(tick.window_secs_left).max(0)
         } else {
             0
         };
@@ -5008,6 +5054,12 @@ pub fn run_clob_1hz_backtest(
         ctx_map.insert("window_ts".into(),        Dynamic::from(tick.window_ts));
         ctx_map.insert("window_secs_left".into(), Dynamic::from(tick.window_secs_left));
         ctx_map.insert("second_in_window".into(), Dynamic::from(second_in_window));
+        // Engine-anchored window-open Binance price (BUG-11 / live-parity): the live
+        // tick runner exposes ctx.window_open_price anchored at each window's open, so
+        // scripts must NOT track it in kv (which persists globally and would freeze on
+        // the first window). Expose the same field here. Authoritative — use this, not
+        // a self-tracked open.
+        ctx_map.insert("window_open_price".into(), Dynamic::from(cur_window_open));
         ctx_map.insert("balance".into(),          Dynamic::from(cur_balance));
         ctx_map.insert("position".into(),         Dynamic::from(cur_position));
         ctx_map.insert("entry_price".into(),      Dynamic::from(cur_entry_price));
@@ -5776,7 +5828,11 @@ pub fn run_clob_events_backtest(
     }));
 
     let book = Arc::new(Mutex::new(Book::default()));
-    let max_pos_usd = max_position_usd.unwrap_or(f64::MAX);
+    // BUG-3 (also here): without an explicit cap, default to 25% of the INITIAL
+    // balance — not f64::MAX, which lets the stake reinvest an exponentially growing
+    // balance and produce absurd (+10^70%) returns. The validator normalizes per
+    // trade so the verdict is unaffected, but the headline metric must stay sane.
+    let max_pos_usd = max_position_usd.unwrap_or_else(|| (initial_balance * 0.25).max(5.0));
     let gates_arc = Arc::new(gates);
 
     // Shared scalars read by the bet closures (current book + ts).
@@ -5917,13 +5973,21 @@ pub fn run_clob_events_backtest(
         s.position = 0; s.entry_price = 0.0; s.stake = 0.0;
     };
 
-    // Map window_ts → official resolution, so a window settles with ITS OWN
-    // resolution (not the cid of the event that triggered the boundary, which
+    // Map window_ts → official resolution AND last Binance price, so a window
+    // settles with ITS OWN data (not the event that triggered the boundary, which
     // already belongs to the NEXT window). Each window is a distinct cid.
+    // BUG-4 fix: the Binance fallback previously compared the NEXT window's price
+    // against the closing window's open — deciding up/down with a price up to 5 min
+    // into the future. last_binance_by_window pins the closing window's last price.
     let mut official_by_window: std::collections::HashMap<i64, bool> = std::collections::HashMap::new();
+    let mut last_binance_by_window: std::collections::HashMap<i64, f64> = std::collections::HashMap::new();
     for ev in &events {
+        let wts = event_window_ts(ev.ts_ms, window_secs);
         if let Some(yw) = markets.get(&ev.cid).and_then(|m| m.yes_won) {
-            official_by_window.entry(event_window_ts(ev.ts_ms, window_secs)).or_insert(yw);
+            official_by_window.entry(wts).or_insert(yw);
+        }
+        if ev.binance_price > 0.0 {
+            last_binance_by_window.insert(wts, ev.binance_price);
         }
     }
 
@@ -5951,11 +6015,18 @@ pub fn run_clob_events_backtest(
             let cur_binance = book.lock().unwrap().binance;
             let mut s = sim.lock().unwrap();
             if wts != s.current_window_ts && s.current_window_ts != 0 {
-                let closing_official = official_by_window.get(&s.current_window_ts).copied();
-                settle(&mut s, cur_binance, ev.ts_ms, closing_official);
+                let closing_ts = s.current_window_ts;
+                let closing_official = official_by_window.get(&closing_ts).copied();
+                let closing_binance = last_binance_by_window.get(&closing_ts).copied()
+                    .filter(|&p| p > 0.0).unwrap_or(cur_binance);
+                settle(&mut s, closing_binance, ev.ts_ms, closing_official);
                 s.window_open_price = 0.0;
                 s.pending_yes = None;
                 s.pending_no = None;
+                // BUG-6 fix: drop per-window kv scratch keys ("*_<window_ts>") so they
+                // don't bleed into later windows or leak over a multi-day stream.
+                let suffix = format!("_{closing_ts}");
+                s.kv.retain(|k, _| !k.ends_with(&suffix));
             }
             if wts != s.current_window_ts {
                 s.current_window_ts = wts;
@@ -6011,7 +6082,7 @@ pub fn run_clob_events_backtest(
         *cur_ts.lock().unwrap() = ev.ts_ms; // bet uses true ts for order_latency math
 
         // 5. Invoke on_event(ctx).
-        let (bal, pos, entry) = { let s = sim.lock().unwrap(); (s.balance, s.position, s.entry_price) };
+        let (bal, pos, entry, win_open) = { let s = sim.lock().unwrap(); (s.balance, s.position, s.entry_price, s.window_open_price) };
         let b = book.lock().unwrap().clone();
         let secs_left = window_secs - (ev.ts_ms / 1000 - wts);
         let spread_pct = if b.yes_bid > 0.0 && b.yes_ask > 0.0 { (b.yes_ask - b.yes_bid) * 100.0 } else { 0.0 };
@@ -6033,6 +6104,9 @@ pub fn run_clob_events_backtest(
         ctx_map.insert("binance_price".into(), Dynamic::from(b.binance));
         ctx_map.insert("window_ts".into(), Dynamic::from(wts));
         ctx_map.insert("window_secs_left".into(), Dynamic::from(secs_left));
+        // Engine-anchored window-open price (live-parity; see BUG-11). Use this
+        // instead of self-tracking the open in kv.
+        ctx_map.insert("window_open_price".into(), Dynamic::from(win_open));
         ctx_map.insert("balance".into(), Dynamic::from(bal));
         ctx_map.insert("position".into(), Dynamic::from(pos));
         ctx_map.insert("entry_price".into(), Dynamic::from(entry));
@@ -6060,8 +6134,11 @@ pub fn run_clob_events_backtest(
         let cur_binance = book.lock().unwrap().binance;
         let mut s = sim.lock().unwrap();
         if s.position != 0 {
-            let official = official_by_window.get(&s.current_window_ts).copied();
-            settle(&mut s, cur_binance, last.ts_ms, official);
+            let closing_ts = s.current_window_ts;
+            let official = official_by_window.get(&closing_ts).copied();
+            let closing_binance = last_binance_by_window.get(&closing_ts).copied()
+                .filter(|&p| p > 0.0).unwrap_or(cur_binance);
+            settle(&mut s, closing_binance, last.ts_ms, official);
         }
     }
 
@@ -6680,35 +6757,49 @@ mod tests {
     async fn clob_events_latency_sweep_export() {
         use std::io::Write;
         let ws = directories::UserDirs::new().unwrap().home_dir().join(".traderclaw/workspace");
-        let slug = "btc_5m_ev";
-        let script = ws.join("scripts/clob_events_latency_arb.rhai");
+        let slug = std::env::var("NV_SWEEP_SLUG").unwrap_or_else(|_| "btc_5m_ev".into());
+        // Script + latencies are env-overridable so the same harness validates any
+        // on_event script at any VPS's real round-trip without a recompile:
+        //   NV_SWEEP_SCRIPT=clob_events_late_certainty.rhai NV_SWEEP_LATS=0,30,50,80,110 \
+        //     cargo test --lib clob_events_latency_sweep_export -- --ignored --nocapture
+        let script_name = std::env::var("NV_SWEEP_SCRIPT")
+            .unwrap_or_else(|_| "clob_events_latency_arb.rhai".into());
+        let script = ws.join("scripts").join(&script_name);
+        let lats: Vec<u64> = std::env::var("NV_SWEEP_LATS")
+            .ok()
+            .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+            .unwrap_or_else(|| vec![0, 110, 220, 500, 1000]);
+        let tag = script_name.trim_end_matches(".rhai").to_string();
         let slugs = list_event_slugs(&ws);
-        let (from_date, to_date) = match slugs.iter().find(|(s, _, _)| s == slug) {
+        let (from_date, to_date) = match slugs.iter().find(|(s, _, _)| s == &slug) {
             Some((_, dates, _)) if !dates.is_empty() =>
                 (dates.first().unwrap().clone(), dates.last().unwrap().clone()),
             _ => panic!("No event stream for '{slug}' under {}/data/events/ — run to-events first.", ws.display()),
         };
-        println!("[sweep] slug={slug} range={from_date}..{to_date}");
-        for lat in [0u64, 110, 220, 500, 1000] {
+        println!("[sweep] script={script_name} slug={slug} range={from_date}..{to_date}");
+        for lat in lats {
             let m = run_clob_events_backtest_from_files(
-                &script, slug, &from_date, &to_date,
+                &script, &slug, &from_date, &to_date,
                 1000.0, 0.0, &ws, None, TickGates::default(),
                 0, lat, "crypto_taker",
             ).await;
-            let csv_path = format!("/tmp/clob_events_lat_{lat}.csv");
+            let csv_path = format!("/tmp/sweep_{tag}_lat_{lat}.csv");
             let mut f = std::fs::File::create(&csv_path).unwrap();
             writeln!(f, "entry_price,won").unwrap();
-            let mut wins = 0u32;
+            // Only binary betting trades carry an entry price the validator can use.
+            let mut wins = 0u32; let mut n = 0u32;
             for t in &m.all_trades {
+                let bin = matches!(t.side.as_str(), "bet_yes"|"bet_no"|"yes"|"no")
+                    || t.side.starts_with("yes_") || t.side.starts_with("no_");
+                if !bin || !(t.price > 0.01 && t.price < 0.99) { continue; }
                 let won = if t.pnl > 0.0 { 1 } else { 0 };
-                wins += won;
+                wins += won; n += 1;
                 writeln!(f, "{},{}", t.price, won).unwrap();
             }
-            let n = m.all_trades.len();
             let wr = if n > 0 { wins as f64 / n as f64 * 100.0 } else { 0.0 };
-            println!("[sweep lat={lat}ms] trades={} WR={:.1}% ret={:+.2}% → {csv_path}",
-                m.total_trades, wr, m.total_return_pct);
+            println!("[sweep lat={lat}ms] n={n} WR={:.1}% ret={:+.2}% → {csv_path}",
+                wr, m.total_return_pct);
         }
-        println!("[sweep] validate: python3 scripts/ml/edge_validator.py --source csv --csv /tmp/clob_events_lat_<lat>.csv");
+        println!("[sweep] validate each: python3 scripts/ml/edge_validator.py --source csv --csv /tmp/sweep_{tag}_lat_<lat>.csv");
     }
 }

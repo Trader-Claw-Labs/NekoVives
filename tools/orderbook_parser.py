@@ -1455,6 +1455,7 @@ def cmd_to_events(args: argparse.Namespace) -> None:
 
     total_events = 0
     days_written = 0
+    days_without_binance: list = []
     for day_str in sorted(file_by_day.keys()):
         day_files = sorted(file_by_day[day_str])
         day_file_list = "[" + ", ".join(f"'{f}'" for f in day_files) + "]"
@@ -1490,6 +1491,7 @@ def cmd_to_events(args: argparse.Namespace) -> None:
 
         out_file = out_dir / f"{day_str}.jsonl.gz"
         n = 0
+        n_binance = 0
         deduped = 0
         # Dedup state: last (bid, ask) written per (cid, token) book. The pmxt v2
         # archive re-emits price_change even when the top-of-book is unchanged
@@ -1535,12 +1537,29 @@ def cmd_to_events(args: argparse.Namespace) -> None:
                     bp = binance_prices.get(ts // 1000, 0.0)
                     if bp:
                         ev["binance_price"] = round(bp, 4)
+                        n_binance += 1
                 fh.write(json.dumps(ev) + "\n")
                 n += 1
         total_events += n
         days_written += 1
         dd = f", {deduped:,} dup book events dropped" if dedup else ""
         print(f"  {day_str} → {n:,} events ({out_file.name}){dd}", file=sys.stderr)
+        # Warn loudly when a day carries NO binance_price: any strategy that gates on
+        # ctx.binance_price (drift, late_certainty, latency_arb) will place ZERO trades
+        # on this day, silently. This is the root cause of the "0 trades over a gapped
+        # range" bug — a day generated without --binance-symbol (or a failed fetch).
+        if binance_symbol and n_binance == 0 and n > 0:
+            print(f"  ⚠ {day_str}: 0/{n:,} events have binance_price — Binance fetch "
+                  f"returned nothing for this day. Strategies that need ctx.binance_price "
+                  f"will NOT trade here. Re-run with a valid --binance-symbol.", file=sys.stderr)
+            days_without_binance.append(day_str)
+
+    if days_without_binance:
+        print(f"\n⚠ {len(days_without_binance)} day(s) have NO binance_price "
+              f"({', '.join(days_without_binance[:5])}{'…' if len(days_without_binance) > 5 else ''}). "
+              f"Backtests of binance-gated strategies will skip these days. Regenerate them "
+              f"with a valid --binance-symbol, or exclude them from the backtest range.",
+              file=sys.stderr)
 
     print(json.dumps({
         "ok": True,
@@ -1548,6 +1567,7 @@ def cmd_to_events(args: argparse.Namespace) -> None:
         "markets": len(markets_meta),
         "days": days_written,
         "total_events": total_events,
+        "days_without_binance": days_without_binance,
         "out_dir": str(out_dir),
         "note": "Sub-second event stream (.jsonl.gz). Feeds the clob_events engine (Fase C).",
     }))
