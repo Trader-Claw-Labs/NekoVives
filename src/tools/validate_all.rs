@@ -146,21 +146,9 @@ pub async fn run_validate_all(
             None, Some("crypto_taker"), None,
         ).await;
 
-        // Extract (entry_price, won) from binary betting trades for the validator.
-        // The 3-leg validator is for BINARY markets (entry in 0-1, $1 payout). The
-        // side label varies by engine: clob_1hz/clob_events emit "bet_yes"/"bet_no"
-        // (and the engine path "yes"/"no"); archive_candles/polymarket_binary emit
-        // "{yes|no}_{win|loss}". A crypto buy/sell script has none of these → N/A.
-        let is_binary_side = |s: &str| {
-            matches!(s, "bet_yes" | "bet_no" | "yes" | "no")
-                || s.starts_with("yes_") || s.starts_with("no_")
-        };
-        let binary: Vec<&crate::tools::backtest::AllTrade> = m.all_trades.iter()
-            .filter(|t| is_binary_side(&t.side))
-            .filter(|t| t.price > 0.01 && t.price < 0.99)
-            .collect();
-        let entries: Vec<f64> = binary.iter().map(|t| t.price).collect();
-        let wons: Vec<bool> = binary.iter().map(|t| t.pnl > 0.0).collect();
+        // Extract (entry_price, won) via the shared extractor (handles every engine's
+        // side-label convention). The 3-leg validator is for BINARY markets only.
+        let (entries, wons) = edge_validator::extract_binary_trades(&m.all_trades);
 
         if entries.is_empty() && m.total_trades > 0 {
             // Traded, but not binary bets → the binary validator doesn't apply.

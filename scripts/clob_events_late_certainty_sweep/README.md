@@ -1,11 +1,17 @@
 # late_certainty — latency sweep at low-VPS latencies (jun-2026)
 
 `clob_events_late_certainty.rhai` (on_event port of `clob_1hz_late_certainty`) over the
-real btc_5m_ev event stream, contiguous range **2026-05-16 → 2026-05-25** (10 days),
-fee model `crypto_taker`, official Polymarket resolution. Motivated by a faster (~50ms)
-VPS: does the lower order latency rescue the strategy?
+real btc_5m_ev event stream, fee model `crypto_taker`, official Polymarket resolution.
+Motivated by a faster (~50ms) VPS: does the lower order latency rescue the strategy?
 
-## Result — NO. The verdict is identical at every latency.
+## Re-run on the FULL 33-day stream (2026-04-23 → 05-25), after the engine bugfixes
+With the window_open_price / stake-cap / per-window-resolution fixes, late_certainty now
+trades correctly (n≈4400 over 33 days, vs 275 before — the frozen-window_open bug had it
+barely trading and losing). **Verdict unchanged: NO EDGE at 0/30/50/80/110 ms — Leg 3
+(shuffle-null) fails p=1.000 at every latency.** WR ~69%, EV/trade ~+85-89%, but the gain
+is which windows won in-period, not skill. The faster VPS does not change the decision.
+
+## Original 10-day run (kept for reference). Verdict identical at every latency.
 
 | Order latency | trades | WR | EV/trade | Leg1 CI | Leg2 random | Leg3 shuffle | Verdict |
 |---|---|---|---|---|---|---|---|

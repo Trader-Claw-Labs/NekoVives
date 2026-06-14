@@ -23,13 +23,9 @@ fn on_event(ctx) {
     if ctx.position != 0 { return; }
     if ctx.binance_price <= 0.0 { return; }
 
-    // Anchor the window-open Binance price once per window.
-    let wkey = "wopen_" + ctx.window_ts;
-    let wopen = ctx.get(wkey, 0.0);
-    if wopen <= 0.0 {
-        ctx.set(wkey, ctx.binance_price);
-        wopen = ctx.binance_price;
-    }
+    // Window-open Binance price: engine-anchored ctx.window_open_price (live-parity;
+    // kv persists globally so self-tracking it would freeze on the first window).
+    let wopen = ctx.window_open_price;
     if wopen <= 0.0 { return; }
 
     // Only act in the final 35s, not the last 3s (avoid no-fill), once the

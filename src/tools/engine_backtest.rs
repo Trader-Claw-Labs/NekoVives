@@ -350,7 +350,14 @@ pub async fn run_engine_clob_1hz_backtest(params: EngineClobBacktestParams<'_>) 
                 // Settle at window close.
                 if tick.window_secs_left == 0 {
                     if let (Some(side), Some(token_id)) = (&current_side, &current_token) {
-                        let yes_won = tick.binance_price > window_open_price;
+                        // BUG-9 fix: prefer the official Polymarket resolution when present
+                        // (backfilled into window_yes_won); fall back to the Binance price
+                        // compare only when absent. Resolving purely on Binance manufactures
+                        // phantom edge (decision and resolution both derive from Binance).
+                        let yes_won = match tick.window_yes_won {
+                            Some(official) => official,
+                            None => tick.binance_price > window_open_price,
+                        };
                         let won = match side {
                             Side::Yes => yes_won,
                             Side::No  => !yes_won,

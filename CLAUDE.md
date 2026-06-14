@@ -509,10 +509,31 @@ shuffle-null (Leg3); the 5m market is calibrated, no residual directional edge.*
 NV_SWEEP_SCRIPT=clob_events_late_certainty.rhai NV_SWEEP_LATS=0,30,50,80,110 \
   cargo test --lib clob_events_latency_sweep_export -- --ignored --nocapture
 ```
-⚠ The clob_events engine zeroes out trades when the event stream has a large DATE GAP
-in [from,to] (a stray day far from the contiguous block, esp. one generated without
-`--binance-symbol`). Run sweeps over a contiguous range. See
-`scripts/clob_events_late_certainty_sweep/README.md`.
+See `scripts/clob_events_late_certainty_sweep/README.md`.
+
+### Engine correctness invariants (audited + fixed, jun-2026)
+A correctness audit found and fixed 11 bugs across the three engines. Invariants now held:
+- **Per-window resolution**: every position settles with ITS OWN window's official
+  `window_yes_won` and its OWN last Binance price — never the next window's (the boundary
+  settle fires on the next window's first tick). Held in clob_1hz, clob_events, and the
+  engine/maker paths via `official_by_window` + `last_binance_by_window` maps.
+- **Stake cap**: no engine reinvests an uncapped percent of a growing balance. Without an
+  explicit `max_position_usd`, the default is 25% of the INITIAL balance (was f64::MAX →
+  +10^33–10^70% fake returns).
+- **`ctx.window_open_price`** is engine-anchored per window in BOTH backtest and live tick
+  runner. Scripts MUST use it — never self-track the open in `kv`, which persists globally
+  across windows (a fixed key freezes on the first window). Per-window kv scratch keys use
+  the `*_<window_ts>` convention and are pruned at window close.
+- **Official-resolution preference**: every path (incl. engine_clob_1hz) prefers
+  `window_yes_won` over the Binance price-compare, which would manufacture phantom edge.
+- **`second_in_window`** is derived from the actual window length (not a hardcoded 300s),
+  so 15m/1h slugs are correct.
+- **edge_validator extraction** (`edge_validator::extract_binary_trades`) recognizes every
+  engine's side labels (`bet_yes`/`bet_no`, `yes`/`no`, `yes_win`/`no_loss`) — previously
+  the on_candle labels were silently dropped, making the validator a no-op on that path.
+- **Data**: `to-events` warns + lists days with no `binance_price` (a day generated without
+  `--binance-symbol` makes binance-gated strategies place zero trades). `days_without_binance`
+  is in the JSON summary.
 
 ## Dynamic Asset Selector (`src/tools/asset_selector.rs`)
 Rolling 30-day win-rate tracker per (script × symbol). Automatically records

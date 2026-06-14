@@ -17,13 +17,9 @@ fn on_event(ctx) {
     // React on book updates only (trades don't change our gates).
     if ctx.event_kind != "book" { return; }
 
-    // Anchor window-open Binance price once per window.
-    let wkey = "wopen_" + ctx.window_ts;
-    let wopen = ctx.get(wkey, 0.0);
-    if wopen <= 0.0 {
-        ctx.set(wkey, ctx.binance_price);
-        wopen = ctx.binance_price;
-    }
+    // Window-open Binance price: engine-anchored ctx.window_open_price (live-parity;
+    // kv persists globally so self-tracking it would freeze on the first window).
+    let wopen = ctx.window_open_price;
     if wopen <= 0.0 { return; }
 
     // Phase: final 30-35s, excluding the last 5s (avoid no-fill).

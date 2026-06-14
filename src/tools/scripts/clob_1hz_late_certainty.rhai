@@ -34,12 +34,10 @@ fn on_tick(ctx) {
     // Guard: Binance price must be valid
     if ctx.binance_price <= 0.0 { return; }
 
-    // Track window_open price
-    let wopen = ctx.get("window_open", 0.0);
-    if wopen <= 0.0 {
-        ctx.set("window_open", ctx.binance_price);
-        wopen = ctx.binance_price;
-    }
+    // Window-open Binance price: use the ENGINE-ANCHORED ctx.window_open_price (set
+    // per window by both the live tick runner and the backtester). Self-tracking it in
+    // kv is wrong — kv persists globally, so a fixed key freezes on the first window.
+    let wopen = ctx.window_open_price;
     if wopen <= 0.0 { return; }
 
     // Phase: final 30-35 seconds, but not the last 5s (avoid no-fill)
