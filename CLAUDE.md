@@ -53,6 +53,13 @@ Workspace crates:
 React + Vite + TanStack Query + Tailwind. Assets embedded into binary via rust-embed.
 Rebuild: `cd web && npm run build` then `cargo build --release`.
 
+⚠️ **The bundled UI is embedded at COMPILE TIME** (`web/dist/` → binary via rust-embed),
+and `web/dist/assets/*.js` is gitignored (only `index.html` is committed). So UI changes do
+NOT appear until you **(1) `npm run build`, (2) `cargo build --release`, (3) RESTART the
+running gateway/daemon** — a long-lived daemon serves whatever dist was embedded when its
+binary was built. After restart, hard-refresh the browser (Cmd+Shift+R) to drop the cached
+bundle. "I merged the UI but don't see it" = stale daemon, not a code bug.
+
 Pages and routes:
 - `/`                — Dashboard (status cards, system health, market scanner widget)
 - `/wallets`         — Web3 Wallets (EVM · Solana · TON)
@@ -500,8 +507,17 @@ fee + official resolution, then the 3-leg edge_validator on each. Prints a table
 by verdict (EDGE / NO_EDGE / INSUFFICIENT / N/A). Slug routing: per-asset scripts
 (eth/sol/xrp/…) map to that asset's 5m slug, else btc_5m; on_event uses `_ev` slugs.
 `--include-events` adds on_event scripts (needs data/events/<slug>).
+`NV_VALIDATE_DUMP=<dir>` env → also writes `<dir>/<script>.csv` (`entry_price,won`) per
+script for offline price-structure analysis.
 **Result (jun-2026): 0 EDGE of 59 — all binary strategies pass Leg1/Leg2 but fail the
 shuffle-null (Leg3); the 5m market is calibrated, no residual directional edge.**
+
+**Edge validator — how it works, explained for humans:** `docs/EDGE_VALIDATOR_EXPLAINED.md`
+(the 3 legs in depth: bootstrap CI, random-null, shuffle-null; backtest ≠ prediction).
+**Why the "winning" strategies are fake:** `docs/FIVE_STRATEGIES_PRICE_STRUCTURE.md` —
+dissects 5 real strategies (WR 54-80%, EV up to +231%) that all fail Leg3 because they
+cluster trades at price ~0.5 and their wins aren't correlated with price; includes what a
+strategy would need to actually pass (wins concentrated at cheap prices).
 
 ### Parametrized latency sweep (on_event)
 `clob_events_latency_sweep_export` test, env-overridable for any on_event script / VPS:
