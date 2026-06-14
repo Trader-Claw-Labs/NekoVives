@@ -96,6 +96,27 @@ export interface BacktestConfig {
   feed_latency_ms?: number
   // Fee model: "pct" = flat fee_pct%, "crypto_taker" = 1.8%×p×(1-p) Polymarket formula.
   fee_model?: 'pct' | 'crypto_taker'
+  // When true, /api/backtest/run also runs the 3-leg edge_validator on the
+  // backtest's own trades and returns `edge_validation`. Passing the backtest is
+  // NOT edge — this is the gate (bootstrap CI, random-null, shuffle-null).
+  validate_edge?: boolean
+}
+
+// 3-leg edge validation result (mirrors edge_validator::ValidationResult).
+export interface EdgeValidation {
+  n: number
+  wr_pct: number
+  break_even_pct: number
+  ev_per_trade_pct: number
+  ci_lo: number
+  ci_hi: number
+  leg1_pass: boolean
+  p_random: number
+  leg2_pass: boolean
+  p_shuffle: number
+  leg3_pass: boolean
+  verdict: 'EDGE' | 'NO_EDGE' | 'INSUFFICIENT'
+  note: string
 }
 
 export interface TradeLog {
@@ -130,6 +151,11 @@ export interface BacktestResult {
   windows_with_estimated_price?: number
   historical_data_coverage_pct?: number
   recommended_max_stake_usd?: number
+  // 3-leg edge validation (present only when config.validate_edge = true).
+  edge_validation?: EdgeValidation
+  // Maker engine stats (present only for rewards_maker / minting_mm on clob_events):
+  // eligible_uptime_pct, adverse_selection_pct, yes_fills, no_fills.
+  maker_stats?: Record<string, number>
 }
 
 export interface ProgressState {
