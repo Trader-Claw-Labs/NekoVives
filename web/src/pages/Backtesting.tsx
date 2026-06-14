@@ -4,7 +4,7 @@ import { useQuery, useMutation } from '@tanstack/react-query'
 import CodeMirror from '@uiw/react-codemirror'
 import { rust } from '@codemirror/lang-rust'
 import { apiFetch, apiPost, apiDelete } from '../hooks/useApi'
-import { useBacktestState, type BacktestConfig, type ProgressState, type MarketType, type BacktestResult, type TradeLog, type MarketSeries, POLY_BINARY_PRESETS } from '../hooks/useBacktestState'
+import { useBacktestState, type BacktestConfig, type ProgressState, type MarketType, type BacktestResult, type TradeLog, type MarketSeries, type EdgeValidation, POLY_BINARY_PRESETS } from '../hooks/useBacktestState'
 import { CreateModal } from './LiveStrategies'
 import EngineParamsForm, { defaultEngineParams } from '../components/EngineParamsForm'
 import ValidatePanel from '../components/ValidatePanel'
@@ -325,6 +325,118 @@ function EquityChart({
   )
 }
 
+// ── Edge Validation (3-leg test) ──────────────────────────────────
+// Shared between the main ResultPanel (#1) and the Walk-Forward panel (#3).
+
+function verdictColor(verdict: EdgeValidation['verdict']): string {
+  return verdict === 'EDGE'
+    ? 'var(--color-accent)'
+    : verdict === 'NO_EDGE'
+    ? 'var(--color-danger)'
+    : 'var(--color-text-muted)'
+}
+
+function verdictBg(verdict: EdgeValidation['verdict']): string {
+  return verdict === 'EDGE'
+    ? 'rgba(34,197,94,0.10)'
+    : verdict === 'NO_EDGE'
+    ? 'rgba(239,68,68,0.10)'
+    : 'rgba(148,163,184,0.10)'
+}
+
+// Single ✓/✗ leg row.
+function EdgeLeg({ label, pass }: { label: string; pass: boolean }) {
+  return (
+    <div className="flex items-center gap-1.5 text-xs">
+      <span
+        className="inline-flex items-center justify-center w-4 h-4 rounded-full text-[10px] font-bold shrink-0"
+        style={{
+          backgroundColor: pass ? 'rgba(34,197,94,0.15)' : 'rgba(239,68,68,0.15)',
+          color: pass ? 'var(--color-accent)' : 'var(--color-danger)',
+        }}
+      >
+        {pass ? '✓' : '✗'}
+      </span>
+      <span style={{ color: 'var(--color-text)' }}>{label}</span>
+    </div>
+  )
+}
+
+// Compact 3-leg list (used inside the walk-forward train/test columns).
+function EdgeLegsCompact({ ev }: { ev: EdgeValidation }) {
+  return (
+    <div className="space-y-1">
+      <EdgeLeg label={`Leg 1 — Bootstrap CI [${fmt(ev.ci_lo)}%, ${fmt(ev.ci_hi)}%]`} pass={ev.leg1_pass} />
+      <EdgeLeg label={`Leg 2 — Random-null p=${fmt(ev.p_random, 3)}`} pass={ev.leg2_pass} />
+      <EdgeLeg label={`Leg 3 — Shuffle-null p=${fmt(ev.p_shuffle, 3)}`} pass={ev.leg3_pass} />
+    </div>
+  )
+}
+
+// Full edge-validation card with verdict badge, legs, stats, note and disclaimer.
+function EdgeValidationCard({ ev }: { ev: EdgeValidation }) {
+  const color = verdictColor(ev.verdict)
+  return (
+    <div
+      className="rounded-lg border p-4 space-y-3"
+      style={{ backgroundColor: verdictBg(ev.verdict), borderColor: color }}
+    >
+      <div className="flex items-center gap-2 flex-wrap">
+        <ListChecks size={14} style={{ color }} />
+        <span className="text-xs font-semibold uppercase tracking-widest" style={{ color: 'var(--color-text-muted)' }}>
+          Edge Validation — 3-leg test
+        </span>
+        <span
+          className="ml-auto px-2.5 py-1 rounded text-sm font-bold uppercase tracking-wide"
+          style={{ backgroundColor: color, color: '#000' }}
+        >
+          {ev.verdict}
+        </span>
+      </div>
+
+      {/* Stats row */}
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
+        <div>
+          <p style={{ color: 'var(--color-text-muted)' }}>n trades</p>
+          <p className="font-mono font-semibold" style={{ color: 'var(--color-text)' }}>{ev.n.toLocaleString()}</p>
+        </div>
+        <div>
+          <p style={{ color: 'var(--color-text-muted)' }}>Win Rate</p>
+          <p className="font-mono font-semibold" style={{ color: 'var(--color-text)' }}>{fmt(ev.wr_pct)}%</p>
+        </div>
+        <div>
+          <p style={{ color: 'var(--color-text-muted)' }}>EV / trade</p>
+          <p className="font-mono font-semibold" style={{ color: colorFor(ev.ev_per_trade_pct) }}>
+            {ev.ev_per_trade_pct >= 0 ? '+' : ''}{fmt(ev.ev_per_trade_pct)}%
+          </p>
+        </div>
+        <div>
+          <p style={{ color: 'var(--color-text-muted)' }}>Break-even</p>
+          <p className="font-mono font-semibold" style={{ color: 'var(--color-text)' }}>{fmt(ev.break_even_pct)}%</p>
+        </div>
+      </div>
+
+      {/* 3 legs */}
+      <div className="space-y-1.5 pt-1">
+        <EdgeLeg label={`Leg 1 — Bootstrap CI [${fmt(ev.ci_lo)}%, ${fmt(ev.ci_hi)}%]`} pass={ev.leg1_pass} />
+        <EdgeLeg label={`Leg 2 — Random-null p=${fmt(ev.p_random, 3)}`} pass={ev.leg2_pass} />
+        <EdgeLeg label={`Leg 3 — Shuffle-null p=${fmt(ev.p_shuffle, 3)}`} pass={ev.leg3_pass} />
+      </div>
+
+      {ev.note && (
+        <p className="text-xs leading-relaxed" style={{ color: 'var(--color-text-muted)' }}>
+          {ev.note}
+        </p>
+      )}
+
+      <p className="text-[10px] leading-snug pt-1 border-t" style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-muted)' }}>
+        <span className="font-semibold" style={{ color: 'var(--color-accent)' }}>EDGE</span> = survived 3 independent tests; license for a SMALL pilot, not a guarantee.{' '}
+        <span className="font-semibold" style={{ color: 'var(--color-danger)' }}>NO_EDGE</span> = do not commit capital.
+      </p>
+    </div>
+  )
+}
+
 function ResultPanel({
   result,
   onRunPaper,
@@ -525,6 +637,40 @@ function ResultPanel({
                 Run: trader-claw backtest-sync --series btc_5m --from YYYY-MM-DD --to YYYY-MM-DD
               </span>
             </span>
+          </div>
+        </div>
+      )}
+
+      {/* Edge validation (3-leg test) — present only when config.validate_edge = true */}
+      {result.edge_validation && <EdgeValidationCard ev={result.edge_validation} />}
+
+      {/* Maker stats — present only for rewards_maker / minting_mm on clob_events */}
+      {result.maker_stats && Object.keys(result.maker_stats).length > 0 && (
+        <div
+          className="rounded-lg border p-4"
+          style={{ backgroundColor: 'var(--color-surface)', borderColor: 'var(--color-border)' }}
+        >
+          <p className="text-xs font-semibold uppercase tracking-widest mb-3" style={{ color: 'var(--color-text-muted)' }}>
+            Maker stats
+          </p>
+          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3 text-xs">
+            {Object.entries(result.maker_stats).map(([k, v]) => {
+              const isPct = k.endsWith('_pct')
+              const isFills = k.endsWith('_fills')
+              const display = isPct
+                ? `${fmt(v)}%`
+                : isFills
+                ? Math.round(v).toLocaleString()
+                : fmt(v)
+              return (
+                <div key={k}>
+                  <p style={{ color: 'var(--color-text-muted)' }}>
+                    {k.replace(/_/g, ' ').replace(/\bpct\b/, '%')}
+                  </p>
+                  <p className="font-mono font-semibold" style={{ color: 'var(--color-text)' }}>{display}</p>
+                </div>
+              )
+            })}
           </div>
         </div>
       )}
@@ -1507,6 +1653,57 @@ export default function Backtesting() {
   }
   const [optResults, setOptResults] = useState<OptRow[] | null>(null)
   const [optVerdict, setOptVerdict] = useState<{ kind: 'accept' | 'marginal' | 'reject'; msg: string; bestValue?: number } | null>(null)
+
+  // ── Latency Sweep state (#2) — POST /api/backtest/latency-sweep ──
+  interface LatencySweepRow {
+    latency_ms: number
+    total_return_pct: number
+    win_rate_pct: number
+    total_trades: number
+    ev_per_trade_usd: number
+  }
+  interface LatencySweepResp {
+    rows: LatencySweepRow[]
+    symbol: string
+    market_type: string
+    from_date: string
+    to_date: string
+    fee_model: string
+  }
+  const [showLatencySweep, setShowLatencySweep] = useState(false)
+  const [latencyGrid, setLatencyGrid] = useState('0,50,110,220,500,1000')
+  const [latencySweep, setLatencySweep] = useState<LatencySweepResp | null>(null)
+  const latencySweepMutation = useMutation({
+    mutationFn: (cfg: BacktestConfig & { latency_values: number[] }) =>
+      apiPost<LatencySweepResp>('/api/backtest/latency-sweep', cfg),
+    onSuccess: (data) => setLatencySweep(data),
+  })
+
+  // ── Walk-Forward state (#3) — POST /api/backtest/walk-forward?train_frac= ──
+  interface WalkForwardSplit {
+    from_date: string
+    to_date: string
+    total_return_pct: number
+    win_rate_pct: number
+    total_trades: number
+    edge_validation?: EdgeValidation
+  }
+  interface WalkForwardResp {
+    train: WalkForwardSplit
+    test: WalkForwardSplit
+    holds_out_of_sample: boolean
+    verdict: string
+    train_frac: number
+  }
+  const [showWalkForward, setShowWalkForward] = useState(false)
+  const [walkFrac, setWalkFrac] = useState(0.7)
+  const [walkForward, setWalkForward] = useState<WalkForwardResp | null>(null)
+  const walkForwardMutation = useMutation({
+    mutationFn: ({ cfg, frac }: { cfg: BacktestConfig; frac: number }) =>
+      apiPost<WalkForwardResp>(`/api/backtest/walk-forward?train_frac=${frac}`, cfg),
+    onSuccess: (data) => setWalkForward(data),
+  })
+
   type SortMode = 'default' | 'win_rate_desc' | 'trades_desc' | 'balance_desc'
   const [sortBy, setSortBy] = useState<SortMode>('default')
   const SORT_MODES: SortMode[] = ['default', 'win_rate_desc', 'trades_desc', 'balance_desc']
@@ -1726,6 +1923,30 @@ export default function Backtesting() {
 
     setBatchProgress(null)
     refetchScripts()
+  }
+
+  // ── Latency Sweep: re-run the backtest at each latency_ms value ──────────
+  const runLatencySweep = () => {
+    const latency_values = latencyGrid
+      .split(',')
+      .map(s => parseFloat(s.trim()))
+      .filter(v => !isNaN(v) && v >= 0)
+    if (latency_values.length === 0) return
+    setLatencySweep(null)
+    latencySweepMutation.mutate({ ...config, latency_values })
+  }
+
+  // ── Walk-Forward: split the date range train_frac / (1-train_frac) and
+  // validate the edge holds out-of-sample. ────────────────────────────────
+  const runWalkForward = () => {
+    if (!config.from_date || !config.to_date) return
+    setWalkForward(null)
+    // Backend uses latency_values[0] as the order latency for both splits.
+    const cfg: BacktestConfig & { latency_values: number[] } = {
+      ...config,
+      latency_values: [config.latency_ms ?? 0],
+    }
+    walkForwardMutation.mutate({ cfg, frac: walkFrac })
   }
 
   // ── Optimizer: parameter sweep with TRAIN/TEST split ─────────────────────
@@ -2503,7 +2724,10 @@ export default function Backtesting() {
             />
           </div>
 
-          {/* Fee % */}
+          {/* Fee % — ignored when fee_model = crypto_taker (backend uses 1.8%×p×(1-p)). */}
+          {(() => {
+            const feeIgnored = config.fee_model === 'crypto_taker'
+            return (
           <div className="lg:col-span-2">
             <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>
               Fee %
@@ -2520,15 +2744,23 @@ export default function Backtesting() {
               max={10}
               step={0.1}
               value={config.fee_pct}
+              disabled={feeIgnored}
               onChange={(e) => set('fee_pct', Number(e.target.value))}
-              className="w-full rounded px-2 py-2 text-sm font-mono"
+              className="w-full rounded px-2 py-2 text-sm font-mono disabled:opacity-40 disabled:cursor-not-allowed"
               style={{
                 backgroundColor: 'var(--color-surface-2)',
                 border: '1px solid var(--color-border)',
                 color: 'var(--color-text)',
               }}
             />
+            {feeIgnored && (
+              <div className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
+                Ignored — fee model is Crypto taker (1.8%×p×(1-p))
+              </div>
+            )}
           </div>
+            )
+          })()}
 
           {/* Latency (ms) — clob_1hz / archive_candles / clob_events.
               For clob_events this is the ORDER arrival latency (latency_ms): the order
@@ -2568,16 +2800,19 @@ export default function Backtesting() {
             </div>
           )}
 
-          {/* Feed latency (ms) — clob_events only. How late the strategy PERCEIVES each
-              event (ctx.ts_ms shifted forward). Separate from order latency above. */}
-          {isEventMode && (
+          {/* Feed latency (ms) — clob_1hz / archive_candles / clob_events. How late the
+              strategy PERCEIVES each event/tick (ctx.ts_ms shifted forward). Separate
+              from order latency above. */}
+          {(config.market_type === 'clob_1hz' || config.market_type === 'archive_candles' || isEventMode) && (
             <div className="lg:col-span-2">
               <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>
                 Feed latency (ms)
                 <span
                   className="ml-1 px-1 rounded text-[9px]"
                   style={{ backgroundColor: 'var(--color-surface-2)', color: 'var(--color-text-muted)' }}
-                  title="How late the strategy perceives each event. ctx.ts_ms is shifted forward by this much; the script reacts to events feed_latency_ms after they actually occurred."
+                  title={isEventMode
+                    ? 'How late the strategy perceives each event. ctx.ts_ms is shifted forward by this much; the script reacts to events feed_latency_ms after they actually occurred.'
+                    : 'How late the strategy perceives each tick. ctx.ts_ms is shifted forward by this much; the script reacts to ticks feed_latency_ms after they actually occurred.'}
                 >
                   perception delay
                 </span>
@@ -2598,7 +2833,9 @@ export default function Backtesting() {
                 }}
               />
               <div className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
-                {config.feed_latency_ms ? `Events perceived ${config.feed_latency_ms}ms late` : 'Events perceived at their real timestamp'}
+                {config.feed_latency_ms
+                  ? `${isEventMode ? 'Events' : 'Ticks'} perceived ${config.feed_latency_ms}ms late`
+                  : `${isEventMode ? 'Events' : 'Ticks'} perceived at their real timestamp`}
               </div>
             </div>
           )}
@@ -2626,6 +2863,34 @@ export default function Backtesting() {
                 {config.fee_model === 'crypto_taker'
                   ? 'Polymarket real fee formula. At p=0.5: ~0.45% of stake.'
                   : 'Flat fee deducted from stake at entry (default).'}
+              </div>
+            </div>
+          )}
+
+          {/* Fee model — polymarket_binary. When crypto_taker, fee_pct above is
+              ignored and the backend uses the real 1.8%×p×(1-p) Polymarket formula. */}
+          {config.market_type === 'polymarket_binary' && (
+            <div className="lg:col-span-2">
+              <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>
+                Fee Model
+              </label>
+              <select
+                value={config.fee_model ?? 'pct'}
+                onChange={(e) => set('fee_model', e.target.value === 'pct' ? undefined : e.target.value as 'crypto_taker')}
+                className="w-full rounded px-2 py-2 text-sm"
+                style={{
+                  backgroundColor: 'var(--color-surface-2)',
+                  border: '1px solid var(--color-border)',
+                  color: 'var(--color-text)',
+                }}
+              >
+                <option value="pct">Flat % (fee_pct field)</option>
+                <option value="crypto_taker">Crypto taker — 1.8%×p×(1-p)</option>
+              </select>
+              <div className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
+                {config.fee_model === 'crypto_taker'
+                  ? 'Polymarket real fee formula. At p=0.5: ~0.45% of stake (Fee % ignored).'
+                  : 'Flat Fee % deducted from stake at entry (default).'}
               </div>
             </div>
           )}
@@ -2984,6 +3249,27 @@ export default function Backtesting() {
             </div>
           )}
 
+          {/* Validate edge (3-leg test) toggle — when on, /api/backtest/run also runs
+              the bootstrap-CI + random-null + shuffle-null gate on the trades. */}
+          <div className="col-span-2 lg:col-span-4">
+            <label className="flex items-start gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={!!config.validate_edge}
+                onChange={(e) => set('validate_edge', e.target.checked || undefined)}
+                className="mt-0.5 h-4 w-4 shrink-0 accent-[var(--color-accent)]"
+              />
+              <span>
+                <span className="text-xs font-semibold" style={{ color: 'var(--color-text)' }}>
+                  Validate edge (3-leg test)
+                </span>
+                <span className="block text-[10px] mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
+                  Runs bootstrap-CI + random-null + shuffle-null on the trades. Passing the backtest is NOT edge.
+                </span>
+              </span>
+            </label>
+          </div>
+
           {/* Run + Live Trading buttons */}
           <div className={clsx('col-span-2 flex gap-2', config.market_type !== 'polymarket_binary' && 'lg:col-span-2')}>
             <button
@@ -3031,6 +3317,32 @@ export default function Backtesting() {
                 >
                   <FlaskConical size={14} style={{ color: showOptimizer ? '#000' : 'var(--color-warning)' }} />
                   Optimize
+                </button>
+                <button
+                  onClick={() => setShowLatencySweep(v => !v)}
+                  className="flex items-center justify-center gap-1.5 px-3 py-2.5 rounded font-semibold text-sm whitespace-nowrap"
+                  style={{
+                    backgroundColor: showLatencySweep ? 'var(--color-accent)' : 'var(--color-surface-2)',
+                    border: '1px solid var(--color-border)',
+                    color: showLatencySweep ? '#000' : 'var(--color-text)',
+                  }}
+                  title="Re-run the backtest at several order-latency values — see how EV decays with latency"
+                >
+                  <Activity size={14} style={{ color: showLatencySweep ? '#000' : 'var(--color-accent)' }} />
+                  Latency Sweep
+                </button>
+                <button
+                  onClick={() => setShowWalkForward(v => !v)}
+                  className="flex items-center justify-center gap-1.5 px-3 py-2.5 rounded font-semibold text-sm whitespace-nowrap"
+                  style={{
+                    backgroundColor: showWalkForward ? 'var(--color-accent)' : 'var(--color-surface-2)',
+                    border: '1px solid var(--color-border)',
+                    color: showWalkForward ? '#000' : 'var(--color-text)',
+                  }}
+                  title="Split the date range train/test and validate the edge holds out-of-sample"
+                >
+                  <TrendingUp size={14} style={{ color: showWalkForward ? '#000' : 'var(--color-accent)' }} />
+                  Walk-Forward
                 </button>
                 <button
                   onClick={() => setShowLiveModal(true)}
@@ -3177,6 +3489,217 @@ export default function Backtesting() {
                   )}
                 </div>
               )}
+            </div>
+          )}
+
+          {/* ── LATENCY SWEEP PANEL (#2) ──────────────────────────────────── */}
+          {showLatencySweep && !isBatchMode && config.script && (
+            <div className="col-span-2 lg:col-span-4 rounded border p-3 mt-2"
+              style={{ backgroundColor: 'var(--color-surface-2)', borderColor: 'var(--color-accent)' }}>
+              <div className="flex items-center gap-2 mb-2">
+                <Activity size={14} style={{ color: 'var(--color-accent)' }} />
+                <span className="text-sm font-semibold">Latency Sweep</span>
+                <span className="text-[10px] px-1.5 py-0.5 rounded" style={{ backgroundColor: 'var(--color-base)', color: 'var(--color-text-muted)' }}>
+                  EV vs order latency
+                </span>
+              </div>
+              <p className="text-[11px] mb-3" style={{ color: 'var(--color-text-muted)' }}>
+                Re-runs the backtest at each latency value (ms). Most useful for tick / event modes (clob_1hz, clob_events) where fills race the book — watch how EV/trade decays as latency rises.
+              </p>
+              <div className="flex flex-wrap items-end gap-3 mb-3">
+                <div className="flex-1 min-w-[220px]">
+                  <label className="block text-[10px] mb-1" style={{ color: 'var(--color-text-muted)' }}>
+                    Latencies (ms, comma-separated)
+                  </label>
+                  <input
+                    value={latencyGrid}
+                    onChange={e => setLatencyGrid(e.target.value)}
+                    placeholder="0,50,110,220,500,1000"
+                    className="w-full rounded border px-2 py-1.5 text-xs font-mono"
+                    style={{ backgroundColor: 'var(--color-base)', borderColor: 'var(--color-border)', color: 'var(--color-text)' }}
+                  />
+                </div>
+                <button
+                  onClick={runLatencySweep}
+                  disabled={latencySweepMutation.isPending}
+                  className="flex items-center gap-1.5 px-4 py-2 rounded font-semibold text-xs disabled:opacity-40"
+                  style={{ backgroundColor: 'var(--color-accent)', color: '#000' }}
+                >
+                  {latencySweepMutation.isPending ? (
+                    <><RefreshCw size={12} className="animate-spin" />Running sweep…</>
+                  ) : (
+                    <><Play size={12} />Run sweep</>
+                  )}
+                </button>
+              </div>
+
+              {latencySweepMutation.isError && (
+                <div className="rounded border p-2 text-xs mb-2" style={{ backgroundColor: 'rgba(239,68,68,0.10)', borderColor: 'var(--color-danger)', color: 'var(--color-danger)' }}>
+                  {(latencySweepMutation.error as Error)?.message ?? 'Latency sweep failed'}
+                </div>
+              )}
+
+              {latencySweep && latencySweep.rows.length > 0 && (() => {
+                const baseEv = latencySweep.rows[0]?.ev_per_trade_usd ?? 0
+                return (
+                  <div className="rounded border overflow-hidden mt-2" style={{ borderColor: 'var(--color-border)' }}>
+                    <table className="w-full text-xs">
+                      <thead style={{ backgroundColor: 'var(--color-base)', color: 'var(--color-text-muted)' }}>
+                        <tr>
+                          <th className="text-right px-3 py-1.5">Latency (ms)</th>
+                          <th className="text-right px-3 py-1.5">Return %</th>
+                          <th className="text-right px-3 py-1.5">Win Rate %</th>
+                          <th className="text-right px-3 py-1.5">Trades</th>
+                          <th className="text-right px-3 py-1.5">EV/trade ($)</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {latencySweep.rows.map((row, i) => {
+                          // Shade the EV cell from green (kept edge) → red (decayed) relative to 0-latency.
+                          const evRatio = baseEv !== 0 ? row.ev_per_trade_usd / baseEv : 1
+                          const evColor = row.ev_per_trade_usd >= 0 ? 'var(--color-accent)' : 'var(--color-danger)'
+                          return (
+                            <tr key={i} style={{ borderTop: '1px solid var(--color-border)' }}>
+                              <td className="px-3 py-1.5 text-right font-mono font-semibold">{row.latency_ms}</td>
+                              <td className="px-3 py-1.5 text-right font-mono" style={{ color: row.total_return_pct >= 0 ? 'var(--color-accent)' : 'var(--color-danger)' }}>
+                                {row.total_return_pct >= 0 ? '+' : ''}{fmt(row.total_return_pct)}%
+                              </td>
+                              <td className="px-3 py-1.5 text-right font-mono">{fmt(row.win_rate_pct)}%</td>
+                              <td className="px-3 py-1.5 text-right font-mono">{row.total_trades.toLocaleString()}</td>
+                              <td className="px-3 py-1.5 text-right font-mono font-semibold"
+                                style={{
+                                  color: evColor,
+                                  backgroundColor: i > 0 ? `rgba(239,68,68,${Math.min(0.25, Math.max(0, (1 - evRatio) * 0.25))})` : undefined,
+                                }}
+                                title={i > 0 && baseEv !== 0 ? `${fmt(evRatio * 100)}% of 0-latency EV` : undefined}
+                              >
+                                {row.ev_per_trade_usd >= 0 ? '+' : ''}{fmtCompact(row.ev_per_trade_usd, '$')}
+                              </td>
+                            </tr>
+                          )
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                )
+              })()}
+            </div>
+          )}
+
+          {/* ── WALK-FORWARD PANEL (#3) ───────────────────────────────────── */}
+          {showWalkForward && !isBatchMode && config.script && (
+            <div className="col-span-2 lg:col-span-4 rounded border p-3 mt-2"
+              style={{ backgroundColor: 'var(--color-surface-2)', borderColor: 'var(--color-accent)' }}>
+              <div className="flex items-center gap-2 mb-2">
+                <TrendingUp size={14} style={{ color: 'var(--color-accent)' }} />
+                <span className="text-sm font-semibold">Walk-Forward (out-of-sample)</span>
+                <span className="text-[10px] px-1.5 py-0.5 rounded" style={{ backgroundColor: 'var(--color-base)', color: 'var(--color-text-muted)' }}>
+                  train → test
+                </span>
+              </div>
+              <div className="flex flex-wrap items-end gap-3 mb-3">
+                <div>
+                  <label className="block text-[10px] mb-1" style={{ color: 'var(--color-text-muted)' }}>Train fraction</label>
+                  <input
+                    type="number"
+                    min={0.1}
+                    max={0.9}
+                    step={0.05}
+                    value={walkFrac}
+                    onChange={e => {
+                      const v = Number(e.target.value)
+                      if (!isNaN(v)) setWalkFrac(Math.min(0.9, Math.max(0.1, v)))
+                    }}
+                    className="w-24 rounded border px-2 py-1.5 text-xs font-mono"
+                    style={{ backgroundColor: 'var(--color-base)', borderColor: 'var(--color-border)', color: 'var(--color-text)' }}
+                  />
+                </div>
+                <button
+                  onClick={runWalkForward}
+                  disabled={walkForwardMutation.isPending}
+                  className="flex items-center gap-1.5 px-4 py-2 rounded font-semibold text-xs disabled:opacity-40"
+                  style={{ backgroundColor: 'var(--color-accent)', color: '#000' }}
+                >
+                  {walkForwardMutation.isPending ? (
+                    <><RefreshCw size={12} className="animate-spin" />Running…</>
+                  ) : (
+                    <><Play size={12} />Run walk-forward</>
+                  )}
+                </button>
+                <span className="text-[11px]" style={{ color: 'var(--color-text-muted)' }}>
+                  Trains on the first {Math.round(walkFrac * 100)}%, tests on the last {Math.round((1 - walkFrac) * 100)}% of the date range.
+                </span>
+              </div>
+
+              {walkForwardMutation.isError && (
+                <div className="rounded border p-2 text-xs mb-2" style={{ backgroundColor: 'rgba(239,68,68,0.10)', borderColor: 'var(--color-danger)', color: 'var(--color-danger)' }}>
+                  {(walkForwardMutation.error as Error)?.message ?? 'Walk-forward failed'}
+                </div>
+              )}
+
+              {walkForward && (() => {
+                const oos = walkForward.holds_out_of_sample
+                const bannerColor = oos ? 'var(--color-accent)' : 'var(--color-danger)'
+                const bannerBg = oos ? 'rgba(34,197,94,0.12)' : 'rgba(239,68,68,0.12)'
+                const renderSplit = (label: string, s: WalkForwardSplit) => (
+                  <div className="rounded border p-3 space-y-2" style={{ backgroundColor: 'var(--color-base)', borderColor: 'var(--color-border)' }}>
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-semibold uppercase tracking-widest" style={{ color: 'var(--color-text-muted)' }}>{label}</span>
+                      <span className="text-[10px] font-mono" style={{ color: 'var(--color-text-muted)' }}>{s.from_date} → {s.to_date}</span>
+                    </div>
+                    <div className="grid grid-cols-3 gap-2 text-xs">
+                      <div>
+                        <p style={{ color: 'var(--color-text-muted)' }}>Return</p>
+                        <p className="font-mono font-semibold" style={{ color: s.total_return_pct >= 0 ? 'var(--color-accent)' : 'var(--color-danger)' }}>
+                          {s.total_return_pct >= 0 ? '+' : ''}{fmt(s.total_return_pct)}%
+                        </p>
+                      </div>
+                      <div>
+                        <p style={{ color: 'var(--color-text-muted)' }}>Win Rate</p>
+                        <p className="font-mono font-semibold" style={{ color: 'var(--color-text)' }}>{fmt(s.win_rate_pct)}%</p>
+                      </div>
+                      <div>
+                        <p style={{ color: 'var(--color-text-muted)' }}>Trades</p>
+                        <p className="font-mono font-semibold" style={{ color: 'var(--color-text)' }}>{s.total_trades.toLocaleString()}</p>
+                      </div>
+                    </div>
+                    {s.edge_validation && (
+                      <div className="pt-2 border-t space-y-1.5" style={{ borderColor: 'var(--color-border)' }}>
+                        <span
+                          className="inline-block px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wide"
+                          style={{ backgroundColor: verdictColor(s.edge_validation.verdict), color: '#000' }}
+                        >
+                          {s.edge_validation.verdict}
+                        </span>
+                        <EdgeLegsCompact ev={s.edge_validation} />
+                      </div>
+                    )}
+                  </div>
+                )
+                return (
+                  <div className="space-y-3 mt-2">
+                    {/* Verdict banner */}
+                    <div className="rounded border px-3 py-2.5" style={{ backgroundColor: bannerBg, borderColor: bannerColor }}>
+                      <div className="flex items-center gap-2">
+                        {oos
+                          ? <Check size={16} style={{ color: bannerColor }} />
+                          : <AlertTriangle size={16} style={{ color: bannerColor }} />}
+                        <span className="text-sm font-bold" style={{ color: bannerColor }}>
+                          {oos ? 'EDGE survives out-of-sample' : walkForward.verdict || 'OVERFIT — edge in train only'}
+                        </span>
+                      </div>
+                      <p className="text-[11px] mt-1" style={{ color: 'var(--color-text)' }}>
+                        {walkForward.verdict} · train_frac {fmt(walkForward.train_frac, 2)}
+                      </p>
+                    </div>
+                    {/* Train / Test columns */}
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                      {renderSplit('Train', walkForward.train)}
+                      {renderSplit('Test (OOS)', walkForward.test)}
+                    </div>
+                  </div>
+                )
+              })()}
             </div>
           )}
           </div>
