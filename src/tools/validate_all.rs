@@ -150,6 +150,22 @@ pub async fn run_validate_all(
         // side-label convention). The 3-leg validator is for BINARY markets only.
         let (entries, wons) = edge_validator::extract_binary_trades(&m.all_trades);
 
+        // Optional per-script trade export (NV_VALIDATE_DUMP=<dir>): writes
+        // <dir>/<script>.csv with `entry_price,won` for offline analysis (price
+        // structure, custom edge tests). Off by default.
+        if let Ok(dump) = std::env::var("NV_VALIDATE_DUMP") {
+            if !entries.is_empty() {
+                let _ = std::fs::create_dir_all(&dump);
+                let stem = filename.trim_end_matches(".rhai");
+                let path = std::path::Path::new(&dump).join(format!("{stem}.csv"));
+                let mut out = String::from("entry_price,won\n");
+                for (e, w) in entries.iter().zip(&wons) {
+                    out.push_str(&format!("{:.4},{}\n", e, if *w { 1 } else { 0 }));
+                }
+                let _ = std::fs::write(path, out);
+            }
+        }
+
         if entries.is_empty() && m.total_trades > 0 {
             // Traded, but not binary bets → the binary validator doesn't apply.
             eprintln!("N/A non-binary ({} trades)", m.total_trades);
