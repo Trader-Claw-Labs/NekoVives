@@ -115,6 +115,10 @@ export interface EdgeValidation {
   leg2_pass: boolean
   p_shuffle: number
   leg3_pass: boolean
+  // Leg 4 — calibration null: bettor wins with prob = entry price (fair value).
+  // Works at constant price where Leg 3 (shuffle) is blind. Added after the quant review.
+  p_calib?: number
+  leg4_pass?: boolean
   verdict: 'EDGE' | 'NO_EDGE' | 'INSUFFICIENT'
   note: string
 }
