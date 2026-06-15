@@ -369,6 +369,9 @@ function EdgeLegsCompact({ ev }: { ev: EdgeValidation }) {
       <EdgeLeg label={`Leg 1 — Bootstrap CI [${fmt(ev.ci_lo)}%, ${fmt(ev.ci_hi)}%]`} pass={ev.leg1_pass} />
       <EdgeLeg label={`Leg 2 — Random-null p=${fmt(ev.p_random, 3)}`} pass={ev.leg2_pass} />
       <EdgeLeg label={`Leg 3 — Shuffle-null p=${fmt(ev.p_shuffle, 3)}`} pass={ev.leg3_pass} />
+      {ev.p_calib != null && (
+        <EdgeLeg label={`Leg 4 — Calibration-null p=${fmt(ev.p_calib, 3)}`} pass={!!ev.leg4_pass} />
+      )}
     </div>
   )
 }
@@ -416,11 +419,14 @@ function EdgeValidationCard({ ev }: { ev: EdgeValidation }) {
         </div>
       </div>
 
-      {/* 3 legs */}
+      {/* 4 legs */}
       <div className="space-y-1.5 pt-1">
         <EdgeLeg label={`Leg 1 — Bootstrap CI [${fmt(ev.ci_lo)}%, ${fmt(ev.ci_hi)}%]`} pass={ev.leg1_pass} />
         <EdgeLeg label={`Leg 2 — Random-null p=${fmt(ev.p_random, 3)}`} pass={ev.leg2_pass} />
         <EdgeLeg label={`Leg 3 — Shuffle-null p=${fmt(ev.p_shuffle, 3)}`} pass={ev.leg3_pass} />
+        {ev.p_calib != null && (
+          <EdgeLeg label={`Leg 4 — Calibration-null p=${fmt(ev.p_calib, 3)}`} pass={!!ev.leg4_pass} />
+        )}
       </div>
 
       {ev.note && (
