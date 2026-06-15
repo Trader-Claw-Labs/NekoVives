@@ -73,6 +73,9 @@ pub struct RunnerConfig {
     pub symbol: String,
     pub interval: String,
     pub mode: String,
+    /// Selected Polymarket wallet profile id. Credentials are resolved at live start/restart.
+    #[serde(default)]
+    pub polymarket_wallet_id: Option<String>,
     pub initial_balance: f64,
     pub fee_pct: f64,
     pub warmup_days: u32,

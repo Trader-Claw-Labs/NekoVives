@@ -934,6 +934,41 @@ pub struct ChainsRpcConfig {
 
 // ── Polymarket CLOB credentials ──────────────────────────────────
 
+/// One named Polymarket wallet/API credential profile.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct PolymarketWalletProfile {
+    /// Stable UI/API identifier for this profile.
+    #[serde(default)]
+    pub id: String,
+    /// Human-friendly label shown in the runner wallet picker.
+    #[serde(default)]
+    pub label: String,
+    /// Polymarket CLOB API key.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// HMAC secret for L2 request signing.
+    #[serde(default)]
+    pub secret: Option<String>,
+    /// API passphrase.
+    #[serde(default)]
+    pub passphrase: Option<String>,
+    /// Polygon wallet address used for Polymarket activity.
+    #[serde(default)]
+    pub wallet_address: Option<String>,
+    /// Private key of the Polygon wallet (hex, with or without 0x prefix).
+    #[serde(default)]
+    pub private_key: Option<String>,
+    /// Whether these credentials are Polymarket Builder Key credentials.
+    #[serde(default)]
+    pub is_builder: Option<bool>,
+    /// Optional proxy wallet address (e.g. Polymarket proxy / Safe).
+    #[serde(default)]
+    pub proxy_address: Option<String>,
+    /// Override EIP-712 signature type for order signing.
+    #[serde(default)]
+    pub signature_type: Option<String>,
+}
+
 /// Polymarket CLOB API credentials (`[polymarket]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
 pub struct PolymarketConfig {
@@ -967,6 +1002,10 @@ pub struct PolymarketConfig {
     /// private key without a Polymarket proxy/safe wallet.
     #[serde(default)]
     pub signature_type: Option<String>,
+    /// Additional named Polymarket wallet profiles. Existing top-level fields above
+    /// remain the legacy/default profile for backward compatibility.
+    #[serde(default)]
+    pub wallets: Vec<PolymarketWalletProfile>,
 }
 
 // ── Copy Trading ─────────────────────────────────────────────────

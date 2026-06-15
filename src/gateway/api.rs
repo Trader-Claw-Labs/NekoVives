@@ -1391,6 +1391,139 @@ pub async fn handle_api_polymarket_markets(
     }
 }
 
+
+#[derive(Deserialize)]
+pub struct PolymarketWalletProfileBody {
+    pub id: Option<String>,
+    pub label: Option<String>,
+    pub wallet_address: Option<String>,
+    pub api_key: Option<String>,
+    pub secret: Option<String>,
+    pub passphrase: Option<String>,
+    pub private_key: Option<String>,
+    #[serde(default)]
+    pub is_builder: Option<bool>,
+    #[serde(default)]
+    pub proxy_address: Option<String>,
+    #[serde(default)]
+    pub signature_type: Option<String>,
+}
+
+fn mask_short(s: &Option<String>) -> Option<String> {
+    s.as_deref().filter(|v| !v.trim().is_empty()).map(|v| {
+        if v.len() <= 10 { "••••••••".to_string() } else { format!("{}…{}", &v[..6], &v[v.len()-4..]) }
+    })
+}
+
+fn profile_summary(p: &crate::config::schema::PolymarketWalletProfile) -> serde_json::Value {
+    let configured = clean_optional(&p.api_key).is_some()
+        && clean_optional(&p.secret).is_some()
+        && clean_optional(&p.passphrase).is_some()
+        && clean_optional(&p.wallet_address).is_some()
+        && clean_optional(&p.private_key).is_some();
+    serde_json::json!({
+        "id": p.id,
+        "label": if p.label.trim().is_empty() { p.id.clone() } else { p.label.clone() },
+        "configured": configured,
+        "wallet_address": clean_optional(&p.wallet_address),
+        "wallet_address_masked": mask_short(&p.wallet_address),
+        "api_key_masked": mask_short(&p.api_key),
+        "proxy_address": clean_optional(&p.proxy_address),
+        "proxy_address_masked": mask_short(&p.proxy_address),
+        "has_secret": clean_optional(&p.secret).is_some(),
+        "has_passphrase": clean_optional(&p.passphrase).is_some(),
+        "has_private_key": clean_optional(&p.private_key).is_some(),
+        "is_builder": p.is_builder.unwrap_or(false),
+        "signature_type": p.signature_type,
+    })
+}
+
+/// GET /api/polymarket/wallets — list named wallet profiles (masked; secrets omitted).
+pub async fn handle_api_polymarket_wallets_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+    let cfg = state.config.lock();
+    let profiles = list_poly_wallet_profiles(&cfg.polymarket);
+    let wallets: Vec<_> = profiles.iter().map(profile_summary).collect();
+    Json(serde_json::json!({ "wallets": wallets })).into_response()
+}
+
+/// POST /api/polymarket/wallets — create/update a named wallet profile.
+pub async fn handle_api_polymarket_wallets_upsert(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<PolymarketWalletProfileBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+
+    fn clean(s: Option<String>) -> Option<String> { s.map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) }
+    fn is_placeholder(s: &str) -> bool {
+        !s.is_empty() && (s.chars().all(|c| matches!(c, '•' | '*' | '·' | '●')) || s.contains('…'))
+    }
+    fn merge_secret(input: Option<String>, existing: Option<String>) -> Option<String> {
+        match clean(input) {
+            Some(v) if is_placeholder(&v) => existing,
+            other => other.or(existing),
+        }
+    }
+
+    let id = clean(body.id.clone()).unwrap_or_else(|| format!("wallet-{}", uuid::Uuid::new_v4().simple()));
+    if id == "default" {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"Use /api/polymarket/configure for the legacy default profile; named profiles cannot use id=default."}))).into_response();
+    }
+
+    let mut config = state.config.lock().clone();
+    let existing_idx = config.polymarket.wallets.iter().position(|p| p.id == id);
+    let existing = existing_idx.and_then(|i| config.polymarket.wallets.get(i).cloned()).unwrap_or_default();
+    let profile = crate::config::schema::PolymarketWalletProfile {
+        id: id.clone(),
+        label: clean(body.label).or_else(|| if existing.label.is_empty() { None } else { Some(existing.label.clone()) }).unwrap_or_else(|| id.clone()),
+        wallet_address: merge_secret(body.wallet_address, existing.wallet_address),
+        api_key: merge_secret(body.api_key, existing.api_key),
+        secret: merge_secret(body.secret, existing.secret),
+        passphrase: merge_secret(body.passphrase, existing.passphrase),
+        private_key: merge_secret(body.private_key, existing.private_key),
+        is_builder: body.is_builder.or(existing.is_builder),
+        proxy_address: merge_secret(body.proxy_address, existing.proxy_address),
+        signature_type: clean(body.signature_type).or(existing.signature_type),
+    };
+    if let Some(i) = existing_idx {
+        config.polymarket.wallets[i] = profile.clone();
+    } else {
+        config.polymarket.wallets.push(profile.clone());
+    }
+    if let Err(e) = config.save().await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("Failed to save config: {e}")}))).into_response();
+    }
+    *state.config.lock() = config;
+    Json(serde_json::json!({"status":"ok", "wallet": profile_summary(&profile)})).into_response()
+}
+
+/// DELETE /api/polymarket/wallets/{id} — remove a named wallet profile.
+pub async fn handle_api_polymarket_wallets_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+    if id == "default" {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"The legacy default profile cannot be deleted here."}))).into_response();
+    }
+    let mut config = state.config.lock().clone();
+    let before = config.polymarket.wallets.len();
+    config.polymarket.wallets.retain(|p| p.id != id);
+    if config.polymarket.wallets.len() == before {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error":"wallet profile not found"}))).into_response();
+    }
+    if let Err(e) = config.save().await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("Failed to save config: {e}")}))).into_response();
+    }
+    *state.config.lock() = config;
+    Json(serde_json::json!({"status":"deleted", "id": id})).into_response()
+}
+
 /// GET /api/polymarket/configure — return saved credentials (masked)
 pub async fn handle_api_polymarket_configure_get(
     State(state): State<AppState>,
@@ -1481,6 +1614,7 @@ pub async fn handle_api_polymarket_configure(
         is_builder: existing.is_builder,
         proxy_address: existing.proxy_address,
         signature_type: body.signature_type.filter(|s| !s.is_empty()).or(existing.signature_type),
+        wallets: existing.wallets,
     };
     if let Err(e) = config.save().await {
         return (
@@ -2173,6 +2307,7 @@ pub async fn handle_api_polymarket_setup_generate_creds(
 
     if body.persist {
         let mut config = state.config.lock().clone();
+        let existing_wallets = config.polymarket.wallets.clone();
         config.polymarket = crate::config::schema::PolymarketConfig {
             api_key: Some(creds.api_key.clone()),
             secret: Some(creds.secret.clone()),
@@ -2182,6 +2317,7 @@ pub async fn handle_api_polymarket_setup_generate_creds(
             is_builder: body.is_builder.or(config.polymarket.is_builder),
             proxy_address: body.proxy_address.clone().filter(|p| !p.trim().is_empty()),
             signature_type: body.signature_type.clone().filter(|s| !s.trim().is_empty()),
+            wallets: existing_wallets,
         };
         if let Err(e) = config.save().await {
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
@@ -2468,28 +2604,86 @@ pub async fn handle_api_rewards_history(
 
 // ── Polymarket orders / positions helpers ────────────────────────
 
-fn get_poly_creds(state: &AppState) -> Option<polymarket_trader::auth::PolyCredentials> {
-    let cfg = state.config.lock();
-    let pm = &cfg.polymarket;
-    let api_key = pm.api_key.clone().filter(|k| !k.is_empty())?;
-    Some(polymarket_trader::auth::PolyCredentials {
-        api_key,
-        secret: pm.secret.clone().unwrap_or_default(),
-        passphrase: pm.passphrase.clone().unwrap_or_default(),
-        wallet_address: pm.wallet_address.clone().unwrap_or_default().to_lowercase(),
-        private_key: pm.private_key.clone().filter(|k| !k.is_empty()),
-        is_builder: pm.is_builder.unwrap_or(false),
-        proxy_address: pm.proxy_address.clone().filter(|k| !k.is_empty()).map(|s| s.to_lowercase()),
-        signature_type: pm.signature_type.clone().filter(|k| !k.is_empty()),
+fn clean_optional(s: &Option<String>) -> Option<String> {
+    s.as_deref().map(str::trim).filter(|v| !v.is_empty()).map(str::to_string)
+}
+
+fn legacy_poly_profile(pm: &crate::config::schema::PolymarketConfig) -> Option<crate::config::schema::PolymarketWalletProfile> {
+    let has_any = clean_optional(&pm.api_key).is_some()
+        || clean_optional(&pm.wallet_address).is_some()
+        || clean_optional(&pm.private_key).is_some();
+    if !has_any { return None; }
+    Some(crate::config::schema::PolymarketWalletProfile {
+        id: "default".to_string(),
+        label: "Default Polymarket wallet".to_string(),
+        api_key: pm.api_key.clone(),
+        secret: pm.secret.clone(),
+        passphrase: pm.passphrase.clone(),
+        wallet_address: pm.wallet_address.clone(),
+        private_key: pm.private_key.clone(),
+        is_builder: pm.is_builder,
+        proxy_address: pm.proxy_address.clone(),
+        signature_type: pm.signature_type.clone(),
     })
 }
 
-fn get_poly_wallet_address(state: &AppState) -> Option<String> {
+fn list_poly_wallet_profiles(pm: &crate::config::schema::PolymarketConfig) -> Vec<crate::config::schema::PolymarketWalletProfile> {
+    let mut out = Vec::new();
+    if let Some(p) = legacy_poly_profile(pm) { out.push(p); }
+    for (idx, profile) in pm.wallets.iter().enumerate() {
+        let mut p = profile.clone();
+        if p.id.trim().is_empty() { p.id = format!("wallet-{}", idx + 1); }
+        if p.label.trim().is_empty() { p.label = p.id.clone(); }
+        out.push(p);
+    }
+    out
+}
+
+fn resolve_poly_wallet_profile(
+    pm: &crate::config::schema::PolymarketConfig,
+    selected_id: Option<&str>,
+) -> Option<crate::config::schema::PolymarketWalletProfile> {
+    let profiles = list_poly_wallet_profiles(pm);
+    let selected = selected_id.map(str::trim).filter(|s| !s.is_empty());
+    if let Some(id) = selected {
+        if let Some(p) = profiles.iter().find(|p| p.id == id).cloned() {
+            return Some(p);
+        }
+    }
+    profiles.into_iter().find(|p| p.id == "default").or_else(|| pm.wallets.first().cloned())
+}
+
+fn poly_creds_from_profile(profile: &crate::config::schema::PolymarketWalletProfile) -> Option<polymarket_trader::auth::PolyCredentials> {
+    let api_key = clean_optional(&profile.api_key)?;
+    Some(polymarket_trader::auth::PolyCredentials {
+        api_key,
+        secret: clean_optional(&profile.secret).unwrap_or_default(),
+        passphrase: clean_optional(&profile.passphrase).unwrap_or_default(),
+        wallet_address: clean_optional(&profile.wallet_address).unwrap_or_default().to_lowercase(),
+        private_key: clean_optional(&profile.private_key),
+        is_builder: profile.is_builder.unwrap_or(false),
+        proxy_address: clean_optional(&profile.proxy_address).map(|s| s.to_lowercase()),
+        signature_type: clean_optional(&profile.signature_type),
+    })
+}
+
+fn get_poly_creds_for_wallet(state: &AppState, wallet_profile_id: Option<&str>) -> Option<polymarket_trader::auth::PolyCredentials> {
     let cfg = state.config.lock();
-    cfg.polymarket
-        .wallet_address
-        .clone()
-        .filter(|w| !w.trim().is_empty())
+    let profile = resolve_poly_wallet_profile(&cfg.polymarket, wallet_profile_id)?;
+    poly_creds_from_profile(&profile)
+}
+
+fn get_poly_creds(state: &AppState) -> Option<polymarket_trader::auth::PolyCredentials> {
+    get_poly_creds_for_wallet(state, None)
+}
+
+fn get_poly_wallet_profile(state: &AppState, wallet_profile_id: Option<&str>) -> Option<crate::config::schema::PolymarketWalletProfile> {
+    let cfg = state.config.lock();
+    resolve_poly_wallet_profile(&cfg.polymarket, wallet_profile_id)
+}
+
+fn get_poly_wallet_address(state: &AppState) -> Option<String> {
+    get_poly_wallet_profile(state, None).and_then(|p| clean_optional(&p.wallet_address))
 }
 
 /// Resolve (yes_token_id, no_token_id) for a fixed market by condition_id via the CLOB.
@@ -5615,6 +5809,9 @@ pub struct CreateRunnerBody {
     #[serde(default)]
     pub interval: String,
     pub mode: String,
+    /// Polymarket wallet profile id for this runner (default = legacy profile).
+    #[serde(default)]
+    pub polymarket_wallet_id: Option<String>,
     pub initial_balance: f64,
     pub fee_pct: Option<f64>,
     pub warmup_days: Option<u32>,
@@ -5781,21 +5978,20 @@ async fn hydrate_live_runtime_config(
         return Ok(());
     }
 
-    let poly = state.config.lock().polymarket.clone();
-    let api_key = poly.api_key.unwrap_or_default();
-    let secret = poly.secret.unwrap_or_default();
-    let passphrase = poly.passphrase.unwrap_or_default();
-    if api_key.is_empty() || secret.is_empty() || passphrase.is_empty() {
-        anyhow::bail!("Live mode requires polymarket.api_key, polymarket.secret, and polymarket.passphrase in config.");
+    let profile = get_poly_wallet_profile(state, config.polymarket_wallet_id.as_deref())
+        .ok_or_else(|| anyhow::anyhow!("Live mode requires a configured Polymarket wallet profile."))?;
+    let creds = poly_creds_from_profile(&profile)
+        .ok_or_else(|| anyhow::anyhow!("Live mode requires polymarket api_key, secret, passphrase, wallet_address, and private_key in the selected wallet profile."))?;
+    if creds.secret.is_empty() || creds.passphrase.is_empty() {
+        anyhow::bail!("Live mode requires polymarket.secret and polymarket.passphrase in the selected wallet profile.");
     }
-
-    let wallet_address = get_poly_wallet_address(state)
-        .ok_or_else(|| anyhow::anyhow!("Live mode requires polymarket.wallet_address. Go to Settings → Config and set your Polymarket wallet address."))?;
-
-    let private_key = poly.private_key.filter(|k| !k.is_empty());
-    if private_key.is_none() {
-        anyhow::bail!("Live mode requires polymarket.private_key for EIP-712 order signing. Go to Settings → Polymarket and set your wallet private key.");
+    if creds.wallet_address.is_empty() {
+        anyhow::bail!("Live mode requires a wallet address in the selected Polymarket wallet profile.");
     }
+    if creds.private_key.as_deref().unwrap_or("").is_empty() {
+        anyhow::bail!("Live mode requires private_key for EIP-712 order signing in the selected Polymarket wallet profile.");
+    }
+    let wallet_address = creds.wallet_address.clone();
 
     // The rewards_maker engine resolves its own YES/NO tokens from the condition_id
     // (stored in `symbol`/`poly_condition_id`) — it quotes one fixed market, not a
@@ -5814,20 +6010,9 @@ async fn hydrate_live_runtime_config(
     };
     let min_live_usdc = 1.0;
     if config.mode == "live" {
-        let proxy_for_check = poly.proxy_address.clone().filter(|k| !k.trim().is_empty());
+        let proxy_for_check = clean_optional(&profile.proxy_address);
         ensure_live_wallet_has_min_balance(&wallet_address, proxy_for_check.as_deref(), min_live_usdc).await?;
     }
-
-    let creds = polymarket_trader::auth::PolyCredentials {
-        api_key,
-        secret,
-        passphrase,
-        wallet_address: wallet_address.clone().to_lowercase(),
-        private_key,
-        is_builder: poly.is_builder.unwrap_or(false),
-        proxy_address: poly.proxy_address.clone().filter(|k| !k.is_empty()).map(|s| s.to_lowercase()),
-        signature_type: poly.signature_type.clone().filter(|k| !k.is_empty()),
-    };
 
     // Pre-flight: verify L2 auth actually works before starting the runner.
     // Catches mismatched api_key/secret/passphrase so we don't discover the
@@ -6145,6 +6330,7 @@ pub async fn handle_api_live_create(
         symbol,
         interval,
         mode: body.mode,
+        polymarket_wallet_id: body.polymarket_wallet_id,
         initial_balance: body.initial_balance,
         fee_pct: body.fee_pct.unwrap_or(0.1),
         warmup_days: body.warmup_days.unwrap_or(90),
