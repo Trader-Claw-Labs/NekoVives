@@ -42,6 +42,16 @@ pub struct ValidationResult {
     pub leg2_pass: bool,
     pub p_shuffle: f64,
     pub leg3_pass: bool,
+    /// Leg 4 — calibration null: a bettor that wins each trade with probability equal
+    /// to the ENTRY PRICE (the fair value the price implies). Unlike Leg 2 (50/50),
+    /// this works at constant price — it asks "does your selection beat the price's own
+    /// implied probability?". p_calib < 0.05 → your edge is over fair value, not just
+    /// over a coin flip. (Added after an external quant review showed Leg 3 is blind to
+    /// constant-price edge.)
+    #[serde(default)]
+    pub p_calib: f64,
+    #[serde(default)]
+    pub leg4_pass: bool,
     pub verdict: String, // "EDGE" | "NO_EDGE" | "INSUFFICIENT"
     pub note: String,
 }
@@ -129,10 +139,45 @@ pub fn validate(entries: &[f64], wons: &[bool], iters: usize) -> ValidationResul
         .count();
     let p3 = ge3 as f64 / iters as f64;
 
+    // LEG 4 — calibration null: bettor wins each trade with prob = its ENTRY PRICE.
+    // Works at constant price (unlike Leg 3): tests whether the selection beats the
+    // fair value implied by the price itself.
+    let ge4 = (0..iters)
+        .filter(|_| {
+            let m: f64 = entries.iter()
+                .map(|&e| ev1(e, rand::random::<f64>() < e))
+                .sum::<f64>() / n as f64;
+            m >= obs
+        })
+        .count();
+    let p4 = ge4 as f64 / iters as f64;
+
+    // Is there enough price variance for Leg 3 (shuffle-null) to be meaningful? At
+    // (near-)constant price the shuffle is mathematically blind (it always yields
+    // p≈1.0 — the quant's valid point). Measure the std of entry prices; below a
+    // small threshold, Leg 3 is SKIPPED rather than counted as a failure.
+    let mean_e = entries.iter().sum::<f64>() / n as f64;
+    let price_std = (entries.iter().map(|&e| (e - mean_e).powi(2)).sum::<f64>() / n as f64).sqrt();
+    let leg3_applicable = price_std >= 0.05; // ≥5¢ spread of entry prices
+
     let l1 = ci_lo > 0.0;
     let l2 = p2 < 0.05;
     let l3 = p3 < 0.05;
-    let edge = l1 && l2 && l3;
+    let l4 = p4 < 0.05;
+    // EDGE requires Leg1 + Leg2 + Leg4 always; Leg3 only when price has variance.
+    let edge = l1 && l2 && l4 && (!leg3_applicable || l3);
+
+    let note = if edge {
+        if leg3_applicable {
+            "Survives all 4 tests (incl. shuffle + calibration null) — worth a small real pilot.".to_string()
+        } else {
+            "Constant-price strategy: passes Leg1/2/4 (calibration null); Leg3 skipped (no price \
+             variance). Edge is over fair value, but a backtest can't tell signal from lookahead — \
+             verify with walk-forward + a no-end-of-window-lookahead run before any capital.".to_string()
+        }
+    } else {
+        "Consistent with luck/fees/lookahead — do NOT commit capital.".to_string()
+    };
 
     ValidationResult {
         n,
@@ -145,12 +190,10 @@ pub fn validate(entries: &[f64], wons: &[bool], iters: usize) -> ValidationResul
         p_random: p2,
         leg2_pass: l2,
         p_shuffle: p3,
-        leg3_pass: l3,
+        leg3_pass: if leg3_applicable { l3 } else { true }, // true = "not blocking"
+        p_calib: p4,
+        leg4_pass: l4,
         verdict: if edge { "EDGE" } else { "NO_EDGE" }.to_string(),
-        note: if edge {
-            "Survives all 3 independent tests — worth a small real pilot.".to_string()
-        } else {
-            "Consistent with luck/fees — do NOT commit capital.".to_string()
-        },
+        note,
     }
 }
