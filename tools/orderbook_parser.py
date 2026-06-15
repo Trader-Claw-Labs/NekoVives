@@ -1837,10 +1837,18 @@ def cmd_to_ticks_multi(args: argparse.Namespace) -> None:
             else:
                 asset_filter = ""
 
-            # Aggregate to 1Hz in SQL using max_by (last event per second)
+            # Aggregate to 1Hz in SQL using max_by (last event per second) — PER MARKET.
+            # CRITICAL (data-integrity fix): group by (market, ts_s), NOT ts_s alone.
+            # Up to ~6,000 distinct Polymarket markets emit a price_change in the SAME
+            # second; collapsing them with `GROUP BY ts_s` keeps whichever market printed
+            # last, so the price for "window W" was frequently a NEIGHBORING market's
+            # settling price. That spliced price encodes other markets' near-resolved
+            # outcomes → a phantom drift "edge" (75% WR at 0.50 on a 50/50-calibrated
+            # market). Keeping `market` separate yields one coherent price path per window.
             try:
                 day_df = con.execute(f"""
                 SELECT
+                    CAST(market AS VARCHAR) AS market,
                     CAST(epoch(timestamp_received) AS BIGINT) AS ts_s,
                     max_by(CAST(best_bid AS DOUBLE), timestamp_received) AS yes_bid,
                     max_by(CAST(best_ask AS DOUBLE), timestamp_received) AS yes_ask
@@ -1848,7 +1856,7 @@ def cmd_to_ticks_multi(args: argparse.Namespace) -> None:
                 WHERE event_type = 'price_change'
                   AND CAST(market AS VARCHAR) IN ({cids_sql})
                   {asset_filter}
-                GROUP BY ts_s
+                GROUP BY market, ts_s
                 ORDER BY ts_s
                 """).df()
             except Exception as e:
@@ -1875,21 +1883,47 @@ def cmd_to_ticks_multi(args: argparse.Namespace) -> None:
         )
         print(f"[to-ticks-multi] {slug}: {len(binance_prices):,} Binance price points", file=sys.stderr)
 
-        # ── Step 4: Build 1Hz tick table ──────────────────────────────────────
-        # Data is already aggregated to 1Hz by DuckDB; just forward-fill gaps
-        # and add window / Binance fields.
+        # ── Step 4: Build 1Hz tick table — PER MARKET, no cross-market mixing ──
+        # Each market is assigned to ITS OWN window (from end_ts), and ticks are
+        # clipped to that window's [open, close]. window_ts/secs_left come from the
+        # market's real end_ts — NOT from `ts_s % window_secs` (wall-clock), which
+        # was the second half of the contamination bug (it let a tick from market A
+        # land in market B's window just because they shared a clock second).
         window_secs = window_minutes * 60
-        df_1hz = (
-            pd.concat(all_day_dfs, ignore_index=True)
-            .sort_values("ts_s")
-            .drop_duplicates("ts_s", keep="last")  # guard against day-boundary overlaps
-            .reset_index(drop=True)
-        )
+        # cid → end_ts (window close, unix secs) from the discovered markets.
+        end_ts_by_cid = {m["condition_id"]: int(m["end_ts"]) for m in markets_info if m.get("end_ts")}
 
-        t_min = int(df_1hz["ts_s"].min())
-        t_max = int(df_1hz["ts_s"].max())
+        raw = pd.concat(all_day_dfs, ignore_index=True)
+        # Attach each row's own window via its market's end_ts.
+        raw["win_close"] = raw["market"].map(end_ts_by_cid)
+        raw = raw.dropna(subset=["win_close"])
+        raw["win_close"] = raw["win_close"].astype(int)
+        raw["window_ts"] = raw["win_close"] - window_secs
+        # Keep only ticks that fall inside their OWN market's window.
+        raw = raw[(raw["ts_s"] >= raw["window_ts"]) & (raw["ts_s"] <= raw["win_close"])]
+        if raw.empty:
+            print(f"[to-ticks-multi] {slug}: no ticks inside their own windows — skipping", file=sys.stderr)
+            results.append({"slug": slug, "ok": False, "error": "no in-window ticks after per-market clip"})
+            continue
+        # window_secs_left from the market's own close; clamp ≥0.
+        raw["window_secs_left"] = (raw["win_close"] - raw["ts_s"]).clip(lower=0).astype(int)
+        # If two windows of the SAME asset overlap on a second (shouldn't for a clean
+        # series), keep the one closest to its close (smallest secs_left = most decided).
+        raw = (raw.sort_values(["ts_s", "window_secs_left"])
+                  .drop_duplicates("ts_s", keep="first")
+                  .sort_values("ts_s").reset_index(drop=True))
+
+        # Forward-fill ONLY within each window (never across window boundaries, which
+        # would carry a closing price into the next market's open).
+        t_min, t_max = int(raw["ts_s"].min()), int(raw["ts_s"].max())
         all_secs = pd.DataFrame({"ts_s": range(t_min, t_max + 1)})
-        yes_1hz = all_secs.merge(df_1hz, on="ts_s", how="left").ffill()
+        yes_1hz = all_secs.merge(raw, on="ts_s", how="left")
+        # window_ts ffill is safe within a window; reset price ffill at each new window.
+        yes_1hz["window_ts"] = yes_1hz["window_ts"].ffill()
+        grp = yes_1hz.groupby("window_ts")
+        yes_1hz["yes_bid"] = grp["yes_bid"].ffill()
+        yes_1hz["yes_ask"] = grp["yes_ask"].ffill()
+        yes_1hz["win_close"] = grp["win_close"].ffill()
 
         yes_1hz["yes_bid"]   = yes_1hz["yes_bid"].fillna(0.0)
         yes_1hz["yes_ask"]   = yes_1hz["yes_ask"].fillna(0.0)
@@ -1897,20 +1931,12 @@ def cmd_to_ticks_multi(args: argparse.Namespace) -> None:
         yes_1hz["no_bid"]    = (1.0 - yes_1hz["yes_ask"]).clip(0, 1)
         yes_1hz["no_ask"]    = (1.0 - yes_1hz["yes_bid"]).clip(0, 1)
         yes_1hz["ts_ms_out"] = yes_1hz["ts_s"].astype(int) * 1000
-
         yes_1hz["binance_price"] = yes_1hz["ts_s"].map(
             lambda s: binance_prices.get(int(s), 0.0)
         )
-        _rem2 = (yes_1hz["ts_s"] % window_secs).astype(int)
-        _is_boundary2 = _rem2 == 0
-        yes_1hz["window_ts"] = _np.where(
-            _is_boundary2,
-            yes_1hz["ts_s"].astype(int) - window_secs,
-            yes_1hz["ts_s"].astype(int) - _rem2,
-        ).astype(int)
-        yes_1hz["window_secs_left"] = _np.where(
-            _is_boundary2, 0, window_secs - _rem2
-        ).astype(int)
+        yes_1hz["window_ts"] = yes_1hz["window_ts"].fillna(0).astype(int)
+        yes_1hz["window_secs_left"] = (yes_1hz["win_close"].fillna(yes_1hz["ts_s"]).astype(int)
+                                       - yes_1hz["ts_s"].astype(int)).clip(lower=0).astype(int)
         yes_1hz["date"] = pd.to_datetime(
             yes_1hz["ts_s"], unit="s", utc=True
         ).dt.date

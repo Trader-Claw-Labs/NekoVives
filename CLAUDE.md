@@ -349,6 +349,13 @@ python3 tools/orderbook_parser.py to-candles --market 0x... --slug ob_test \
 
 # Auto-detect all recurring 5/15/60-min series and convert in one shot
 python3 tools/orderbook_parser.py to-ticks-multi --days 40
+# ⚠️ DATA-INTEGRITY: to-ticks-multi groups the 1Hz book by (market, ts_s) and assigns
+# window_ts from each market's own end_ts. An earlier version grouped by ts_s alone —
+# up to ~6000 markets share a clock-second, so it spliced neighboring markets' settling
+# prices into each window, creating a PHANTOM directional edge (drift_v1 WR@0.50 went
+# 71.5%→51.7% after the fix). Any ticks generated before this fix are contaminated;
+# regenerate. See docs/TICK_CONTAMINATION_BUG.md. (to-events / single-market to-ticks
+# were never affected — they separate by market.)
 
 # List ALL markets in local parquets (crypto + politics + sports + esports),
 # ranked by event volume. --enrich adds question/slug via the CLOB endpoint;
