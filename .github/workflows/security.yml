@@ -128,7 +128,7 @@ jobs:
       - name: Run cargo-geiger
         run: cargo geiger --all-features 2>&1 | tee geiger-report.txt || true
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: geiger-unsafe-report
           path: geiger-report.txt
