@@ -43,6 +43,9 @@ pub struct RewardMarket {
     /// CLOB token ids for posting maker quotes (YES then NO). Empty if unavailable.
     pub yes_token_id: Option<String>,
     pub no_token_id: Option<String>,
+    /// YES token mid price (0-1). ~0.5 = balanced book (maker fills both sides);
+    /// near 0/1 = skewed longshot (quotes rarely cross). Drives the balance factor.
+    pub yes_price: f64,
 }
 
 // ── CLOB sampling-markets deserialization ───────────────────────────────────────
@@ -85,6 +88,10 @@ struct RawToken {
     token_id: String,
     #[serde(default)]
     outcome: String,
+    /// Token mid/last price (0-1) from sampling-markets. Used to gauge how balanced
+    /// the book is — maker fills come from balanced markets, not 0.1/0.9 longshots.
+    #[serde(default)]
+    price: f64,
 }
 
 #[derive(Deserialize)]
@@ -126,7 +133,13 @@ fn days_to_end(end_iso: &Option<String>) -> Option<f64> {
 /// Reward-per-risk heuristic. Toxic markets score 0 (excluded). Otherwise reward grows
 /// with the daily rate and the eligible spread (wider band = quote further from mid =
 /// less adverse selection), and with longer time-to-resolution (slower fair value).
-fn score_market(daily_rate: f64, max_spread: f64, days: Option<f64>, toxic: bool) -> (f64, String) {
+///
+/// `yes_price` (0-1) gauges how BALANCED the book is. A balanced market (~0.50) gives
+/// maker fills on BOTH sides and the best reward-efficiency; a skewed longshot (~0.1 /
+/// ~0.9) almost never crosses your quotes (the World-Cup-winner markets the pilot kept
+/// quoting with 0 fills). We multiply the score by a balance factor and DOWNGRADE the
+/// safety label of very skewed markets so a `min_safety = high` orchestrator skips them.
+fn score_market(daily_rate: f64, max_spread: f64, days: Option<f64>, toxic: bool, yes_price: f64) -> (f64, String) {
     if toxic {
         return (0.0, "toxic".to_string());
     }
@@ -139,13 +152,27 @@ fn score_market(daily_rate: f64, max_spread: f64, days: Option<f64>, toxic: bool
     let horizon = days.unwrap_or(1.0).max(0.05);
     // Wider eligible spread and longer horizon both reduce adverse-selection risk.
     let safety_mult = (max_spread / 2.0).min(3.0) * (1.0 + horizon.min(30.0) / 30.0);
-    let score = daily_rate * safety_mult;
-    let label = if horizon >= 7.0 && max_spread >= 3.0 {
+    // Balance factor: 1.0 at mid=0.50, decaying to ~0 at the 0/1 extremes. Skew = how
+    // far the YES price is from a coin-flip. When the price is unknown (0), assume
+    // mildly balanced (0.5) rather than penalising it to zero.
+    let skew = if yes_price > 0.0 { (yes_price - 0.5).abs() } else { 0.25 };
+    let balance = (1.0 - 2.0 * skew).max(0.0); // 0.50→1.0, 0.25/0.75→0.5, ≤0.05/≥0.95→~0
+    let score = daily_rate * safety_mult * (0.15 + 0.85 * balance);
+    // Base label from horizon + spread, then cap by balance: a heavily skewed book can
+    // be at most "medium" (≤0.15 / ≥0.85 → "low"), so it won't pass a high-only pool.
+    let base = if horizon >= 7.0 && max_spread >= 3.0 {
         "high"
     } else if horizon >= 1.0 && max_spread >= 1.5 {
         "medium"
     } else {
         "low"
+    };
+    let label = if balance < 0.30 {
+        "low"           // very skewed (≤0.35 / ≥0.65 in YES price): maker rarely fills
+    } else if balance < 0.60 && base == "high" {
+        "medium"        // moderately skewed: demote from high
+    } else {
+        base
     };
     (score, label.to_string())
 }
@@ -193,10 +220,18 @@ pub async fn scan_reward_markets(max_pages: usize) -> Result<Vec<RewardMarket>> 
             let tags = m.tags.unwrap_or_default();
             let toxic = is_toxic(&m.question, &tags);
             let days = days_to_end(&m.end_date_iso);
-            let (score, safety) = score_market(daily_rate, rewards.max_spread, days, toxic);
             let toks = m.tokens.unwrap_or_default();
-            let yes_token_id = toks.iter().find(|t| t.outcome.eq_ignore_ascii_case("yes")).map(|t| t.token_id.clone());
-            let no_token_id = toks.iter().find(|t| t.outcome.eq_ignore_ascii_case("no")).map(|t| t.token_id.clone());
+            let yes_tok = toks.iter().find(|t| t.outcome.eq_ignore_ascii_case("yes"));
+            let no_tok = toks.iter().find(|t| t.outcome.eq_ignore_ascii_case("no"));
+            // YES mid: prefer the YES token's price; else derive from NO (1 - no_price).
+            let yes_price = match (yes_tok.map(|t| t.price), no_tok.map(|t| t.price)) {
+                (Some(p), _) if p > 0.0 => p,
+                (_, Some(np)) if np > 0.0 => 1.0 - np,
+                _ => 0.0,
+            };
+            let (score, safety) = score_market(daily_rate, rewards.max_spread, days, toxic, yes_price);
+            let yes_token_id = yes_tok.map(|t| t.token_id.clone());
+            let no_token_id = no_tok.map(|t| t.token_id.clone());
             out.push(RewardMarket {
                 condition_id: m.condition_id,
                 question: m.question,
@@ -213,6 +248,7 @@ pub async fn scan_reward_markets(max_pages: usize) -> Result<Vec<RewardMarket>> 
                 safety,
                 yes_token_id,
                 no_token_id,
+                yes_price,
             });
         }
 

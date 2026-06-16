@@ -2875,6 +2875,12 @@ fn run_polymarket_slug_backtest(
         .map_err(|e| anyhow::anyhow!("Script compile error (patched): {e}"))?;
     // ─────────────────────────────────────────────────────────────────────────
 
+    // NV_OFFICIAL_ONLY=1 → skip windows lacking an official Polymarket outcome, so no
+    // trade is ever settled via the Binance-close fallback (the lookahead vector).
+    let official_only_gate = std::env::var("NV_OFFICIAL_ONLY")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
     let mut window_ts = first_window;
     while window_ts + window_secs <= last_ts {
         // For a 5m window starting at T:
@@ -2899,6 +2905,20 @@ fn run_polymarket_slug_backtest(
         // are skipped, exactly as the live runner does.
         if spread_skipped_windows.contains(&minute0_ts) {
             continue;
+        }
+
+        // ── Official-resolution-only gate (NV_OFFICIAL_ONLY=1) ──
+        // Skip any window that lacks an official Polymarket outcome, so the test
+        // never settles a trade via the Binance-close fallback (the lookahead vector).
+        // Answers: "what does the test say on official-resolution windows only?"
+        if official_only_gate {
+            let has_official = historical.get(&minute0_ts)
+                .and_then(|h| h.resolution.as_deref())
+                .map(|r| r == "up" || r == "down")
+                .unwrap_or(false);
+            if !has_official {
+                continue;
+            }
         }
 
         let (Some(&m0_idx), Some(&dec_idx), Some(&res_idx)) = (
@@ -5382,19 +5402,30 @@ pub async fn run_archive_candles_backtest(
 
     // Fill any window still lacking an official outcome with the binance fallback, and
     // report the split so a low official-coverage run is visible (and distrusted).
+    //
+    // NV_OFFICIAL_ONLY=1 → do NOT fill with the binance fallback. Windows without an
+    // official `window_yes_won` are left unresolved, so the trade loop SKIPS them
+    // entirely. This answers "what does the test say if we drop the binance-fallback
+    // windows?" — it removes the only lookahead vector (binance close = the same series
+    // that feeds the candles), at the cost of fewer trades.
+    let official_only = std::env::var("NV_OFFICIAL_ONLY").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false);
     let mut res_official = 0usize;
     let mut res_binance = 0usize;
+    let mut res_dropped = 0usize;
     for w in windows.values_mut() {
         if w.resolution.is_some() {
             res_official += 1;
+        } else if official_only {
+            res_dropped += 1; // leave resolution = None → window is skipped in the trade loop
         } else if let (Some(o), Some(c)) = (w.btc_open, w.btc_close) {
             w.resolution = Some(if c > o { "up".to_string() } else { "down".to_string() });
             res_binance += 1;
         }
     }
     tracing::info!(
-        "[ARCHIVE-CANDLES] resolution: {} official (window_yes_won), {} binance-fallback",
-        res_official, res_binance
+        "[ARCHIVE-CANDLES] resolution: {} official (window_yes_won), {} binance-fallback{}",
+        res_official, res_binance,
+        if official_only { format!(", {res_dropped} unresolved DROPPED (NV_OFFICIAL_ONLY)") } else { String::new() }
     );
 
     // ── P4 (decision price): tick closest to secs_left = decision_offset_secs (60) ──

@@ -23,6 +23,7 @@ interface RewardMarket {
   days_to_end: number | null
   score: number
   safety: string
+  yes_price?: number
 }
 
 interface RewardsResponse {

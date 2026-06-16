@@ -771,6 +771,112 @@ def fetch_gamma_markets_via_events(
     return results
 
 
+def fetch_gamma_hourly_updown(
+    asset_word: str,
+    start_ts: int,
+    end_ts: int,
+) -> list[dict]:
+    """
+    Discover the HOURLY Up/Down series (e.g. `bitcoin-up-or-down-april-23-2026-3pm-et`).
+
+    Unlike the 5m/15m series whose slug is `{prefix}-{unix_ts}`, the hourly series uses
+    a TEXT date+hour slug in US Eastern time. We generate one candidate per ET hour across
+    the range and look each up via /events?slug= (serves closed markets). The authoritative
+    window close (`end_ts`, UTC secs) is read from the returned market's `endDate` — NO local
+    timezone math, so DST/offset can't introduce a lookahead misalignment.
+
+    `asset_word`: the slug word — "bitcoin" | "ethereum" | "solana" | "xrp" | ….
+    Returns the same shape as fetch_gamma_markets_via_events:
+    {condition_id, yes_token_id, no_token_id, end_ts}.
+    """
+    import concurrent.futures
+    try:
+        from zoneinfo import ZoneInfo
+        et = ZoneInfo("America/New_York")
+    except Exception:
+        et = timezone(timedelta(hours=-4))  # fallback fixed offset
+
+    base = "https://gamma-api.polymarket.com"
+    ua = {"User-Agent": "orderbook-parser/1.0"}
+    MONTHS = ["january", "february", "march", "april", "may", "june",
+              "july", "august", "september", "october", "november", "december"]
+
+    def slug_for(dt_et: datetime) -> str:
+        h = dt_et.hour
+        ampm = "am" if h < 12 else "pm"
+        h12 = h % 12
+        if h12 == 0:
+            h12 = 12
+        return f"{asset_word}-up-or-down-{MONTHS[dt_et.month - 1]}-{dt_et.day}-{dt_et.year}-{h12}{ampm}-et"
+
+    # Iterate every ET hour boundary across [start_ts, end_ts]. We pad ±1 day in ET so
+    # UTC↔ET offset never clips the first/last few windows.
+    cur = datetime.fromtimestamp(start_ts, tz=timezone.utc).astimezone(et).replace(minute=0, second=0, microsecond=0) - timedelta(days=1)
+    stop = datetime.fromtimestamp(end_ts, tz=timezone.utc).astimezone(et) + timedelta(days=1)
+    slugs: list[str] = []
+    seen: set = set()
+    while cur <= stop:
+        s = slug_for(cur)
+        if s not in seen:
+            seen.add(s)
+            slugs.append(s)
+        cur += timedelta(hours=1)
+
+    print(f"[gamma-hourly] {asset_word}: checking {len(slugs)} ET-hour slugs via /events...",
+          file=sys.stderr)
+
+    def lookup(slug: str) -> "dict | None":
+        url = f"{base}/events?slug={slug}"
+        try:
+            req = urllib.request.Request(url, headers=ua)
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                events = json.loads(resp.read())
+            for evt in events:
+                for m in evt.get("markets", []):
+                    cid = m.get("conditionId", "")
+                    if not cid:
+                        continue
+                    raw_ids = m.get("clobTokenIds", [])
+                    if isinstance(raw_ids, str):
+                        try:
+                            raw_ids = json.loads(raw_ids)
+                        except Exception:
+                            raw_ids = []
+                    # Authoritative window close from the market's endDate (UTC).
+                    end_iso = m.get("endDate") or evt.get("endDate")
+                    win_end = 0
+                    if end_iso:
+                        try:
+                            win_end = int(datetime.fromisoformat(
+                                end_iso.replace("Z", "+00:00")).timestamp())
+                        except Exception:
+                            win_end = 0
+                    if win_end <= 0:
+                        continue
+                    return {
+                        "condition_id": cid,
+                        "yes_token_id": raw_ids[0] if raw_ids else "",
+                        "no_token_id":  raw_ids[1] if len(raw_ids) > 1 else "",
+                        "end_ts":       win_end,
+                    }
+        except Exception:
+            pass
+        return None
+
+    results: list[dict] = []
+    seen_cids: set = set()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as ex:
+        for r in ex.map(lookup, slugs):
+            if r and r["condition_id"] not in seen_cids:
+                # Keep only windows whose close falls in the requested range (+1 window grace).
+                if start_ts - 3600 <= r["end_ts"] <= end_ts + 3600:
+                    seen_cids.add(r["condition_id"])
+                    results.append(r)
+
+    print(f"[gamma-hourly] {asset_word}: found {len(results)} hourly markets", file=sys.stderr)
+    return results
+
+
 # Known recurring series: Gamma slug prefix → (tick slug, Binance symbol, window minutes)
 MULTI_SERIES: list[dict] = [
     # ── 5-minute markets ──────────────────────────────────────────────────────
@@ -787,9 +893,14 @@ MULTI_SERIES: list[dict] = [
     {"prefix": "sol-updown-15m", "slug": "sol_15m", "binance": "SOLUSDT",  "window_minutes": 15},
     {"prefix": "xrp-updown-15m", "slug": "xrp_15m", "binance": "XRPUSDT",  "window_minutes": 15},
     # ── 1-hour markets ────────────────────────────────────────────────────────
-    {"prefix": "btc-updown-1h",  "slug": "btc_1h",  "binance": "BTCUSDT",  "window_minutes": 60},
-    {"prefix": "eth-updown-1h",  "slug": "eth_1h",  "binance": "ETHUSDT",  "window_minutes": 60},
-    {"prefix": "sol-updown-1h",  "slug": "sol_1h",  "binance": "SOLUSDT",  "window_minutes": 60},
+    # The hourly Up/Down series (`btc-up-or-down-hourly`) uses a TEXT date+hour slug
+    # in US-Eastern time (e.g. bitcoin-up-or-down-april-23-2026-3pm-et), NOT a unix-ts
+    # slug like the 5m/15m series. discover="hourly_text" routes to the dedicated
+    # fetch_gamma_hourly_updown() which generates ET-hour candidates and reads each
+    # window's UTC close from Gamma's endDate. Same binary Up/Down structure as 5m/15m.
+    {"slug": "btc_1h", "binance": "BTCUSDT", "window_minutes": 60, "discover": "hourly_text", "asset_word": "bitcoin"},
+    {"slug": "eth_1h", "binance": "ETHUSDT", "window_minutes": 60, "discover": "hourly_text", "asset_word": "ethereum"},
+    {"slug": "sol_1h", "binance": "SOLUSDT", "window_minutes": 60, "discover": "hourly_text", "asset_word": "solana"},
 ]
 
 
@@ -1377,7 +1488,7 @@ def cmd_to_events(args: argparse.Namespace) -> None:
     if series_prefix:
         # Rolling series: discover every window's condition_id + tokens (reuses
         # the same JSONL/Gamma path as to-ticks-multi).
-        series_slug = next((s["slug"] for s in MULTI_SERIES if s["prefix"] == series_prefix), slug)
+        series_slug = next((s["slug"] for s in MULTI_SERIES if s.get("prefix") == series_prefix), slug)
         markets_info = load_markets_from_historical_jsonl(series_slug, start_ts, end_ts_range, workspace_dir)
         if not markets_info:
             markets_info = fetch_gamma_markets_via_events(series_prefix, start_ts, end_ts_range, window_minutes)
@@ -1734,13 +1845,15 @@ def cmd_to_ticks_multi(args: argparse.Namespace) -> None:
     results = []
 
     for series in series_list:
-        prefix         = series["prefix"]
         slug           = series["slug"]
         binance        = series["binance"]
         window_minutes = series.get("window_minutes", 5)
+        discover       = series.get("discover", "timestamp")
+        prefix         = series.get("prefix", "")  # absent for hourly_text series
 
         print(f"\n{'='*60}", file=sys.stderr)
-        print(f"[to-ticks-multi] Series: {slug} (prefix={prefix}, binance={binance}, window={window_minutes}m)", file=sys.stderr)
+        print(f"[to-ticks-multi] Series: {slug} (prefix={prefix or series.get('asset_word','?')}, "
+              f"discover={discover}, binance={binance}, window={window_minutes}m)", file=sys.stderr)
 
         # ── Step 1: Load condition IDs from local historical JSONL ─────────────
         # Primary: scraped historical data (no network needed, covers full history)
@@ -1748,8 +1861,14 @@ def cmd_to_ticks_multi(args: argparse.Namespace) -> None:
             slug, start_ts, end_ts, workspace_dir
         )
 
-        # Supplement: if the JSONL doesn't cover the full range, fill the gap
-        # using the Gamma /events?slug= endpoint (works for recent closed markets).
+        # Supplement: if the JSONL doesn't cover the full range, fill the gap.
+        # The 5m/15m series use the unix-ts /events slug; the hourly series uses the
+        # ET text-date slug (fetch_gamma_hourly_updown) — both return the same shape.
+        def _discover_range(a_start: int, a_end: int) -> list:
+            if discover == "hourly_text":
+                return fetch_gamma_hourly_updown(series["asset_word"], a_start, a_end)
+            return fetch_gamma_markets_via_events(prefix, a_start, a_end, window_minutes)
+
         if markets_info:
             covered_end_ts = max(m["end_ts"] for m in markets_info)
             # Leave a 1-window grace margin before calling the events API
@@ -1759,9 +1878,7 @@ def cmd_to_ticks_multi(args: argparse.Namespace) -> None:
                       f"{datetime.fromtimestamp(covered_end_ts, tz=timezone.utc).date()}, "
                       f"filling gap to {range_end.date()} via Gamma events API...",
                       file=sys.stderr)
-                gap_markets = fetch_gamma_markets_via_events(
-                    prefix, gap_start, end_ts, window_minutes
-                )
+                gap_markets = _discover_range(gap_start, end_ts)
                 if gap_markets:
                     # Merge, deduplicating by condition_id
                     existing_cids = {m["condition_id"] for m in markets_info}
@@ -1770,13 +1887,11 @@ def cmd_to_ticks_multi(args: argparse.Namespace) -> None:
                     print(f"[to-ticks-multi] {slug}: added {len(new_markets)} markets "
                           f"from gap fill", file=sys.stderr)
 
-        # Full fallback: if no historical data at all, try Gamma events API
+        # Full fallback: if no historical data at all, discover via Gamma.
         if not markets_info:
             print(f"[to-ticks-multi] {slug}: no local historical data — "
-                  f"falling back to Gamma events API...", file=sys.stderr)
-            markets_info = fetch_gamma_markets_via_events(
-                prefix, start_ts, end_ts, window_minutes
-            )
+                  f"falling back to Gamma events API ({discover})...", file=sys.stderr)
+            markets_info = _discover_range(start_ts, end_ts)
 
         if not markets_info:
             print(f"[to-ticks-multi] {slug}: no markets found — skipping", file=sys.stderr)
@@ -2245,9 +2360,17 @@ def cmd_backfill_resolutions(args: argparse.Namespace) -> None:
     import urllib.request as _ur
 
     slug = args.slug
-    series_prefix = args.series  # e.g. "btc-up-or-down-5m"
+    series_prefix = args.series  # e.g. "btc-updown-5m" (None for hourly_text)
     window_minutes = args.window_minutes
     window_secs = window_minutes * 60
+    discover = getattr(args, "discover", "timestamp")
+    asset_word = getattr(args, "asset_word", None)
+    if discover == "hourly_text" and not asset_word:
+        print(json.dumps({"error": "--discover hourly_text requires --asset-word (bitcoin|ethereum|solana)"}))
+        return
+    if discover == "timestamp" and not series_prefix:
+        print(json.dumps({"error": "--series is required for --discover timestamp"}))
+        return
 
     # Auto-detect ticks dir
     ticks_dir: Path
@@ -2293,31 +2416,67 @@ def cmd_backfill_resolutions(args: argparse.Namespace) -> None:
         file=sys.stderr
     )
 
-    # Step 2: batch-fetch resolutions from Gamma API using slug + window_ts
+    # Step 2: batch-fetch resolutions from Gamma API using slug + window_ts.
+    # IMPORTANT: use /events?slug= NOT /markets?slug=. Gamma's /markets slug filter
+    # returns EMPTY for these closed window slugs (the same broken-filter family as
+    # ?condition_id=), so the old /markets path resolved 0 windows. /events?slug=
+    # serves closed/resolved markets and is what to-ticks / to-events already use.
+    def _parse_outcome_prices(op):
+        # Gamma returns outcomePrices either as a list or a JSON-encoded string.
+        if isinstance(op, str):
+            try:
+                op = json.loads(op)
+            except Exception:
+                return None
+        if isinstance(op, (list, tuple)) and len(op) >= 1:
+            try:
+                return float(op[0])
+            except Exception:
+                return None
+        return None
+
+    # ── Hourly (text-date) series: reuse the discovery to map window_ts → condition_id,
+    # then resolve each via the CLOB key-value endpoint (tokens[0].winner). The 5m/15m
+    # {prefix}-{ts} slug doesn't exist for the hourly series, so we can't use it here.
+    wts_to_cid: dict = {}
+    if discover == "hourly_text" and pending:
+        lo = min(pending)
+        hi = max(pending) + window_secs
+        print(f"[backfill] hourly_text: discovering {asset_word} markets in range via Gamma...", file=sys.stderr)
+        for m in fetch_gamma_hourly_updown(asset_word, lo, hi):
+            wts = int(m["end_ts"]) - window_secs
+            if m.get("condition_id"):
+                wts_to_cid[wts] = m["condition_id"]
+        print(f"[backfill] hourly_text: mapped {len(wts_to_cid)} window_ts → condition_id", file=sys.stderr)
+
     def fetch_one(wts: int):
-        slug_for_window = f"{series_prefix}-{wts}"
-        url = f"https://gamma-api.polymarket.com/markets?slug={slug_for_window}&limit=1"
-        try:
-            req = _ur.Request(url, headers={"User-Agent": "trader-claw/1.0"})
-            with _ur.urlopen(req, timeout=8) as r:
-                markets_list = json.loads(r.read())
-            if not markets_list:
-                # Try timestamp in milliseconds variant
-                slug_ms = f"{series_prefix}-{wts * 1000}"
-                url2 = f"https://gamma-api.polymarket.com/markets?slug={slug_ms}&limit=1"
-                req2 = _ur.Request(url2, headers={"User-Agent": "trader-claw/1.0"})
-                with _ur.urlopen(req2, timeout=8) as r2:
-                    markets_list = json.loads(r2.read())
-            if not markets_list:
+        if discover == "hourly_text":
+            cid = wts_to_cid.get(wts)
+            if not cid:
                 return (wts, None)
-            mkt = markets_list[0]
-            outcome_prices = mkt.get("outcomePrices")
-            if outcome_prices and len(outcome_prices) >= 2:
-                yes_price = float(outcome_prices[0])
-                return (wts, yes_price >= 0.5)
+            mkt = fetch_clob_market(cid)
+            tokens = mkt.get("tokens", []) or []
+            if mkt.get("closed") and tokens and tokens[0].get("winner") is not None:
+                return (wts, bool(tokens[0].get("winner")))
             return (wts, None)
-        except Exception:
-            return (wts, None)
+        for slug_val in (f"{series_prefix}-{wts}", f"{series_prefix}-{wts * 1000}"):
+            url = f"https://gamma-api.polymarket.com/events?slug={slug_val}"
+            try:
+                req = _ur.Request(url, headers={"User-Agent": "trader-claw/1.0"})
+                with _ur.urlopen(req, timeout=8) as r:
+                    events = json.loads(r.read())
+            except Exception:
+                continue
+            if not isinstance(events, list) or not events:
+                continue
+            for evt in events:
+                for mkt in evt.get("markets", []) or []:
+                    if not mkt.get("closed"):
+                        continue
+                    yes_price = _parse_outcome_prices(mkt.get("outcomePrices"))
+                    if yes_price is not None:
+                        return (wts, yes_price >= 0.5)
+        return (wts, None)
 
     now_ts = _time.time()
     # Only fetch windows that ended in the past (can be resolved)
@@ -2485,6 +2644,12 @@ def cmd_orchestrate(args: argparse.Namespace) -> None:
         ev_results = {}
         for s in series_list:
             ev_slug = f"{s['slug']}_ev"
+            # to-events discovers windows by unix-ts slug prefix; the hourly_text series
+            # has no such prefix, so event-stream build is not supported for it yet.
+            if s.get("discover") == "hourly_text" or not s.get("prefix"):
+                ev_results[ev_slug] = "skipped (hourly_text series — to-events needs a unix-ts prefix)"
+                _log(f"[orchestrate]   to-events {ev_slug} skipped (hourly series)")
+                continue
             _log(f"[orchestrate]   to-events {s['prefix']} → {ev_slug}")
             ev_args = argparse.Namespace(
                 input_dir=str(ob_dir), slug=ev_slug, market=None,
@@ -2519,7 +2684,10 @@ def cmd_orchestrate(args: argparse.Namespace) -> None:
                 mkts = load_markets_from_historical_jsonl(s["slug"], start_ts, end_ts, workspace)
                 if not mkts:
                     try:
-                        mkts = fetch_gamma_markets_via_events(s["prefix"], start_ts, end_ts, s["window_minutes"])
+                        if s.get("discover") == "hourly_text":
+                            mkts = fetch_gamma_hourly_updown(s["asset_word"], start_ts, end_ts)
+                        else:
+                            mkts = fetch_gamma_markets_via_events(s["prefix"], start_ts, end_ts, s["window_minutes"])
                     except Exception:  # noqa: BLE001
                         mkts = []
                 if not mkts:
@@ -2669,8 +2837,13 @@ def main() -> None:
     )
     p.add_argument("--slug",    required=True, help="Tick slug (e.g. btc_5m)")
     p.add_argument("--ticks-dir", default=None, help="Path to ticks/ directory (default: auto-detect from workspace)")
-    p.add_argument("--series",  required=True, help="Market series slug prefix (e.g. btc-up-or-down-5m)")
+    p.add_argument("--series",  default=None, help="Market series slug prefix (e.g. btc-updown-5m). Not used for --discover hourly_text.")
     p.add_argument("--window-minutes", type=int, default=5, help="Window duration in minutes (default: 5)")
+    p.add_argument("--discover", default="timestamp", choices=["timestamp", "hourly_text"],
+                   help="Window discovery: 'timestamp' (5m/15m, {prefix}-{ts} slug) or 'hourly_text' "
+                        "(1h series, ET text-date slug — needs --asset-word)")
+    p.add_argument("--asset-word", dest="asset_word", default=None,
+                   help="For --discover hourly_text: the slug asset word (bitcoin|ethereum|solana)")
 
     # orchestrate — master pipeline: download once → ticks + events (+ candles) for all series
     p = sub.add_parser(
