@@ -61,6 +61,23 @@ export const ENGINE_PARAM_DEFS: Record<string, FieldDef[]> = {
     { key: 'hedge_trigger_pct', label: 'Hedge trigger %', type: 'number', default: 0.2, min: 0, max: 1, step: 0.05, hint: 'Position loss % that opens counter-hedge' },
     { key: 'max_position_usd', label: 'Max position ($)', type: 'number', default: 200, min: 10, max: 100000, step: 10 },
   ],
+  rewards_maker: [
+    { key: 'offset_cents', label: 'Offset (¢)', type: 'number', default: 1.0, min: 0.5, max: 5, step: 0.5, hint: 'Cents inside the mid each leg rests. Stay within the market max_spread to be eligible.' },
+    { key: 'reprice_threshold', label: 'Reprice drift', type: 'number', default: 0.02, min: 0.005, max: 0.1, step: 0.005, hint: 'Re-center both quotes when the mid drifts this far (abs price). 0.02 = 2¢.' },
+    { key: 'poll_secs', label: 'Poll interval (s)', type: 'number', default: 60, min: 5, max: 600, step: 5, hint: 'How often the maker checks the mid and re-posts filled legs.' },
+  ],
+  rewards_orchestrator: [
+    { key: 'max_markets', label: 'Pool size (markets)', type: 'number', default: 3, min: 1, max: 10, step: 1, hint: 'How many safe reward markets to quote at once. Capital is split across all of them.' },
+    { key: 'min_safety', label: 'Min safety', type: 'select', default: 'high', options: [
+      { value: 'high', label: 'High (≥7d, ≥3¢ spread)' },
+      { value: 'medium', label: 'Medium (≥1d, ≥1.5¢)' },
+      { value: 'low', label: 'Low (any non-toxic)' },
+    ], hint: 'Only quote markets at/above this safety. Toxic markets are always excluded.' },
+    { key: 'offset_cents', label: 'Offset (¢)', type: 'number', default: 1.0, min: 0.5, max: 5, step: 0.5, hint: 'Cents inside the mid each leg rests.' },
+    { key: 'reprice_threshold', label: 'Reprice drift', type: 'number', default: 0.02, min: 0.005, max: 0.1, step: 0.005, hint: 'Re-center when the mid drifts this far (abs price).' },
+    { key: 'poll_secs', label: 'Poll interval (s)', type: 'number', default: 60, min: 10, max: 600, step: 5, hint: 'How often it re-scans markets + re-posts filled legs.' },
+    { key: 'size_usd', label: 'Size/side ($, 0=auto)', type: 'number', default: 0, min: 0, max: 100000, step: 5, hint: '0 = auto-split capital across pool×2 legs. Override to fix the per-side size.' },
+  ],
   minting_mm: [
     { key: 'premium_cents', label: 'Premium (cents)', type: 'number', default: 0.02, min: 0, max: 0.2, step: 0.005, hint: 'Min spread above CTF parity to mint' },
     { key: 'max_cycle_usd', label: 'Max cycle ($)', type: 'number', default: 200, min: 10, max: 100000, step: 10 },

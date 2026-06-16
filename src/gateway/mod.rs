@@ -864,6 +864,14 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             get(api::handle_api_polymarket_configure_get).post(api::handle_api_polymarket_configure),
         )
         .route(
+            "/api/polymarket/wallets",
+            get(api::handle_api_polymarket_wallets_list).post(api::handle_api_polymarket_wallets_upsert),
+        )
+        .route(
+            "/api/polymarket/wallets/{id}",
+            delete(api::handle_api_polymarket_wallets_delete),
+        )
+        .route(
             "/api/polymarket/test",
             post(api::handle_api_polymarket_test),
         )

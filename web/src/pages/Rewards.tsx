@@ -81,7 +81,55 @@ export default function RewardsPage() {
   const [quoteOffset, setQuoteOffset] = useState('1.0')
   const [quoteBusy, setQuoteBusy] = useState(false)
   const [quoteResult, setQuoteResult] = useState<string | null>(null)
+  // Autonomous-pilot launcher state
+  const [pilotWallet, setPilotWallet] = useState('')
+  const [pilotCapital, setPilotCapital] = useState('2500')
+  const [pilotLive, setPilotLive] = useState(false)
+  const [pilotBusy, setPilotBusy] = useState(false)
+  const [pilotResult, setPilotResult] = useState<string | null>(null)
   const qc = useQueryClient()
+
+  // Wallet profiles for the pilot launcher (same source as the strategy create modal).
+  const { data: walletData } = useQuery<{ wallets: { id: string; label: string; configured: boolean; wallet_address_masked?: string | null }[] }>({
+    queryKey: ['polymarket-wallets'],
+    queryFn: () => apiFetch('/api/polymarket/wallets'),
+    staleTime: 60 * 1000,
+  })
+  const walletProfiles = walletData?.wallets ?? []
+
+  async function launchPilot() {
+    setPilotBusy(true); setPilotResult(null)
+    try {
+      const capital = Number(pilotCapital) || 0
+      if (capital <= 0) { setPilotResult('✗ Assign capital greater than 0.'); setPilotBusy(false); return }
+      const body: Record<string, unknown> = {
+        name: `Rewards Pilot (${cfg.max_markets} markets, ${cfg.min_safety})`,
+        kind: 'rewards_orchestrator',
+        market_type: 'polymarket_binary',
+        mode: pilotLive ? 'live' : 'paper',
+        initial_balance: capital,
+        polymarket_wallet_id: pilotWallet || undefined,
+        force_live: true, // maker engine: not a directional bet, no edge-gate applies
+        engine_params: {
+          max_markets: cfg.max_markets,
+          min_safety: cfg.min_safety,
+          offset_cents: cfg.spread_offset_c,
+          poll_secs: cfg.reprice_secs,
+          size_usd: 0, // auto-split capital across pool × 2 legs
+        },
+      }
+      const r = await apiPost<{ id?: string; error?: string }>('/api/live/strategies', body)
+      if (r.error) { setPilotResult('✗ ' + r.error) }
+      else {
+        setPilotResult(`✓ ${pilotLive ? 'LIVE' : 'Dry-run'} pilot started${r.id ? ` (${r.id})` : ''} — monitor it in Live Strategies.`)
+        qc.invalidateQueries({ queryKey: ['live-strategies'] })
+      }
+    } catch (e) {
+      setPilotResult('✗ ' + (e as Error).message)
+    } finally {
+      setPilotBusy(false)
+    }
+  }
 
   async function submitQuote() {
     if (!quoteMarket?.yes_token_id || !quoteMarket?.no_token_id) return
@@ -202,6 +250,80 @@ export default function RewardsPage() {
             Saved locally — consumed by the maker-quoting runner (start with a small real pilot to confirm payout).
           </span>
         </div>
+      </div>
+
+      {/* Autonomous pilot launcher — wallet + capital → start the orchestrator runner */}
+      <div
+        className="rounded-lg border p-4 mb-4"
+        style={{ background: 'var(--color-surface)', borderColor: 'var(--color-accent)' }}
+      >
+        <div className="flex items-center gap-2 mb-1">
+          <Coins size={15} style={{ color: 'var(--color-accent)' }} />
+          <span className="text-sm font-semibold" style={{ color: 'var(--color-text)' }}>
+            Launch Autonomous Pilot
+          </span>
+        </div>
+        <p className="text-[11px] mb-3" style={{ color: 'var(--color-text-muted)' }}>
+          Pick a wallet and assign capital. The engine auto-selects the top{' '}
+          <span className="font-mono">{cfg.max_markets}</span> markets at{' '}
+          <span className="font-mono">{cfg.min_safety}</span>+ safety (from the config above), quotes both
+          sides on each, and closes + rotates out of any market that turns toxic. Manage/stop it in Live Strategies.
+        </p>
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-3 items-end">
+          <div>
+            <label className="block text-[10px] mb-1" style={{ color: 'var(--color-text-muted)' }}>Wallet</label>
+            <select
+              className="w-full rounded border px-2 py-1.5 text-xs"
+              style={{ background: 'var(--color-surface-2)', borderColor: 'var(--color-border)', color: 'var(--color-text)' }}
+              value={pilotWallet}
+              onChange={e => setPilotWallet(e.target.value)}
+            >
+              <option value="">Default wallet</option>
+              {walletProfiles.filter(w => w.id !== 'default').map(w => (
+                <option key={w.id} value={w.id} disabled={pilotLive && !w.configured}>
+                  {w.label}{w.wallet_address_masked ? ` · ${w.wallet_address_masked}` : ''}{!w.configured ? ' (incomplete)' : ''}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label className="block text-[10px] mb-1" style={{ color: 'var(--color-text-muted)' }}>Capital ($)</label>
+            <input
+              type="number" min={1} step={100} value={pilotCapital}
+              onChange={e => setPilotCapital(e.target.value)}
+              className="w-full rounded border px-2 py-1.5 text-xs"
+              style={{ background: 'var(--color-surface-2)', borderColor: 'var(--color-border)', color: 'var(--color-text)' }}
+            />
+          </div>
+          <div>
+            <label className="block text-[10px] mb-1" style={{ color: 'var(--color-text-muted)' }}>Mode</label>
+            <label className="flex items-center gap-1.5 text-xs h-[30px]" style={{ color: 'var(--color-text)' }}>
+              <input type="checkbox" checked={pilotLive} onChange={e => setPilotLive(e.target.checked)} />
+              <span style={{ color: pilotLive ? 'var(--color-warning)' : 'var(--color-text-muted)' }}>
+                {pilotLive ? 'LIVE (real orders)' : 'Dry run'}
+              </span>
+            </label>
+          </div>
+          <button
+            onClick={launchPilot}
+            disabled={pilotBusy}
+            className="flex items-center justify-center gap-1.5 px-3 py-2 rounded text-xs font-medium disabled:opacity-50"
+            style={{ background: pilotLive ? 'var(--color-warning)' : 'var(--color-accent)', color: '#000' }}
+          >
+            {pilotBusy ? 'Starting…' : pilotLive ? 'Launch LIVE pilot' : 'Launch dry-run pilot'}
+          </button>
+        </div>
+        {pilotLive && (
+          <div className="flex items-center gap-1.5 mt-2 text-[11px]" style={{ color: 'var(--color-warning)' }}>
+            <AlertTriangle size={12} /> Live mode places real CLOB orders signed with the selected wallet.
+            Recommended: run dry-run first to confirm eligible%.
+          </div>
+        )}
+        {pilotResult && (
+          <div className="mt-2 text-xs" style={{ color: pilotResult.startsWith('✓') ? 'var(--color-accent)' : '#f87171' }}>
+            {pilotResult}
+          </div>
+        )}
       </div>
 
       {/* Active maker quotes + balance */}

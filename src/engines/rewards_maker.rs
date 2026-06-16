@@ -32,8 +32,18 @@ use crate::strategy_runner::{RunnerConfig, StrategyRunnerStore, LiveOrder};
 const DEFAULT_OFFSET_C: f64 = 1.0;
 /// Re-center the quote if the mid drifts more than this (in absolute price) from where
 /// we posted. 0.02 = 2¢. Below this we leave the resting orders to keep earning.
-const REPRICE_THRESHOLD: f64 = 0.02;
-const POLL_SECS: u64 = 60;
+const DEFAULT_REPRICE_THRESHOLD: f64 = 0.02;
+const DEFAULT_POLL_SECS: u64 = 60;
+
+/// Pull a positive f64 from `engine_params[key]`, else `default`. Accepts JSON
+/// numbers or numeric strings (the UI sends params as a flat object).
+fn param_f64(params: Option<&serde_json::Value>, key: &str, default: f64) -> f64 {
+    params
+        .and_then(|p| p.get(key))
+        .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+        .filter(|v| *v > 0.0)
+        .unwrap_or(default)
+}
 
 struct QuoteState {
     /// Mid price at which the current pair was posted (for drift detection).
@@ -54,7 +64,13 @@ pub async fn run_rewards_maker_loop(
     let id = config.id.clone();
     let is_live = config.mode == "live";
     let size_usd = if config.live_sizing_value > 0.0 { config.live_sizing_value } else { 50.0 };
-    let offset = DEFAULT_OFFSET_C / 100.0;
+    // Tunables: offset / reprice / poll come from engine_params when present, else the
+    // pilot defaults. (The backtest path reads the same keys via MakerBacktestParams.)
+    let ep = config.engine_params.as_ref();
+    let offset_c = param_f64(ep, "offset_cents", DEFAULT_OFFSET_C);
+    let offset = offset_c / 100.0;
+    let reprice_threshold = param_f64(ep, "reprice_threshold", DEFAULT_REPRICE_THRESHOLD);
+    let poll_secs = param_f64(ep, "poll_secs", DEFAULT_POLL_SECS as f64).round().max(5.0) as u64;
 
     // Resolve YES/NO token ids: prefer explicit config, else look them up from the
     // condition_id via the CLOB (the maker quotes one fixed market, not a series).
@@ -96,11 +112,11 @@ pub async fn run_rewards_maker_loop(
     append_log(&store, &id, &format!(
         "rewards_maker started ({}). YES={}… NO={}… size=${:.0}/side offset={:.0}¢",
         if is_live { "LIVE" } else { "DRY-RUN" },
-        &yes_token[..yes_token.len().min(10)], &no_token[..no_token.len().min(10)], size_usd, DEFAULT_OFFSET_C
+        &yes_token[..yes_token.len().min(10)], &no_token[..no_token.len().min(10)], size_usd, offset_c
     ));
 
     let mut st = QuoteState { ref_mid: 0.0, yes_order_id: None, no_order_id: None, fills: 0, eligible_polls: 0, total_polls: 0 };
-    let mut interval = tokio::time::interval(Duration::from_secs(POLL_SECS));
+    let mut interval = tokio::time::interval(Duration::from_secs(poll_secs));
 
     loop {
         interval.tick().await;
@@ -120,7 +136,7 @@ pub async fn run_rewards_maker_loop(
         let mid = yes_ask;
 
         // 2. Drift check → cancel stale quotes so they get re-centered below.
-        let drifted = st.ref_mid > 0.0 && (mid - st.ref_mid).abs() > REPRICE_THRESHOLD;
+        let drifted = st.ref_mid > 0.0 && (mid - st.ref_mid).abs() > reprice_threshold;
         if drifted {
             if is_live {
                 if let Some(c) = &clob {

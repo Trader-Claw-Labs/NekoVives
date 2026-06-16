@@ -5996,7 +5996,11 @@ async fn hydrate_live_runtime_config(
     // The rewards_maker engine resolves its own YES/NO tokens from the condition_id
     // (stored in `symbol`/`poly_condition_id`) — it quotes one fixed market, not a
     // rolling series, so it must NOT go through the series-based token resolver.
-    let (yes_token_id, no_token_id) = if config.kind.as_deref() == Some(strategy_core::engines::REWARDS_MAKER) {
+    // The rewards_orchestrator auto-SELECTS markets at runtime (every poll), so it has
+    // no fixed condition_id and no tokens to resolve at start — skip resolution entirely.
+    let (yes_token_id, no_token_id) = if config.kind.as_deref() == Some(strategy_core::engines::REWARDS_ORCHESTRATOR) {
+        (String::new(), String::new())
+    } else if config.kind.as_deref() == Some(strategy_core::engines::REWARDS_MAKER) {
         let cid = config.poly_condition_id.clone()
             .or_else(|| if config.symbol.starts_with("0x") { Some(config.symbol.clone()) } else { None })
             .ok_or_else(|| anyhow::anyhow!("rewards_maker live mode needs poly_condition_id"))?;

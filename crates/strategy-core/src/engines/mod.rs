@@ -30,11 +30,16 @@ pub const RHAI_TICK: &str = "rhai_tick";
 /// reward market, re-posting the side that fills and re-centering on mid drift.
 pub const REWARDS_MAKER: &str = "rewards_maker";
 
+/// Autonomous liquidity-rewards orchestrator — scans the reward-market pool every poll,
+/// auto-selects the top-N safe markets, quotes both sides on each, closes + drops any
+/// market that turns toxic, and rotates capital into fresh markets. No fixed condition_id.
+pub const REWARDS_ORCHESTRATOR: &str = "rewards_orchestrator";
+
 /// Returns `true` if the given kind string is a recognised engine kind.
 pub fn is_known(kind: &str) -> bool {
     matches!(
         kind,
-        RHAI_CANDLE | ARB_BINARY | MINTING_MM | ROTATION_COMPOUNDER | FAIR_VALUE | FV_MOMENTUM | ARB_HEDGE | RHAI_TICK | REWARDS_MAKER
+        RHAI_CANDLE | ARB_BINARY | MINTING_MM | ROTATION_COMPOUNDER | FAIR_VALUE | FV_MOMENTUM | ARB_HEDGE | RHAI_TICK | REWARDS_MAKER | REWARDS_ORCHESTRATOR
     )
 }
 

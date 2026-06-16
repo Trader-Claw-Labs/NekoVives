@@ -2377,6 +2377,173 @@ def cmd_backfill_resolutions(args: argparse.Namespace) -> None:
     }))
 
 
+# ── Master orchestration ────────────────────────────────────────────────────────
+
+def _log(msg: str) -> None:
+    """Progress to stderr (stdout stays clean JSON for callers)."""
+    print(msg, file=sys.stderr, flush=True)
+
+
+def _default_workspace() -> Path:
+    return Path(os.path.expanduser("~/.traderclaw/workspace"))
+
+
+def _parse_parquet_ts(f: Path) -> "datetime | None":
+    """Parse the UTC hour from a downloaded `YYYY-MM-DDTHH.parquet` file (stem = the hour).
+    Matches the nested parse_file_ts used by to-ticks-multi / to-events."""
+    stem = f.stem.replace("polymarket_orderbook_", "")
+    try:
+        return datetime.strptime(stem, "%Y-%m-%dT%H").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def cmd_orchestrate(args: argparse.Namespace) -> None:
+    """
+    Master pipeline: download the pmxt.dev v2 archive ONCE, then produce the
+    lookahead-safe tick + event (+ optional candle) datasets for every selected
+    5m/15m/1h UP/DOWN series, writing to the workspace layout the backtester reads:
+
+        <workspace>/data/orderbook/                 (downloaded parquets, shared)
+        <workspace>/data/ticks/<slug>/*.jsonl       (on_tick / on_candle archive_candles)
+        <workspace>/data/events/<slug>_ev/*.jsonl.gz (on_event)
+        <workspace>/data/candles/<slug>_ob_<freq>.json (optional, on_candle from PM mid)
+
+    It does NOT add any new data transformation — it just sequences the existing,
+    audited, lookahead-safe converters (to-ticks-multi groups by (market, ts_s) and
+    derives window_ts from each market's end_ts; to-events separates by market). So
+    the master script can't reintroduce the contamination bug.
+    """
+    workspace = Path(args.workspace) if args.workspace else _default_workspace()
+    ob_dir = Path(args.orderbook_dir) if args.orderbook_dir else (workspace / "data" / "orderbook")
+    ticks_out = workspace / "data" / "ticks"
+    events_out = workspace / "data" / "events"
+    candles_out = workspace / "data" / "candles"
+    ob_dir.mkdir(parents=True, exist_ok=True)
+
+    # Which series to build. --slugs restricts; default = all in MULTI_SERIES.
+    wanted = set(s.strip() for s in args.slugs.split(",")) if args.slugs else None
+    series_list = [s for s in MULTI_SERIES if wanted is None or s["slug"] in wanted]
+    if not series_list:
+        print(json.dumps({"error": f"No known series match --slugs={args.slugs}. "
+                                   f"Known: {[s['slug'] for s in MULTI_SERIES]}"}))
+        return
+
+    do_ticks = not args.no_ticks
+    do_events = not args.no_events
+    do_candles = args.candles
+
+    summary: dict = {"workspace": str(workspace), "orderbook_dir": str(ob_dir),
+                     "days": args.days, "series": [s["slug"] for s in series_list],
+                     "steps": {}}
+
+    # ── Step 1: download the archive ONCE (shared by every converter) ──────────
+    if not args.skip_download:
+        _log(f"[orchestrate] STEP 1/4 — downloading {args.days}d of v2 archive → {ob_dir}")
+        dl_args = argparse.Namespace(days=args.days, out=str(ob_dir), market=None, progress=args.progress)
+        try:
+            cmd_download(dl_args)
+            summary["steps"]["download"] = "ok"
+        except SystemExit:
+            raise
+        except Exception as e:  # noqa: BLE001
+            summary["steps"]["download"] = f"error: {e}"
+            _log(f"[orchestrate] download failed: {e}")
+    else:
+        _log(f"[orchestrate] STEP 1/4 — skipped (using existing parquets in {ob_dir})")
+        summary["steps"]["download"] = "skipped"
+
+    n_parquet = len(list(ob_dir.glob("*.parquet")))
+    summary["parquet_files"] = n_parquet
+    if n_parquet == 0:
+        print(json.dumps({"error": f"No parquet files in {ob_dir} after download step.",
+                          "summary": summary}))
+        return
+
+    slugs_csv = ",".join(s["slug"] for s in series_list)
+
+    # ── Step 2: ticks (1Hz) for ALL selected series in one pass ───────────────
+    # to-ticks-multi already loops every series and is the contamination-fixed path.
+    if do_ticks:
+        _log(f"[orchestrate] STEP 2/4 — to-ticks-multi → {ticks_out} [{slugs_csv}]")
+        tm_args = argparse.Namespace(
+            input_dir=str(ob_dir), out=str(ticks_out), slugs=slugs_csv,
+            workspace=str(workspace),
+        )
+        try:
+            cmd_to_ticks_multi(tm_args)
+            summary["steps"]["ticks"] = {"slugs": [s["slug"] for s in series_list], "out": str(ticks_out)}
+        except Exception as e:  # noqa: BLE001
+            summary["steps"]["ticks"] = f"error: {e}"
+            _log(f"[orchestrate] to-ticks-multi failed: {e}")
+    else:
+        summary["steps"]["ticks"] = "skipped"
+
+    # ── Step 3: events (ms) per series-prefix (separate by market → safe) ──────
+    if do_events:
+        _log(f"[orchestrate] STEP 3/4 — to-events per series → {events_out}")
+        ev_results = {}
+        for s in series_list:
+            ev_slug = f"{s['slug']}_ev"
+            _log(f"[orchestrate]   to-events {s['prefix']} → {ev_slug}")
+            ev_args = argparse.Namespace(
+                input_dir=str(ob_dir), slug=ev_slug, market=None,
+                series_prefix=s["prefix"], out=str(events_out),
+                binance_symbol=s["binance"], window_minutes=s["window_minutes"],
+                workspace=str(workspace), no_dedup=args.events_no_dedup,
+            )
+            try:
+                cmd_to_events(ev_args)
+                ev_results[ev_slug] = "ok"
+            except Exception as e:  # noqa: BLE001
+                ev_results[ev_slug] = f"error: {e}"
+                _log(f"[orchestrate]   to-events {ev_slug} failed: {e}")
+        summary["steps"]["events"] = ev_results
+    else:
+        summary["steps"]["events"] = "skipped"
+
+    # ── Step 4 (optional): PM-mid OHLC candles per series (1 condition_id each) ─
+    # to-candles is single-market; we build from the most recent window's cid so
+    # there is a representative Polymarket-price candle file. Off by default.
+    if do_candles:
+        _log(f"[orchestrate] STEP 4/4 — to-candles (PM mid) → {candles_out}")
+        candles_out.mkdir(parents=True, exist_ok=True)
+        files = sorted(ob_dir.glob("*.parquet"))
+        file_dts = [dt for f in files if (dt := _parse_parquet_ts(f))]
+        cd_results = {}
+        if file_dts:
+            start_ts = int(min(file_dts).timestamp())
+            end_ts = int(max(file_dts).timestamp()) + 3600
+            for s in series_list:
+                # Discover a representative condition_id for this series in-range.
+                mkts = load_markets_from_historical_jsonl(s["slug"], start_ts, end_ts, workspace)
+                if not mkts:
+                    try:
+                        mkts = fetch_gamma_markets_via_events(s["prefix"], start_ts, end_ts, s["window_minutes"])
+                    except Exception:  # noqa: BLE001
+                        mkts = []
+                if not mkts:
+                    cd_results[s["slug"]] = "no condition_id found"
+                    continue
+                cid = mkts[-1]["condition_id"]
+                freq = f"{s['window_minutes']}min"
+                cd_args = argparse.Namespace(
+                    dir=str(ob_dir), market=cid, slug=f"{s['slug']}_ob",
+                    freq=freq, out=str(candles_out),
+                )
+                try:
+                    cmd_to_candles(cd_args)
+                    cd_results[s["slug"]] = f"ok ({freq}, cid={cid[:14]}…)"
+                except Exception as e:  # noqa: BLE001
+                    cd_results[s["slug"]] = f"error: {e}"
+        summary["steps"]["candles"] = cd_results
+    else:
+        summary["steps"]["candles"] = "skipped"
+
+    _log("[orchestrate] DONE.")
+    print(json.dumps(summary, indent=2))
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -2505,9 +2672,34 @@ def main() -> None:
     p.add_argument("--series",  required=True, help="Market series slug prefix (e.g. btc-up-or-down-5m)")
     p.add_argument("--window-minutes", type=int, default=5, help="Window duration in minutes (default: 5)")
 
+    # orchestrate — master pipeline: download once → ticks + events (+ candles) for all series
+    p = sub.add_parser(
+        "orchestrate",
+        help="MASTER: download the v2 archive once, then build lookahead-safe tick + event "
+             "(+ optional candle) datasets for every 5m/15m/1h UP/DOWN series in one shot",
+    )
+    p.add_argument("--days", type=int, default=30, help="Days of archive to download (default 30)")
+    p.add_argument("--slugs", default=None,
+                   help="Comma-separated slugs to build (default: all). E.g. btc_5m,btc_15m,btc_1h")
+    p.add_argument("--workspace", default=None,
+                   help="Trader-Claw workspace dir (default ~/.traderclaw/workspace). "
+                        "Outputs go to <workspace>/data/{ticks,events,candles}/.")
+    p.add_argument("--orderbook-dir", dest="orderbook_dir", default=None,
+                   help="Where to store/read parquets (default <workspace>/data/orderbook)")
+    p.add_argument("--skip-download", dest="skip_download", action="store_true",
+                   help="Reuse parquets already in the orderbook dir (skip step 1)")
+    p.add_argument("--no-ticks", dest="no_ticks", action="store_true", help="Skip the 1Hz tick build")
+    p.add_argument("--no-events", dest="no_events", action="store_true", help="Skip the ms event-stream build")
+    p.add_argument("--candles", action="store_true",
+                   help="Also build Polymarket-mid OHLC candle JSON per series (off by default)")
+    p.add_argument("--events-no-dedup", dest="events_no_dedup", action="store_true",
+                   help="Pass through to to-events: keep every book event (no dedup of unchanged tops)")
+    p.add_argument("--progress", default=None, help="Path to a download progress JSON file (polled by Rust)")
+
     args = parser.parse_args()
 
     dispatch = {
+        "orchestrate":          cmd_orchestrate,
         "summary":              cmd_summary,
         "price-series":         cmd_price_series,
         "top-markets":          cmd_top_markets,

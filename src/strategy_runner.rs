@@ -859,6 +859,9 @@ pub async fn runner_loop(
         strategy_core::engines::REWARDS_MAKER => {
             crate::engines::rewards_maker::run_rewards_maker_loop(store, config, workspace_dir).await;
         }
+        strategy_core::engines::REWARDS_ORCHESTRATOR => {
+            crate::engines::rewards_orchestrator::run_rewards_orchestrator_loop(store, config, workspace_dir).await;
+        }
         // "rhai_candle" or None → legacy path (unchanged behaviour)
         _ => {
             if config.market_type == "polymarket_binary" {

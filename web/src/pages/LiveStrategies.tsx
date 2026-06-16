@@ -49,6 +49,7 @@ interface RunnerConfig {
   fee_pct: number
   warmup_days: number
   series_id?: string
+  polymarket_wallet_id?: string | null
   resolution_logic?: string
   threshold?: number | null
   live_sizing_mode?: 'fixed' | 'percent'
@@ -65,6 +66,13 @@ interface RunnerConfig {
   max_runner_loss_pct?: number | null
   max_consecutive_losses?: number | null
   min_entry_price?: number
+}
+
+interface PolyWalletProfile {
+  id: string
+  label: string
+  configured: boolean
+  wallet_address_masked?: string | null
 }
 
 interface RunnerStatus {
@@ -815,6 +823,14 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript, prefil
   })
   const allSeries: MarketSeries[] = seriesData?.series ?? []
 
+  // Polymarket wallet profiles — let the user pick which wallet this runner trades on.
+  const { data: walletData } = useQuery<{ wallets: PolyWalletProfile[] }>({
+    queryKey: ['polymarket-wallets'],
+    queryFn: () => apiFetch('/api/polymarket/wallets'),
+    staleTime: 60 * 1000,
+  })
+  const walletProfiles: PolyWalletProfile[] = walletData?.wallets ?? []
+
   const [form, setForm] = useState({
     kind: (prefill?.kind ?? 'rhai_candle') as string,
     name: '',
@@ -827,6 +843,8 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript, prefil
     fee_pct: 1.5,
     warmup_days: 7,
     series_id: prefill?.series_id ?? 'btc_5m',
+    polymarket_wallet_id: '' as string,
+    poly_condition_id: '' as string,
     resolution_logic: 'price_up',
     threshold: null as number | null,
     live_sizing_mode: 'percent' as 'fixed' | 'percent',
@@ -860,6 +878,11 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript, prefil
 
   const isRhaiTick = form.kind === 'rhai_tick'
   const isEngineKind = form.kind !== 'rhai_candle' && !isRhaiTick
+  // rewards_maker quotes ONE fixed slow market (politics/macro), not a recurring
+  // crypto series — it needs a condition_id, not the series picker.
+  const isRewardsMaker = form.kind === 'rewards_maker'
+  // rewards_orchestrator auto-selects markets at runtime — no market input at all.
+  const isRewardsOrchestrator = form.kind === 'rewards_orchestrator'
   // Quick Start: hide the advanced risk/timing controls behind a disclosure so a
   // new user's first Dry Run only needs Engine + Script + Series + Mode.
   const [showAdvanced, setShowAdvanced] = useState(false)
@@ -1096,6 +1119,19 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript, prefil
         script: tickScript,
         engine_params: {},
       }))
+    } else if (newKind === 'rewards_maker' || newKind === 'rewards_orchestrator') {
+      // rewards_maker quotes ONE fixed market by condition_id; rewards_orchestrator
+      // auto-selects markets at runtime. Neither uses a recurring series/symbol slug.
+      setForm(f => ({
+        ...f,
+        kind: newKind,
+        market_type: 'polymarket_binary',
+        mode: 'paper',
+        symbol: '',
+        series_id: '',
+        script: '',
+        engine_params: defaultEngineParams(newKind),
+      }))
     } else {
       // Default to the BTC 5m recurring series so the engine picks up the
       // current window slug each poll. Without a series_id the engine would
@@ -1208,29 +1244,76 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript, prefil
 
           {isEngineKind && (
             <div className="space-y-3">
-              <EngineMarketPicker
-                selected={form.symbol ? form.symbol.split(',').map(s => s.trim()).filter(Boolean) : []}
-                onChange={slugs => set('symbol', slugs.join(','))}
-                series={allSeries}
-                seriesId={form.series_id}
-                onSeriesChange={(sid) => {
-                  // When a recurring series is chosen, drop any pasted fixed
-                  // slugs and let the runner resolve the current window's
-                  // slug automatically each poll (see series_helper.rs).
-                  setForm(f => ({ ...f, series_id: sid, symbol: sid ? '' : f.symbol }))
-                }}
-              />
+              {isRewardsOrchestrator ? (
+                <div className="rounded px-3 py-2 text-[11px]" style={{ background: 'var(--color-surface-2)', color: 'var(--color-text-muted)' }}>
+                  This engine <span className="font-semibold">auto-selects</span> the top reward markets at runtime
+                  (set the pool size + min-safety in Engine Parameters below). No market to pick —
+                  just assign capital + wallet and start. It closes and rotates out of any market that turns toxic.
+                </div>
+              ) : isRewardsMaker ? (
+                <div>
+                  <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>Market condition_id</label>
+                  <input
+                    type="text"
+                    className="w-full rounded px-3 py-2 text-sm font-mono"
+                    value={form.poly_condition_id}
+                    onChange={e => set('poly_condition_id', e.target.value.trim())}
+                    placeholder="0x… (a SLOW market — politics / macro / far-dated)"
+                  />
+                  <p className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
+                    Quotes ONE fixed market. Pick a high-safety reward market on the
+                    <span className="font-mono"> /rewards </span> page (NEVER crypto 5m/15m — toxic).
+                    The engine resolves YES/NO tokens from this condition_id.
+                  </p>
+                </div>
+              ) : (
+                <>
+                  <EngineMarketPicker
+                    selected={form.symbol ? form.symbol.split(',').map(s => s.trim()).filter(Boolean) : []}
+                    onChange={slugs => set('symbol', slugs.join(','))}
+                    series={allSeries}
+                    seriesId={form.series_id}
+                    onSeriesChange={(sid) => {
+                      // When a recurring series is chosen, drop any pasted fixed
+                      // slugs and let the runner resolve the current window's
+                      // slug automatically each poll (see series_helper.rs).
+                      setForm(f => ({ ...f, series_id: sid, symbol: sid ? '' : f.symbol }))
+                    }}
+                  />
+                  <div>
+                    <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>Threshold / Edge</label>
+                    <input
+                      type="number"
+                      step="0.001"
+                      className="w-full rounded px-3 py-2 text-sm"
+                      value={form.threshold ?? ''}
+                      onChange={e => set('threshold', e.target.value === '' ? null : Number(e.target.value))}
+                      placeholder="0.03"
+                    />
+                    <p className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-muted)' }}>Min edge / arb spread (engine default if blank)</p>
+                  </div>
+                </>
+              )}
+              {/* Wallet profile — engine runners also trade Polymarket */}
               <div>
-                <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>Threshold / Edge</label>
-                <input
-                  type="number"
-                  step="0.001"
+                <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>Wallet</label>
+                <select
                   className="w-full rounded px-3 py-2 text-sm"
-                  value={form.threshold ?? ''}
-                  onChange={e => set('threshold', e.target.value === '' ? null : Number(e.target.value))}
-                  placeholder="0.03"
-                />
-                <p className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-muted)' }}>Min edge / arb spread (engine default if blank)</p>
+                  value={form.polymarket_wallet_id}
+                  onChange={e => set('polymarket_wallet_id', e.target.value)}
+                >
+                  <option value="">Default wallet</option>
+                  {walletProfiles
+                    .filter(w => w.id !== 'default')
+                    .map(w => (
+                      <option key={w.id} value={w.id} disabled={form.mode === 'live' && !w.configured}>
+                        {w.label}{w.wallet_address_masked ? ` · ${w.wallet_address_masked}` : ''}{!w.configured ? ' (incomplete)' : ''}
+                      </option>
+                    ))}
+                </select>
+                <p className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
+                  Manage wallets on the Polymarket page → Wallet Profiles.
+                </p>
               </div>
             </div>
           )}
@@ -1285,6 +1368,30 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript, prefil
                 {' · '}Logic: <span className="font-mono">{form.resolution_logic}</span>
                 {form.threshold !== null ? <> {' · '}Threshold: <span className="font-mono">{form.threshold}</span></> : null}
               </p>
+
+              {/* Wallet profile — which Polymarket wallet this runner trades on */}
+              <div className="mt-3">
+                <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>Wallet</label>
+                <select
+                  className="w-full rounded px-3 py-2 text-sm"
+                  value={form.polymarket_wallet_id}
+                  onChange={e => set('polymarket_wallet_id', e.target.value)}
+                >
+                  <option value="">Default wallet</option>
+                  {walletProfiles
+                    .filter(w => w.id !== 'default')
+                    .map(w => (
+                      <option key={w.id} value={w.id} disabled={form.mode === 'live' && !w.configured}>
+                        {w.label}{w.wallet_address_masked ? ` · ${w.wallet_address_masked}` : ''}{!w.configured ? ' (incomplete)' : ''}
+                      </option>
+                    ))}
+                </select>
+                <p className="text-[10px] mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
+                  {form.mode === 'live'
+                    ? 'Live orders are signed with this wallet’s credentials.'
+                    : 'Manage wallets on the Polymarket page → Wallet Profiles.'}
+                </p>
+              </div>
             </div>
           ) : !isEngineKind && form.market_type === 'funding_arb' ? (
             <div>
@@ -1987,7 +2094,11 @@ export function CreateModal({ scripts, onClose, onCreated, defaultScript, prefil
             // (form.symbol) OR a recurring series (form.series_id) — the
             // runner resolves the slug per-window in the latter case.  The
             // legacy Rhai path still requires `form.script` + `form.symbol`.
-            const hasMarketTarget = isEngineKind
+            const hasMarketTarget = isRewardsOrchestrator
+              ? true // auto-selects markets at runtime — no market input needed
+              : isRewardsMaker
+              ? Boolean(form.poly_condition_id)
+              : isEngineKind
               ? Boolean(form.symbol || form.series_id)
               : Boolean(form.symbol)
             const needsScript = !isEngineKind && !form.script

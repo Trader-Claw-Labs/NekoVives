@@ -84,6 +84,15 @@ export const ENGINE_KINDS: EngineKindMeta[] = [
     example: 'Use ONLY on slow markets (politics, SpaceX FDV, far-dated events) where adverse selection is low. NEVER on crypto 5m/15m (toxic). Start in Dry Run.',
     risk: 'low',
   },
+  {
+    id: 'rewards_orchestrator',
+    label: 'Liquidity Rewards Orchestrator (auto)',
+    summary: 'auto-picks the top-N safe reward markets, quotes both sides on each, closes + rotates when one turns toxic.',
+    description:
+      'The hands-off pilot. Every poll it re-scans the reward-market list, auto-selects the top-N markets that clear your minimum safety (excluding toxic ones), and keeps a two-sided resting quote alive on each. When a held market turns toxic, drops below min-safety, or expires, it closes those quotes and rotates capital into the next-best fresh market. You only pick a wallet, assign capital, and set the pool size — the engine selects the slugs.',
+    example: 'This is the autonomous rewards pilot: assign capital, set pool size + min-safety, and let it run. Start in Dry Run to measure eligible% before going Live.',
+    risk: 'low',
+  },
 ]
 
 export function engineKindMeta(id: string): EngineKindMeta | undefined {

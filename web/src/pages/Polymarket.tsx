@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch, apiPost, apiDelete } from '../hooks/useApi'
-import { BarChart2, Eye, EyeOff, RefreshCw, TrendingUp, X, CheckCircle, AlertCircle, Trash2, Copy } from 'lucide-react'
+import { BarChart2, Eye, EyeOff, RefreshCw, TrendingUp, X, CheckCircle, AlertCircle, Trash2, Copy, Wallet, Plus, Pencil } from 'lucide-react'
 import PolymarketSetupWizard from '../components/PolymarketSetupWizard'
 
 interface Market {
@@ -384,6 +384,302 @@ function PlaceOrderTab() {
   )
 }
 
+// ── Wallet profiles (multiple named Polymarket wallets) ───────────────
+
+interface WalletProfile {
+  id: string
+  label: string
+  configured: boolean
+  wallet_address?: string | null
+  wallet_address_masked?: string | null
+  api_key_masked?: string | null
+  proxy_address?: string | null
+  proxy_address_masked?: string | null
+  has_secret?: boolean
+  has_passphrase?: boolean
+  has_private_key?: boolean
+  is_builder?: boolean
+  signature_type?: string | null
+}
+
+const SIGNATURE_TYPES = ['', 'eoa', 'proxy', 'gnosis_safe', 'poly1271']
+
+function emptyProfileForm() {
+  return {
+    id: '',
+    label: '',
+    wallet_address: '',
+    private_key: '',
+    api_key: '',
+    secret: '',
+    passphrase: '',
+    proxy_address: '',
+    signature_type: '',
+    is_builder: false,
+  }
+}
+
+function WalletProfileEditor({
+  initial,
+  isNew,
+  onSaved,
+  onCancel,
+}: {
+  initial: ReturnType<typeof emptyProfileForm>
+  isNew: boolean
+  onSaved: () => void
+  onCancel: () => void
+}) {
+  const [form, setForm] = useState(initial)
+  const [showSecrets, setShowSecrets] = useState(isNew)
+  const [err, setErr] = useState('')
+
+  const save = useMutation({
+    mutationFn: () => {
+      // Send only fields the user actually filled. The backend preserves
+      // existing secrets when a field comes back empty (or as a mask), so
+      // editing a profile never wipes credentials the user didn't re-type.
+      const body: Record<string, unknown> = {
+        id: form.id || undefined,
+        label: form.label || undefined,
+        wallet_address: form.wallet_address || undefined,
+        private_key: form.private_key || undefined,
+        api_key: form.api_key || undefined,
+        secret: form.secret || undefined,
+        passphrase: form.passphrase || undefined,
+        proxy_address: form.proxy_address || undefined,
+        signature_type: form.signature_type || undefined,
+        is_builder: form.is_builder,
+      }
+      return apiPost('/api/polymarket/wallets', body)
+    },
+    onSuccess: () => onSaved(),
+    onError: (e: Error) => setErr(e.message),
+  })
+
+  function f<K extends keyof typeof form>(k: K, v: typeof form[K]) {
+    setForm(s => ({ ...s, [k]: v }))
+  }
+
+  const fieldStyle = { background: 'var(--color-bg)', border: '1px solid var(--color-border)' }
+
+  return (
+    <div className="rounded-lg border p-4 space-y-3"
+      style={{ backgroundColor: 'var(--color-bg)', borderColor: 'var(--color-accent)' }}>
+      <div className="flex items-center justify-between">
+        <h3 className="text-sm font-semibold">{isNew ? 'Add wallet profile' : `Edit ${initial.label || initial.id}`}</h3>
+        <button onClick={onCancel} className="p-1 rounded hover:bg-white/10" style={{ color: 'var(--color-text-muted)' }}>
+          <X size={14} />
+        </button>
+      </div>
+
+      <div className="grid grid-cols-2 gap-3">
+        <div>
+          <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>Label</label>
+          <input className="w-full rounded px-3 py-2 text-sm" style={fieldStyle}
+            value={form.label} onChange={e => f('label', e.target.value)} placeholder="e.g. Main · Scalper · Test" />
+        </div>
+        <div>
+          <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>
+            Profile ID {!isNew && <span className="opacity-60">(fixed)</span>}
+          </label>
+          <input className="w-full rounded px-3 py-2 text-sm font-mono disabled:opacity-50" style={fieldStyle}
+            value={form.id} disabled={!isNew}
+            onChange={e => f('id', e.target.value.trim().toLowerCase().replace(/[^a-z0-9-]/g, '-'))}
+            placeholder="auto-generated if blank" />
+        </div>
+      </div>
+
+      <div>
+        <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>Wallet Address</label>
+        <input className="w-full rounded px-3 py-2 text-sm font-mono" style={fieldStyle}
+          value={form.wallet_address} onChange={e => f('wallet_address', e.target.value)} placeholder="0x…" />
+      </div>
+
+      <div className="flex items-center justify-between">
+        <span className="text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>Credentials</span>
+        <button type="button" onClick={() => setShowSecrets(s => !s)}
+          className="text-[11px] flex items-center gap-1" style={{ color: 'var(--color-text-muted)' }}>
+          {showSecrets ? <EyeOff size={12} /> : <Eye size={12} />}
+          {showSecrets ? 'Hide' : 'Show'}
+        </button>
+      </div>
+
+      <div className="space-y-2">
+        <input type={showSecrets ? 'text' : 'password'} className="w-full rounded px-3 py-2 text-sm font-mono" style={fieldStyle}
+          value={form.private_key} onChange={e => f('private_key', e.target.value)}
+          placeholder={initial.label && !isNew ? 'private key (leave blank to keep current)' : 'private key (0x…)'} />
+        <input type={showSecrets ? 'text' : 'password'} className="w-full rounded px-3 py-2 text-sm font-mono" style={fieldStyle}
+          value={form.api_key} onChange={e => f('api_key', e.target.value)}
+          placeholder={!isNew ? 'API key (leave blank to keep current)' : 'API key'} />
+        <div className="grid grid-cols-2 gap-2">
+          <input type={showSecrets ? 'text' : 'password'} className="w-full rounded px-3 py-2 text-sm font-mono" style={fieldStyle}
+            value={form.secret} onChange={e => f('secret', e.target.value)}
+            placeholder={!isNew ? 'secret (kept)' : 'secret'} />
+          <input type={showSecrets ? 'text' : 'password'} className="w-full rounded px-3 py-2 text-sm font-mono" style={fieldStyle}
+            value={form.passphrase} onChange={e => f('passphrase', e.target.value)}
+            placeholder={!isNew ? 'passphrase (kept)' : 'passphrase'} />
+        </div>
+      </div>
+
+      <div className="grid grid-cols-2 gap-3">
+        <div>
+          <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>Proxy / Safe Address</label>
+          <input className="w-full rounded px-3 py-2 text-sm font-mono" style={fieldStyle}
+            value={form.proxy_address} onChange={e => f('proxy_address', e.target.value)} placeholder="optional 0x…" />
+        </div>
+        <div>
+          <label className="text-xs block mb-1" style={{ color: 'var(--color-text-muted)' }}>Signature Type</label>
+          <select className="w-full rounded px-3 py-2 text-sm" style={fieldStyle}
+            value={form.signature_type} onChange={e => f('signature_type', e.target.value)}>
+            {SIGNATURE_TYPES.map(t => <option key={t} value={t}>{t === '' ? 'auto-detect' : t}</option>)}
+          </select>
+        </div>
+      </div>
+
+      <label className="flex items-center gap-1.5 text-[11px] cursor-pointer" style={{ color: 'var(--color-text-muted)' }}>
+        <input type="checkbox" checked={form.is_builder} onChange={e => f('is_builder', e.target.checked)} />
+        Builder Key credentials
+      </label>
+
+      {err && <p className="text-xs" style={{ color: 'var(--color-danger)' }}>{err}</p>}
+
+      <div className="flex gap-2 pt-1">
+        <button onClick={() => save.mutate()} disabled={save.isPending}
+          className="px-4 py-1.5 rounded text-sm font-medium disabled:opacity-50"
+          style={{ backgroundColor: 'var(--color-accent)', color: '#000' }}>
+          {save.isPending ? 'Saving…' : 'Save profile'}
+        </button>
+        <button onClick={onCancel} className="px-4 py-1.5 rounded text-sm" style={{ color: 'var(--color-text-muted)' }}>
+          Cancel
+        </button>
+      </div>
+    </div>
+  )
+}
+
+function WalletProfilesCard() {
+  const qc = useQueryClient()
+  const [editing, setEditing] = useState<string | null>(null) // profile id or '__new__'
+  const { data, isLoading } = useQuery<{ wallets: WalletProfile[] }>({
+    queryKey: ['polymarket-wallets'],
+    queryFn: () => apiFetch('/api/polymarket/wallets'),
+  })
+
+  const del = useMutation({
+    mutationFn: (id: string) => apiDelete(`/api/polymarket/wallets/${encodeURIComponent(id)}`),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['polymarket-wallets'] }),
+  })
+
+  const profiles = data?.wallets ?? []
+
+  function onSaved() {
+    setEditing(null)
+    qc.invalidateQueries({ queryKey: ['polymarket-wallets'] })
+    qc.invalidateQueries({ queryKey: ['polymarket-config'] })
+  }
+
+  return (
+    <div className="rounded-lg border p-4 mb-5"
+      style={{ backgroundColor: 'var(--color-surface)', borderColor: 'var(--color-border)' }}>
+      <div className="flex items-center justify-between mb-3">
+        <div className="flex items-center gap-2">
+          <Wallet size={14} style={{ color: 'var(--color-accent)' }} />
+          <h2 className="text-sm font-semibold">Wallet Profiles</h2>
+          <span className="text-[11px]" style={{ color: 'var(--color-text-muted)' }}>
+            ({profiles.length})
+          </span>
+        </div>
+        {editing === null && (
+          <button onClick={() => setEditing('__new__')}
+            className="flex items-center gap-1 text-xs px-2.5 py-1 rounded"
+            style={{ backgroundColor: 'var(--color-accent)', color: '#000' }}>
+            <Plus size={12} /> Add wallet
+          </button>
+        )}
+      </div>
+
+      <p className="text-[11px] mb-3" style={{ color: 'var(--color-text-muted)' }}>
+        Configure multiple Polymarket wallets here, then pick one per strategy in Live Strategies.
+        The <span className="font-mono">default</span> profile is the wallet set up via the wizard above.
+      </p>
+
+      {editing === '__new__' && (
+        <div className="mb-3">
+          <WalletProfileEditor initial={emptyProfileForm()} isNew onSaved={onSaved} onCancel={() => setEditing(null)} />
+        </div>
+      )}
+
+      {isLoading ? (
+        <p className="text-xs" style={{ color: 'var(--color-text-muted)' }}>Loading…</p>
+      ) : profiles.length === 0 && editing !== '__new__' ? (
+        <p className="text-xs" style={{ color: 'var(--color-text-muted)' }}>
+          No wallet profiles yet. Add one to run strategies on a dedicated wallet.
+        </p>
+      ) : (
+        <div className="space-y-2">
+          {profiles.map(p => editing === p.id ? (
+            <WalletProfileEditor
+              key={p.id}
+              isNew={false}
+              initial={{
+                ...emptyProfileForm(),
+                id: p.id,
+                label: p.label,
+                wallet_address: p.wallet_address ?? '',
+                proxy_address: p.proxy_address ?? '',
+                signature_type: p.signature_type ?? '',
+                is_builder: !!p.is_builder,
+              }}
+              onSaved={onSaved}
+              onCancel={() => setEditing(null)}
+            />
+          ) : (
+            <div key={p.id}
+              className="flex items-center justify-between gap-3 rounded border px-3 py-2.5"
+              style={{ backgroundColor: 'var(--color-bg)', borderColor: 'var(--color-border)' }}>
+              <div className="min-w-0">
+                <div className="flex items-center gap-2">
+                  <span className="text-sm font-medium truncate">{p.label || p.id}</span>
+                  <code className="text-[10px] px-1.5 py-0.5 rounded font-mono"
+                    style={{ background: 'rgba(255,255,255,0.04)', color: 'var(--color-text-muted)' }}>{p.id}</code>
+                  {p.configured ? (
+                    <span className="text-[10px] flex items-center gap-0.5" style={{ color: 'var(--color-accent)' }}>
+                      <CheckCircle size={10} /> ready
+                    </span>
+                  ) : (
+                    <span className="text-[10px] flex items-center gap-0.5" style={{ color: 'var(--color-warning)' }}>
+                      <AlertCircle size={10} /> incomplete
+                    </span>
+                  )}
+                </div>
+                <p className="text-[11px] font-mono mt-0.5 truncate" style={{ color: 'var(--color-text-muted)' }}>
+                  {p.wallet_address_masked ?? p.wallet_address ?? 'no address'}
+                  {p.is_builder ? ' · builder' : ''}
+                  {p.signature_type ? ` · ${p.signature_type}` : ''}
+                </p>
+              </div>
+              <div className="flex items-center gap-1 shrink-0">
+                <button onClick={() => setEditing(p.id)} className="p-1.5 rounded hover:bg-white/10"
+                  style={{ color: 'var(--color-text-muted)' }} title="Edit">
+                  <Pencil size={13} />
+                </button>
+                {p.id !== 'default' && (
+                  <button
+                    onClick={() => { if (confirm(`Delete wallet profile "${p.label || p.id}"?`)) del.mutate(p.id) }}
+                    className="p-1.5 rounded hover:bg-white/10" style={{ color: 'var(--color-danger)' }} title="Delete">
+                    <Trash2 size={13} />
+                  </button>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
 export default function Polymarket() {
   const [activeTab, setActiveTab] = useState<'markets' | 'orders' | 'positions'>('markets')
   const [walletAddress, setWalletAddress] = useState('')
@@ -713,6 +1009,9 @@ export default function Polymarket() {
         onCancel={() => {}}
       />
       <div className="h-6" />
+
+      {/* Named wallet profiles — pick one per strategy in Live Strategies */}
+      <WalletProfilesCard />
 
       {/* Markets tab content */}
       <div

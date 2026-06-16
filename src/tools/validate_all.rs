@@ -92,6 +92,18 @@ pub async fn run_validate_all(
         .unwrap_or_default();
     files.sort();
 
+    // NV_VALIDATE_ONLY=substr,substr2 → run only scripts whose filename contains any
+    // of the comma-separated substrings (cross-asset sweep of a portable subset).
+    if let Ok(only) = std::env::var("NV_VALIDATE_ONLY") {
+        let pats: Vec<String> = only.split(',').map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect();
+        if !pats.is_empty() {
+            files.retain(|p| {
+                let n = p.file_name().and_then(|x| x.to_str()).unwrap_or("").to_lowercase();
+                pats.iter().any(|pat| n.contains(pat))
+            });
+        }
+    }
+
     let total = files.len();
     let mut rows = Vec::new();
     for (idx, path) in files.into_iter().enumerate() {
@@ -126,7 +138,13 @@ pub async fn run_validate_all(
             continue;
         }
 
-        let Some(slug) = slug_for(&filename, &engine, slug_pool) else {
+        // NV_VALIDATE_SLUG=<slug> forces every (non-event) script onto one slug —
+        // used for cross-asset sweeps (run the same script against eth_5m, sol_5m, …).
+        // Ignored for on_event (its slugs are _ev) and when the slug isn't available.
+        let forced_slug = std::env::var("NV_VALIDATE_SLUG").ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty() && !matches!(engine, Engine::ClobEvents) && slug_pool.iter().any(|a| a == s));
+        let Some(slug) = forced_slug.or_else(|| slug_for(&filename, &engine, slug_pool)) else {
             eprintln!("skip (no data slug)");
             rows.push(ScriptVerdict {
                 script: filename, engine: engine_label.into(), slug: "—".into(),
