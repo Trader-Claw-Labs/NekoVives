@@ -172,8 +172,20 @@ pub async fn run_rewards_orchestrator_loop(
         }
 
         // 5. Maintain a two-sided quote on every active market.
+        // Budget check: only post quotes we can actually fund. Each new BUY leg locks
+        // `size_usd` of liquid USDC; capital already in open positions is NOT available.
+        // Without this, the loop hammered create_limit_order with no funds and every
+        // order failed silently → eligible 0% with no explanation. Track the liquid
+        // balance and decrement it as we commit legs this cycle.
+        let mut liquid_remaining = if is_live {
+            fetch_liquid_balance(&clob).await.unwrap_or(0.0)
+        } else {
+            f64::MAX // paper mode: never funding-constrained
+        };
         let mut all_eligible = !pool.is_empty();
         let mut live_orders: Vec<LiveOrder> = Vec::new();
+        let mut skipped_funds = 0u32;
+        let mut place_errors: Vec<String> = Vec::new();
         for q in pool.values_mut() {
             let yes_ask = polymarket_trader::markets::get_market_price(&q.yes_token).await.unwrap_or(0.0);
             if !(yes_ask > 0.02 && yes_ask < 0.98) {
@@ -191,14 +203,20 @@ pub async fn run_rewards_orchestrator_loop(
             let no_px = ((1.0 - mid - offset) * 100.0).round() / 100.0;
             let mut posted_any = false;
             if q.yes_order_id.is_none() && yes_px > 0.01 {
-                let oid = place_or_sim(&clob, &q.yes_token, yes_px, size_usd, is_live).await;
-                if oid.is_some() { posted_any = true; }
-                q.yes_order_id = oid;
+                if liquid_remaining >= size_usd {
+                    match place_or_sim(&clob, &q.yes_token, yes_px, size_usd, is_live).await {
+                        Ok(oid) => { posted_any = true; liquid_remaining -= size_usd; q.yes_order_id = Some(oid); }
+                        Err(e) => place_errors.push(format!("{}/YES: {e}", trunc(&q.question, 28))),
+                    }
+                } else { skipped_funds += 1; }
             }
             if q.no_order_id.is_none() && no_px > 0.01 {
-                let oid = place_or_sim(&clob, &q.no_token, no_px, size_usd, is_live).await;
-                if oid.is_some() { posted_any = true; }
-                q.no_order_id = oid;
+                if liquid_remaining >= size_usd {
+                    match place_or_sim(&clob, &q.no_token, no_px, size_usd, is_live).await {
+                        Ok(oid) => { posted_any = true; liquid_remaining -= size_usd; q.no_order_id = Some(oid); }
+                        Err(e) => place_errors.push(format!("{}/NO: {e}", trunc(&q.question, 28))),
+                    }
+                } else { skipped_funds += 1; }
             }
             if posted_any { q.ref_mid = mid; }
 
@@ -208,6 +226,21 @@ pub async fn run_rewards_orchestrator_loop(
             if let Some(ref oid) = q.no_order_id { live_orders.push(quote_order("no", &q.no_token, no_px, size_usd, oid, &q.condition_id)); }
         }
         if all_eligible { eligible_polls += 1; }
+
+        // Surface why quoting is incomplete — only when something is actually wrong,
+        // and rate-limited to once per ~10 polls so the log doesn't flood.
+        if (skipped_funds > 0 || !place_errors.is_empty()) && total_polls % 10 == 1 {
+            if skipped_funds > 0 {
+                append_log(&store, &id, &format!(
+                    "rewards_orchestrator: {} quote leg(s) UNFUNDED — liquid ${:.2} < ${:.0}/leg. \
+                     Capital is locked in open positions; free it (let positions resolve / reduce size_usd / lower max_markets).",
+                    skipped_funds, liquid_remaining, size_usd
+                ));
+            }
+            for err in place_errors.iter().take(3) {
+                append_log(&store, &id, &format!("rewards_orchestrator: order rejected — {err}"));
+            }
+        }
 
         let elig_pct = if total_polls > 0 { eligible_polls as f64 / total_polls as f64 * 100.0 } else { 0.0 };
         let n_markets = pool.len();
@@ -252,22 +285,25 @@ async fn close_quotes(
 }
 
 /// Place a real limit order (live) or return a simulated id (paper).
+/// Returns `Err(reason)` instead of swallowing failures, so the caller can log
+/// WHY a quote didn't rest (insufficient balance, CLOB rejection, …) — a silent
+/// `None` previously made a non-quoting orchestrator look healthy (eligible 0%).
 async fn place_or_sim(
     clob: &Option<Arc<polymarket_trader::orders::ClobClient>>,
     token_id: &str,
     price: f64,
     size_usd: f64,
     is_live: bool,
-) -> Option<String> {
+) -> Result<String, String> {
     let shares = (size_usd / price).round();
     if is_live {
-        let c = clob.as_ref()?;
+        let c = clob.as_ref().ok_or_else(|| "no CLOB client".to_string())?;
         match c.create_limit_order(token_id, polymarket_trader::orders::Side::Buy, price, shares).await {
-            Ok(resp) => Some(resp.order_id),
-            Err(_) => None,
+            Ok(resp) => Ok(resp.order_id),
+            Err(e) => Err(e.to_string()),
         }
     } else {
-        Some(format!("paper-{token_id}-{price}"))
+        Ok(format!("paper-{token_id}-{price}"))
     }
 }
 
@@ -286,6 +322,21 @@ fn quote_order(side: &str, token: &str, px: f64, size_usd: f64, oid: &str, cid: 
         stop_loss_triggered: false,
         condition_id: Some(cid.to_string()),
         ..Default::default()
+    }
+}
+
+/// Liquid USDC available to fund NEW quotes (max of CLOB API and Polygon RPC).
+/// Capital already locked in resting orders / open positions is NOT counted here —
+/// that's the whole point: we must only post quotes we can actually fund.
+async fn fetch_liquid_balance(clob: &Option<Arc<polymarket_trader::orders::ClobClient>>) -> Option<f64> {
+    let c = clob.as_ref()?;
+    let api = c.get_api_balance().await.ok();
+    let rpc = c.get_balance().await.ok();
+    match (api, rpc) {
+        (Some(a), Some(r)) => Some(a.max(r)),
+        (Some(a), None) => Some(a),
+        (None, Some(r)) => Some(r),
+        (None, None) => None,
     }
 }
 

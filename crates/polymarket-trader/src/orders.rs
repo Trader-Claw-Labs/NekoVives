@@ -366,10 +366,17 @@ impl ClobClient {
 
         let token_id_u256 = U256::from_str(token_id)
             .map_err(|e| anyhow::anyhow!("Invalid token_id: {e}"))?;
-        let amount_dec = Decimal::from_f64_retain(amount)
-            .ok_or_else(|| anyhow::anyhow!("Invalid amount: {amount}"))?;
-        let price_dec = Decimal::from_f64_retain(worst_price)
-            .ok_or_else(|| anyhow::anyhow!("Invalid worst_price: {worst_price}"))?;
+        // Parse via string then round to 2dp. `from_f64_retain` keeps IEEE-754 noise
+        // (e.g. 2614.46 → …4600000000…25dp) and the CLOB rejects amounts/prices with
+        // more than 2 decimal places. Same fix as create_limit_order's price.
+        let amount_dec = amount.to_string().parse::<Decimal>()
+            .or_else(|_| format!("{amount:.2}").parse::<Decimal>())
+            .map_err(|e| anyhow::anyhow!("Invalid amount {amount}: {e}"))?
+            .round_dp(2);
+        let price_dec = worst_price.to_string().parse::<Decimal>()
+            .or_else(|_| format!("{worst_price:.2}").parse::<Decimal>())
+            .map_err(|e| anyhow::anyhow!("Invalid worst_price {worst_price}: {e}"))?
+            .round_dp(2);
 
         let sdk_amount = match side {
             Side::Buy => Amount::usdc(amount_dec)?,

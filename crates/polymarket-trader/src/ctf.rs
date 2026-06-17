@@ -163,7 +163,90 @@ pub async fn merge(
     })
 }
 
+/// Merge YES + NO tokens back to USDC for a wallet that holds them inside a
+/// **Polymarket ProxyWallet** contract (signature_type proxy / poly1271).
+///
+/// Direct `merge()` doesn't work for these: the CTF tokens live in the proxy
+/// CONTRACT, not in the owner EOA, so a `mergePositions` signed by the EOA would
+/// operate on the EOA's (empty) balance. Instead we wrap the CTF call in the proxy's
+/// `proxy(ProxyCall[])` entrypoint (onlyOwner) so `msg.sender` at the CTF is the
+/// proxy. The tx is still signed & gas-paid by the owner EOA (`wallet_address`),
+/// which therefore must hold a little POL for gas.
+///
+/// `proxy_address` = the ProxyWallet contract that owns the tokens.
+pub async fn merge_via_proxy(
+    condition_id: &str,
+    amount_tokens: f64,
+    collateral: &str,
+    owner_eoa: &str,
+    proxy_address: &str,
+    private_key: Option<&str>,
+) -> Result<MergeResult> {
+    if private_key.is_none() {
+        info!("[CTF:merge_via_proxy] DryRun — simulating merge of {amount_tokens:.2} on {condition_id} via proxy {proxy_address}");
+        return Ok(MergeResult {
+            tx_hash: "0x0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            amount_usdc_recovered: amount_tokens,
+            condition_id: condition_id.to_string(),
+        });
+    }
+    let pk = private_key.unwrap();
+    let amount_raw: u128 = (amount_tokens * USDC_SCALE as f64) as u128;
+
+    // Inner call: mergePositions(...) targeted at the CTF contract.
+    let inner = encode_merge_positions(collateral, condition_id, amount_raw)?;
+    // Wrap it: proxy([{ typeCode: CALL(1), to: CTF, value: 0, data: inner }]).
+    let outer = encode_proxy_call(CTF_CONTRACT, 0, &inner)?;
+
+    // Signed by the owner EOA, sent TO the proxy contract.
+    let tx_hash = send_raw_transaction(pk, owner_eoa, proxy_address, &outer, 0).await?;
+    info!("[CTF:merge_via_proxy] tx confirmed: {tx_hash}");
+
+    Ok(MergeResult {
+        tx_hash,
+        amount_usdc_recovered: amount_tokens,
+        condition_id: condition_id.to_string(),
+    })
+}
+
 // ── ABI encoding ──────────────────────────────────────────────────────────────
+
+/// ABI-encode `proxy((uint8,address,uint256,bytes)[])` with a single ProxyCall.
+/// CallType.CALL = 1. Layout: selector, offset→array(0x20), array len(1),
+/// offset→elem(0x20), then the tuple: typeCode, to, value, offset→data(0x80),
+/// data len, data (right-padded to 32).
+fn encode_proxy_call(to: &str, value: u128, inner: &[u8]) -> Result<Vec<u8>> {
+    let selector = keccak_selector("proxy((uint8,address,uint256,bytes)[])");
+    let mut data = Vec::new();
+    data.extend_from_slice(&selector);
+
+    // head: offset to the (dynamic) array argument
+    data.extend_from_slice(&u128_to_bytes32(0x20));
+    // array length = 1
+    data.extend_from_slice(&u128_to_bytes32(1));
+    // offset to element[0] relative to start of array-data region = 0x20
+    data.extend_from_slice(&u128_to_bytes32(0x20));
+
+    // tuple (uint8 typeCode, address to, uint256 value, bytes data)
+    // typeCode = 1 (CALL)
+    data.extend_from_slice(&u128_to_bytes32(1));
+    // to (address, left-padded)
+    let to_bytes = hex_to_bytes20(to)?;
+    data.extend_from_slice(&[0u8; 12]);
+    data.extend_from_slice(&to_bytes);
+    // value
+    data.extend_from_slice(&u128_to_bytes32(value));
+    // offset to `data` within the tuple = 4 words (typeCode,to,value,offset) = 0x80
+    data.extend_from_slice(&u128_to_bytes32(0x80));
+    // bytes length
+    data.extend_from_slice(&u128_to_bytes32(inner.len() as u128));
+    // bytes content, right-padded to a 32-byte boundary
+    data.extend_from_slice(inner);
+    let pad = (32 - (inner.len() % 32)) % 32;
+    data.extend(std::iter::repeat(0u8).take(pad));
+
+    Ok(data)
+}
 
 /// Minimal ABI-encode for `splitPosition(address,bytes32,bytes32,uint256[],uint256)`.
 fn encode_split_position(
@@ -485,15 +568,18 @@ mod tests {
     #[test]
     fn selector_split_position() {
         // keccak256("splitPosition(address,bytes32,bytes32,uint256[],uint256)")[0..4]
+        // Verified against 4byte.directory + onchain CTF: 0x72ce4275.
+        // (The previous hardcoded "752d549c" was wrong — never matched the real selector.)
         let sel = keccak_selector("splitPosition(address,bytes32,bytes32,uint256[],uint256)");
-        // Precomputed reference value
-        assert_eq!(hex::encode(sel), "752d549c");
+        assert_eq!(hex::encode(sel), "72ce4275");
     }
 
     #[test]
     fn selector_merge_positions() {
+        // Verified against 4byte.directory + onchain CTF: 0x9e7212ad.
+        // (The previous hardcoded "f82bf5de" was wrong.)
         let sel = keccak_selector("mergePositions(address,bytes32,bytes32,uint256[],uint256)");
-        assert_eq!(hex::encode(sel), "f82bf5de");
+        assert_eq!(hex::encode(sel), "9e7212ad");
     }
 
     #[test]
@@ -519,9 +605,42 @@ mod tests {
             "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
             1_000_000,
         ).unwrap();
-        // First 4 bytes = splitPosition selector
-        assert_eq!(&data[..4], &[0x75, 0x2d, 0x54, 0x9c]);
+        // First 4 bytes = splitPosition selector (0x72ce4275, verified onchain)
+        assert_eq!(&data[..4], &[0x72, 0xce, 0x42, 0x75]);
         assert!(data.len() >= 4 + 5 * 32, "calldata too short");
+    }
+
+    #[test]
+    fn encode_proxy_call_layout() {
+        // Wrap a tiny 4-byte inner call and verify the ABI layout of
+        // proxy((uint8,address,uint256,bytes)[]) word by word.
+        let to = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"; // CTF
+        let inner = [0xde, 0xad, 0xbe, 0xef];
+        let d = encode_proxy_call(to, 0, &inner).unwrap();
+
+        // selector of proxy((uint8,address,uint256,bytes)[])
+        let sel = keccak_selector("proxy((uint8,address,uint256,bytes)[])");
+        assert_eq!(&d[..4], &sel);
+        let word = |i: usize| &d[4 + i * 32..4 + (i + 1) * 32];
+        // word0: offset to array = 0x20
+        assert_eq!(word(0)[31], 0x20);
+        // word1: array length = 1
+        assert_eq!(word(1)[31], 1);
+        // word2: offset to elem[0] = 0x20
+        assert_eq!(word(2)[31], 0x20);
+        // word3: typeCode = 1 (CALL)
+        assert_eq!(word(3)[31], 1);
+        // word4: `to` address in the low 20 bytes
+        assert_eq!(hex::encode(&word(4)[12..32]), to[2..].to_lowercase());
+        // word5: value = 0
+        assert_eq!(word(5), &[0u8; 32]);
+        // word6: offset to data within tuple = 0x80
+        assert_eq!(word(6)[31], 0x80);
+        // word7: bytes length = 4
+        assert_eq!(word(7)[31], 4);
+        // word8: the 4 data bytes, right-padded
+        assert_eq!(&word(8)[..4], &inner);
+        assert_eq!(&word(8)[4..], &[0u8; 28]);
     }
 
     #[tokio::test]

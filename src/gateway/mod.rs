@@ -1039,6 +1039,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/tick-recorder/status", get(api::handle_api_tick_recorder_status))
         .route("/api/polymarket/active-token", get(api::handle_api_polymarket_active_token))
         .route("/api/polymarket/balance", get(api::handle_api_polymarket_balance))
+        .route("/api/polymarket/merge", post(api::handle_api_polymarket_merge))
+        .route("/api/polymarket/sell-position", post(api::handle_api_polymarket_sell_position))
         // ── SSE event stream (no timeout — long-lived) ──
         .route("/api/export", get(api::handle_api_export))
         .route("/api/import", post(api::handle_api_import))

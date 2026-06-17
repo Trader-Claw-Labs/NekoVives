@@ -2549,6 +2549,188 @@ pub async fn handle_api_polymarket_balance(
     .into_response()
 }
 
+#[derive(Deserialize)]
+pub struct MergePositionBody {
+    /// Market condition_id (0x… 66-char hex). Both YES and NO tokens of this
+    /// condition must be held in at least `amount_tokens` size each.
+    pub condition_id: String,
+    /// Number of YES+NO PAIRS to merge back to collateral. Each pair returns $1.
+    /// Must be <= min(yes_size, no_size).
+    pub amount_tokens: f64,
+    /// Collateral token: "usdce" (default) or "pusd". Iran/standard markets = usdce.
+    #[serde(default)]
+    pub collateral: Option<String>,
+}
+
+/// POST /api/polymarket/merge — merge YES+NO token pairs back to USDC via the CTF
+/// `mergePositions` contract call. No slippage (each pair = $1), unlike selling each
+/// leg on the CLOB. Used to free capital locked in a bilateral maker inventory.
+/// Requires the wallet profile to expose a private_key (to sign the onchain tx).
+pub async fn handle_api_polymarket_merge(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<MergePositionBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    // Validate inputs before touching funds.
+    let cid = body.condition_id.trim().to_string();
+    if !cid.starts_with("0x") || cid.len() != 66 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "condition_id must be a 0x-prefixed 66-char hex string"
+        }))).into_response();
+    }
+    if !(body.amount_tokens > 0.0) || !body.amount_tokens.is_finite() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "amount_tokens must be a positive number (count of YES+NO pairs to merge)"
+        }))).into_response();
+    }
+
+    let creds = match get_poly_creds(&state) {
+        Some(c) if c.private_key.is_some() => c,
+        Some(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "Polymarket wallet has no private_key configured — cannot sign the merge tx. Set polymarket.private_key in config."
+        }))).into_response(),
+        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "Polymarket credentials not configured."
+        }))).into_response(),
+    };
+
+    let collateral_addr = match body.collateral.as_deref().unwrap_or("usdce") {
+        "pusd" => polymarket_trader::ctf::PUSD_CONTRACT,
+        _ => polymarket_trader::ctf::USDC_E_CONTRACT,
+    };
+
+    // Route via the proxy wallet when one is configured: the CTF tokens live in the
+    // proxy CONTRACT, so a direct EOA-signed mergePositions would hit the empty EOA
+    // balance. merge_via_proxy wraps the call in proxy(ProxyCall[]) (onlyOwner), still
+    // signed & gas-paid by the owner EOA. Falls back to direct merge for EOA wallets.
+    let proxy = creds.proxy_address.as_deref().filter(|p| !p.is_empty());
+    tracing::warn!(
+        "[MERGE] manual merge requested: condition={} amount={:.2} pairs collateral={} via_proxy={}",
+        cid, body.amount_tokens, collateral_addr, proxy.unwrap_or("(none/direct)")
+    );
+
+    let merge_result = match proxy {
+        Some(proxy_addr) => polymarket_trader::ctf::merge_via_proxy(
+            &cid,
+            body.amount_tokens,
+            collateral_addr,
+            &creds.wallet_address,
+            proxy_addr,
+            creds.private_key.as_deref(),
+        ).await,
+        None => polymarket_trader::ctf::merge(
+            &cid,
+            body.amount_tokens,
+            collateral_addr,
+            &creds.wallet_address,
+            creds.private_key.as_deref(),
+        ).await,
+    };
+
+    match merge_result {
+        Ok(r) => {
+            tracing::warn!("[MERGE] confirmed tx={} recovered≈${:.2}", r.tx_hash, r.amount_usdc_recovered);
+            Json(serde_json::json!({
+                "success": true,
+                "tx_hash": r.tx_hash,
+                "amount_usdc_recovered": r.amount_usdc_recovered,
+                "condition_id": r.condition_id,
+            })).into_response()
+        }
+        Err(e) => {
+            tracing::error!("[MERGE] failed: {e}");
+            (StatusCode::BAD_GATEWAY, Json(serde_json::json!({
+                "success": false,
+                "error": format!("merge failed: {e}"),
+            }))).into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct SellPositionBody {
+    /// Token id (ERC1155 position id, decimal string) to sell.
+    pub token_id: String,
+    /// Number of SHARES to sell (CLOB sell amount is denominated in shares).
+    pub shares: f64,
+    /// Optional worst acceptable fill price (slippage floor). If set within
+    /// [0.01, 0.99] the CLOB rejects fills below it; omit/0 for a true market order.
+    #[serde(default)]
+    pub min_price: Option<f64>,
+}
+
+/// POST /api/polymarket/sell-position — sell a held position back to USDC via a CLOB
+/// market order. Unlike the onchain CTF merge, CLOB orders are GASLESS (off-chain
+/// signed) and honor the proxy (poly1271) wallet — so this works where merge can't.
+/// Used to free capital locked in maker inventory. One token leg per call.
+pub async fn handle_api_polymarket_sell_position(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<SellPositionBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let token_id = body.token_id.trim().to_string();
+    if token_id.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "token_id is required"
+        }))).into_response();
+    }
+    if !(body.shares > 0.0) || !body.shares.is_finite() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "shares must be a positive number"
+        }))).into_response();
+    }
+
+    let creds = match get_poly_creds(&state) {
+        Some(c) if !c.api_key.is_empty() => c,
+        _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "Polymarket credentials not configured."
+        }))).into_response(),
+    };
+
+    let worst_price = body.min_price.unwrap_or(0.0);
+    // The CLOB SDK rejects amounts with >2 decimal places, and an f64 like 2614.46
+    // carries IEEE-754 noise (…4600000000…25dp). Truncate to 2dp (floor, so we never
+    // try to sell more shares than we hold) before handing it to the SDK.
+    let shares = (body.shares * 100.0).floor() / 100.0;
+    tracing::warn!(
+        "[SELL] manual sell requested: token={} shares={:.2} (req {:.4}) worst_price={}",
+        token_id, shares, body.shares, worst_price
+    );
+
+    let client = polymarket_trader::orders::ClobClient::new(creds);
+    match client.create_market_order(
+        &token_id,
+        polymarket_trader::orders::Side::Sell,
+        shares,
+        worst_price,
+    ).await {
+        Ok(resp) => {
+            tracing::warn!("[SELL] order placed id={} status={}", resp.order_id, resp.status);
+            Json(serde_json::json!({
+                "success": true,
+                "order_id": resp.order_id,
+                "status": resp.status,
+                "token_id": token_id,
+                "shares": shares,
+            })).into_response()
+        }
+        Err(e) => {
+            tracing::error!("[SELL] failed: {e}");
+            (StatusCode::BAD_GATEWAY, Json(serde_json::json!({
+                "success": false,
+                "error": format!("sell failed: {e}"),
+            }))).into_response()
+        }
+    }
+}
+
 /// GET /api/rewards/history — daily USDC balance deltas as a reward proxy.
 /// Reads balance_snapshots.jsonl (appended on each balance poll) and computes the
 /// change across each UTC midnight. Positive deltas not explained by fills ≈ rewards.

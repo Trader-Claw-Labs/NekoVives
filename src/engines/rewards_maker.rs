@@ -156,14 +156,20 @@ pub async fn run_rewards_maker_loop(
         let mut posted_any = false;
 
         if st.yes_order_id.is_none() && yes_px > 0.01 {
-            let oid = place_or_sim(&clob, &yes_token, yes_px, size_usd, is_live).await;
-            if oid.is_some() { posted_any = true; }
-            st.yes_order_id = oid;
+            match place_or_sim(&clob, &yes_token, yes_px, size_usd, is_live).await {
+                Ok(oid) => { posted_any = true; st.yes_order_id = Some(oid); }
+                Err(e) => if st.total_polls % 10 == 1 {
+                    append_log(&store, &id, &format!("rewards_maker: YES quote rejected — {e}"));
+                },
+            }
         }
         if st.no_order_id.is_none() && no_px > 0.01 {
-            let oid = place_or_sim(&clob, &no_token, no_px, size_usd, is_live).await;
-            if oid.is_some() { posted_any = true; }
-            st.no_order_id = oid;
+            match place_or_sim(&clob, &no_token, no_px, size_usd, is_live).await {
+                Ok(oid) => { posted_any = true; st.no_order_id = Some(oid); }
+                Err(e) => if st.total_polls % 10 == 1 {
+                    append_log(&store, &id, &format!("rewards_maker: NO quote rejected — {e}"));
+                },
+            }
         }
         if posted_any || drifted {
             st.ref_mid = mid;
@@ -200,22 +206,24 @@ pub async fn run_rewards_maker_loop(
 }
 
 /// Place a real limit order (live) or return a simulated id (paper).
+/// Returns `Err(reason)` rather than a silent `None` so the caller can log why a
+/// quote failed to rest (a silent failure made a non-quoting maker look healthy).
 async fn place_or_sim(
     clob: &Option<Arc<polymarket_trader::orders::ClobClient>>,
     token_id: &str,
     price: f64,
     size_usd: f64,
     is_live: bool,
-) -> Option<String> {
+) -> Result<String, String> {
     let shares = (size_usd / price).round();
     if is_live {
-        let c = clob.as_ref()?;
+        let c = clob.as_ref().ok_or_else(|| "no CLOB client".to_string())?;
         match c.create_limit_order(token_id, polymarket_trader::orders::Side::Buy, price, shares).await {
-            Ok(resp) => Some(resp.order_id),
-            Err(_) => None,
+            Ok(resp) => Ok(resp.order_id),
+            Err(e) => Err(e.to_string()),
         }
     } else {
-        Some(format!("paper-{token_id}-{price}"))
+        Ok(format!("paper-{token_id}-{price}"))
     }
 }
 
