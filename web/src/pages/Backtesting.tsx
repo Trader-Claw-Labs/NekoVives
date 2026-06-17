@@ -1713,11 +1713,15 @@ export default function Backtesting() {
   type SortMode = 'default' | 'win_rate_desc' | 'trades_desc' | 'balance_desc'
   const [sortBy, setSortBy] = useState<SortMode>('default')
   const SORT_MODES: SortMode[] = ['default', 'win_rate_desc', 'trades_desc', 'balance_desc']
-  // Show result only when it belongs to the currently selected script; fall back to cached
-  const displayResult = (result && result.script === config.script)
+  // Show result only when it belongs to the current run configuration.
+  // Engine kinds return script="engine:<kind>" — match on that when no script is selected.
+  const expectedScript = (config.kind && config.kind !== 'rhai_candle')
+    ? `engine:${config.kind}`
+    : config.script
+  const displayResult = (result && result.script === expectedScript)
     ? result
-    : (config.script ? scriptResults[config.script] ?? null : null)
-  const isShowingCachedResult = !(result && result.script === config.script) && !!displayResult
+    : (expectedScript ? scriptResults[expectedScript] ?? null : null)
+  const isShowingCachedResult = !(result && result.script === expectedScript) && !!displayResult
 
   // Load available scripts
   const { data: scriptsData, isLoading: scriptsLoading, refetch: refetchScripts } = useQuery<{ scripts: BacktestScript[] }>({
@@ -1846,9 +1850,23 @@ export default function Backtesting() {
 
   const isEngineKind = (config.kind ?? 'rhai_candle') !== 'rhai_candle'
 
+  // Which data source does this engine kind require?
+  // rewards_maker / minting_mm → ms event stream (clob_events)
+  // rewards_orchestrator → live-only, no real backtest (use clob_1hz for dry metrics)
+  // all other engine kinds → 1Hz tick replay (clob_1hz)
+  const engineRequiredMarketType: MarketType | null = isEngineKind
+    ? (config.kind === 'rewards_maker' || config.kind === 'minting_mm' ? 'clob_events' : 'clob_1hz')
+    : null
+
+  // If the user somehow changed market_type to something incompatible while an engine kind is
+  // selected, silently correct it so the backend always gets the right path.
+  const effectiveMarketType: MarketType = isEngineKind
+    ? (engineRequiredMarketType ?? config.market_type)
+    : config.market_type
+
   const isBatchMode = selectedScripts.length > 1
-  const isArchiveMode = config.market_type === 'clob_1hz' || config.market_type === 'archive_candles'
-  const isEventMode = config.market_type === 'clob_events'
+  const isArchiveMode = effectiveMarketType === 'clob_1hz' || effectiveMarketType === 'archive_candles'
+  const isEventMode = effectiveMarketType === 'clob_events'
   // A slug must be selected before a slug-based run (archive tick modes OR the event stream).
   const hasClob1HzSlug = (!isArchiveMode && !isEventMode) || !!(config.clob_slug ?? config.symbol)
   const canRun = (isBatchMode || !!config.script || isEngineKind) && hasClob1HzSlug && !isRunning && !batchProgress
@@ -2165,21 +2183,29 @@ export default function Backtesting() {
                     return
                   }
                   // Engine kinds backtest against a Polymarket recurring series.
-                  // Default to btc_5m (matches the live runner's default) and keep
-                  // symbol/interval in sync with the series so the synthetic
-                  // backtester fetches the right Binance candles for normalization.
+                  // Engine kinds default to REAL Polymarket tick data (clob_1hz over the
+                  // recorded archive), NOT the synthetic-candle path — synthetic prices are
+                  // dishonest and the engine should run on real YES/NO book data. The slug
+                  // (e.g. btc_5m) names the data/ticks/<slug>/ directory.
+                  // rewards_maker / minting_mm are makers → they need the ms event stream
+                  // (clob_events), so default those to the _ev slug.
                   const seriesId = config.series_id ?? 'btc_5m'
                   const series = allSeries.find(s => s.id === seriesId)
                   const preset = POLY_BINARY_PRESETS.find(p => p.id === seriesId) ?? POLY_BINARY_PRESETS[0]
+                  const baseSlug = series?.id ?? preset.id
+                  const isMaker = k === 'rewards_maker' || k === 'minting_mm'
+                  const mtype = isMaker ? 'clob_events' : 'clob_1hz'
+                  const slug = isMaker ? `${baseSlug}_ev` : baseSlug
                   setFullConfig({
                     ...config,
                     kind: k,
-                    market_type: 'polymarket_binary',
+                    market_type: mtype,
                     engine_params: defaultEngineParams(k),
                     script: '',
-                    series_id: series?.id ?? preset.id,
-                    poly_binary_preset: series?.id ?? preset.id,
-                    symbol: series?.symbol ?? preset.symbol,
+                    series_id: baseSlug,
+                    poly_binary_preset: baseSlug,
+                    clob_slug: slug,
+                    symbol: slug,
                     interval: series?.cadence ?? preset.defaultInterval,
                     resolution_logic: series?.resolution_logic ?? 'price_up',
                     threshold: series?.threshold ?? undefined,
@@ -2213,9 +2239,30 @@ export default function Backtesting() {
 
           {/* Row 1: Market, Script, Symbol/Series, Window */}
           <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-12 gap-3 items-end">
-            {/* Market Type Select */}
+            {/* Market Type Select — locked to compatible data source when engine kind is selected */}
             <div className="lg:col-span-2">
               <label className="block text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>Market</label>
+            {isEngineKind ? (
+              <div
+                className="w-full rounded px-2 py-2 text-sm flex items-center gap-1.5"
+                style={{
+                  backgroundColor: 'var(--color-surface-2)',
+                  border: '1px solid var(--color-border)',
+                  color: 'var(--color-text)',
+                  opacity: 0.7,
+                  cursor: 'not-allowed',
+                }}
+                title="Data source is fixed by the engine kind"
+              >
+                <Database size={12} style={{ color: 'var(--color-accent)', flexShrink: 0 }} />
+                <span className="font-mono text-xs truncate">
+                  {engineRequiredMarketType === 'clob_events'
+                    ? 'Orderbook Events (ms)'
+                    : 'Orderbook Ticks (1Hz)'}
+                </span>
+              </div>
+            ) : (
+            <>
             <select
               value={config.market_type}
               onChange={(e) => {
@@ -2292,6 +2339,8 @@ export default function Backtesting() {
               never to measure edge. For real edge, use the <strong>Validate</strong> tab
               (3-leg test on a runner's official-resolution trades).
             </p>
+            </>
+            )}
           </div>
 
           {/* Script select — hidden for engine kinds */}
@@ -3283,7 +3332,13 @@ export default function Backtesting() {
                 if (isBatchMode) {
                   runBatchBacktest()
                 } else {
-                  runBacktest()
+                  // When an engine kind is selected, enforce the compatible market_type
+                  // so the backend routes to the correct path regardless of what the user
+                  // manually set in the Market selector (which is locked/hidden for engine kinds).
+                  const cfgToRun = isEngineKind && engineRequiredMarketType
+                    ? { ...config, market_type: engineRequiredMarketType }
+                    : config
+                  runBacktest(cfgToRun)
                 }
               }}
               disabled={!canRun}
@@ -4064,7 +4119,12 @@ export default function Backtesting() {
                   </div>
                   {isShowingCachedResult && (
                     <button
-                      onClick={() => runBacktest()}
+                      onClick={() => {
+                        const cfgToRun = isEngineKind && engineRequiredMarketType
+                          ? { ...config, market_type: engineRequiredMarketType }
+                          : config
+                        runBacktest(cfgToRun)
+                      }}
                       disabled={!canRun}
                       className="flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-semibold disabled:opacity-40"
                       style={{ backgroundColor: 'var(--color-accent)', color: '#000' }}

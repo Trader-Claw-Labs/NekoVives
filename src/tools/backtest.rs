@@ -2875,11 +2875,16 @@ fn run_polymarket_slug_backtest(
         .map_err(|e| anyhow::anyhow!("Script compile error (patched): {e}"))?;
     // ─────────────────────────────────────────────────────────────────────────
 
-    // NV_OFFICIAL_ONLY=1 → skip windows lacking an official Polymarket outcome, so no
-    // trade is ever settled via the Binance-close fallback (the lookahead vector).
-    let official_only_gate = std::env::var("NV_OFFICIAL_ONLY")
+    // DEFAULT: skip windows lacking an official Polymarket outcome, so no trade is ever
+    // settled via the Binance-close fallback. That fallback is a proven lookahead vector
+    // (the close that resolves the window IS the same series that feeds the candles the
+    // strategy reads), which manufactured phantom edges (sol_15m / sol_1h / btc_1h). The
+    // honest test only counts windows with a real Chainlink-settled outcome.
+    // Escape hatch: NV_ALLOW_BINANCE_FALLBACK=1 restores the old (lookahead-prone) behaviour.
+    let allow_binance_fallback = std::env::var("NV_ALLOW_BINANCE_FALLBACK")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
+    let official_only_gate = !allow_binance_fallback;
 
     let mut window_ts = first_window;
     while window_ts + window_secs <= last_ts {
@@ -4645,6 +4650,12 @@ pub fn run_clob_1hz_backtest(
     let mut peak = initial_balance;
     let mut max_dd = 0.0_f64;
 
+    // DEFAULT: when a window has no official `window_yes_won`, VOID the open position
+    // (refund stake, record no trade) instead of settling via the Binance close — that
+    // close is a lookahead vector. Escape hatch: NV_ALLOW_BINANCE_FALLBACK=1.
+    let allow_binance_fallback = std::env::var("NV_ALLOW_BINANCE_FALLBACK")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false);
+
     // ── BUG-1 fix: per-window resolution + last price, keyed by window_ts ──────────
     // The window-transition settle path runs when the FIRST tick of the NEXT window
     // arrives — at which point `tick.window_yes_won`/`tick.binance_price` belong to
@@ -4929,9 +4940,17 @@ pub fn run_clob_1hz_backtest(
                     let prev_close = last_binance_by_window.get(&closing_ts).copied()
                         .filter(|&p| p > 0.0)
                         .unwrap_or(s.window_open_price);
-                    let yes_won = if let Some(official) = official_by_window.get(&closing_ts).copied() {
+                    let official = official_by_window.get(&closing_ts).copied();
+                    if official.is_none() && !allow_binance_fallback {
+                        // No official resolution → VOID: refund stake, record no trade
+                        // (never settle via the Binance close — lookahead).
+                        s.balance += s.stake;
+                        s.resolved_binance += 1; // count as dropped/void for reporting
+                        s.position = 0; s.entry_price = 0.0; s.stake = 0.0;
+                    } else {
+                    let yes_won = if let Some(o) = official {
                         s.resolved_official += 1;
-                        official // Polymarket's official Chainlink-based resolution for THIS window
+                        o // Polymarket's official Chainlink-based resolution for THIS window
                     } else {
                         s.resolved_binance += 1;
                         prev_close > s.window_open_price // Fallback: Binance price comparison
@@ -4953,6 +4972,7 @@ pub fn run_clob_1hz_backtest(
                     s.trades.push(Trade { timestamp: ts, side: side_label.to_string(),
                         price: ep, size: sk, pnl, debug: None });
                     s.position = 0; s.entry_price = 0.0; s.stake = 0.0;
+                    } // end official/fallback settle branch
                 }
                 s.window_open_price = 0.0;
                 // Discard any pending order that didn't fill before window close
@@ -4977,7 +4997,13 @@ pub fn run_clob_1hz_backtest(
         // Also handles properly-formatted JSONL files that emit a secs_left=0 tick.
         if tick.window_secs_left == 0 {
             let mut s = sim.lock().unwrap();
-            if s.position != 0 {
+            if s.position != 0 && tick.window_yes_won.is_none() && !allow_binance_fallback {
+                // No official resolution → VOID the position: refund stake, no trade
+                // recorded (never settle via the Binance close — lookahead vector).
+                s.balance += s.stake;
+                s.resolved_binance += 1;
+                s.position = 0; s.entry_price = 0.0; s.stake = 0.0;
+            } else if s.position != 0 {
                 let open_p  = s.window_open_price;
                 let close_p = tick.binance_price;
                 // Prefer official Polymarket resolution; fall back to Binance price
@@ -5400,32 +5426,31 @@ pub async fn run_archive_candles_backtest(
         }
     }
 
-    // Fill any window still lacking an official outcome with the binance fallback, and
-    // report the split so a low official-coverage run is visible (and distrusted).
-    //
-    // NV_OFFICIAL_ONLY=1 → do NOT fill with the binance fallback. Windows without an
-    // official `window_yes_won` are left unresolved, so the trade loop SKIPS them
-    // entirely. This answers "what does the test say if we drop the binance-fallback
-    // windows?" — it removes the only lookahead vector (binance close = the same series
-    // that feeds the candles), at the cost of fewer trades.
-    let official_only = std::env::var("NV_OFFICIAL_ONLY").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false);
+    // DEFAULT: leave windows without an official `window_yes_won` UNRESOLVED so the trade
+    // loop skips them — never settle via the Binance-close fallback (a lookahead vector:
+    // the resolving close is the same series that feeds the candles the strategy reads).
+    // Escape hatch: NV_ALLOW_BINANCE_FALLBACK=1 restores the old fill behaviour.
+    let allow_binance_fallback = std::env::var("NV_ALLOW_BINANCE_FALLBACK")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false);
     let mut res_official = 0usize;
     let mut res_binance = 0usize;
     let mut res_dropped = 0usize;
     for w in windows.values_mut() {
         if w.resolution.is_some() {
             res_official += 1;
-        } else if official_only {
-            res_dropped += 1; // leave resolution = None → window is skipped in the trade loop
-        } else if let (Some(o), Some(c)) = (w.btc_open, w.btc_close) {
-            w.resolution = Some(if c > o { "up".to_string() } else { "down".to_string() });
-            res_binance += 1;
+        } else if allow_binance_fallback {
+            if let (Some(o), Some(c)) = (w.btc_open, w.btc_close) {
+                w.resolution = Some(if c > o { "up".to_string() } else { "down".to_string() });
+                res_binance += 1;
+            }
+        } else {
+            res_dropped += 1; // resolution stays None → window skipped in the trade loop
         }
     }
     tracing::info!(
         "[ARCHIVE-CANDLES] resolution: {} official (window_yes_won), {} binance-fallback{}",
         res_official, res_binance,
-        if official_only { format!(", {res_dropped} unresolved DROPPED (NV_OFFICIAL_ONLY)") } else { String::new() }
+        if !allow_binance_fallback { format!(", {res_dropped} unresolved DROPPED (official-only default)") } else { String::new() }
     );
 
     // ── P4 (decision price): tick closest to secs_left = decision_offset_secs (60) ──
@@ -5974,9 +5999,21 @@ pub fn run_clob_events_backtest(
     let mut peak = initial_balance;
     let mut max_dd = 0.0_f64;
 
+    // DEFAULT: VOID a position whose window has no official resolution (refund stake,
+    // no trade) rather than settle via the Binance close — lookahead. Escape hatch:
+    // NV_ALLOW_BINANCE_FALLBACK=1.
+    let allow_binance_fallback = std::env::var("NV_ALLOW_BINANCE_FALLBACK")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false);
+
     // Settle the open position for a window that just closed (official > binance).
-    let settle = |s: &mut Sim, close_binance: f64, ts_ms: i64, official: Option<bool>| {
+    let settle = move |s: &mut Sim, close_binance: f64, ts_ms: i64, official: Option<bool>| {
         if s.position == 0 || s.window_open_price <= 0.0 { return; }
+        if official.is_none() && !allow_binance_fallback {
+            s.balance += s.stake; // void: refund stake, record no trade
+            s.resolved_binance += 1;
+            s.position = 0; s.entry_price = 0.0; s.stake = 0.0;
+            return;
+        }
         let yes_won = match official {
             Some(o) => { s.resolved_official += 1; o }
             None => {

@@ -26,6 +26,15 @@ use strategy_core::{
 };
 use crate::tools::backtest::{fetch_candles, load_ticks_for_range, AllTrade, BacktestMetrics};
 
+/// Whether to settle windows lacking an official resolution via the Binance close.
+/// Default false (= VOID such windows) — that fallback is a lookahead vector. Set
+/// NV_ALLOW_BINANCE_FALLBACK=1 to restore the old behaviour. Mirrors backtest.rs.
+fn engine_allow_binance_fallback() -> bool {
+    std::env::var("NV_ALLOW_BINANCE_FALLBACK")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 // ── Params ────────────────────────────────────────────────────────────────────
 
 pub struct EngineBacktestParams<'a> {
@@ -349,14 +358,23 @@ pub async fn run_engine_clob_1hz_backtest(params: EngineClobBacktestParams<'_>) 
 
                 // Settle at window close.
                 if tick.window_secs_left == 0 {
+                    if let (Some(_side), Some(token_id)) = (&current_side, &current_token) {
+                        if tick.window_yes_won.is_none() && !engine_allow_binance_fallback() {
+                            // No official resolution → VOID: refund stake, no trade recorded
+                            // (never settle on the Binance close — lookahead vector). Matches
+                            // the default in the on_candle / on_tick backtest paths.
+                            portfolio.balance_usdc += current_stake;
+                            portfolio.positions.remove(token_id);
+                            current_side = None; current_token = None;
+                            current_size_tokens = 0.0; current_entry_price = 0.0; current_stake = 0.0;
+                            window_open_price = 0.0;
+                            continue;
+                        }
+                    }
                     if let (Some(side), Some(token_id)) = (&current_side, &current_token) {
-                        // BUG-9 fix: prefer the official Polymarket resolution when present
-                        // (backfilled into window_yes_won); fall back to the Binance price
-                        // compare only when absent. Resolving purely on Binance manufactures
-                        // phantom edge (decision and resolution both derive from Binance).
                         let yes_won = match tick.window_yes_won {
                             Some(official) => official,
-                            None => tick.binance_price > window_open_price,
+                            None => tick.binance_price > window_open_price, // only with escape hatch
                         };
                         let won = match side {
                             Side::Yes => yes_won,
@@ -691,10 +709,22 @@ pub async fn run_engine_clob_events_backtest(params: EngineClobEventsParams<'_>)
                 // 2. Window boundary → settle the open position with the CLOSING
                 //    window's official resolution.
                 if wts != cur_window && cur_window != 0 {
+                    if let (Some(_side), Some(token_id)) = (&pos_side, &pos_token) {
+                        if official_by_window.get(&cur_window).is_none() && !engine_allow_binance_fallback() {
+                            // No official resolution → VOID (refund stake, no trade). Default;
+                            // NV_ALLOW_BINANCE_FALLBACK=1 restores the old Binance-close settle.
+                            portfolio.balance_usdc += pos_stake;
+                            portfolio.positions.remove(token_id);
+                            pos_side = None; pos_token = None; pos_size_tokens = 0.0;
+                            pos_entry = 0.0; pos_stake = 0.0; window_open_price = 0.0;
+                            if wts != cur_window { cur_window = wts; }
+                            continue;
+                        }
+                    }
                     if let (Some(side), Some(token_id)) = (&pos_side, &pos_token) {
                         let yes_won = match official_by_window.get(&cur_window) {
                             Some(o) => *o,
-                            None => binance > window_open_price, // Binance fallback
+                            None => binance > window_open_price, // only with escape hatch
                         };
                         let won = match side { Side::Yes => yes_won, Side::No => !yes_won };
                         let pnl = if won {

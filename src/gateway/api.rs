@@ -4746,6 +4746,14 @@ pub async fn handle_api_backtest_run(
             workspace_dir: &workspace_dir,
         };
         let metrics = crate::tools::engine_backtest::run_engine_backtest(params).await;
+        // Pass through the engine's REAL trades (was hardcoded empty → the results
+        // panel rendered nothing for engine kinds even when the engine traded).
+        let all_trades: Vec<serde_json::Value> = metrics.all_trades.iter().map(|t| {
+            serde_json::json!({
+                "timestamp": t.timestamp, "side": t.side, "price": t.price,
+                "size": t.size, "pnl": t.pnl, "balance": t.balance,
+            })
+        }).collect();
         return Json(serde_json::json!({
             "script": format!("engine:{engine_kind}"),
             "symbol": body.symbol,
@@ -4757,7 +4765,7 @@ pub async fn handle_api_backtest_run(
             "analysis":          metrics.analysis,
             "markets_tested":    metrics.markets_tested,
             "worst_trades":      serde_json::Value::Array(vec![]),
-            "all_trades":        serde_json::Value::Array(vec![]),
+            "all_trades":        all_trades,
         })).into_response();
     }
 

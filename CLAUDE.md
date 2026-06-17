@@ -547,8 +547,15 @@ A correctness audit found and fixed 11 bugs across the three engines. Invariants
   runner. Scripts MUST use it — never self-track the open in `kv`, which persists globally
   across windows (a fixed key freezes on the first window). Per-window kv scratch keys use
   the `*_<window_ts>` convention and are pruned at window close.
-- **Official-resolution preference**: every path (incl. engine_clob_1hz) prefers
-  `window_yes_won` over the Binance price-compare, which would manufacture phantom edge.
+- **Official-resolution ONLY (default, jun-2026)**: every backtest path (on_candle /
+  archive_candles, on_tick / clob_1hz, on_event / clob_events) now **skips/voids any window
+  without an official `window_yes_won`** instead of settling it via the Binance close. That
+  fallback was a proven lookahead vector — the close that resolves the window IS the same
+  series feeding the candles the strategy reads — and it manufactured phantom EDGEs (sol_15m,
+  sol_1h, btc_1h: e.g. favorite_fade on sol_1h went EDGE→INSUFFICIENT, 180→11 trades, EV
+  −5.3%). Escape hatch: `NV_ALLOW_BINANCE_FALLBACK=1` restores the old behaviour. Keep tick
+  data backfilled (`backfill-resolutions`, now supports hourly via `--discover hourly_text`)
+  so official coverage stays ~95-100% and few windows are dropped.
 - **`second_in_window`** is derived from the actual window length (not a hardcoded 300s),
   so 15m/1h slugs are correct.
 - **edge_validator extraction** (`edge_validator::extract_binary_trades`) recognizes every
