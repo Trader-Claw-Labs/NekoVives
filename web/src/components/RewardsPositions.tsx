@@ -5,7 +5,7 @@ import { RefreshCw, X, TrendingUp } from 'lucide-react'
 interface Order {
   id: string; price: string; side: string; size: string; status: string; token_id: string
 }
-interface Balance { balance: number; currency: string }
+interface Balance { balance: number; positions_value: number | null; total_equity: number; currency: string }
 
 export default function RewardsPositions() {
   const qc = useQueryClient()
@@ -51,7 +51,16 @@ export default function RewardsPositions() {
         <div className="flex items-center gap-3">
           {balData && (
             <span className="text-xs font-mono" style={{ color: 'var(--color-accent)' }}>
-              ${balData.balance.toFixed(2)} USDC free
+              {balData.positions_value != null && balData.positions_value > 0.01 ? (
+                <span title="liquid USDC + open-position value">
+                  ${balData.total_equity.toFixed(2)} equity
+                  <span style={{ color: 'var(--color-text-muted)' }}>
+                    {' '}(${balData.balance.toFixed(2)} free + ${balData.positions_value.toFixed(2)} in positions)
+                  </span>
+                </span>
+              ) : (
+                <>${balData.balance.toFixed(2)} USDC free</>
+              )}
             </span>
           )}
           <button onClick={() => refetch()}

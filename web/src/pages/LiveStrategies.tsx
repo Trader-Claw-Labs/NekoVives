@@ -191,6 +191,21 @@ function runnerPnlUSD(r: StoredRunner): number {
   return 0
 }
 
+/** Derive the wallet a runner trades on, mirroring the backend's
+ *  /api/live/wallets-summary precedence so the UI groupings reconcile.
+ *  Returns null for paper runners (no real wallet). */
+function runnerWallet(r: StoredRunner): string | null {
+  if (r.config.mode !== 'live') return null
+  const w = r.result?.wallet_address || r.config.polymarket_wallet_id
+  return w ? w.toLowerCase() : 'unknown'
+}
+
+function maskWallet(w: string): string {
+  if (w === 'unknown') return 'unknown / legacy'
+  if (w.length <= 12 || !w.startsWith('0x')) return w
+  return `${w.slice(0, 6)}…${w.slice(-4)}`
+}
+
 /** Convert live_orders to LiveTrade[] for equity chart rendering. */
 function liveOrdersToTrades(orders: LiveOrder[], initialBalance: number): LiveTrade[] {
   let balance = initialBalance
@@ -3752,7 +3767,33 @@ export default function LiveStrategies() {
     onSuccess: () => qc.invalidateQueries({ queryKey: ['live-strategies'] }),
   })
 
-  const runners = data?.runners ?? []
+  const allRunners = data?.runners ?? []
+
+  // ── Per-wallet analytics filter ──────────────────────────────────────
+  // Live runners are grouped by the wallet they trade on so a fresh pilot
+  // wallet's stats don't mix with a legacy wallet's history. Selecting a
+  // wallet filters `runners` here, before all downstream totals/lists are
+  // derived, so every KPI and card recomputes for that wallet automatically.
+  // 'all' keeps the original combined view. Paper runners are always shown
+  // (no wallet) so dry-run experiments stay visible regardless of selection.
+  const [walletFilter, setWalletFilter] = useState<string>(() => {
+    try { return localStorage.getItem('live-strategies-wallet-filter') || 'all' } catch { return 'all' }
+  })
+  const liveWallets = Array.from(
+    allRunners.reduce((m, r) => {
+      const w = runnerWallet(r)
+      if (w) m.set(w, (m.get(w) ?? 0) + 1)
+      return m
+    }, new Map<string, number>())
+  ).sort((a, b) => b[1] - a[1])
+  const setWalletFilterPersisted = (w: string) => {
+    setWalletFilter(w)
+    try { localStorage.setItem('live-strategies-wallet-filter', w) } catch {}
+  }
+  const runners = walletFilter === 'all'
+    ? allRunners
+    : allRunners.filter(r => r.config.mode !== 'live' || runnerWallet(r) === walletFilter)
+
   const scripts = scriptsData?.scripts ?? []
   const running = runners.filter(r => r.status.status === 'running').length
   const { pnlDisplay: totalPnl, tradesDisplay: totalTradesDelta, winsDisplay: totalWinsDelta, reset: resetStats } = useResettableStats(runners)
@@ -3872,6 +3913,20 @@ export default function LiveStrategies() {
           </button>
         </div>
         <div className="flex gap-2">
+          {liveWallets.length > 1 && (
+            <select
+              value={walletFilter}
+              onChange={e => setWalletFilterPersisted(e.target.value)}
+              className="text-xs px-2 rounded border h-[34px] bg-transparent"
+              style={{ borderColor: 'var(--color-border)', color: 'var(--color-text)' }}
+              title="Filter live analytics by wallet — keeps each wallet's history separate"
+            >
+              <option value="all">All wallets ({liveWallets.length})</option>
+              {liveWallets.map(([w, n]) => (
+                <option key={w} value={w}>{maskWallet(w)} · {n} runner{n === 1 ? '' : 's'}</option>
+              ))}
+            </select>
+          )}
           <div className="relative">
             <button
               onClick={() => setShowCelebrationSettings(!showCelebrationSettings)}

@@ -2488,6 +2488,32 @@ pub async fn handle_api_polymarket_balance(
         }
     };
 
+    // Market value of OPEN positions (capital deployed but not yet resolved). The
+    // liquid `balance` above understates real equity while positions are open — the
+    // same gap that falsely tripped the PortfolioGuard. We surface both so the UI can
+    // show available vs. in-positions vs. total. Best-effort: null if the proxy
+    // wallet is unknown or data-api errors.
+    let proxy_wallet = creds.proxy_address.clone()
+        .filter(|a| !a.is_empty())
+        .unwrap_or_else(|| creds.wallet_address.clone());
+    let positions_value: Option<f64> = if proxy_wallet.is_empty() {
+        None
+    } else {
+        let url = format!("https://data-api.polymarket.com/value?user={proxy_wallet}");
+        match reqwest::Client::new()
+            .get(&url)
+            .header("User-Agent", "trader-claw")
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .await
+        {
+            Ok(resp) => resp.json::<serde_json::Value>().await.ok()
+                .and_then(|v| v.as_array()?.first()?.get("value")?.as_f64()),
+            Err(_) => None,
+        }
+    };
+    let total_equity = balance + positions_value.unwrap_or(0.0);
+
     // Append a balance snapshot (hourly granularity) for the rewards-history diff.
     // Polymarket pays liquidity rewards in USDC directly to the proxy wallet at
     // midnight UTC; there is no public rewards API, so the balance delta across
@@ -2514,7 +2540,9 @@ pub async fn handle_api_polymarket_balance(
     }
 
     Json(serde_json::json!({
-        "balance": balance,
+        "balance": balance,                  // liquid USDC (available) — used to pre-fill Initial Balance
+        "positions_value": positions_value,  // market value of open positions (null if unavailable)
+        "total_equity": total_equity,        // balance + positions_value — true equity
         "wallet_address": creds.wallet_address,
         "currency": "USDC"
     }))
@@ -6189,6 +6217,76 @@ pub async fn handle_api_live_list(
     if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
     let runners = state.strategy_runner.list();
     Json(serde_json::json!({ "runners": runners })).into_response()
+}
+
+/// GET /api/live/wallets-summary — aggregate LIVE runner stats grouped by the
+/// wallet each runner trades on. Lets the dashboard separate analytics per wallet
+/// (e.g. a fresh pilot wallet vs. a legacy wallet whose history shouldn't pollute
+/// the new one). Wallet is derived from the runner itself — no data migration:
+///   result.wallet_address → config.wallet_address → config.polymarket_wallet_id → "unknown".
+/// Paper runners are excluded (no real wallet). PnL = Σ live_orders[].pnl, matching
+/// the UI's runnerPnlUSD so the per-wallet totals reconcile with the per-runner rows.
+pub async fn handle_api_live_wallets_summary(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) { return e.into_response(); }
+    let runners = state.strategy_runner.list();
+
+    // wallet key → accumulator
+    struct Acc {
+        wallet: String,
+        runners: u32,
+        running: u32,
+        trades: u32,
+        wins: u32,
+        pnl: f64,
+        balance: f64,
+        runner_ids: Vec<String>,
+    }
+    let mut groups: std::collections::BTreeMap<String, Acc> = std::collections::BTreeMap::new();
+
+    for r in &runners {
+        if r.config.mode != "live" { continue; }
+        let wallet = r.result.as_ref().and_then(|res| res.wallet_address.clone())
+            .or_else(|| r.config.wallet_address.clone())
+            .or_else(|| r.config.polymarket_wallet_id.clone())
+            .map(|w| w.to_lowercase())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let acc = groups.entry(wallet.clone()).or_insert_with(|| Acc {
+            wallet: wallet.clone(),
+            runners: 0, running: 0, trades: 0, wins: 0, pnl: 0.0, balance: 0.0,
+            runner_ids: Vec::new(),
+        });
+        acc.runners += 1;
+        if r.status.status == "running" { acc.running += 1; }
+        acc.runner_ids.push(r.config.id.clone());
+        if let Some(res) = r.result.as_ref() {
+            acc.trades += res.live_total_trades;
+            acc.wins += res.live_wins;
+            acc.pnl += res.live_orders.iter().filter_map(|o| o.pnl).sum::<f64>();
+            acc.balance += res.balance;
+        }
+    }
+
+    let wallets: Vec<serde_json::Value> = groups.into_values().map(|a| {
+        let win_rate = if a.trades > 0 { a.wins as f64 / a.trades as f64 * 100.0 } else { 0.0 };
+        serde_json::json!({
+            "wallet": a.wallet,
+            "wallet_masked": mask_short(&Some(a.wallet.clone())),
+            "runners": a.runners,
+            "running": a.running,
+            "trades": a.trades,
+            "wins": a.wins,
+            "win_rate_pct": win_rate,
+            "pnl_usd": a.pnl,
+            "balance": a.balance,
+            "runner_ids": a.runner_ids,
+        })
+    }).collect();
+
+    Json(serde_json::json!({ "wallets": wallets })).into_response()
 }
 
 #[derive(Deserialize)]

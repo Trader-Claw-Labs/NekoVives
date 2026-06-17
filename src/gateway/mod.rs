@@ -1025,6 +1025,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/chat", post(api::handle_api_chat))
         // ── Live Strategy Runner ──
         .route("/api/live/strategies", get(api::handle_api_live_list).post(api::handle_api_live_create))
+        .route("/api/live/wallets-summary", get(api::handle_api_live_wallets_summary))
         .route("/api/validate/runner", get(api::handle_api_validate_runner))
         .route("/api/validate/wallet", get(api::handle_api_validate_wallet))
         .route("/api/live/strategies/{id}", get(api::handle_api_live_get).patch(api::handle_api_live_patch).delete(api::handle_api_live_delete))

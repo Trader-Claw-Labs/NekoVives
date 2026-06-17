@@ -3122,6 +3122,9 @@ async fn polymarket_runner_loop(
             last_decision_window = current_window;
 
             // ── Guardrail: max_runner_loss_pct ──────────────────────────────────────
+            // Only meaningful while live: switching an already-paper runner "to paper"
+            // is a no-op that re-fires every loop and spams the log. Skip in paper mode.
+            if config.mode == "live" {
             if let Some(max_loss_pct) = config.max_runner_loss_pct {
                 if max_loss_pct > 0.0 {
                     let settled_pnl: f64 = live_orders.iter().filter_map(|o| o.pnl).sum();
@@ -3146,6 +3149,7 @@ async fn polymarket_runner_loop(
                     }
                 }
             }
+            } // end: live-only loss_pct guardrail
 
             // ── Guardrail: max_consecutive_losses ───────────────────────────────────
             let consecutive_losses: u32 = {
@@ -3162,6 +3166,7 @@ async fn polymarket_runner_loop(
                 }
                 streak
             };
+            if config.mode == "live" {
             if let Some(max_streak) = config.max_consecutive_losses {
                 if max_streak > 0 && consecutive_losses >= max_streak {
                     let msg = format!(
@@ -3181,6 +3186,7 @@ async fn polymarket_runner_loop(
                     store.persist();
                 }
             }
+            } // end: live-only consecutive-losses guardrail
 
             let display_minute = decision_minute + 1; // 1-based for user clarity
             tracing::info!(
@@ -4164,16 +4170,29 @@ pub fn spawn_portfolio_guard(store: Arc<StrategyRunnerStore>, max_loss_pct: f64)
             };
             let Some(creds) = creds else { continue; }; // no live runner → nothing to guard
 
-            let client = polymarket_trader::orders::ClobClient::new(creds);
-            let Some(balance) = fetch_usdc_balance_clob(&client).await else { continue; };
+            // Proxy wallet holds the open positions; fall back to the EOA address.
+            let proxy_wallet = creds.proxy_address.clone()
+                .filter(|a| !a.is_empty())
+                .unwrap_or_else(|| creds.wallet_address.clone());
 
-            guard.set_baseline(balance); // no-op after first set
-            if guard.check(balance) {
+            let client = polymarket_trader::orders::ClobClient::new(creds);
+
+            // Guard on TOTAL EQUITY (liquid USDC + open-position value), NOT liquid
+            // alone — otherwise capital deployed into open positions reads as a loss
+            // and falsely trips the breach. If either component can't be fetched we
+            // skip this cycle (conservative: never stop runners on incomplete data).
+            let Some(equity) = fetch_total_equity_clob(&client, &proxy_wallet).await else {
+                tracing::warn!("[PORTFOLIO_GUARD] could not compute total equity — skipping check this cycle");
+                continue;
+            };
+
+            guard.set_baseline(equity); // no-op after first set
+            if guard.check(equity) {
                 let stopped = store.stop_all_live();
                 store.persist();
                 tracing::error!(
-                    "[PORTFOLIO_GUARD] WALLET DROP BREACH at ${:.2} — stopped {} live runners",
-                    balance, stopped.len()
+                    "[PORTFOLIO_GUARD] EQUITY DROP BREACH at ${:.2} (liquid+positions) — stopped {} live runners",
+                    equity, stopped.len()
                 );
             }
         }
@@ -5308,6 +5327,52 @@ async fn fetch_usdc_balance_clob(client: &polymarket_trader::orders::ClobClient)
         (None, Some(r)) => Some(r),
         (None, None) => None,
     }
+}
+
+/// Market value (USD) of all OPEN positions held by `proxy_wallet`, via the public
+/// data-api `/value` endpoint. This is the capital that has left the liquid USDC
+/// balance and is currently tied up in unresolved binary positions.
+///
+/// Returns `None` on any network/parse error so callers can decide whether to skip
+/// (the PortfolioGuard skips its check rather than firing on incomplete data).
+async fn fetch_positions_value(proxy_wallet: &str) -> Option<f64> {
+    if proxy_wallet.is_empty() {
+        return None;
+    }
+    let url = format!("https://data-api.polymarket.com/value?user={proxy_wallet}");
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .header("User-Agent", "trader-claw")
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+        .ok()?;
+    // Shape: [{"user":"0x..","value":45.40}]
+    let arr = resp.json::<serde_json::Value>().await.ok()?;
+    let value = arr.as_array()?.first()?.get("value")?.as_f64()?;
+    Some(value)
+}
+
+/// Total Polymarket equity = liquid USDC (`fetch_usdc_balance_clob`) + market value
+/// of open positions (`fetch_positions_value`). This is the number the PortfolioGuard
+/// and the dashboard must compare against the baseline — using liquid USDC alone
+/// counts capital deployed into open positions as a loss, which falsely tripped the
+/// guard (a 5m UP/DOWN runner holding positions looked "down 79%" mid-cycle).
+///
+/// Returns `None` if EITHER component cannot be fetched, so the guard skips the check
+/// rather than acting on a partial (and therefore understated) equity figure.
+async fn fetch_total_equity_clob(
+    client: &polymarket_trader::orders::ClobClient,
+    proxy_wallet: &str,
+) -> Option<f64> {
+    let liquid = fetch_usdc_balance_clob(client).await?;
+    let positions = fetch_positions_value(proxy_wallet).await?;
+    let total = liquid + positions;
+    tracing::info!(
+        "Polymarket total equity: ${:.2} (liquid ${:.2} + open positions ${:.2})",
+        total, liquid, positions
+    );
+    Some(total)
 }
 
 async fn update_runner_result(
