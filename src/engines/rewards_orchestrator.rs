@@ -151,23 +151,34 @@ pub async fn run_rewards_orchestrator_loop(
             let liquid = fetch_liquid_balance(&clob).await.unwrap_or(0.0);
             if liquid < cycle_need {
                 let positions = fetch_open_positions(&proxy_wallet).await;
-                // Sell from the largest position until we'd have ~1.5 cycles of liquid,
-                // capped at 2 sells per poll to avoid dumping the whole book at once.
+                // Recycle in BALANCED YES+NO pairs only: sell equal shares of both legs of
+                // the same market. This recovers ~$1/pair WITHOUT leaving a directional
+                // naked leg (an earlier version sold the largest single leg and left the
+                // other exposed — the market then moved against it, costing ~$500). This is
+                // the CLOB equivalent of a merge; the maker stays delta-neutral.
+                let pairs = balanced_pairs(positions);
                 let target = cycle_need * 1.5;
                 let mut freed = 0.0; let mut sells = 0;
-                for p in positions.iter() {
-                    if liquid + freed >= target || sells >= 2 { break; }
-                    if p.cur_price <= 0.02 || p.cur_price >= 0.98 { continue; } // skip near-resolved dust
+                for bp in pairs.iter() {
+                    if liquid + freed >= target || sells >= 1 { break; } // 1 pair (=2 orders)/poll
+                    // each pair recovers ~$1/share; sell enough pairs to reach target
                     let need_usd = target - (liquid + freed);
-                    let shares_to_sell = (need_usd / p.cur_price).min(p.size);
-                    if shares_to_sell < 1.0 { continue; }
-                    if let Some(oid) = sell_shares(&clob, &p.token_id, shares_to_sell).await {
-                        let gross = shares_to_sell * p.cur_price;
+                    let shares = need_usd.min(bp.pair_shares); // ~$1 recovered per pair-share
+                    if shares < 1.0 { continue; }
+                    let oid_yes = sell_shares(&clob, &bp.yes.token_id, shares).await;
+                    let oid_no = sell_shares(&clob, &bp.no.token_id, shares).await;
+                    if oid_yes.is_some() && oid_no.is_some() {
+                        let gross = shares * (bp.yes.cur_price + bp.no.cur_price);
                         freed += gross; recycle_sold_usd += gross; recycle_count += 1; sells += 1;
                         append_log(&store, &id, &format!(
-                            "rewards_orchestrator: RECYCLE sold {:.0} sh @ ~{:.2} (~${:.0}) token ...{} order={} | cumulative recycled ${:.0} in {} sells",
-                            shares_to_sell, p.cur_price, gross,
-                            &p.token_id[p.token_id.len().saturating_sub(6)..], oid, recycle_sold_usd, recycle_count
+                            "rewards_orchestrator: RECYCLE sold {:.0} balanced pairs (YES@{:.2}+NO@{:.2}, ~${:.0}) cond ...{} | cumulative recycled ${:.0} in {} ops",
+                            shares, bp.yes.cur_price, bp.no.cur_price, gross,
+                            &bp.condition_id_tail(), recycle_sold_usd, recycle_count
+                        ));
+                    } else {
+                        append_log(&store, &id, &format!(
+                            "rewards_orchestrator: RECYCLE partial fill (yes={} no={}) — leaving pair, will retry",
+                            oid_yes.is_some(), oid_no.is_some()
                         ));
                     }
                 }
@@ -392,14 +403,16 @@ async fn fetch_liquid_balance(clob: &Option<Arc<polymarket_trader::orders::ClobC
     }
 }
 
-/// An open position held by the proxy wallet: (token_id, size_shares, avg_price).
+/// An open position held by the proxy wallet.
 struct HeldPosition {
     token_id: String,
+    condition_id: String,
+    outcome: String, // "Yes"/"No"/"Up"/"Down"
     size: f64,
     cur_price: f64,
 }
 
-/// Read open positions of `proxy_wallet` from the public data-api, sorted largest first.
+/// Read open positions of `proxy_wallet` from the public data-api.
 async fn fetch_open_positions(proxy_wallet: &str) -> Vec<HeldPosition> {
     if proxy_wallet.is_empty() { return Vec::new(); }
     let url = format!("https://data-api.polymarket.com/positions?user={proxy_wallet}");
@@ -408,14 +421,58 @@ async fn fetch_open_positions(proxy_wallet: &str) -> Vec<HeldPosition> {
         .timeout(std::time::Duration::from_secs(15)).send().await
     else { return Vec::new(); };
     let Ok(arr) = resp.json::<Vec<serde_json::Value>>().await else { return Vec::new(); };
-    let mut out: Vec<HeldPosition> = arr.iter().filter_map(|p| {
+    arr.iter().filter_map(|p| {
         let token_id = p.get("asset")?.as_str()?.to_string();
         let size = p.get("size")?.as_f64()?;
-        let cur_price = p.get("curPrice").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        if size > 0.0 { Some(HeldPosition { token_id, size, cur_price }) } else { None }
+        if size <= 0.0 { return None; }
+        Some(HeldPosition {
+            token_id,
+            condition_id: p.get("conditionId").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            outcome: p.get("outcome").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            size,
+            cur_price: p.get("curPrice").and_then(|v| v.as_f64()).unwrap_or(0.0),
+        })
+    }).collect()
+}
+
+/// A balanced YES+NO pair within one market that can be recycled to ~$1/pair.
+struct BalancedPair {
+    yes: HeldPosition,
+    no: HeldPosition,
+    pair_shares: f64, // min(yes.size, no.size) — the balanced quantity
+}
+
+impl BalancedPair {
+    fn condition_id_tail(&self) -> String {
+        let c = &self.yes.condition_id;
+        c[c.len().saturating_sub(6)..].to_string()
+    }
+}
+
+/// Group positions into balanced YES+NO pairs per market. Selling equal shares of
+/// both legs recovers ~$1/pair WITHOUT leaving directional exposure (the CLOB
+/// equivalent of a merge). Sorted by recoverable value, largest first.
+fn balanced_pairs(positions: Vec<HeldPosition>) -> Vec<BalancedPair> {
+    use std::collections::HashMap;
+    let mut by_market: HashMap<String, (Option<HeldPosition>, Option<HeldPosition>)> = HashMap::new();
+    for p in positions {
+        if p.condition_id.is_empty() { continue; }
+        let e = by_market.entry(p.condition_id.clone()).or_insert((None, None));
+        match p.outcome.to_ascii_lowercase().as_str() {
+            "yes" | "up" => e.0 = Some(p),
+            "no" | "down" => e.1 = Some(p),
+            _ => {}
+        }
+    }
+    let mut pairs: Vec<BalancedPair> = by_market.into_values().filter_map(|(y, n)| {
+        let (yes, no) = (y?, n?);
+        let pair_shares = yes.size.min(no.size);
+        if pair_shares < 1.0 { return None; }
+        Some(BalancedPair { yes, no, pair_shares })
     }).collect();
-    out.sort_by(|a, b| (b.size * b.cur_price).partial_cmp(&(a.size * a.cur_price)).unwrap_or(std::cmp::Ordering::Equal));
-    out
+    // ~$1/pair recoverable → sort by pair_shares (= recoverable USD) descending.
+    pairs.sort_by(|a, b| b.pair_shares.partial_cmp(&a.pair_shares).unwrap_or(std::cmp::Ordering::Equal));
+    pairs
 }
 
 /// Sell `shares` of `token_id` via a CLOB market order (gasless, works on the proxy
