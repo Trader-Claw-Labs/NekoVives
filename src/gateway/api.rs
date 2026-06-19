@@ -6117,6 +6117,11 @@ pub struct PatchRunnerBody {
     pub live_sizing_value: Option<f64>,
     /// Hide / unhide a runner in the Live Strategies UI.
     pub hidden: Option<bool>,
+    /// Replace engine_params JSON (rewards orchestrator/maker tuning:
+    /// size_usd, max_markets, offset_cents, min_safety, poll_secs, …).
+    /// Applied on next (re)start since engines read params at launch.
+    #[serde(default)]
+    pub engine_params: Option<serde_json::Value>,
     // These use Option<Option<T>> so we can distinguish:
     //   absent → None (skip)   |   null → Some(None) (clear)   |   value → Some(Some(v)) (set)
     #[serde(default, deserialize_with = "nullable::deserialize")]
@@ -6338,6 +6343,13 @@ pub async fn handle_api_live_patch(
 
     if let Some(hidden) = body.hidden {
         match state.strategy_runner.set_hidden(&id, hidden) {
+            Some(runner) => return Json(serde_json::json!({ "runner": runner })).into_response(),
+            None => return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "runner not found" }))).into_response(),
+        }
+    }
+
+    if let Some(params) = body.engine_params {
+        match state.strategy_runner.set_engine_params(&id, params) {
             Some(runner) => return Json(serde_json::json!({ "runner": runner })).into_response(),
             None => return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "runner not found" }))).into_response(),
         }

@@ -55,7 +55,12 @@ pub fn score_wallet(
 
     let diversity_score = (metrics.unique_tickers as f64 / 20.0).min(1.0);
 
-    let total_score = 0.30 * pnl_norm
+    // Sub-scores are all normalized to 0–1; the weighted sum is therefore 0–1.
+    // The rest of the system (dispatcher thresholds <65/>=80, RiskGate
+    // min_leader_score_to_mirror=80, UI) works on a 0–100 scale, so scale up by
+    // 100 here. Without this, every auto-scored wallet lands near ~50 at most and
+    // was silently dropped as ScoreTooLow.
+    let total_score_0_1 = 0.30 * pnl_norm
         + 0.20 * winrate_score
         + 0.15 * drawdown_score
         + 0.15 * sharpe_score
@@ -72,7 +77,7 @@ pub fn score_wallet(
         sharpe_score,
         consistency_score,
         diversity_score,
-        total_score: total_score.min(100.0).max(0.0),
+        total_score: (total_score_0_1 * 100.0).clamp(0.0, 100.0),
     }
 }
 

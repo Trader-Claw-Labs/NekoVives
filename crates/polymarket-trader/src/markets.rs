@@ -577,6 +577,48 @@ pub async fn get_resolution_by_condition_id(condition_id: &str) -> Result<Option
     Ok(yes_won)
 }
 
+/// Resolve the YES and NO token ids for a market by its condition_id, via the
+/// CLOB `/markets/{condition_id}` key-value endpoint. Returns (yes_token, no_token).
+/// Used by copy-trading to map a leader's fill (condition_id + side) to the actual
+/// ERC-1155 token to buy. (Gamma `?condition_id=` silently ignores the filter — must
+/// use this CLOB path, same as the resolution lookup above.)
+pub async fn fetch_market_tokens(condition_id: &str) -> Result<(String, String)> {
+    #[derive(Deserialize)]
+    struct ClobMarket {
+        #[serde(default)]
+        tokens: Vec<ClobTok>,
+    }
+    #[derive(Deserialize)]
+    struct ClobTok {
+        #[serde(default)]
+        token_id: String,
+        #[serde(default)]
+        outcome: String,
+    }
+    let url = format!("https://clob.polymarket.com/markets/{condition_id}");
+    let m: ClobMarket = reqwest::Client::new()
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let mut yes = None;
+    let mut no = None;
+    for t in &m.tokens {
+        match t.outcome.to_ascii_lowercase().as_str() {
+            "yes" | "up" => yes = Some(t.token_id.clone()),
+            "no" | "down" => no = Some(t.token_id.clone()),
+            _ => {}
+        }
+    }
+    match (yes, no) {
+        (Some(y), Some(n)) => Ok((y, n)),
+        _ => anyhow::bail!("could not resolve YES/NO tokens for condition {condition_id}"),
+    }
+}
+
 /// Get YES token price (0.0 to 1.0).
 /// GET https://clob.polymarket.com/price?token_id=<token_id>&side=buy
 pub async fn get_market_price(token_id: &str) -> Result<f64> {

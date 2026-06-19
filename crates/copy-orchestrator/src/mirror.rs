@@ -16,6 +16,14 @@ pub struct MirrorPosition {
     pub opened_at: String,
     pub closed_at: Option<String>,
     pub pnl: Option<f64>,
+    /// The resolved ERC-1155 token id this mirror would buy (YES/NO of the leader's
+    /// market). Set even in dry-run so the path is validated and Live can execute
+    /// directly. None for legacy positions.
+    #[serde(default)]
+    pub target_token_id: Option<String>,
+    /// true = real CLOB order was/should be placed; false = paper (dry-run) fill.
+    #[serde(default)]
+    pub is_live: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

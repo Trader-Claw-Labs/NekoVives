@@ -428,6 +428,22 @@ impl StrategyRunnerStore {
         updated
     }
 
+    /// Replace the engine_params JSON for a runner (e.g. to retune a rewards
+    /// orchestrator's size_usd / max_markets without recreating it). Takes effect
+    /// on the next runner (re)start, since engines read engine_params at launch.
+    pub fn set_engine_params(&self, id: &str, params: serde_json::Value) -> Option<StoredRunner> {
+        let mut map = self.runners.lock().unwrap();
+        let updated = map.get_mut(id).map(|r| {
+            r.config.engine_params = Some(params);
+            r.clone()
+        });
+        drop(map);
+        if updated.is_some() {
+            self.persist();
+        }
+        updated
+    }
+
     pub fn update_runner_config(
         &self,
         id: &str,

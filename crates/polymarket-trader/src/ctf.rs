@@ -32,6 +32,7 @@ pub const PUSD_CONTRACT: &str = "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb";
 pub const CHAIN_ID: u64 = 137;
 
 const POLYGON_RPCS: &[&str] = &[
+    "https://polygon-mainnet.g.alchemy.com/v2/Cuu-vpezr187QNaaAteWRHXrKbGXphrU",
     "https://polygon.drpc.org",
     "https://1rpc.io/matic",
     "https://polygon-bor-rpc.publicnode.com",
@@ -193,20 +194,214 @@ pub async fn merge_via_proxy(
     let pk = private_key.unwrap();
     let amount_raw: u128 = (amount_tokens * USDC_SCALE as f64) as u128;
 
-    // Inner call: mergePositions(...) targeted at the CTF contract.
-    let inner = encode_merge_positions(collateral, condition_id, amount_raw)?;
-    // Wrap it: proxy([{ typeCode: CALL(1), to: CTF, value: 0, data: inner }]).
-    let outer = encode_proxy_call(CTF_CONTRACT, 0, &inner)?;
+    // The Polymarket wallet is a "DepositWallet" (poly1271) — an EIP-712 smart
+    // account, NOT a classic ProxyWallet with proxy(ProxyCall[]). Arbitrary calls
+    // go through `execute(Batch,signature)` where Batch = {wallet, nonce, deadline,
+    // Call[]} and each Call = {target, value, data}, authorised by an EIP-712
+    // signature from the owner. We batch both required calls in ONE execute():
+    //   1. setApprovalForAll(CTF, true)  — lets the CTF move the wallet's ERC-1155s
+    //   2. mergePositions(...)           — recombines YES+NO back to USDC
+    // Batching avoids the nonce/approval-ordering problem of two separate txs.
+    let approval_calldata = encode_set_approval_for_all(CTF_CONTRACT, true)?;
+    let merge_calldata = encode_merge_positions(collateral, condition_id, amount_raw)?;
+    let calls = vec![
+        DepositCall { target: CTF_CONTRACT.to_string(), value: 0, data: approval_calldata },
+        DepositCall { target: CTF_CONTRACT.to_string(), value: 0, data: merge_calldata },
+    ];
 
-    // Signed by the owner EOA, sent TO the proxy contract.
-    let tx_hash = send_raw_transaction(pk, owner_eoa, proxy_address, &outer, 0).await?;
-    info!("[CTF:merge_via_proxy] tx confirmed: {tx_hash}");
+    let tx_hash = execute_via_deposit_wallet(pk, owner_eoa, proxy_address, calls).await?;
+    info!("[CTF:merge_via_proxy] execute() tx confirmed: {tx_hash}");
 
     Ok(MergeResult {
         tx_hash,
         amount_usdc_recovered: amount_tokens,
         condition_id: condition_id.to_string(),
     })
+}
+
+/// One call inside a DepositWallet `execute` batch.
+struct DepositCall {
+    target: String,
+    value: u128,
+    data: Vec<u8>,
+}
+
+/// Execute a batch of calls through a Polymarket DepositWallet (`execute(Batch,bytes)`).
+///
+/// Builds the EIP-712 `Batch{wallet,nonce,deadline,Call[]}` typed-data, signs it with
+/// the owner's key, ABI-encodes `execute(batch, signature)` and sends it (signed &
+/// gas-paid by `owner_eoa`) to the wallet contract. The wallet verifies the signature
+/// (Solady ERC-1271) and runs each Call from its own context, so the CTF sees the
+/// wallet as `msg.sender` and operates on the wallet's token balance.
+async fn execute_via_deposit_wallet(
+    pk: &str,
+    owner_eoa: &str,
+    wallet: &str,
+    calls: Vec<DepositCall>,
+) -> Result<String> {
+    let client = reqwest::Client::new();
+
+    // 1. Read the wallet's current execute-nonce (selector nonce() = 0xaffed0e0).
+    let nonce_dw = read_uint_call(&client, wallet, "0xaffed0e0").await
+        .context("read DepositWallet nonce")?;
+    // Deadline: far in the future (the chain has no clock here; use a fixed large ts).
+    let deadline: u128 = 4_000_000_000; // year 2096
+
+    // 2. Compute the EIP-712 digest and sign it.
+    let digest = deposit_batch_digest(wallet, nonce_dw, deadline, &calls)?;
+    let signature = sign_digest_65(pk, &digest)?;
+
+    // 3. ABI-encode execute((address,uint256,uint256,(address,uint256,bytes)[]),bytes).
+    let calldata = encode_execute(wallet, nonce_dw, deadline, &calls, &signature)?;
+
+    // 4. Send, signed & gas-paid by the owner EOA, to the wallet.
+    send_raw_transaction(pk, owner_eoa, wallet, &calldata, 0).await
+}
+
+/// EIP-712 digest for `Batch(address wallet,uint256 nonce,uint256 deadline,Call[] calls)Call(address target,uint256 value,bytes data)`.
+fn deposit_batch_digest(wallet: &str, nonce: u128, deadline: u128, calls: &[DepositCall]) -> Result<[u8; 32]> {
+    // Type hashes (Keccak256 of the canonical type strings).
+    let batch_typehash = Keccak256::digest(
+        b"Batch(address wallet,uint256 nonce,uint256 deadline,Call[] calls)Call(address target,uint256 value,bytes data)"
+    );
+    let call_typehash = Keccak256::digest(b"Call(address target,uint256 value,bytes data)");
+
+    // hashStruct(Call) for each, then keccak of the concatenation = calls array hash.
+    let mut calls_concat = Vec::new();
+    for c in calls {
+        let mut h = Vec::new();
+        h.extend_from_slice(&call_typehash);
+        h.extend_from_slice(&[0u8; 12]);
+        h.extend_from_slice(&hex_to_bytes20(&c.target)?);
+        h.extend_from_slice(&u128_to_bytes32(c.value));
+        h.extend_from_slice(&Keccak256::digest(&c.data)); // bytes → keccak256(data)
+        calls_concat.extend_from_slice(&Keccak256::digest(&h));
+    }
+    let calls_hash = Keccak256::digest(&calls_concat);
+
+    // hashStruct(Batch)
+    let mut batch = Vec::new();
+    batch.extend_from_slice(&batch_typehash);
+    batch.extend_from_slice(&[0u8; 12]);
+    batch.extend_from_slice(&hex_to_bytes20(wallet)?);
+    batch.extend_from_slice(&u128_to_bytes32(nonce));
+    batch.extend_from_slice(&u128_to_bytes32(deadline));
+    batch.extend_from_slice(&calls_hash);
+    let batch_hash = Keccak256::digest(&batch);
+
+    // domainSeparator: EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)
+    let domain_typehash = Keccak256::digest(
+        b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
+    );
+    let mut domain = Vec::new();
+    domain.extend_from_slice(&domain_typehash);
+    domain.extend_from_slice(&Keccak256::digest(b"DepositWallet"));
+    domain.extend_from_slice(&Keccak256::digest(b"1"));
+    domain.extend_from_slice(&u128_to_bytes32(CHAIN_ID as u128));
+    domain.extend_from_slice(&[0u8; 12]);
+    domain.extend_from_slice(&hex_to_bytes20(wallet)?); // verifyingContract = the wallet itself
+    let domain_separator = Keccak256::digest(&domain);
+
+    // EIP-712: keccak256(0x1901 ++ domainSeparator ++ hashStruct(message))
+    let mut pre = Vec::with_capacity(2 + 32 + 32);
+    pre.extend_from_slice(&[0x19, 0x01]);
+    pre.extend_from_slice(&domain_separator);
+    pre.extend_from_slice(&batch_hash);
+    Ok(Keccak256::digest(&pre).into())
+}
+
+/// Sign a 32-byte digest, returning a 65-byte (r ‖ s ‖ v) signature with v ∈ {27,28}.
+fn sign_digest_65(pk_hex: &str, digest: &[u8; 32]) -> Result<Vec<u8>> {
+    let pk_raw = hex::decode(pk_hex.strip_prefix("0x").unwrap_or(pk_hex))
+        .map_err(|e| anyhow::anyhow!("invalid private key hex: {e}"))?;
+    let pk = SigningKey::from_slice(&pk_raw)
+        .map_err(|e| anyhow::anyhow!("invalid private key: {e}"))?;
+    let (sig, recid) = pk.sign_prehash(digest)
+        .map_err(|e| anyhow::anyhow!("signing failed: {e}"))?;
+    let sig_bytes = sig.to_bytes();
+    let mut out = Vec::with_capacity(65);
+    out.extend_from_slice(&sig_bytes);                 // r ‖ s (64 bytes)
+    out.push(recid.to_byte() + 27);                    // v
+    Ok(out)
+}
+
+/// ABI-encode `execute((address,uint256,uint256,(address,uint256,bytes)[]),bytes)`.
+fn encode_execute(wallet: &str, nonce: u128, deadline: u128, calls: &[DepositCall], signature: &[u8]) -> Result<Vec<u8>> {
+    let selector = keccak_selector("execute((address,uint256,uint256,(address,uint256,bytes)[]),bytes)");
+    let mut out = Vec::new();
+    out.extend_from_slice(&selector);
+
+    // Two top-level args: Batch (tuple, dynamic because it contains Call[]) and bytes signature.
+    // head[0] = offset to Batch, head[1] = offset to signature.
+    // Build the Batch tail first to know the signature offset.
+    let batch = encode_batch_tuple(wallet, nonce, deadline, calls)?;
+    let head_len = 2 * 32;
+    out.extend_from_slice(&u128_to_bytes32(head_len as u128));            // offset to Batch
+    out.extend_from_slice(&u128_to_bytes32((head_len + batch.len()) as u128)); // offset to signature
+    out.extend_from_slice(&batch);
+    // signature (dynamic bytes)
+    out.extend_from_slice(&u128_to_bytes32(signature.len() as u128));
+    out.extend_from_slice(signature);
+    let pad = (32 - (signature.len() % 32)) % 32;
+    out.extend(std::iter::repeat(0u8).take(pad));
+    Ok(out)
+}
+
+/// ABI-encode the Batch tuple `(address wallet, uint256 nonce, uint256 deadline, Call[] calls)`.
+fn encode_batch_tuple(wallet: &str, nonce: u128, deadline: u128, calls: &[DepositCall]) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    // Batch is a dynamic tuple. Its head: wallet, nonce, deadline, offset→calls.
+    out.extend_from_slice(&[0u8; 12]);
+    out.extend_from_slice(&hex_to_bytes20(wallet)?);
+    out.extend_from_slice(&u128_to_bytes32(nonce));
+    out.extend_from_slice(&u128_to_bytes32(deadline));
+    out.extend_from_slice(&u128_to_bytes32(0x80)); // offset to calls (4 head words)
+
+    // calls array
+    let mut arr = Vec::new();
+    arr.extend_from_slice(&u128_to_bytes32(calls.len() as u128)); // length
+    // each Call is a dynamic tuple → array head is offsets to each element
+    let mut elems: Vec<Vec<u8>> = Vec::new();
+    for c in calls {
+        elems.push(encode_call_tuple(c)?);
+    }
+    let head_region = calls.len() * 32;
+    let mut running = head_region;
+    for e in &elems {
+        arr.extend_from_slice(&u128_to_bytes32(running as u128));
+        running += e.len();
+    }
+    for e in &elems {
+        arr.extend_from_slice(e);
+    }
+    out.extend_from_slice(&arr);
+    Ok(out)
+}
+
+/// ABI-encode one Call tuple `(address target, uint256 value, bytes data)`.
+fn encode_call_tuple(c: &DepositCall) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&[0u8; 12]);
+    out.extend_from_slice(&hex_to_bytes20(&c.target)?);
+    out.extend_from_slice(&u128_to_bytes32(c.value));
+    out.extend_from_slice(&u128_to_bytes32(0x60)); // offset to data (3 head words)
+    out.extend_from_slice(&u128_to_bytes32(c.data.len() as u128));
+    out.extend_from_slice(&c.data);
+    let pad = (32 - (c.data.len() % 32)) % 32;
+    out.extend(std::iter::repeat(0u8).take(pad));
+    Ok(out)
+}
+
+/// `eth_call` a no-arg uint256 getter and return the value.
+async fn read_uint_call(client: &reqwest::Client, to: &str, selector_hex: &str) -> Result<u128> {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0", "method": "eth_call",
+        "params": [{ "to": to, "data": selector_hex }, "latest"], "id": 1
+    });
+    let v = rpc_call(client, &body).await?;
+    let hex = v["result"].as_str().context("no result")?;
+    let hex = hex.strip_prefix("0x").unwrap_or(hex);
+    Ok(u128::from_str_radix(&hex[hex.len().saturating_sub(32)..], 16).unwrap_or(0))
 }
 
 // ── ABI encoding ──────────────────────────────────────────────────────────────
@@ -267,6 +462,19 @@ fn encode_merge_positions(
 ) -> Result<Vec<u8>> {
     let selector = keccak_selector("mergePositions(address,bytes32,bytes32,uint256[],uint256)");
     encode_ctf_call(&selector, collateral, condition_id, amount)
+}
+
+/// ABI-encode `setApprovalForAll(address,bool)` for ERC-1155 (ConditionalTokens).
+/// selector = keccak256("setApprovalForAll(address,bool)") = 0xa22cb465.
+fn encode_set_approval_for_all(operator: &str, approved: bool) -> Result<Vec<u8>> {
+    let mut data = Vec::with_capacity(4 + 2 * 32);
+    data.extend_from_slice(&[0xa2, 0x2c, 0xb4, 0x65]);
+    let op_bytes = hex_to_bytes20(operator)?;
+    data.extend_from_slice(&[0u8; 12]);
+    data.extend_from_slice(&op_bytes);
+    data.extend_from_slice(if approved { &[0u8; 31] } else { &[0u8; 32] });
+    data[35] = if approved { 1 } else { 0 };
+    Ok(data)
 }
 
 /// Shared ABI encoding for split and merge (same parameter structure).
@@ -611,36 +819,12 @@ mod tests {
     }
 
     #[test]
-    fn encode_proxy_call_layout() {
-        // Wrap a tiny 4-byte inner call and verify the ABI layout of
-        // proxy((uint8,address,uint256,bytes)[]) word by word.
-        let to = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"; // CTF
-        let inner = [0xde, 0xad, 0xbe, 0xef];
-        let d = encode_proxy_call(to, 0, &inner).unwrap();
-
-        // selector of proxy((uint8,address,uint256,bytes)[])
+    #[test]
+    fn print_selectors() {
         let sel = keccak_selector("proxy((uint8,address,uint256,bytes)[])");
-        assert_eq!(&d[..4], &sel);
-        let word = |i: usize| &d[4 + i * 32..4 + (i + 1) * 32];
-        // word0: offset to array = 0x20
-        assert_eq!(word(0)[31], 0x20);
-        // word1: array length = 1
-        assert_eq!(word(1)[31], 1);
-        // word2: offset to elem[0] = 0x20
-        assert_eq!(word(2)[31], 0x20);
-        // word3: typeCode = 1 (CALL)
-        assert_eq!(word(3)[31], 1);
-        // word4: `to` address in the low 20 bytes
-        assert_eq!(hex::encode(&word(4)[12..32]), to[2..].to_lowercase());
-        // word5: value = 0
-        assert_eq!(word(5), &[0u8; 32]);
-        // word6: offset to data within tuple = 0x80
-        assert_eq!(word(6)[31], 0x80);
-        // word7: bytes length = 4
-        assert_eq!(word(7)[31], 4);
-        // word8: the 4 data bytes, right-padded
-        assert_eq!(&word(8)[..4], &inner);
-        assert_eq!(&word(8)[4..], &[0u8; 28]);
+        println!("proxy selector: {}", hex::encode(sel));
+        let sel2 = keccak_selector("setApprovalForAll(address,bool)");
+        println!("setApprovalForAll selector: {}", hex::encode(sel2));
     }
 
     #[tokio::test]

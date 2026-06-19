@@ -107,10 +107,23 @@ pub async fn run_rewards_orchestrator_loop(
         return;
     }
 
+    // Capital recycling: when filled quotes lock up liquid USDC, the maker self-strangles
+    // (UNFUNDED) because this wallet (DepositWallet) cannot merge YES+NO onchain. If enabled,
+    // periodically sell the largest accumulated positions via CLOB to free capital and keep
+    // quoting. recycle_enabled=1 to turn on; recycle_min_liquid = the liquid floor that triggers
+    // a sell (default = one full cycle of quotes = size_usd * max_markets * 2).
+    let recycle_enabled = param_f64(ep, "recycle_enabled", 0.0) > 0.0;
+    let proxy_wallet = config.poly_creds.as_ref()
+        .map(|c| c.proxy_address.clone().filter(|a| !a.is_empty()).unwrap_or_else(|| c.wallet_address.clone()))
+        .unwrap_or_default();
+    let mut recycle_sold_usd: f64 = 0.0; // cumulative gross USD recycled (for the spread-vs-rewards tally)
+    let mut recycle_count: u32 = 0;
+
     crate::strategy_runner::set_runner_status(&store, &id, "running");
     append_log(&store, &id, &format!(
-        "rewards_orchestrator started ({}). pool={} markets · min_safety={} · ${:.0}/side · offset={:.0}¢ · poll={}s",
-        if is_live { "LIVE" } else { "DRY-RUN" }, max_markets, min_safety, size_usd, offset * 100.0, poll_secs
+        "rewards_orchestrator started ({}). pool={} markets · min_safety={} · ${:.0}/side · offset={:.0}¢ · poll={}s · recycle={}",
+        if is_live { "LIVE" } else { "DRY-RUN" }, max_markets, min_safety, size_usd, offset * 100.0, poll_secs,
+        if recycle_enabled { "ON" } else { "off" }
     ));
 
     // Active pool keyed by condition_id.
@@ -128,6 +141,45 @@ pub async fn run_rewards_orchestrator_loop(
             .unwrap_or(false);
         if !still_running { break; }
         total_polls += 1;
+
+        // 0. Capital recycling (live only): if liquid USDC has dropped below one full
+        //    cycle of quotes, sell down the largest accumulated positions to free capital.
+        //    Logs gross USD recycled so the operator can compare exit-spread cost against
+        //    rewards earned (the analysis says it likely doesn't pay; this MEASURES it).
+        if recycle_enabled && is_live && !proxy_wallet.is_empty() {
+            let cycle_need = size_usd * max_markets as f64 * 2.0;
+            let liquid = fetch_liquid_balance(&clob).await.unwrap_or(0.0);
+            if liquid < cycle_need {
+                let positions = fetch_open_positions(&proxy_wallet).await;
+                // Sell from the largest position until we'd have ~1.5 cycles of liquid,
+                // capped at 2 sells per poll to avoid dumping the whole book at once.
+                let target = cycle_need * 1.5;
+                let mut freed = 0.0; let mut sells = 0;
+                for p in positions.iter() {
+                    if liquid + freed >= target || sells >= 2 { break; }
+                    if p.cur_price <= 0.02 || p.cur_price >= 0.98 { continue; } // skip near-resolved dust
+                    let need_usd = target - (liquid + freed);
+                    let shares_to_sell = (need_usd / p.cur_price).min(p.size);
+                    if shares_to_sell < 1.0 { continue; }
+                    if let Some(oid) = sell_shares(&clob, &p.token_id, shares_to_sell).await {
+                        let gross = shares_to_sell * p.cur_price;
+                        freed += gross; recycle_sold_usd += gross; recycle_count += 1; sells += 1;
+                        append_log(&store, &id, &format!(
+                            "rewards_orchestrator: RECYCLE sold {:.0} sh @ ~{:.2} (~${:.0}) token ...{} order={} | cumulative recycled ${:.0} in {} sells",
+                            shares_to_sell, p.cur_price, gross,
+                            &p.token_id[p.token_id.len().saturating_sub(6)..], oid, recycle_sold_usd, recycle_count
+                        ));
+                    }
+                }
+                if freed > 0.0 {
+                    // Surface the recycle tally vs rewards for the dashboard.
+                    store.update_result(&id, |res| {
+                        res.live_kv_state.insert("recycle_sold_usd".to_string(), recycle_sold_usd);
+                        res.live_kv_state.insert("recycle_count".to_string(), recycle_count as f64);
+                    });
+                }
+            }
+        }
 
         // 1. Re-scan the reward market universe. On failure keep the existing pool alive.
         let markets = match market_analyzer::rewards::scan_reward_markets(3).await {
@@ -337,6 +389,50 @@ async fn fetch_liquid_balance(clob: &Option<Arc<polymarket_trader::orders::ClobC
         (Some(a), None) => Some(a),
         (None, Some(r)) => Some(r),
         (None, None) => None,
+    }
+}
+
+/// An open position held by the proxy wallet: (token_id, size_shares, avg_price).
+struct HeldPosition {
+    token_id: String,
+    size: f64,
+    cur_price: f64,
+}
+
+/// Read open positions of `proxy_wallet` from the public data-api, sorted largest first.
+async fn fetch_open_positions(proxy_wallet: &str) -> Vec<HeldPosition> {
+    if proxy_wallet.is_empty() { return Vec::new(); }
+    let url = format!("https://data-api.polymarket.com/positions?user={proxy_wallet}");
+    let Ok(resp) = reqwest::Client::new()
+        .get(&url).header("User-Agent", "trader-claw")
+        .timeout(std::time::Duration::from_secs(15)).send().await
+    else { return Vec::new(); };
+    let Ok(arr) = resp.json::<Vec<serde_json::Value>>().await else { return Vec::new(); };
+    let mut out: Vec<HeldPosition> = arr.iter().filter_map(|p| {
+        let token_id = p.get("asset")?.as_str()?.to_string();
+        let size = p.get("size")?.as_f64()?;
+        let cur_price = p.get("curPrice").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        if size > 0.0 { Some(HeldPosition { token_id, size, cur_price }) } else { None }
+    }).collect();
+    out.sort_by(|a, b| (b.size * b.cur_price).partial_cmp(&(a.size * a.cur_price)).unwrap_or(std::cmp::Ordering::Equal));
+    out
+}
+
+/// Sell `shares` of `token_id` via a CLOB market order (gasless, works on the proxy
+/// DepositWallet — unlike onchain merge). Returns the order id on success.
+async fn sell_shares(
+    clob: &Option<Arc<polymarket_trader::orders::ClobClient>>,
+    token_id: &str,
+    shares: f64,
+) -> Option<String> {
+    let c = clob.as_ref()?;
+    // worst_price 0.0 → true market order (SDK walks the book). Round shares to 2dp
+    // (create_market_order already does, but keep the call clean).
+    let shares = (shares * 100.0).floor() / 100.0;
+    if shares <= 0.0 { return None; }
+    match c.create_market_order(token_id, polymarket_trader::orders::Side::Sell, shares, 0.0).await {
+        Ok(resp) => Some(resp.order_id),
+        Err(_) => None,
     }
 }
 

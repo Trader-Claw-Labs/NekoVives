@@ -179,17 +179,58 @@ pub fn spawn_polymarket_dispatch_loop(
                     // sized like the dispatcher computed. Live execution (real place_order)
                     // is intentionally NOT wired yet; Dry Run must validate first.
                     if let dispatcher::DispatchResult::Mirrored(ref id) = result {
-                        let live_mode = {
+                        let (live_mode, size_factor) = {
                             let wl = orchestrator.watchlist.lock().await;
-                            wl.get(&event.leader).map(|e| e.live_mode).unwrap_or(false)
+                            wl.get(&event.leader)
+                                .map(|e| (e.live_mode, e.size_factor))
+                                .unwrap_or((false, 1.0))
                         };
                         let capital = *orchestrator.capital.lock().await;
-                        let my_notional = (event.notional / capital.max(1.0)) * capital * 0.5;
+                        // Unified sizing: a fraction of the leader's notional, scaled by the
+                        // per-leader size_factor, capped at 10% of our capital per trade. This
+                        // is the SAME notional the RiskGate approved (no approved≠opened drift).
+                        let my_notional =
+                            (event.notional * 0.5 * size_factor).min(capital * 0.10);
+
+                        // Resolve the actual token to buy: leader's market (condition_id) + side.
+                        // BUY of YES on the leader → we buy the same YES token. (A leader SELL is
+                        // a close signal, handled by B2's close path, not opened here.)
+                        let target_token = match event.market_id.as_deref() {
+                            Some(cid) if !cid.is_empty() => {
+                                match polymarket_trader::markets::fetch_market_tokens(cid).await {
+                                    Ok((yes, no)) => {
+                                        // The leader's `symbol`/side semantics: we mirror the YES
+                                        // side they took. Most updown/event fills are YES-token
+                                        // buys; default to YES, fall back to NO only if symbol says.
+                                        let want_no = event.symbol.to_ascii_lowercase().contains("no")
+                                            || event.symbol.to_ascii_lowercase().contains("down");
+                                        Some(if want_no { no } else { yes })
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("[Orchestrator] token resolve failed for {cid}: {e}");
+                                        None
+                                    }
+                                }
+                            }
+                            _ => None,
+                        };
+
+                        // DRY-RUN-REAL: the full pipeline runs (token resolved, sized, recorded)
+                        // but no CLOB order is sent yet — entry = leader's fill price as a
+                        // realistic paper fill. Flipping to real execution = add the place_order
+                        // call here gated on `live_mode`. We force paper until validated.
+                        let executed_live = false; // TODO(B1-live): set when real execution is enabled
+                        let my_order_id = if executed_live {
+                            None // would hold the real CLOB order id
+                        } else {
+                            None
+                        };
+
                         let mut mirror = orchestrator.mirror.lock().await;
                         mirror.open(mirror::MirrorPosition {
                             leader_address: event.leader.clone(),
                             leader_fill_id: id.clone(),
-                            my_order_id: None, // None = simulated (Dry Run); set when Live executes
+                            my_order_id,
                             venue: event.venue.to_string(),
                             symbol: event.symbol.clone(),
                             side: side_str.to_string(),
@@ -199,12 +240,19 @@ pub fn spawn_polymarket_dispatch_loop(
                             opened_at: event.timestamp.to_rfc3339(),
                             closed_at: None,
                             pnl: None,
+                            target_token_id: target_token.clone(),
+                            is_live: executed_live,
                         });
                         tracing::info!(
-                            "[Orchestrator] {} mirror position opened: {} ${:.2} @ {:.4}",
-                            if live_mode { "LIVE" } else { "DRY-RUN" },
-                            event.symbol, my_notional, event.price
+                            "[Orchestrator] {} mirror opened: {} ${:.2} @ {:.4} token={} (live_mode={})",
+                            if executed_live { "LIVE" } else { "DRY-RUN" },
+                            event.symbol, my_notional, event.price,
+                            target_token.as_deref().unwrap_or("unresolved"), live_mode
                         );
+
+                        // Register exposure with the RiskGate (B5) so cumulative caps bind.
+                        orchestrator.risk_gate.update_leader_exposure(&event.leader, my_notional);
+                        orchestrator.risk_gate.update_venue_exposure(&event.venue.to_string(), my_notional);
                     }
                     // Persist the fill to wallet_trades so Fill Audit is populated.
                     if let Err(e) = indexer.record_fill(
