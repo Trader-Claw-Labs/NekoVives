@@ -13,6 +13,7 @@ members = [
     "crates/wallet-indexer",
     "crates/copy-orchestrator",
     "crates/hyperliquid-trader",
+    "crates/micro-recorder",
 ]
 resolver = "2"
 
