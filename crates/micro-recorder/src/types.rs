@@ -94,6 +94,9 @@ impl BookSnapshot {
 /// Which CEX feed an event came from.
 pub const SRC_BINANCE_SPOT: &str = "binance_spot";
 pub const SRC_BINANCE_PERP: &str = "binance_perp";
+/// Bybit linear perp — the recorder's primary derivatives venue (trades,
+/// liquidations, funding) when Binance Futures push streams are geo-restricted.
+pub const SRC_BYBIT_PERP: &str = "bybit_perp";
 
 /// The active Polymarket window the recorder is tracking.
 #[derive(Debug, Clone)]

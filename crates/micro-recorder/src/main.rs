@@ -21,6 +21,7 @@
 //!     --metrics-hz 5 [--no-spot] [--no-perp] [--no-poly] [--no-chainlink]
 
 mod binance;
+mod bybit;
 mod chainlink;
 mod metrics;
 mod polymarket;
@@ -53,6 +54,9 @@ struct Args {
     no_spot: bool,
     #[arg(long)]
     no_perp: bool,
+    /// Disable the Bybit perp venue (trades + liquidations + funding).
+    #[arg(long)]
+    no_bybit: bool,
     #[arg(long)]
     no_poly: bool,
     #[arg(long)]
@@ -99,6 +103,9 @@ async fn main() -> anyhow::Result<()> {
     }
     if !args.no_perp {
         binance::spawn_perp(tx.clone());
+    }
+    if !args.no_bybit {
+        bybit::spawn(tx.clone());
     }
     if !args.no_chainlink {
         chainlink::spawn(tx.clone());

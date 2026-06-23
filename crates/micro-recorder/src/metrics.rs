@@ -36,30 +36,43 @@ pub struct MetricSnapshot {
     pub spot_vamp: f64,
     pub spot_ofi_5s: f64,
 
-    // ── Perp venue ──────────────────────────────────────────────────────────
+    // ── Binance perp venue (depth only on geo-restricted IPs) ─────────────────
     pub perp_mid: f64,
     pub perp_obi_l1: f64,
     pub perp_obi_l5: f64,
     pub perp_vamp: f64,
     pub perp_ofi_5s: f64,
+
+    // ── Bybit perp venue (primary derivatives venue: trades+liq+funding) ──────
+    pub bybit_mid: f64,
+    pub bybit_obi_l1: f64,
+    pub bybit_obi_l5: f64,
+    pub bybit_vamp: f64,
+    pub bybit_ofi_5s: f64,
+
+    // ── Mark / funding (whichever derivatives venue delivers them) ────────────
     pub mark_price: f64,
     pub index_price: f64,
     pub funding_rate: f64,
 
-    // ── Flow: CVD per venue (perp is the informative venue when available; spot
-    //    is the fallback / cross-check). `cvd_total`/`cvd_5s`/`cvd_15s` track perp
-    //    for backward-compatibility; the `*_spot` fields track spot. ───────────
+    // ── Flow: CVD per venue. `cvd_total`/`*_5s`/`*_15s` track Binance perp for
+    //    backward-compat; `*_spot` track Binance spot; `*_bybit` track Bybit perp
+    //    (the venue that actually delivers the trade tape on restricted IPs). ──
     pub cvd_total: f64,
     pub cvd_5s: f64,
     pub cvd_15s: f64,
     pub cvd_total_spot: f64,
     pub cvd_5s_spot: f64,
     pub cvd_15s_spot: f64,
+    pub cvd_total_bybit: f64,
+    pub cvd_5s_bybit: f64,
+    pub cvd_15s_bybit: f64,
     pub trade_count_total: u64,
     pub trade_count_spot: u64,
+    pub trade_count_bybit: u64,
 
-    // ── Liquidations (perp @forceOrder) ───────────────────────────────────────
-    /// Signed liq notional in the last 60s: +long-liq (sells), −short-liq (buys).
+    // ── Liquidations (Binance @forceOrder and/or Bybit allLiquidation) ────────
+    /// Signed liq notional in the last 60s: +long-liq, −short-liq.
     pub liq_notional_60s: f64,
     pub liq_long_notional_60s: f64,
     pub liq_short_notional_60s: f64,
@@ -67,7 +80,8 @@ pub struct MetricSnapshot {
 
     // ── Oracle / basis ─────────────────────────────────────────────────────────
     pub chainlink: f64,
-    /// (perp_mid − chainlink)/chainlink × 1e4.
+    /// (derivatives_mid − chainlink)/chainlink × 1e4, where derivatives_mid is the
+    /// Binance perp mid if available, else the Bybit perp mid.
     pub basis_bps: f64,
     pub oracle_age_ms: i64,
 
@@ -197,16 +211,22 @@ pub struct PmToken {
 pub struct RecorderState {
     spot: VenueState,
     perp: VenueState,
+    bybit: VenueState,
 
-    // Flow tape (perp).
+    // Flow tape (Binance perp).
     trades: VecDeque<TradePrint>,
     cvd_total: f64,
     trade_count_total: u64,
 
-    // Flow tape (spot) — cross-check / fallback when the perp tape is unavailable.
+    // Flow tape (Binance spot) — cross-check / fallback for the perp tape.
     trades_spot: VecDeque<TradePrint>,
     cvd_total_spot: f64,
     trade_count_spot: u64,
+
+    // Flow tape (Bybit perp) — primary tape on Binance-restricted IPs.
+    trades_bybit: VecDeque<TradePrint>,
+    cvd_total_bybit: f64,
+    trade_count_bybit: u64,
 
     // Liquidations (perp).
     liqs: VecDeque<LiqPrint>,
@@ -252,6 +272,15 @@ impl RecorderState {
                     self.trades_spot.pop_front();
                 }
             }
+            crate::types::SRC_BYBIT_PERP => {
+                self.cvd_total_bybit += t.signed_qty();
+                self.trade_count_bybit += 1;
+                self.trades_bybit.push_back(t);
+                let cutoff = t.ts_ms - CVD_HIST_MS;
+                while self.trades_bybit.front().is_some_and(|x| x.ts_ms < cutoff) {
+                    self.trades_bybit.pop_front();
+                }
+            }
             _ => {}
         }
     }
@@ -260,6 +289,7 @@ impl RecorderState {
         match src {
             crate::types::SRC_BINANCE_SPOT => self.spot.on_book(b),
             crate::types::SRC_BINANCE_PERP => self.perp.on_book(b),
+            crate::types::SRC_BYBIT_PERP => self.bybit.on_book(b),
             _ => {}
         }
     }
@@ -348,9 +378,18 @@ impl RecorderState {
             }
         }
 
-        let perp_mid = self.perp.book.mid().unwrap_or(self.mark_price);
-        let basis_bps = if self.chainlink > 0.0 && perp_mid > 0.0 {
-            (perp_mid - self.chainlink) / self.chainlink * 10_000.0
+        let perp_mid = self.perp.book.mid().unwrap_or(0.0);
+        let bybit_mid = self.bybit.book.mid().unwrap_or(0.0);
+        // Prefer the Binance perp mid; fall back to Bybit, then the mark price.
+        let deriv_mid = if perp_mid > 0.0 {
+            perp_mid
+        } else if bybit_mid > 0.0 {
+            bybit_mid
+        } else {
+            self.mark_price
+        };
+        let basis_bps = if self.chainlink > 0.0 && deriv_mid > 0.0 {
+            (deriv_mid - self.chainlink) / self.chainlink * 10_000.0
         } else {
             0.0
         };
@@ -369,6 +408,13 @@ impl RecorderState {
             perp_obi_l5: self.perp.obi(5),
             perp_vamp: self.perp.vamp(),
             perp_ofi_5s: self.perp.ofi_window(now_ms, OFI_WINDOW_MS),
+
+            bybit_mid,
+            bybit_obi_l1: self.bybit.obi(1),
+            bybit_obi_l5: self.bybit.obi(5),
+            bybit_vamp: self.bybit.vamp(),
+            bybit_ofi_5s: self.bybit.ofi_window(now_ms, OFI_WINDOW_MS),
+
             mark_price: self.mark_price,
             index_price: self.index_price,
             funding_rate: self.funding_rate,
@@ -379,8 +425,12 @@ impl RecorderState {
             cvd_total_spot: self.cvd_total_spot,
             cvd_5s_spot: Self::cvd_window(&self.trades_spot, now_ms, 5_000),
             cvd_15s_spot: Self::cvd_window(&self.trades_spot, now_ms, 15_000),
+            cvd_total_bybit: self.cvd_total_bybit,
+            cvd_5s_bybit: Self::cvd_window(&self.trades_bybit, now_ms, 5_000),
+            cvd_15s_bybit: Self::cvd_window(&self.trades_bybit, now_ms, 15_000),
             trade_count_total: self.trade_count_total,
             trade_count_spot: self.trade_count_spot,
+            trade_count_bybit: self.trade_count_bybit,
 
             liq_notional_60s: liq_long - liq_short,
             liq_long_notional_60s: liq_long,

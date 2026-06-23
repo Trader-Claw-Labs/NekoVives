@@ -6,15 +6,23 @@ Polymarket's BTC Up/Down 5-minute markets — for **offline analysis**, not trad
 
 ## What it records
 
-Four independent WebSocket feeds funnel into one recorder task (mpsc, no shared
+Five independent WebSocket feeds funnel into one recorder task (mpsc, no shared
 locks on the hot path):
 
 | Feed | Source | Used for |
 |------|--------|----------|
 | Binance **SPOT** aggTrade + depth20@100ms | `stream.binance.com` | OBI, OFI, CVD, VAMP |
-| Binance **PERP** aggTrade + depth20@100ms + **forceOrder** + **markPrice@1s** | `fstream.binance.com` | perp OBI/OFI/CVD, **liquidations**, funding/basis |
+| Binance **PERP** aggTrade + depth20@100ms + **forceOrder** + **markPrice@1s** | `fstream.binance.com` | perp OBI/OFI/CVD, liquidations, funding/basis |
+| **Bybit PERP** publicTrade + allLiquidation + orderbook.50 + tickers | `stream.bybit.com` | **primary derivatives venue**: CVD, **liquidations**, funding, OBI/OFI/VAMP |
 | **Chainlink RTDS** `crypto_prices_chainlink` | `ws-live-data.polymarket.com` | the price Polymarket actually resolves against |
 | **Polymarket CLOB** market-channel | `ws-subscriptions-clob.polymarket.com/ws/market` | live two-sided Up/Down book + trades |
+
+**Why Bybit?** Binance Futures push-WS (`fstream`) is geo-restricted on many IPs:
+it delivers the futures depth book but silently drops the `aggTrade` / `markPrice`
+/ `forceOrder` streams (confirmed on 3 separate networks; the REST API may still
+return 200). Bybit's public WS is open everywhere and exposes the full trade tape,
+forced liquidations and funding — so it is the recorder's primary derivatives /
+liquidation venue. `basis_bps` uses the Binance perp mid when available, else Bybit.
 
 The Polymarket window (token ids) is re-discovered every 5 min via the Gamma API
 (`btc-updown-5m-<window_open_unix>`) and the WS re-subscribes seamlessly; it holds
@@ -50,7 +58,15 @@ cargo build -p micro-recorder --release
   --slug btc_5m \
   --out ~/.traderclaw/workspace/data/micro \
   --metrics-hz 5            # snapshots/sec; 0 disables the metrics plane
-# flags: --no-spot --no-perp --no-poly --no-chainlink
+# flags: --no-spot --no-perp --no-bybit --no-poly --no-chainlink
+```
+
+On a Binance-restricted IP (REST 200 but futures push-WS silent), disable the dead
+Binance feeds and rely on Bybit for the derivatives/liquidation data:
+
+```bash
+./target/release/micro-recorder --slug btc_5m --out ~/micro-data --metrics-hz 5 \
+  --no-spot --no-perp        # keep Bybit + Chainlink + Polymarket
 ```
 
 Graceful on SIGINT/SIGTERM (flushes + finishes both gzip streams). Suitable for a
