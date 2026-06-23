@@ -69,8 +69,9 @@ async fn connect_once(tx: &Sender<RawEvent>) -> anyhow::Result<()> {
     let mut ping = tokio::time::interval(Duration::from_secs(20));
     ping.tick().await;
 
-    // Local order book maintained from snapshot + delta frames.
+    // Local state maintained from snapshot + delta frames.
     let mut book = OrderBook::default();
+    let mut ticker = TickerState::default();
 
     loop {
         tokio::select! {
@@ -80,7 +81,7 @@ async fn connect_once(tx: &Sender<RawEvent>) -> anyhow::Result<()> {
             msg = r.next() => {
                 let Some(msg) = msg else { break };
                 match msg? {
-                    Message::Text(txt) => handle_text(&txt, tx, &mut book).await,
+                    Message::Text(txt) => handle_text(&txt, tx, &mut book, &mut ticker).await,
                     Message::Ping(p) => { let _ = w.send(Message::Pong(p)).await; }
                     Message::Close(_) => break,
                     _ => {}
@@ -136,16 +137,49 @@ struct OrderbookData {
     asks: Vec<[String; 2]>,
 }
 
+/// Bybit `tickers` is a delta-merge channel: the first frame is a full snapshot,
+/// later frames carry ONLY the fields that changed. Fields are `Option` so we can
+/// distinguish "absent in this delta" from "present and zero", and merge into a
+/// persistent `TickerState` — otherwise every mark-price delta would null out the
+/// funding/index fields it omits.
 #[derive(Deserialize)]
 struct TickerData {
-    #[serde(rename = "markPrice", default)]
-    mark_price: String,
-    #[serde(rename = "indexPrice", default)]
-    index_price: String,
-    #[serde(rename = "fundingRate", default)]
-    funding_rate: String,
-    #[serde(rename = "nextFundingTime", default)]
-    next_funding_time: String,
+    #[serde(rename = "markPrice")]
+    mark_price: Option<String>,
+    #[serde(rename = "indexPrice")]
+    index_price: Option<String>,
+    #[serde(rename = "fundingRate")]
+    funding_rate: Option<String>,
+    #[serde(rename = "nextFundingTime")]
+    next_funding_time: Option<String>,
+}
+
+/// Last-known merged ticker state (mark/index/funding survive across deltas).
+#[derive(Default)]
+struct TickerState {
+    mark_price: f64,
+    index_price: f64,
+    funding_rate: f64,
+    next_funding_ms: i64,
+    have_mark: bool,
+}
+
+impl TickerState {
+    fn merge(&mut self, d: &TickerData) {
+        if let Some(v) = d.mark_price.as_ref().and_then(|s| s.parse::<f64>().ok()) {
+            self.mark_price = v;
+            self.have_mark = true;
+        }
+        if let Some(v) = d.index_price.as_ref().and_then(|s| s.parse::<f64>().ok()) {
+            self.index_price = v;
+        }
+        if let Some(v) = d.funding_rate.as_ref().and_then(|s| s.parse::<f64>().ok()) {
+            self.funding_rate = v;
+        }
+        if let Some(v) = d.next_funding_time.as_ref().and_then(|s| s.parse::<i64>().ok()) {
+            self.next_funding_ms = v;
+        }
+    }
 }
 
 /// Local 50-level book maintained across snapshot/delta frames. Bybit sends a
@@ -199,7 +233,12 @@ impl OrderBook {
     }
 }
 
-async fn handle_text(txt: &str, tx: &Sender<RawEvent>, book: &mut OrderBook) {
+async fn handle_text(
+    txt: &str,
+    tx: &Sender<RawEvent>,
+    book: &mut OrderBook,
+    ticker: &mut TickerState,
+) {
     let Ok(env) = serde_json::from_str::<Envelope>(txt) else {
         return; // subscription acks / pong frames have no `data`
     };
@@ -261,20 +300,19 @@ async fn handle_text(txt: &str, tx: &Sender<RawEvent>, book: &mut OrderBook) {
                 .await;
         }
     } else if env.topic.starts_with("tickers") {
-        // tickers is delta-merged; fields may be absent on partial updates.
+        // tickers is delta-merged: merge into persistent state, then emit the full
+        // last-known mark/index/funding (a mark-price delta must not zero funding).
         if let Ok(t) = serde_json::from_value::<TickerData>(env.data) {
-            let mark = t.mark_price.parse::<f64>().unwrap_or(0.0);
-            let index = t.index_price.parse::<f64>().unwrap_or(0.0);
-            let funding = t.funding_rate.parse::<f64>().unwrap_or(0.0);
-            if mark > 0.0 || funding != 0.0 {
+            ticker.merge(&t);
+            if ticker.have_mark {
                 let _ = tx
                     .send(RawEvent::Mark {
                         src: SRC_BYBIT_PERP,
                         ts_ms: env.ts,
-                        mark_price: mark,
-                        index_price: index,
-                        funding_rate: funding,
-                        next_funding_ms: t.next_funding_time.parse().unwrap_or(0),
+                        mark_price: ticker.mark_price,
+                        index_price: ticker.index_price,
+                        funding_rate: ticker.funding_rate,
+                        next_funding_ms: ticker.next_funding_ms,
                     })
                     .await;
             }
@@ -313,5 +351,23 @@ mod tests {
         let e: LiqEntry =
             serde_json::from_value(serde_json::json!({"T":1,"S":"Buy","v":"2","p":"100"})).unwrap();
         assert_eq!(e.side, "Buy");
+    }
+
+    #[test]
+    fn ticker_delta_merge_preserves_funding() {
+        // Snapshot sets funding+index; a later mark-only delta must NOT zero them.
+        let mut ts = TickerState::default();
+        let snap: TickerData = serde_json::from_value(serde_json::json!({
+            "markPrice": "64000.0", "indexPrice": "64010.0", "fundingRate": "0.0001",
+            "nextFundingTime": "1782201600000"
+        })).unwrap();
+        ts.merge(&snap);
+        let delta: TickerData =
+            serde_json::from_value(serde_json::json!({ "markPrice": "64050.0" })).unwrap();
+        ts.merge(&delta);
+        assert_eq!(ts.mark_price, 64050.0, "mark updated by delta");
+        assert_eq!(ts.funding_rate, 0.0001, "funding survives the mark-only delta");
+        assert_eq!(ts.index_price, 64010.0, "index survives the mark-only delta");
+        assert!(ts.have_mark);
     }
 }
